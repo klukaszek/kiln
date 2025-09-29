@@ -628,6 +628,7 @@ dependencies = [
  "bitflags 2.9.4",
  "block2 0.6.1 (git+https://github.com/madsmtm/objc2?rev=b0af693bb2de8d236be86b328d79417eb9658adf)",
  "objc2 0.6.2",
+ "objc2-core-foundation",
  "objc2-foundation 0.3.1",
  "objc2-quartz-core 0.3.1",
 ]

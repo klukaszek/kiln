@@ -6,7 +6,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::ClassType;
 
-use objc2_foundation::NSDate;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use objc2_metal::MTL4CommandEncoder;
 use objc2_metal::MTL4RenderCommandEncoder as _;
@@ -213,7 +214,12 @@ impl Renderer {
         unsafe {
             let ca0 = rp.colorAttachments().objectAtIndexedSubscript(0);
             ca0.setLoadAction(objc2_metal::MTLLoadAction::Clear);
-            ca0.setClearColor(objc2_metal::MTLClearColor { red: 0.1, green: 0.1, blue: 0.12, alpha: 1.0 });
+            ca0.setClearColor(objc2_metal::MTLClearColor {
+                red: 0.1,
+                green: 0.1,
+                blue: 0.12,
+                alpha: 1.0,
+            });
         }
 
         let Some(enc) = (unsafe { cmd.renderCommandEncoderWithDescriptor(&rp) }) else {
@@ -252,8 +258,9 @@ impl Renderer {
     }
 }
 
-// Keep a helper for potential timing differences; not used by examples currently.
-#[allow(dead_code)]
+// Monotonic time since first call (seconds). Cross-platform and non-negative.
+static START_INSTANT: OnceLock<Instant> = OnceLock::new();
 pub fn now_time() -> f32 {
-    NSDate::now().timeIntervalSinceNow() as f32
+    let start = START_INSTANT.get_or_init(Instant::now);
+    start.elapsed().as_secs_f32()
 }

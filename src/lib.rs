@@ -4,6 +4,7 @@
 pub mod kiln {
     pub mod app;
     pub mod events;
+    pub mod shader;
     pub mod renderer;
     pub mod swapchain;
     pub mod windowing;

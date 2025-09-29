@@ -1,0 +1,113 @@
+[package]
+name = "kiln"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+winit = ["dep:winit", "dep:raw-window-handle"]
+
+[dependencies]
+objc2 = "0.6.2"
+dispatch2 = "0.3.0"
+block2 = "0.6.1"
+zerocopy = { version = "0.8.27", features = ["derive"] }
+objc2-metal = { version = "0.3.1", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "MTLAllocation",
+    "MTLAccelerationStructureTypes",
+    "MTLLibrary",
+    "MTLRenderPipeline",
+    "MTLRenderCommandEncoder",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLPixelFormat",
+    "MTLDevice",
+    "MTLDrawable",
+    "MTLRenderPass",
+    "MTL4CommandBuffer",
+    "MTL4CommandEncoder",
+    "MTL4CommandQueue",
+    "MTL4RenderCommandEncoder",
+    "MTL4Compiler",
+    "MTL4PipelineState",
+    "MTL4RenderPipeline",
+    "default" # temp
+] }
+objc2-metal-kit = { version = "0.3.1", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "objc2-app-kit",
+    "objc2-quartz-core",
+    "objc2-model-io",
+    "MTKView",
+    "MTKModel",
+    "default" # temporary
+] }
+objc2-quartz-core = { version = "0.3.1", default-features = false, features = [
+    "std",
+    "CALayer",
+    "objc2-metal",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+] }
+objc2-core-graphics = { version = "0.3.1", default-features = false, features = [
+    "std",
+    "CGColorSpace",
+] }
+winit = { version = "0.30.12", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+objc2-model-io = { version = "0.3.1", default-features = false, features = [
+    "std",
+    "MDLTypes",
+    "MDLMesh",
+] }
+objc2-foundation = { version = "0.3.1", default-features = false, features = [
+    "std",
+    "NSError",
+    "NSString",
+    "NSDate",
+    "NSNotification",
+    "NSThread",
+    "NSGeometry",
+] }
+objc2-core-foundation = { version = "0.3.1", default-features = false, features = [
+    "std",
+    "CFCGTypes",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3.1", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "block2",
+    "NSGraphics",
+    "NSEvent",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSView",
+    "NSViewController",
+    "NSWindow",
+    "NSWindowController",
+    "objc2-quartz-core",
+] }
+
+[lib]
+name = "kiln"
+path = "src/lib.rs"
+
+# Use objc2 crates from a specific git revision that includes Metal 4 (MTL4) APIs
+[patch.crates-io]
+objc2 = { git = "https://github.com/madsmtm/objc2", rev = "b0af693bb2de8d236be86b328d79417eb9658adf" }
+objc2-foundation = { git = "https://github.com/madsmtm/objc2", rev = "b0af693bb2de8d236be86b328d79417eb9658adf" }
+objc2-core-foundation = { git = "https://github.com/madsmtm/objc2", rev = "b0af693bb2de8d236be86b328d79417eb9658adf" }
+objc2-app-kit = { git = "https://github.com/madsmtm/objc2", rev = "b0af693bb2de8d236be86b328d79417eb9658adf" }
+objc2-metal = { git = "https://github.com/madsmtm/objc2", rev = "b0af693bb2de8d236be86b328d79417eb9658adf" }
+objc2-metal-kit = { git = "https://github.com/madsmtm/objc2", rev = "b0af693bb2de8d236be86b328d79417eb9658adf" }
+objc2-quartz-core = { git = "https://github.com/madsmtm/objc2", rev = "b0af693bb2de8d236be86b328d79417eb9658adf" }
+objc2-core-graphics = { git = "https://github.com/madsmtm/objc2", rev = "b0af693bb2de8d236be86b328d79417eb9658adf" }
+objc2-model-io = { git = "https://github.com/madsmtm/objc2", rev = "b0af693bb2de8d236be86b328d79417eb9658adf" }

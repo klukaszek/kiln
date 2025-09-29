@@ -1,4 +1,4 @@
-use crate::kiln::swapchain::{SwapchainConfig, ColorSpace, PresentMode};
+use crate::kiln::renderer::swapchain::{SwapchainConfig, ColorSpace, PresentMode};
 
 #[cfg(target_os = "macos")]
 use objc2_metal_kit::MTKView;
@@ -42,4 +42,3 @@ use core::sync::atomic::{AtomicBool, Ordering};
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "winit")]
 pub fn request_app_exit(event_loop: &ActiveEventLoop) { if !EXIT_REQUESTED.swap(true, Ordering::SeqCst) { event_loop.exit(); } }
-

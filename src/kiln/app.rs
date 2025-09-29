@@ -6,7 +6,7 @@ pub use crate::kiln::events::{
     self, AppEvent, ElementState, EventQueue, Modifiers, MouseButton, TouchPhase,
 };
 pub use crate::kiln::renderer::{self, Renderer};
-pub use crate::kiln::swapchain::{self, ColorSpace, PresentMode, RenderSurface, SwapchainConfig};
+pub use crate::kiln::renderer::swapchain::{self, ColorSpace, PresentMode, RenderSurface, SwapchainConfig};
 pub use crate::kiln::windowing;
 
 use crate::kiln;
@@ -20,7 +20,7 @@ impl<'a> RunConfig<'a> {
     }
 }
 
-type DrawFn = Box<dyn FnMut(&dyn kiln::swapchain::RenderSurface, f32) + 'static>;
+type DrawFn = Box<dyn FnMut(&dyn kiln::renderer::swapchain::RenderSurface, f32) + 'static>;
 
 // High-level lifecycle hooks for a stateful example
 pub trait KilnApp {
@@ -60,7 +60,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
         pending_drawable:
             RefCell<Option<Retained<ProtocolObject<dyn objc2_quartz_core::CAMetalDrawable>>>>,
     }
-    impl kiln::renderer::RenderSurface for Surface {
+    impl kiln::renderer::swapchain::RenderSurface for Surface {
         fn current_mtl4_render_pass_descriptor(
             &self,
         ) -> Option<Retained<objc2_metal::MTL4RenderPassDescriptor>> {
@@ -112,7 +112,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
         ns_view: Option<*mut objc2::runtime::AnyObject>,
         surface: Option<Surface>,
         start: Option<Instant>,
-        swapchain: kiln::swapchain::SwapchainConfig,
+        swapchain: kiln::renderer::swapchain::SwapchainConfig,
         translator: kiln::events::WinitEventTranslator,
         draw: DrawFn,
         title: String,
@@ -124,7 +124,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                 ns_view: None,
                 surface: None,
                 start: None,
-                swapchain: kiln::swapchain::SwapchainConfig::default(),
+                swapchain: kiln::renderer::swapchain::SwapchainConfig::default(),
                 translator: kiln::events::WinitEventTranslator::new(),
                 draw,
                 title: title.to_string(),
@@ -481,7 +481,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                     v: &'a MTKView,
                     d: Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>,
                 }
-                impl<'a> kiln::swapchain::RenderSurface for ViewSurface<'a> {
+                impl<'a> kiln::renderer::swapchain::RenderSurface for ViewSurface<'a> {
                     fn current_mtl4_render_pass_descriptor(
                         &self,
                     ) -> Option<Retained<objc2_metal::MTL4RenderPassDescriptor>>
@@ -569,7 +569,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                     v: &'a MTKView,
                     d: Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>,
                 }
-                impl<'a> kiln::swapchain::RenderSurface for ViewSurface<'a> {
+                impl<'a> kiln::renderer::swapchain::RenderSurface for ViewSurface<'a> {
                     fn current_mtl4_render_pass_descriptor(
                         &self,
                     ) -> Option<Retained<objc2_metal::MTL4RenderPassDescriptor>>
@@ -657,7 +657,7 @@ pub fn run_app<A: KilnApp + 'static>(mut example: A) {
         pending_drawable:
             RefCell<Option<Retained<ProtocolObject<dyn objc2_quartz_core::CAMetalDrawable>>>>,
     }
-    impl kiln::renderer::RenderSurface for Surface {
+    impl kiln::renderer::swapchain::RenderSurface for Surface {
         fn current_mtl4_render_pass_descriptor(
             &self,
         ) -> Option<Retained<objc2_metal::MTL4RenderPassDescriptor>> {
@@ -707,7 +707,7 @@ pub fn run_app<A: KilnApp + 'static>(mut example: A) {
         surface: Option<Surface>,
         start: Option<Instant>,
         last: Option<Instant>,
-        swapchain: kiln::swapchain::SwapchainConfig,
+        swapchain: kiln::renderer::swapchain::SwapchainConfig,
         translator: kiln::events::WinitEventTranslator,
         app: Box<dyn KilnApp>,
     }
@@ -719,7 +719,7 @@ pub fn run_app<A: KilnApp + 'static>(mut example: A) {
                 surface: None,
                 start: None,
                 last: None,
-                swapchain: kiln::swapchain::SwapchainConfig::default(),
+                swapchain: kiln::renderer::swapchain::SwapchainConfig::default(),
                 translator: kiln::events::WinitEventTranslator::new(),
                 app,
             }
@@ -1125,7 +1125,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                         v: &'a MTKView,
                         d: Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>,
                     }
-                    impl<'a> kiln::swapchain::RenderSurface for ViewSurface<'a> {
+                    impl<'a> kiln::renderer::swapchain::RenderSurface for ViewSurface<'a> {
                         fn current_mtl4_render_pass_descriptor(
                             &self,
                         ) -> Option<Retained<objc2_metal::MTL4RenderPassDescriptor>>

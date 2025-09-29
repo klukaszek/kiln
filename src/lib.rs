@@ -4,10 +4,13 @@
 pub mod kiln {
     pub mod app;
     pub mod events;
-    pub mod shader;
+    pub mod gfx;
     pub mod renderer;
     pub mod swapchain;
     pub mod windowing;
 }
 
 // Example binaries live under `examples/` and are not part of the library API.
+
+// Top-level re-exports for cleaner imports: `use kiln::{app, gfx, renderer, swapchain};`
+pub use crate::kiln::{app, events, gfx, renderer, swapchain, windowing};

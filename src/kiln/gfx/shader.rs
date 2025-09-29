@@ -1,6 +1,6 @@
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
 use objc2::ClassType;
+use objc2::runtime::ProtocolObject;
 
 use objc2_foundation::NSString;
 
@@ -36,7 +36,6 @@ pub fn from_source(
     }
 }
 
-// Simple alias so examples can call kiln::shader::new(...)
 pub fn new(device: &ProtocolObject<dyn MTLDevice>, name: &str, source: &str) -> Result<Library, String> {
     from_source(device, name, source)
 }
@@ -50,7 +49,7 @@ pub fn pipeline_state(
 ) -> Result<PipelineState, String> {
     unsafe {
         let compiler_desc = MTL4CompilerDescriptor::new();
-    let compiler: Retained<ProtocolObject<dyn MTL4Compiler>> = device
+        let compiler: Retained<ProtocolObject<dyn MTL4Compiler>> = device
             .newCompilerWithDescriptor_error(&compiler_desc)
             .map_err(|_| "failed to create MTL4 compiler".to_string())?;
 

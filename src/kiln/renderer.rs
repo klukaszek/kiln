@@ -1,10 +1,9 @@
-use core::ffi::c_void;
 use core::mem;
-use core::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::ClassType;
+use objc2::ClassType; // retained for parity with other modules
+use std::ptr::NonNull;
 
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -12,43 +11,20 @@ use std::time::Instant;
 use objc2_metal::MTL4CommandEncoder;
 use objc2_metal::MTL4RenderCommandEncoder as _;
 use objc2_metal::MTLDrawable;
-use objc2_metal::MTLPixelFormat;
 use objc2_metal::{
-    MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4BlendState, MTL4CommandAllocator,
-    MTL4CommandBuffer, MTL4CommandQueue, MTL4Compiler, MTL4CompilerDescriptor,
-    MTL4FunctionDescriptor, MTL4LibraryDescriptor, MTL4LibraryFunctionDescriptor,
-    MTL4RenderPipelineDescriptor, MTLBuffer, MTLDevice, MTLLibrary, MTLPrimitiveType,
-    MTLRenderPipelineState, MTLRenderStages, MTLResourceOptions,
+    MTL4ArgumentTable, MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandQueue, MTLBuffer,
+    MTLDevice, MTLPrimitiveType, MTLRenderPipelineState, MTLRenderStages, MTLResourceOptions,
 };
 
-// Use kiln::swapchain types when the example provides the `kiln` module.
-pub use crate::kiln::swapchain::{ColorSpace, PresentMode, RenderSurface, SwapchainConfig};
-
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct PackedFloat3 {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-}
-impl PackedFloat3 {
-    pub const fn new(x: f32, y: f32, z: f32) -> Self {
-        Self { x, y, z }
-    }
+// Expose swapchain under renderer namespace for a cohesive API
+pub mod swapchain {
+    pub use crate::kiln::swapchain::*;
 }
 
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct SceneProperties {
-    pub time: f32,
-}
+// Internal use of swapchain traits/types
+use crate::kiln::swapchain::{RenderSurface, SwapchainConfig};
 
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct VertexInput {
-    pub position: PackedFloat3,
-    pub color: PackedFloat3,
-}
+pub use crate::kiln::gfx::{PackedFloat3, SceneProperties, VertexInput};
 
 #[derive(Debug)]
 pub struct Renderer {
@@ -62,65 +38,20 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new<S: RenderSurface + ?Sized>(surface: &S, _swapchain: SwapchainConfig) -> Self {
+    pub fn new<S: RenderSurface + ?Sized>(
+        surface: &S,
+        _swapchain: SwapchainConfig,
+        pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+        vertex_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ) -> Self {
         let device = surface.device();
         let command_queue = unsafe { device.newMTL4CommandQueue().expect("create queue") };
         let command_allocator = unsafe { device.newCommandAllocator().expect("create allocator") };
 
-        let compiler_desc = unsafe { MTL4CompilerDescriptor::new() };
-        let compiler = unsafe {
-            device
-                .newCompilerWithDescriptor_error(&compiler_desc)
-                .expect("create compiler")
-        };
-
-        let lib_desc = unsafe { MTL4LibraryDescriptor::new() };
-        unsafe {
-            // Keep kiln self-contained: embed a local copy of the MSL shader
-            lib_desc.setSource(Some(objc2_foundation::ns_string!(include_str!(
-                ".././shaders/metal4_triangle.metal"
-            ))));
-            lib_desc.setName(Some(objc2_foundation::ns_string!("shared_renderer_lib")));
-        }
-        let library: Retained<ProtocolObject<dyn MTLLibrary>> = unsafe {
-            compiler
-                .newLibraryWithDescriptor_error(&lib_desc)
-                .expect("create lib")
-        };
-
-        let vfd = unsafe { MTL4LibraryFunctionDescriptor::new() };
-        unsafe {
-            vfd.setName(Some(objc2_foundation::ns_string!("vertex_main")));
-            vfd.setLibrary(Some(&library));
-        }
-        let ffd = unsafe { MTL4LibraryFunctionDescriptor::new() };
-        unsafe {
-            ffd.setName(Some(objc2_foundation::ns_string!("fragment_main")));
-            ffd.setLibrary(Some(&library));
-        }
-
-        let rp_desc = unsafe { MTL4RenderPipelineDescriptor::new() };
-        let vfd_base: &MTL4FunctionDescriptor = (&*vfd).as_super();
-        let ffd_base: &MTL4FunctionDescriptor = (&*ffd).as_super();
-        unsafe {
-            rp_desc.setVertexFunctionDescriptor(Some(vfd_base));
-            rp_desc.setFragmentFunctionDescriptor(Some(ffd_base));
-            let ca0 = rp_desc.colorAttachments().objectAtIndexedSubscript(0);
-            ca0.setPixelFormat(surface.color_pixel_format());
-            ca0.setBlendingState(MTL4BlendState::Enabled);
-        }
-        let pipeline_state = unsafe {
-            compiler
-                .newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(&rp_desc, None)
-                .expect("create pipeline")
-        };
-
-        let at_desc = unsafe { MTL4ArgumentTableDescriptor::new() };
-        unsafe {
+        let argument_table = unsafe {
+            let at_desc = objc2_metal::MTL4ArgumentTableDescriptor::new();
             at_desc.setMaxBufferBindCount(2);
             at_desc.setMaxTextureBindCount(0);
-        }
-        let argument_table = unsafe {
             device
                 .newArgumentTableWithDescriptor_error(&at_desc)
                 .expect("create arg table")
@@ -133,32 +64,6 @@ impl Renderer {
                 MTLResourceOptions::CPUCacheModeDefaultCache,
             )
             .expect("create scene buf");
-
-        let verts: [VertexInput; 3] = [
-            VertexInput {
-                position: PackedFloat3::new(-f32::sqrt(3.0) / 4.0, -0.25, 0.0),
-                color: PackedFloat3::new(1.0, 0.0, 0.0),
-            },
-            VertexInput {
-                position: PackedFloat3::new(f32::sqrt(3.0) / 4.0, -0.25, 0.0),
-                color: PackedFloat3::new(0.0, 1.0, 0.0),
-            },
-            VertexInput {
-                position: PackedFloat3::new(0.0, 0.5, 0.0),
-                color: PackedFloat3::new(0.0, 0.0, 1.0),
-            },
-        ];
-        let verts_len = mem::size_of_val(&verts);
-        let verts_ptr = NonNull::new(verts.as_ptr() as *mut c_void).unwrap();
-        let vertex_buffer = unsafe {
-            device
-                .newBufferWithBytes_length_options(
-                    verts_ptr,
-                    verts_len,
-                    MTLResourceOptions::CPUCacheModeDefaultCache,
-                )
-                .expect("create vbuf")
-        };
 
         Self {
             device,

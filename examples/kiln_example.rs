@@ -1,14 +1,10 @@
 //! Kiln example entry-point — unified. Backend is selected by crate features.
-#![deny(unsafe_op_in_unsafe_fn)]
 
-use kiln::kiln::renderer::Renderer;
-use kiln::kiln::swapchain::{RenderSurface, SwapchainConfig};
-use kiln::kiln::{app, shader};
+use kiln::renderer::swapchain::{RenderSurface, SwapchainConfig};
+use kiln::renderer::Renderer;
+use kiln::{app, gfx};
+use objc2_metal::MTLResourceOptions;
 
-// A minimal ExampleApp demonstrating:
-// - Loading a Metal shader via kiln::shader::from_source
-// - Building a pipeline via kiln::shader::pipeline_state
-// - Drawing a triangle via kiln::renderer using the shared draw loop
 struct TriangleApp {
     renderer: Option<Renderer>,
 }
@@ -23,11 +19,12 @@ impl app::KilnApp for TriangleApp {
         "kiln triangle"
     }
     fn init(&mut self, surface: &dyn RenderSurface) {
-        // Demonstrate shader compilation helpers
+        // Load shader and build pipeline state via kiln::gfx::shader
         let device = surface.device();
         let msl = include_str!("../src/shaders/metal4_triangle.metal");
-        let lib = shader::from_source(&device, "example_lib", msl).expect("compile shader lib");
-        let _pso = shader::pipeline_state(
+        let lib =
+            gfx::shader::from_source(&device, "example_lib", msl).expect("compile shader lib");
+        let pso = gfx::shader::pipeline_state(
             &device,
             &lib,
             "vertex_main",
@@ -36,8 +33,34 @@ impl app::KilnApp for TriangleApp {
         )
         .expect("pipeline state");
 
-        // Use the shared renderer to draw
-        self.renderer = Some(Renderer::new(surface, SwapchainConfig::default()));
+        // Create vertex buffer for a triangle via kiln::gfx helpers
+        let verts: [gfx::VertexInput; 3] = [
+            gfx::VertexInput {
+                position: gfx::PackedFloat3::new(-f32::sqrt(3.0) / 4.0, -0.25, 0.0),
+                color: gfx::PackedFloat3::new(1.0, 0.0, 0.0),
+            },
+            gfx::VertexInput {
+                position: gfx::PackedFloat3::new(f32::sqrt(3.0) / 4.0, -0.25, 0.0),
+                color: gfx::PackedFloat3::new(0.0, 1.0, 0.0),
+            },
+            gfx::VertexInput {
+                position: gfx::PackedFloat3::new(0.0, 0.5, 0.0),
+                color: gfx::PackedFloat3::new(0.0, 0.0, 1.0),
+            },
+        ];
+        let vbuf = gfx::new_buffer_with_bytes(
+            &device,
+            &verts,
+            MTLResourceOptions::CPUCacheModeDefaultCache,
+        );
+
+        // Construct renderer with provided PSO + vertex buffer
+        self.renderer = Some(Renderer::new(
+            surface,
+            SwapchainConfig::default(),
+            pso,
+            vbuf,
+        ));
     }
     fn update(&mut self, dt: f32) {
         // println!("Delta Time: {}", dt);

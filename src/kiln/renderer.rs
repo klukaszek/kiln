@@ -61,7 +61,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new<S: RenderSurface>(surface: &S, _swapchain: SwapchainConfig) -> Self {
+    pub fn new<S: RenderSurface + ?Sized>(surface: &S, _swapchain: SwapchainConfig) -> Self {
         let device = surface.device();
         let command_queue = unsafe { device.newMTL4CommandQueue().expect("create queue") };
         let command_allocator = unsafe { device.newCommandAllocator().expect("create allocator") };
@@ -170,7 +170,7 @@ impl Renderer {
         }
     }
 
-    pub fn draw_frame<S: RenderSurface>(&self, surface: &S, time: f32) {
+    pub fn draw_frame<S: RenderSurface + ?Sized>(&self, surface: &S, time: f32) {
         // Update scene data (zero-copy via contents())
         let scene = SceneProperties { time };
         let dst = self.scene_buffer.contents();
@@ -207,6 +207,13 @@ impl Renderer {
         };
         unsafe {
             cmd.beginCommandBufferWithAllocator(&self.command_allocator);
+        }
+
+        // Ensure unified clear behavior across backends
+        unsafe {
+            let ca0 = rp.colorAttachments().objectAtIndexedSubscript(0);
+            ca0.setLoadAction(objc2_metal::MTLLoadAction::Clear);
+            ca0.setClearColor(objc2_metal::MTLClearColor { red: 0.1, green: 0.1, blue: 0.12, alpha: 1.0 });
         }
 
         let Some(enc) = (unsafe { cmd.renderCommandEncoderWithDescriptor(&rp) }) else {

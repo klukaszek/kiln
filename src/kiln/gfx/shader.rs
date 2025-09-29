@@ -76,3 +76,26 @@ pub fn pipeline_state(
             .map_err(|_| "failed to create pipeline state".to_string())
     }
 }
+
+pub struct RenderPipelineBuilder<'a> {
+    device: &'a ProtocolObject<dyn MTLDevice>,
+    library: &'a Library,
+    vertex_name: Option<String>,
+    fragment_name: Option<String>,
+    color_format: Option<MTLPixelFormat>,
+}
+
+impl<'a> RenderPipelineBuilder<'a> {
+    pub fn new(device: &'a ProtocolObject<dyn MTLDevice>, library: &'a Library) -> Self {
+        Self { device, library, vertex_name: None, fragment_name: None, color_format: None }
+    }
+    pub fn vertex(mut self, name: &str) -> Self { self.vertex_name = Some(name.to_string()); self }
+    pub fn fragment(mut self, name: &str) -> Self { self.fragment_name = Some(name.to_string()); self }
+    pub fn color_format(mut self, pf: MTLPixelFormat) -> Self { self.color_format = Some(pf); self }
+    pub fn build(self) -> Result<PipelineState, String> {
+        let v = self.vertex_name.ok_or_else(|| "vertex function name not set".to_string())?;
+        let f = self.fragment_name.ok_or_else(|| "fragment function name not set".to_string())?;
+        let cf = self.color_format.ok_or_else(|| "color format not set".to_string())?;
+        pipeline_state(self.device, self.library, &v, &f, cf)
+    }
+}

@@ -8,13 +8,9 @@ use std::ptr::NonNull;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use objc2_metal::MTL4CommandEncoder;
-use objc2_metal::MTL4RenderCommandEncoder as _;
-use objc2_metal::MTLDrawable;
-use objc2_metal::{
-    MTL4ArgumentTable, MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandQueue, MTLBuffer,
-    MTLDevice, MTLPrimitiveType, MTLRenderPipelineState, MTLRenderStages, MTLResourceOptions,
-};
+use crate::kiln::metal;
+use crate::kiln::metal::{MTLPrimitiveType, MTLRenderStages, MTLResourceOptions};
+use objc2_metal::MTLRenderPipelineState;
 
 // Expose swapchain under renderer namespace for a cohesive API
 pub mod swapchain {
@@ -24,142 +20,132 @@ pub mod swapchain {
 // Internal use of swapchain traits/types
 use crate::kiln::swapchain::{RenderSurface, SwapchainConfig};
 
-pub use crate::kiln::gfx::{PackedFloat3, SceneProperties, VertexInput};
+pub use crate::kiln::gfx::buffer;
+pub use crate::kiln::gfx::{self, PackedFloat3, SceneProperties, VertexInput};
 
 #[derive(Debug)]
 pub struct Renderer {
-    device: Retained<ProtocolObject<dyn MTLDevice>>,
-    command_queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
-    command_allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
-    pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    argument_table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
-    scene_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    vertex_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    device: metal::Device,
+    queue: metal::Queue,
+    allocator: metal::CommandAllocator,
+    pipeline_state: Retained<ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>>,
+    argument_table: metal::ArgumentTable,
+    scene_buffer: buffer::Uniform<SceneProperties>,
+    vertex_buffer: buffer::Vertex<VertexInput>,
+    index_buffer: Option<buffer::IndexBuffer>,
+    instance_count: usize,
 }
 
 impl Renderer {
     pub fn new<S: RenderSurface + ?Sized>(
         surface: &S,
         _swapchain: SwapchainConfig,
-        pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-        vertex_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+        pipeline_state: metal::PipelineState,
+        vertex_buffer: buffer::Vertex<VertexInput>,
     ) -> Self {
-        let device = surface.device();
-        let command_queue = unsafe { device.newMTL4CommandQueue().expect("create queue") };
-        let command_allocator = unsafe { device.newCommandAllocator().expect("create allocator") };
+        let device = metal::Device::from_surface(surface);
+        let command_queue = device.new_queue();
+        let command_allocator = device.new_command_allocator();
+        let argument_table = device.new_argument_table(2, 0);
 
-        let argument_table = unsafe {
-            let at_desc = objc2_metal::MTL4ArgumentTableDescriptor::new();
-            at_desc.setMaxBufferBindCount(2);
-            at_desc.setMaxTextureBindCount(0);
-            device
-                .newArgumentTableWithDescriptor_error(&at_desc)
-                .expect("create arg table")
-        };
-
-        let scene_buf_len = mem::size_of::<SceneProperties>();
-        let scene_buffer = device
-            .newBufferWithLength_options(
-                scene_buf_len,
-                MTLResourceOptions::CPUCacheModeDefaultCache,
-            )
-            .expect("create scene buf");
+        // Safe creation via Device: one-element uniform buffer for scene data.
+        let scene_buffer = device.uniform_buffer_with_len::<SceneProperties>(
+            1,
+            MTLResourceOptions::CPUCacheModeDefaultCache,
+        );
 
         Self {
             device,
-            command_queue,
-            command_allocator,
-            pipeline_state,
+            queue: command_queue,
+            allocator: command_allocator,
+            pipeline_state: pipeline_state.into_raw(),
             argument_table,
             scene_buffer,
             vertex_buffer,
+            index_buffer: None,
+            instance_count: 1,
         }
     }
 
     pub fn draw_frame<S: RenderSurface + ?Sized>(&self, surface: &S, time: f32) {
-        // Update scene data (zero-copy via contents())
+        // Update scene data (zero-copy via IntoBytes)
         let scene = SceneProperties { time };
-        let dst = self.scene_buffer.contents();
-        let src_ptr = &scene as *const SceneProperties as *const u8;
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                src_ptr,
-                dst.as_ptr().cast::<u8>(),
-                mem::size_of::<SceneProperties>(),
-            );
-        }
+        let _ = self.scene_buffer.write_one(0, &scene);
 
-        unsafe {
-            self.argument_table
-                .setAddress_atIndex(self.scene_buffer.gpuAddress(), 0);
-        }
-        unsafe {
-            self.argument_table
-                .setAddress_atIndex(self.vertex_buffer.gpuAddress(), 1);
-        }
+        self.argument_table
+            .bind2(0, &self.scene_buffer, 1, &self.vertex_buffer);
 
-        let Some(rp) = surface.current_mtl4_render_pass_descriptor() else {
+        let Some(rp) = metal::RenderPass::from_surface_current(surface) else {
             return;
         };
-        let Some(drawable) = surface.current_drawable() else {
+        let Some(drawable) = metal::Drawable::from_surface_current(surface) else {
             return;
         };
 
-        unsafe {
-            self.command_allocator.reset();
-        }
-        let Some(cmd) = (unsafe { self.device.newCommandBuffer() }) else {
+        self.allocator.reset();
+        let Some(cmd) = metal::CommandBuffer::begin_with_allocator(&self.device, &self.allocator)
+        else {
             return;
         };
-        unsafe {
-            cmd.beginCommandBufferWithAllocator(&self.command_allocator);
-        }
 
-        // Ensure unified clear behavior across backends
-        unsafe {
-            let ca0 = rp.colorAttachments().objectAtIndexedSubscript(0);
-            ca0.setLoadAction(objc2_metal::MTLLoadAction::Clear);
-            ca0.setClearColor(objc2_metal::MTLClearColor {
+        rp.set_clear(
+            metal::MTLClearColor {
                 red: 0.1,
                 green: 0.1,
                 blue: 0.12,
                 alpha: 1.0,
-            });
-        }
+            },
+            metal::MTLLoadAction::Clear,
+        );
 
-        let Some(enc) = (unsafe { cmd.renderCommandEncoderWithDescriptor(&rp) }) else {
+        let Some(enc) = cmd.render_encoder(&rp) else {
             return;
         };
-        unsafe {
-            enc.setRenderPipelineState(&self.pipeline_state);
+        enc.set_pipeline(&metal::PipelineState(self.pipeline_state.clone()));
+        enc.set_argument_table_at_stages(&self.argument_table, MTLRenderStages::Vertex);
+        match &self.index_buffer {
+            Some(_ib) => {
+                // TODO: Enable once objc2_metal exposes indexed draw on MTL4 encoder.
+                if self.instance_count > 1 {
+                    enc.draw_primitives_instanced(
+                        MTLPrimitiveType::Triangle,
+                        0,
+                        3,
+                        self.instance_count,
+                    );
+                } else {
+                    enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
+                }
+            }
+            None => {
+                if self.instance_count > 1 {
+                    enc.draw_primitives_instanced(
+                        MTLPrimitiveType::Triangle,
+                        0,
+                        3,
+                        self.instance_count,
+                    );
+                } else {
+                    enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3)
+                }
+            }
         }
-        unsafe {
-            enc.setArgumentTable_atStages(&self.argument_table, MTLRenderStages::Vertex);
-        }
-        unsafe {
-            enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
-        }
-        unsafe {
-            enc.endEncoding();
-        }
-        unsafe {
-            cmd.endCommandBuffer();
-        }
+        enc.end();
+        cmd.end();
 
-        unsafe {
-            self.command_queue
-                .waitForDrawable(ProtocolObject::from_ref(&*drawable));
-        }
-        let mut arr = [NonNull::from(&*cmd)];
-        let ptr = unsafe { NonNull::new_unchecked(arr.as_mut_ptr()) };
-        unsafe {
-            self.command_queue.commit_count(ptr, 1);
-        }
-        unsafe {
-            self.command_queue
-                .signalDrawable(ProtocolObject::from_ref(&*drawable));
-        }
+        self.queue.wait_for_drawable(&drawable);
+        self.queue.commit_one(&cmd);
+        self.queue.signal_drawable(&drawable);
         drawable.present();
+    }
+}
+
+impl Renderer {
+    pub fn set_instance_count(&mut self, count: usize) {
+        self.instance_count = count.max(1);
+    }
+    pub fn set_index_buffer(&mut self, ib: buffer::IndexBuffer) {
+        self.index_buffer = Some(ib);
     }
 }
 

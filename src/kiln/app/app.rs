@@ -1,13 +1,14 @@
 //! Runtime-facing API surface only. Example code lives in examples/.
 #![allow(clippy::too_many_arguments)]
+#![allow(non_snake_case)]
 
 // Re-export types needed to implement a runtime outside the library.
-pub use crate::kiln::events::{
+pub use crate::kiln::app::events::{
     self, AppEvent, ElementState, EventQueue, Modifiers, MouseButton, TouchPhase,
 };
-pub use crate::kiln::renderer::{self, Renderer};
-pub use crate::kiln::renderer::swapchain::{self, ColorSpace, PresentMode, RenderSurface, SwapchainConfig};
-pub use crate::kiln::windowing;
+pub use crate::kiln::app::renderer::{self, Renderer};
+pub use crate::kiln::metal::{self as swapchain, ColorSpace, PresentMode, MTLDrawableSource as RenderSurface, SwapchainConfig};
+pub use crate::kiln::app::windowing;
 
 use crate::kiln;
 
@@ -20,7 +21,7 @@ impl<'a> RunConfig<'a> {
     }
 }
 
-type DrawFn = Box<dyn FnMut(&dyn kiln::renderer::swapchain::RenderSurface, f32) + 'static>;
+type DrawFn = Box<dyn FnMut(&dyn kiln::metal::MTLDrawableSource, f32) + 'static>;
 
 // High-level lifecycle hooks for a stateful example
 pub trait KilnApp {
@@ -29,7 +30,7 @@ pub trait KilnApp {
     }
     fn init(&mut self, _surface: &dyn RenderSurface) {}
     fn update(&mut self, _dt: f32) {}
-    fn draw(&mut self, surface: &dyn RenderSurface, t: f32);
+    fn draw(&mut self, encoder: &crate::kiln::metal::RenderEncoder, t: f32);
     fn quit(&mut self) {}
 }
 
@@ -37,13 +38,13 @@ pub trait KilnApp {
 #[cfg(all(feature = "winit", target_os = "macos"))]
 pub fn run(config: RunConfig, draw: DrawFn) {
     use core::cell::RefCell;
-    use kiln::windowing::{apply_swapchain_to_metal_layer, request_app_exit};
+    use kiln::app::windowing::{apply_swapchain_to_metal_layer, request_app_exit};
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2::{msg_send, ClassType};
     use objc2_core_foundation::CGSize;
     use objc2_metal::{
-        MTLCreateSystemDefaultDevice, MTLDevice, MTLLoadAction, MTLPixelFormat, MTLStoreAction,
+        MTLCreateSystemDefaultDevice, MTLDevice, MTLPixelFormat,
     };
     use objc2_quartz_core::{CALayer, CAMetalDrawable as _, CAMetalLayer};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -60,7 +61,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
         pending_drawable:
             RefCell<Option<Retained<ProtocolObject<dyn objc2_quartz_core::CAMetalDrawable>>>>,
     }
-    impl kiln::renderer::swapchain::RenderSurface for Surface {
+    impl kiln::metal::MTLDrawableSource for Surface {
         fn current_mtl4_render_pass_descriptor(
             &self,
         ) -> Option<Retained<objc2_metal::MTL4RenderPassDescriptor>> {
@@ -112,8 +113,8 @@ pub fn run(config: RunConfig, draw: DrawFn) {
         ns_view: Option<*mut objc2::runtime::AnyObject>,
         surface: Option<Surface>,
         start: Option<Instant>,
-        swapchain: kiln::renderer::swapchain::SwapchainConfig,
-        translator: kiln::events::WinitEventTranslator,
+        swapchain: kiln::metal::SwapchainConfig,
+        translator: kiln::app::events::WinitEventTranslator,
         draw: DrawFn,
         title: String,
     }
@@ -124,8 +125,8 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                 ns_view: None,
                 surface: None,
                 start: None,
-                swapchain: kiln::renderer::swapchain::SwapchainConfig::default(),
-                translator: kiln::events::WinitEventTranslator::new(),
+                swapchain: kiln::metal::SwapchainConfig::default(),
+                translator: kiln::app::events::WinitEventTranslator::new(),
                 draw,
                 title: title.to_string(),
             }
@@ -196,16 +197,16 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                 | WindowEvent::Touch(_) => {
                     if let Some(mapped) = self.translator.process(&event) {
                         match mapped {
-                            kiln::events::AppEvent::MouseInput { button, state, .. } => {
+                            kiln::app::events::AppEvent::MouseInput { button, state, .. } => {
                                 println!("mouse click: {:?} {:?}", button, state)
                             }
-                            kiln::events::AppEvent::CursorMoved { x, y, .. } => {
+                            kiln::app::events::AppEvent::CursorMoved { x, y, .. } => {
                                 println!("cursor moved: {x:.1},{y:.1}")
                             }
-                            kiln::events::AppEvent::MouseWheel {
+                            kiln::app::events::AppEvent::MouseWheel {
                                 delta_x, delta_y, ..
                             } => println!("wheel: {delta_x:.2},{delta_y:.2}"),
-                            kiln::events::AppEvent::Key {
+                            kiln::app::events::AppEvent::Key {
                                 state,
                                 key_code,
                                 repeat,
@@ -215,7 +216,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                                 "key: code={key_code} {:?} repeat={repeat} text={:?}",
                                 state, text
                             ),
-                            kiln::events::AppEvent::Touch {
+                            kiln::app::events::AppEvent::Touch {
                                 id,
                                 phase,
                                 x,
@@ -267,7 +268,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
 #[cfg(all(not(feature = "winit"), target_os = "macos"))]
 pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
     use core::cell::{OnceCell, RefCell};
-    use kiln::events::{AppEvent, EventQueue, MouseButton};
+    use kiln::app::events::{AppEvent, EventQueue, MouseButton};
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2::{
@@ -278,7 +279,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
         NSWindow, NSWindowStyleMask,
     };
     use objc2_foundation::{
-        NSDate, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+        NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
     };
     use objc2_metal_kit::{MTKView, MTKViewDelegate};
 
@@ -299,7 +300,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                 let loc = (&*self).as_super().convertPoint_fromView(loc_win, None);
                 let mut q = self.ivars().queue.borrow_mut();
                 let flags = unsafe { event.modifierFlags() };
-                q.push(kiln::events::appkit_mouse_input(MouseButton::Left, ElementState::Pressed, loc.x as f64, loc.y as f64, flags));
+                q.push(kiln::app::events::appkit_mouse_input(MouseButton::Left, ElementState::Pressed, loc.x as f64, loc.y as f64, flags));
             }
             #[unsafe(method(mouseUp:))]
             fn mouseUp(&self, event: &objc2_app_kit::NSEvent) {
@@ -307,7 +308,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                 let loc = (&*self).as_super().convertPoint_fromView(loc_win, None);
                 let mut q = self.ivars().queue.borrow_mut();
                 let flags = unsafe { event.modifierFlags() };
-                q.push(kiln::events::appkit_mouse_input(MouseButton::Left, ElementState::Released, loc.x as f64, loc.y as f64, flags));
+                q.push(kiln::app::events::appkit_mouse_input(MouseButton::Left, ElementState::Released, loc.x as f64, loc.y as f64, flags));
             }
             #[unsafe(method(rightMouseDown:))]
             fn rightMouseDown(&self, event: &objc2_app_kit::NSEvent) {
@@ -315,7 +316,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                 let loc = (&*self).as_super().convertPoint_fromView(loc_win, None);
                 let mut q = self.ivars().queue.borrow_mut();
                 let flags = unsafe { event.modifierFlags() };
-                q.push(kiln::events::appkit_mouse_input(MouseButton::Right, ElementState::Pressed, loc.x as f64, loc.y as f64, flags));
+                q.push(kiln::app::events::appkit_mouse_input(MouseButton::Right, ElementState::Pressed, loc.x as f64, loc.y as f64, flags));
             }
             #[unsafe(method(rightMouseUp:))]
             fn rightMouseUp(&self, event: &objc2_app_kit::NSEvent) {
@@ -323,7 +324,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                 let loc = (&*self).as_super().convertPoint_fromView(loc_win, None);
                 let mut q = self.ivars().queue.borrow_mut();
                 let flags = unsafe { event.modifierFlags() };
-                q.push(kiln::events::appkit_mouse_input(MouseButton::Right, ElementState::Released, loc.x as f64, loc.y as f64, flags));
+                q.push(kiln::app::events::appkit_mouse_input(MouseButton::Right, ElementState::Released, loc.x as f64, loc.y as f64, flags));
             }
             #[unsafe(method(otherMouseDown:))]
             fn otherMouseDown(&self, event: &objc2_app_kit::NSEvent) {
@@ -333,7 +334,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                 let mapped = if btn == 2 { MouseButton::Middle } else { MouseButton::Other(btn) };
                 let mut q = self.ivars().queue.borrow_mut();
                 let flags = unsafe { event.modifierFlags() };
-                q.push(kiln::events::appkit_mouse_input(mapped, ElementState::Pressed, loc.x as f64, loc.y as f64, flags));
+                q.push(kiln::app::events::appkit_mouse_input(mapped, ElementState::Pressed, loc.x as f64, loc.y as f64, flags));
             }
             #[unsafe(method(otherMouseUp:))]
             fn otherMouseUp(&self, event: &objc2_app_kit::NSEvent) {
@@ -343,7 +344,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                 let mapped = if btn == 2 { MouseButton::Middle } else { MouseButton::Other(btn) };
                 let mut q = self.ivars().queue.borrow_mut();
                 let flags = unsafe { event.modifierFlags() };
-                q.push(kiln::events::appkit_mouse_input(mapped, ElementState::Released, loc.x as f64, loc.y as f64, flags));
+                q.push(kiln::app::events::appkit_mouse_input(mapped, ElementState::Released, loc.x as f64, loc.y as f64, flags));
             }
             #[unsafe(method(scrollWheel:))]
             fn scrollWheel(&self, event: &objc2_app_kit::NSEvent) {
@@ -352,7 +353,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                 let precise = unsafe { event.hasPreciseScrollingDeltas() };
                 let flags = unsafe { event.modifierFlags() };
                 let mut q = self.ivars().queue.borrow_mut();
-                q.push(kiln::events::appkit_mouse_wheel(dx, dy, precise, flags));
+                q.push(kiln::app::events::appkit_mouse_wheel(dx, dy, precise, flags));
             }
             #[unsafe(method(keyDown:))]
             fn keyDown(&self, event: &objc2_app_kit::NSEvent) {
@@ -361,7 +362,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                 let chars = unsafe { event.characters() };
                 let flags = unsafe { event.modifierFlags() };
                 let mut q = self.ivars().queue.borrow_mut();
-                q.push(kiln::events::appkit_key(ElementState::Pressed, rep, key, chars.as_deref(), flags));
+                q.push(kiln::app::events::appkit_key(ElementState::Pressed, rep, key, chars.as_deref(), flags));
             }
             #[unsafe(method(keyUp:))]
             fn keyUp(&self, event: &objc2_app_kit::NSEvent) {
@@ -369,7 +370,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                 let chars = unsafe { event.characters() };
                 let flags = unsafe { event.modifierFlags() };
                 let mut q = self.ivars().queue.borrow_mut();
-                q.push(kiln::events::appkit_key(ElementState::Released, false, key, chars.as_deref(), flags));
+                q.push(kiln::app::events::appkit_key(ElementState::Released, false, key, chars.as_deref(), flags));
             }
             #[unsafe(method(mouseMoved:))]
             fn mouseMoved(&self, event: &objc2_app_kit::NSEvent) { self.handle_mouse_moved_rust(event); }
@@ -387,7 +388,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
             let loc = (&*self).as_super().convertPoint_fromView(loc_win, None);
             let flags = unsafe { event.modifierFlags() };
             let mut q = self.ivars().queue.borrow_mut();
-            q.push(kiln::events::appkit_cursor_moved(
+            q.push(kiln::app::events::appkit_cursor_moved(
                 loc.x as f64,
                 loc.y as f64,
                 flags,
@@ -403,6 +404,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
         view: OnceCell<Retained<InputView>>,
         title: OnceCell<Retained<NSString>>,
         app: OnceCell<RefCell<Box<dyn KilnApp>>>,
+        renderer: OnceCell<crate::kiln::app::renderer::Renderer>,
     }
     macro_rules! idcell_set {
         ($name:ident, $this:expr, $value:expr) => {{
@@ -481,7 +483,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                     v: &'a MTKView,
                     d: Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>,
                 }
-                impl<'a> kiln::renderer::swapchain::RenderSurface for ViewSurface<'a> {
+                impl<'a> crate::kiln::metal::MTLDrawableSource for ViewSurface<'a> {
                     fn current_mtl4_render_pass_descriptor(
                         &self,
                     ) -> Option<Retained<objc2_metal::MTL4RenderPassDescriptor>>
@@ -509,6 +511,10 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                 if let Some(appcell) = self.ivars().app.get() {
                     appcell.borrow_mut().init(&surf);
                 }
+                let _ = self
+                    .ivars()
+                    .renderer
+                    .set(crate::kiln::app::renderer::Renderer::new(&surf));
             }
             #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
             unsafe fn applicationShouldTerminateAfterLastWindowClosed(
@@ -569,7 +575,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                     v: &'a MTKView,
                     d: Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>,
                 }
-                impl<'a> kiln::renderer::swapchain::RenderSurface for ViewSurface<'a> {
+                impl<'a> crate::kiln::metal::MTLDrawableSource for ViewSurface<'a> {
                     fn current_mtl4_render_pass_descriptor(
                         &self,
                     ) -> Option<Retained<objc2_metal::MTL4RenderPassDescriptor>>
@@ -594,10 +600,18 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
                     v: view,
                     d: device.clone(),
                 };
-                if let Some(appcell) = self.ivars().app.get() {
+                if let (Some(appcell), Some(renderer)) =
+                    (self.ivars().app.get(), self.ivars().renderer.get())
+                {
                     let mut app = appcell.borrow_mut();
                     app.update(dt);
-                    app.draw(&surf, t);
+                    if let Some(mut frame) = renderer.begin_frame(&surf) {
+                        if let Some(enc) = frame.encoder() {
+                            app.draw(&enc, t);
+                            enc.end();
+                        }
+                        frame.end();
+                    }
                 }
             }
             #[unsafe(method(mtkView:drawableSizeWillChange:))]
@@ -619,6 +633,7 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
             view: OnceCell::default(),
             title: OnceCell::default(),
             app: OnceCell::default(),
+            renderer: OnceCell::default(),
         });
         unsafe { msg_send![super(this), init] }
     };
@@ -634,9 +649,9 @@ pub fn run_app<A: KilnApp + 'static>(app_obj: A) {
 
 // High-level: run a stateful ExampleApp (Winit backend)
 #[cfg(all(feature = "winit", target_os = "macos"))]
-pub fn run_app<A: KilnApp + 'static>(mut example: A) {
+pub fn run_app<A: KilnApp + 'static>(example: A) {
     use core::cell::RefCell;
-    use kiln::windowing::{apply_swapchain_to_metal_layer, request_app_exit};
+    use kiln::app::windowing::{apply_swapchain_to_metal_layer, request_app_exit};
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2::{msg_send, ClassType};
@@ -657,7 +672,7 @@ pub fn run_app<A: KilnApp + 'static>(mut example: A) {
         pending_drawable:
             RefCell<Option<Retained<ProtocolObject<dyn objc2_quartz_core::CAMetalDrawable>>>>,
     }
-    impl kiln::renderer::swapchain::RenderSurface for Surface {
+    impl kiln::metal::MTLDrawableSource for Surface {
         fn current_mtl4_render_pass_descriptor(
             &self,
         ) -> Option<Retained<objc2_metal::MTL4RenderPassDescriptor>> {
@@ -707,9 +722,10 @@ pub fn run_app<A: KilnApp + 'static>(mut example: A) {
         surface: Option<Surface>,
         start: Option<Instant>,
         last: Option<Instant>,
-        swapchain: kiln::renderer::swapchain::SwapchainConfig,
-        translator: kiln::events::WinitEventTranslator,
+        swapchain: kiln::metal::SwapchainConfig,
+        translator: kiln::app::events::WinitEventTranslator,
         app: Box<dyn KilnApp>,
+        renderer: Option<crate::kiln::app::renderer::Renderer>,
     }
     impl Handler {
         fn new(app: Box<dyn KilnApp>) -> Self {
@@ -719,9 +735,10 @@ pub fn run_app<A: KilnApp + 'static>(mut example: A) {
                 surface: None,
                 start: None,
                 last: None,
-                swapchain: kiln::renderer::swapchain::SwapchainConfig::default(),
-                translator: kiln::events::WinitEventTranslator::new(),
+                swapchain: kiln::metal::SwapchainConfig::default(),
+                translator: kiln::app::events::WinitEventTranslator::new(),
                 app,
+                renderer: None,
             }
         }
     }
@@ -756,6 +773,7 @@ pub fn run_app<A: KilnApp + 'static>(mut example: A) {
                 pending_drawable: RefCell::new(None),
             };
             self.app.init(&surface);
+            self.renderer = Some(crate::kiln::app::renderer::Renderer::new(&surface));
             self.start = Some(Instant::now());
             self.surface = Some(surface);
             self.ns_view = Some(ns_view);
@@ -791,16 +809,16 @@ pub fn run_app<A: KilnApp + 'static>(mut example: A) {
                 | WindowEvent::Touch(_) => {
                     if let Some(mapped) = self.translator.process(&event) {
                         match mapped {
-                            kiln::events::AppEvent::MouseInput { button, state, .. } => {
+                            kiln::app::events::AppEvent::MouseInput { button, state, .. } => {
                                 println!("mouse click: {:?} {:?}", button, state)
                             }
-                            kiln::events::AppEvent::CursorMoved { x, y, .. } => {
+                            kiln::app::events::AppEvent::CursorMoved { x, y, .. } => {
                                 println!("cursor moved: {x:.1},{y:.1}")
                             }
-                            kiln::events::AppEvent::MouseWheel {
+                            kiln::app::events::AppEvent::MouseWheel {
                                 delta_x, delta_y, ..
                             } => println!("wheel: {delta_x:.2},{delta_y:.2}"),
-                            kiln::events::AppEvent::Key {
+                            kiln::app::events::AppEvent::Key {
                                 state,
                                 key_code,
                                 repeat,
@@ -810,7 +828,7 @@ pub fn run_app<A: KilnApp + 'static>(mut example: A) {
                                 "key: code={key_code} {:?} repeat={repeat} text={:?}",
                                 state, text
                             ),
-                            kiln::events::AppEvent::Touch {
+                            kiln::app::events::AppEvent::Touch {
                                 id,
                                 phase,
                                 x,
@@ -847,7 +865,15 @@ pub fn run_app<A: KilnApp + 'static>(mut example: A) {
                         self.last = Some(now);
                         self.app.update(dt);
                         let t = -start.elapsed().as_secs_f32();
-                        self.app.draw(surface, t);
+                        if let Some(renderer) = self.renderer.as_ref() {
+                            if let Some(mut frame) = renderer.begin_frame(surface) {
+                                if let Some(enc) = frame.encoder() {
+                                    self.app.draw(&enc, t);
+                                    enc.end();
+                                }
+                                frame.end();
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -868,7 +894,7 @@ pub fn run_app<A: KilnApp + 'static>(mut example: A) {
 #[cfg(all(not(feature = "winit"), target_os = "macos"))]
 pub fn run(config: RunConfig, draw: DrawFn) {
     use core::cell::{OnceCell, RefCell};
-    use kiln::events::{AppEvent, EventQueue, MouseButton};
+    use kiln::app::events::{AppEvent, EventQueue, MouseButton};
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2::{
@@ -879,7 +905,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
         NSWindow, NSWindowStyleMask,
     };
     use objc2_foundation::{
-        NSDate, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+        NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
     };
     use objc2_metal_kit::{MTKView, MTKViewDelegate};
 
@@ -900,7 +926,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                 let loc = (&*self).as_super().convertPoint_fromView(loc_win, None);
                 let mut q = self.ivars().queue.borrow_mut();
                 let flags = unsafe { event.modifierFlags() };
-                q.push(kiln::events::appkit_mouse_input(MouseButton::Left, ElementState::Pressed, loc.x as f64, loc.y as f64, flags));
+                q.push(kiln::app::events::appkit_mouse_input(MouseButton::Left, ElementState::Pressed, loc.x as f64, loc.y as f64, flags));
             }
             #[unsafe(method(mouseUp:))]
             fn mouseUp(&self, event: &objc2_app_kit::NSEvent) {
@@ -908,7 +934,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                 let loc = (&*self).as_super().convertPoint_fromView(loc_win, None);
                 let mut q = self.ivars().queue.borrow_mut();
                 let flags = unsafe { event.modifierFlags() };
-                q.push(kiln::events::appkit_mouse_input(MouseButton::Left, ElementState::Released, loc.x as f64, loc.y as f64, flags));
+                q.push(kiln::app::events::appkit_mouse_input(MouseButton::Left, ElementState::Released, loc.x as f64, loc.y as f64, flags));
             }
             #[unsafe(method(rightMouseDown:))]
             fn rightMouseDown(&self, event: &objc2_app_kit::NSEvent) {
@@ -916,7 +942,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                 let loc = (&*self).as_super().convertPoint_fromView(loc_win, None);
                 let mut q = self.ivars().queue.borrow_mut();
                 let flags = unsafe { event.modifierFlags() };
-                q.push(kiln::events::appkit_mouse_input(MouseButton::Right, ElementState::Pressed, loc.x as f64, loc.y as f64, flags));
+                q.push(kiln::app::events::appkit_mouse_input(MouseButton::Right, ElementState::Pressed, loc.x as f64, loc.y as f64, flags));
             }
             #[unsafe(method(rightMouseUp:))]
             fn rightMouseUp(&self, event: &objc2_app_kit::NSEvent) {
@@ -924,7 +950,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                 let loc = (&*self).as_super().convertPoint_fromView(loc_win, None);
                 let mut q = self.ivars().queue.borrow_mut();
                 let flags = unsafe { event.modifierFlags() };
-                q.push(kiln::events::appkit_mouse_input(MouseButton::Right, ElementState::Released, loc.x as f64, loc.y as f64, flags));
+                q.push(kiln::app::events::appkit_mouse_input(MouseButton::Right, ElementState::Released, loc.x as f64, loc.y as f64, flags));
             }
             #[unsafe(method(otherMouseDown:))]
             fn otherMouseDown(&self, event: &objc2_app_kit::NSEvent) {
@@ -934,7 +960,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                 let mapped = if btn == 2 { MouseButton::Middle } else { MouseButton::Other(btn) };
                 let mut q = self.ivars().queue.borrow_mut();
                 let flags = unsafe { event.modifierFlags() };
-                q.push(kiln::events::appkit_mouse_input(mapped, ElementState::Pressed, loc.x as f64, loc.y as f64, flags));
+                q.push(kiln::app::events::appkit_mouse_input(mapped, ElementState::Pressed, loc.x as f64, loc.y as f64, flags));
             }
             #[unsafe(method(otherMouseUp:))]
             fn otherMouseUp(&self, event: &objc2_app_kit::NSEvent) {
@@ -944,7 +970,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                 let mapped = if btn == 2 { MouseButton::Middle } else { MouseButton::Other(btn) };
                 let mut q = self.ivars().queue.borrow_mut();
                 let flags = unsafe { event.modifierFlags() };
-                q.push(kiln::events::appkit_mouse_input(mapped, ElementState::Released, loc.x as f64, loc.y as f64, flags));
+                q.push(kiln::app::events::appkit_mouse_input(mapped, ElementState::Released, loc.x as f64, loc.y as f64, flags));
             }
             #[unsafe(method(scrollWheel:))]
             fn scrollWheel(&self, event: &objc2_app_kit::NSEvent) {
@@ -953,7 +979,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                 let precise = unsafe { event.hasPreciseScrollingDeltas() };
                 let flags = unsafe { event.modifierFlags() };
                 let mut q = self.ivars().queue.borrow_mut();
-                q.push(kiln::events::appkit_mouse_wheel(dx, dy, precise, flags));
+                q.push(kiln::app::events::appkit_mouse_wheel(dx, dy, precise, flags));
             }
             #[unsafe(method(keyDown:))]
             fn keyDown(&self, event: &objc2_app_kit::NSEvent) {
@@ -962,7 +988,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                 let chars = unsafe { event.characters() };
                 let flags = unsafe { event.modifierFlags() };
                 let mut q = self.ivars().queue.borrow_mut();
-                q.push(kiln::events::appkit_key(ElementState::Pressed, rep, key, chars.as_deref(), flags));
+                q.push(kiln::app::events::appkit_key(ElementState::Pressed, rep, key, chars.as_deref(), flags));
             }
             #[unsafe(method(keyUp:))]
             fn keyUp(&self, event: &objc2_app_kit::NSEvent) {
@@ -970,7 +996,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                 let chars = unsafe { event.characters() };
                 let flags = unsafe { event.modifierFlags() };
                 let mut q = self.ivars().queue.borrow_mut();
-                q.push(kiln::events::appkit_key(ElementState::Released, false, key, chars.as_deref(), flags));
+                q.push(kiln::app::events::appkit_key(ElementState::Released, false, key, chars.as_deref(), flags));
             }
             #[unsafe(method(mouseMoved:))]
             fn mouseMoved(&self, event: &objc2_app_kit::NSEvent) { self.handle_mouse_moved_rust(event); }
@@ -988,7 +1014,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
             let loc = (&*self).as_super().convertPoint_fromView(loc_win, None);
             let flags = unsafe { event.modifierFlags() };
             let mut q = self.ivars().queue.borrow_mut();
-            q.push(kiln::events::appkit_cursor_moved(
+            q.push(kiln::app::events::appkit_cursor_moved(
                 loc.x as f64,
                 loc.y as f64,
                 flags,
@@ -1125,7 +1151,7 @@ pub fn run(config: RunConfig, draw: DrawFn) {
                         v: &'a MTKView,
                         d: Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>,
                     }
-                    impl<'a> kiln::renderer::swapchain::RenderSurface for ViewSurface<'a> {
+                impl<'a> crate::kiln::metal::MTLDrawableSource for ViewSurface<'a> {
                         fn current_mtl4_render_pass_descriptor(
                             &self,
                         ) -> Option<Retained<objc2_metal::MTL4RenderPassDescriptor>>

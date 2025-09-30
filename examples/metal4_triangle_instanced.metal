@@ -1,4 +1,4 @@
-// Self-contained shader for kiln's internal renderer
+// Instanced triangle shader demonstrating instance_id usage
 #include <metal_stdlib>
 using namespace metal;
 
@@ -18,15 +18,13 @@ vertex VertexOutput vertex_main(
     float c = cos(properties.time);
     float s = sin(properties.time);
     float2 r = float2x2(c, -s, s, c) * p;
-    // Distribute instances in a sunflower pattern
-    const float golden = 2.39996323; // ~pi * (3 - sqrt(5))
+    // Sunflower distribution for instances
+    const float golden = 2.39996323;
     float iid = float(instance_id);
     float angle = golden * iid;
-    // Smoothly map instance_id -> [0,1) using tanh to keep within view nicely
     float t = tanh(0.06 * iid);
     float radius = 0.9 * t;
     float2 offset = radius * float2(cos(angle), sin(angle));
-    // Larger near center, shrink with distance: invert t so center -> 1, edge -> 0
     float near_factor = 1.0 - t;
     float scale = mix(0.25, 1.15, near_factor);
     float2 rp = r * scale;
@@ -36,3 +34,4 @@ vertex VertexOutput vertex_main(
 }
 
 fragment float4 fragment_main(VertexOutput in [[stage_in]]) { return in.color; }
+

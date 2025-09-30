@@ -1,4 +1,4 @@
-use crate::kiln::renderer::swapchain::{SwapchainConfig, ColorSpace, PresentMode};
+use crate::kiln::metal::{SwapchainConfig, ColorSpace, PresentMode};
 
 #[cfg(target_os = "macos")]
 use objc2_metal_kit::MTKView;

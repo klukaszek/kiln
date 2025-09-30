@@ -1,6 +1,8 @@
 # Kiln Metal Facade: Feature Checklist
 
 This checklist tracks the safe, zero-copy Metal coverage exposed via `kiln::metal`.
+The app runtime now implicitly begins/ends frames and provides a `RenderEncoder`
+to `KilnApp::draw`, making multi‑PSO rendering natural while maintaining zero‑copy usage.
 Goal: provide an idiomatic, safe Rust API without leaking unsafe `objc2_metal` items.
 
 ## Safety & Zero-Copy Principles
@@ -20,6 +22,7 @@ Goal: provide an idiomatic, safe Rust API without leaking unsafe `objc2_metal` i
 ## Shaders & Pipeline
 - [x] MSL compile via `MTL4Compiler` into `metal::Library`
 - [x] Render pipeline builder (vertex/fragment/color format)
+  - [x] Multi‑PSO per frame via encoder API (app‑managed frames)
 - [ ] Compute pipeline creation
 - [ ] Function specialization constants
 - [ ] Linked functions / dynamic libraries
@@ -28,6 +31,7 @@ Goal: provide an idiomatic, safe Rust API without leaking unsafe `objc2_metal` i
 ## Render Pass & Encoder (Graphics)
 - [x] Render pass descriptor wrapper: acquire current, set clear/load
 - [x] Render encoder wrapper: set pipeline, set argument table at stages
+  - [x] Encoder passed into `KilnApp::draw` by app runtime
 - [x] Non-indexed draw (`draw_primitives`)
 - [ ] Indexed draws (u16/u32)
 - [x] Instanced draws
@@ -62,7 +66,7 @@ Goal: provide an idiomatic, safe Rust API without leaking unsafe `objc2_metal` i
 - [ ] Resource fences / hazard tracking controls
 
 ## Synchronization & Presentation
-- [x] Drawable wrapper: acquire/present
+- [x] Drawable wrapper: acquire/present (via app‑managed `RenderFrame` RAII)
 - [x] Queue signals/waits for drawable
 - [ ] Events/shared events
 - [ ] Frame pacing/present at time
@@ -99,7 +103,7 @@ Goal: provide an idiomatic, safe Rust API without leaking unsafe `objc2_metal` i
 
 ## Testing & Examples
 - [x] Triangle example via `kiln::metal` facade
-- [ ] Examples for indexed drawing, instancing
+- [x] Instanced triangle example
 - [ ] Examples for compute + blit
 - [ ] Example for argument tables with multiple resources
 - [ ] Example for textures/samplers

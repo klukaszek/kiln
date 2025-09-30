@@ -1,16 +1,25 @@
-//! Instanced triangle example using `kiln::metal` facade.
+//! Instanced triangle example using zero-copy `kiln::metal` facade.
 
-use kiln::metal::MTLResourceOptions;
-use kiln::renderer::swapchain::{RenderSurface, SwapchainConfig};
-use kiln::renderer::Renderer;
+use kiln::metal::{MTLPrimitiveType, MTLRenderStages, MTLResourceOptions};
+use kiln::metal::MTLDrawableSource as RenderSurface;
 use kiln::{app, metal};
 
 struct TriangleApp {
-    renderer: Option<Renderer>,
+    pipeline: Option<metal::PipelineState>,
+    vbuf: Option<metal::Vertex<metal::VertexInput>>,
+    scene: Option<metal::Uniform<metal::SceneProperties>>,
+    args: Option<metal::ArgumentBuffer>,
+    instances: usize,
 }
 impl TriangleApp {
     fn new() -> Self {
-        Self { renderer: None }
+        Self {
+            pipeline: None,
+            vbuf: None,
+            scene: None,
+            args: None,
+            instances: 100,
+        }
     }
 }
 
@@ -20,7 +29,8 @@ impl app::KilnApp for TriangleApp {
     }
     fn init(&mut self, surface: &dyn RenderSurface) {
         let dev = metal::Device::from_surface(surface);
-        let msl = include_str!("../../src/shaders/metal4_triangle.metal");
+
+        let msl = include_str!("shader.metal");
         let lib = dev
             .compile_library_from_source("example_lib", msl)
             .expect("compile shader lib");
@@ -48,16 +58,30 @@ impl app::KilnApp for TriangleApp {
         ];
         let vbuf =
             dev.vertex_buffer_from_slice(&verts, MTLResourceOptions::CPUCacheModeDefaultCache);
+        let scene = dev.uniform_buffer_with_len::<metal::SceneProperties>(
+            1,
+            MTLResourceOptions::CPUCacheModeDefaultCache,
+        );
+        let args = dev.new_argument_buffer(2, 0);
 
-        let mut r = Renderer::new(surface, SwapchainConfig::default(), pso, vbuf);
-        r.set_instance_count(100);
-        self.renderer = Some(r);
+        self.pipeline = Some(pso);
+        self.vbuf = Some(vbuf);
+        self.scene = Some(scene);
+        self.args = Some(args);
     }
     fn update(&mut self, _dt: f32) {}
-    fn draw(&mut self, surface: &dyn RenderSurface, t: f32) {
-        if let Some(r) = self.renderer.as_mut() {
-            r.draw_frame(surface, t);
-        }
+    fn draw(&mut self, encoder: &kiln::metal::RenderEncoder, t: f32) {
+        let (pso, vbuf, scene, args) = match (&self.pipeline, &self.vbuf, &self.scene, &self.args) {
+            (Some(p), Some(vb), Some(sc), Some(at)) => (p, vb, sc, at),
+            _ => return,
+        };
+
+        let _ = scene.write_one(0, &metal::SceneProperties { time: t });
+        args.bind2(0, scene, 1, vbuf);
+
+        encoder.set_pipeline(pso);
+        encoder.set_argument_table_at_stages(args, MTLRenderStages::Vertex);
+        encoder.draw_primitives_instanced(MTLPrimitiveType::Triangle, 0, 3, self.instances);
     }
     fn quit(&mut self) {}
 }

@@ -1,0 +1,61 @@
+[package]
+name = "spectradio-rhi"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["vulkan"]
+vulkan = ["dep:ash", "dep:ash-window"]
+metal = ["dep:objc2-metal", "dep:objc2", "dep:objc2-foundation", "dep:objc2-quartz-core", "dep:objc2-core-foundation", "dep:dispatch2"]
+
+[dependencies]
+# Common
+zerocopy = { version = "0.8", features = ["derive"] }
+raw-window-handle = "0.6"
+log = "0.4"
+thiserror = "2"
+bitflags = "2"
+
+# Vulkan backend
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"], optional = true }
+ash-window = { version = "0.13", optional = true }
+
+# Metal backend
+objc2-metal = { version = "0.3.2", optional = true, features = [
+    # Core types
+    "MTLDevice", "MTLResource", "MTLAllocation", "MTLTypes", "MTLPixelFormat",
+    "MTLGPUAddress", "MTLDrawable",
+    # Memory
+    "MTLBuffer", "MTLTexture", "MTLSampler", "MTLHeap",
+    # Command infrastructure
+    "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder",
+    "MTLBlitCommandEncoder", "MTLRenderCommandEncoder", "MTLComputeCommandEncoder",
+    # Rendering
+    "MTLRenderPass", "MTLRenderPipeline", "MTLComputePipeline", "MTLDepthStencil",
+    # Shader
+    "MTLLibrary", "MTLArgument", "MTLArgumentEncoder",
+    "MTLFunctionDescriptor", "MTLFunctionHandle",
+    # Indirect command buffers
+    "MTLIndirectCommandBuffer", "MTLIndirectCommandEncoder",
+    # Sync
+    "MTLEvent",
+    # Metal 4
+    "MTL4CommandQueue", "MTL4CommandBuffer", "MTL4CommandAllocator",
+    "MTL4CommandEncoder", "MTL4RenderCommandEncoder", "MTL4RenderPass",
+    "MTL4ComputeCommandEncoder", "MTL4ArgumentTable", "MTL4BufferRange",
+    "MTL4Compiler", "MTL4PipelineState", "MTL4ComputePipeline",
+    "MTL4RenderPipeline", "MTL4FunctionDescriptor", "MTL4LibraryFunctionDescriptor",
+    # Mesh shaders (Metal 4)
+    "MTL4MeshRenderPipeline",
+    # Acceleration structures and ray tracing
+    "MTLAccelerationStructure", "MTL4AccelerationStructure",
+    "MTLAccelerationStructureCommandEncoder", "MTLAccelerationStructureTypes",
+    "MTLIntersectionFunctionTable", "MTLVisibleFunctionTable",
+] }
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+objc2-quartz-core = { version = "0.3", optional = true, features = [
+    "CALayer", "objc2-metal", "objc2-core-foundation",
+] }
+objc2-core-foundation = { version = "0.3", optional = true }
+dispatch2 = { version = "0.3", optional = true }

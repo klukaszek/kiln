@@ -1,0 +1,614 @@
+use crate::types::GpuAddress;
+use crate::{Device, RhiError, RhiResult};
+
+/// Usage hints for GPU buffer allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BufferUsage {
+    /// General-purpose GPU buffer (vertex, index, storage).
+    GpuOnly,
+    /// CPU-writable, GPU-readable (uniforms, staging, transient).
+    Default,
+    /// GPU-writable, CPU-readable (readback).
+    Readback,
+}
+
+/// Description for creating a GPU buffer.
+#[derive(Clone, Debug)]
+pub struct BufferDesc {
+    pub size: u64,
+    pub usage: BufferUsage,
+    pub label: Option<String>,
+}
+
+/// Memory type for pointer-first allocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemoryType {
+    /// CPU-mapped GPU memory (default).
+    Default,
+    /// GPU-only memory (not CPU-mapped).
+    GpuOnly,
+    /// GPU-writable, CPU-readable memory.
+    Readback,
+}
+
+/// Pointer-first GPU allocation (wraps a backing GpuBuffer).
+pub struct GpuAllocation {
+    pub(crate) buffer: GpuBuffer,
+    pub(crate) offset: u64,
+    pub(crate) size: u64,
+}
+
+impl GpuAllocation {
+    /// CPU-mapped pointer for this allocation (if available).
+    pub fn mapped_ptr(&self) -> Option<*mut u8> {
+        self.buffer
+            .mapped_ptr()
+            .map(|ptr| unsafe { ptr.add(self.offset as usize) })
+    }
+
+    /// GPU virtual address for this allocation.
+    pub fn gpu_address(&self) -> GpuAddress {
+        self.buffer.gpu_address().offset(self.offset)
+    }
+
+    /// Allocation size in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Consume the allocation and return the backing buffer.
+    pub fn into_buffer(self) -> GpuBuffer {
+        self.buffer
+    }
+}
+
+/// Description for a user-land GPU allocator.
+#[derive(Clone, Debug)]
+pub struct GpuAllocatorDesc {
+    /// Size of new backing blocks. Large enough blocks avoid runtime allocation churn.
+    pub block_size: u64,
+    /// Backing memory type.
+    pub memory: MemoryType,
+    /// Optional label prefix for backing allocations.
+    pub label: Option<String>,
+}
+
+impl Default for GpuAllocatorDesc {
+    fn default() -> Self {
+        Self {
+            block_size: 64 * 1024 * 1024,
+            memory: MemoryType::Default,
+            label: None,
+        }
+    }
+}
+
+/// A persistent suballocation from `GpuAllocator`.
+#[derive(Debug)]
+pub struct GpuSubAllocation {
+    block: usize,
+    offset: u64,
+    size: u64,
+    cpu_ptr: Option<*mut u8>,
+    gpu_address: GpuAddress,
+}
+
+impl GpuSubAllocation {
+    /// CPU-mapped pointer for this suballocation, if the backing memory is CPU visible.
+    pub fn mapped_ptr(&self) -> Option<*mut u8> {
+        self.cpu_ptr
+    }
+
+    /// GPU virtual address for this suballocation.
+    pub fn gpu_address(&self) -> GpuAddress {
+        self.gpu_address
+    }
+
+    /// Allocation size in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Offset from the backing block base.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Write a value into this suballocation.
+    ///
+    /// # Safety
+    /// The caller must ensure the allocation is CPU mapped and not concurrently
+    /// accessed in a conflicting way by the GPU.
+    pub unsafe fn upload<T: zerocopy::IntoBytes + zerocopy::Immutable>(
+        &self,
+        data: &T,
+    ) -> RhiResult<()> {
+        let bytes = zerocopy::IntoBytes::as_bytes(data);
+        self.upload_bytes(bytes)
+    }
+
+    /// Write a slice of values into this suballocation.
+    ///
+    /// # Safety
+    /// The caller must ensure the allocation is CPU mapped and not concurrently
+    /// accessed in a conflicting way by the GPU.
+    pub unsafe fn upload_slice<T: zerocopy::IntoBytes + zerocopy::Immutable>(
+        &self,
+        data: &[T],
+    ) -> RhiResult<()> {
+        let bytes = zerocopy::IntoBytes::as_bytes(data);
+        self.upload_bytes(bytes)
+    }
+
+    fn upload_bytes(&self, bytes: &[u8]) -> RhiResult<()> {
+        if bytes.len() as u64 > self.size {
+            return Err(RhiError::AllocationFailed(format!(
+                "upload size {} exceeds allocation size {}",
+                bytes.len(),
+                self.size
+            )));
+        }
+        let cpu_ptr = self
+            .cpu_ptr
+            .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU mapped".into()))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), cpu_ptr, bytes.len());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FreeRange {
+    offset: u64,
+    size: u64,
+}
+
+struct GpuAllocatorBlock {
+    allocation: Option<GpuAllocation>,
+    cpu_base: Option<*mut u8>,
+    gpu_base: GpuAddress,
+    size: u64,
+    free: Vec<FreeRange>,
+}
+
+/// User-land GPU allocator over large `gpuMalloc` blocks.
+///
+/// This matches the `NoGraphicsApi.md` philosophy: callers work with CPU/GPU
+/// pointer pairs, while buffer objects remain backend implementation detail.
+pub struct GpuAllocator<'a> {
+    device: &'a Device,
+    desc: GpuAllocatorDesc,
+    blocks: Vec<GpuAllocatorBlock>,
+}
+
+impl<'a> GpuAllocator<'a> {
+    /// Create an allocator. Backing memory is allocated lazily on first use.
+    pub fn new(device: &'a Device, desc: GpuAllocatorDesc) -> Self {
+        Self {
+            device,
+            desc,
+            blocks: Vec::new(),
+        }
+    }
+
+    /// Allocate a range with absolute GPU-address alignment.
+    pub fn alloc(&mut self, size: u64, align: u64) -> RhiResult<GpuSubAllocation> {
+        if size == 0 {
+            return Err(RhiError::AllocationFailed(
+                "allocation size must be non-zero".into(),
+            ));
+        }
+        let align = align.max(1);
+        if !align.is_power_of_two() {
+            return Err(RhiError::AllocationFailed(format!(
+                "alignment must be a power of two, got {align}"
+            )));
+        }
+
+        for block_index in 0..self.blocks.len() {
+            if let Some(allocation) =
+                Self::alloc_from_block(&mut self.blocks[block_index], size, align, block_index)
+            {
+                return Ok(allocation);
+            }
+        }
+
+        let block_index = self.blocks.len();
+        self.blocks.push(self.create_block(size, align)?);
+        Self::alloc_from_block(&mut self.blocks[block_index], size, align, block_index).ok_or_else(
+            || {
+                RhiError::AllocationFailed(
+                    "new allocator block could not satisfy allocation".into(),
+                )
+            },
+        )
+    }
+
+    /// Free a previous suballocation.
+    pub fn free(&mut self, allocation: GpuSubAllocation) {
+        let block = &mut self.blocks[allocation.block];
+        insert_free_range(
+            &mut block.free,
+            FreeRange {
+                offset: allocation.offset,
+                size: allocation.size,
+            },
+        );
+    }
+
+    /// Release all suballocations without freeing backing blocks.
+    pub fn reset(&mut self) {
+        for block in &mut self.blocks {
+            block.free.clear();
+            block.free.push(FreeRange {
+                offset: 0,
+                size: block.size,
+            });
+        }
+    }
+
+    /// Bytes reserved in backing GPU blocks.
+    pub fn reserved(&self) -> u64 {
+        self.blocks.iter().map(|block| block.size).sum()
+    }
+
+    /// Bytes currently allocated from backing GPU blocks.
+    pub fn used(&self) -> u64 {
+        self.blocks
+            .iter()
+            .map(|block| block.size - block.free.iter().map(|range| range.size).sum::<u64>())
+            .sum()
+    }
+
+    /// Number of backing blocks.
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    fn create_block(&self, size: u64, align: u64) -> RhiResult<GpuAllocatorBlock> {
+        let worst_case_padding = align - 1;
+        let min_block_size = size
+            .checked_add(worst_case_padding)
+            .ok_or_else(|| RhiError::AllocationFailed("allocator block size overflow".into()))?;
+        let block_size = self.desc.block_size.max(min_block_size);
+        let block_size = align_up_u64(block_size, 16)?;
+        let allocation = self
+            .device
+            .malloc_aligned(block_size, 16, self.desc.memory)?;
+        let cpu_base = allocation.mapped_ptr();
+        let gpu_base = allocation.gpu_address();
+
+        Ok(GpuAllocatorBlock {
+            allocation: Some(allocation),
+            cpu_base,
+            gpu_base,
+            size: block_size,
+            free: vec![FreeRange {
+                offset: 0,
+                size: block_size,
+            }],
+        })
+    }
+
+    fn alloc_from_block(
+        block: &mut GpuAllocatorBlock,
+        size: u64,
+        align: u64,
+        block_index: usize,
+    ) -> Option<GpuSubAllocation> {
+        for range_index in 0..block.free.len() {
+            let range = block.free[range_index];
+            let aligned_gpu =
+                align_up_u64(block.gpu_base.0.checked_add(range.offset)?, align).ok()?;
+            let aligned_offset = aligned_gpu.checked_sub(block.gpu_base.0)?;
+            let padding = aligned_offset.checked_sub(range.offset)?;
+            let needed = padding.checked_add(size)?;
+            if needed > range.size {
+                continue;
+            }
+
+            let suffix_size = range.size - needed;
+            if padding == 0 && suffix_size == 0 {
+                block.free.swap_remove(range_index);
+            } else if padding == 0 {
+                block.free[range_index] = FreeRange {
+                    offset: aligned_offset + size,
+                    size: suffix_size,
+                };
+            } else if suffix_size == 0 {
+                block.free[range_index].size = padding;
+            } else {
+                block.free[range_index].size = padding;
+                block.free.insert(
+                    range_index + 1,
+                    FreeRange {
+                        offset: aligned_offset + size,
+                        size: suffix_size,
+                    },
+                );
+            }
+
+            let cpu_ptr = block
+                .cpu_base
+                .map(|ptr| unsafe { ptr.add(aligned_offset as usize) });
+            return Some(GpuSubAllocation {
+                block: block_index,
+                offset: aligned_offset,
+                size,
+                cpu_ptr,
+                gpu_address: GpuAddress(aligned_gpu),
+            });
+        }
+        None
+    }
+}
+
+impl Drop for GpuAllocator<'_> {
+    fn drop(&mut self) {
+        for block in &mut self.blocks {
+            if let Some(allocation) = block.allocation.take() {
+                self.device.free(allocation);
+            }
+        }
+    }
+}
+
+fn align_up_u64(value: u64, align: u64) -> RhiResult<u64> {
+    debug_assert!(align.is_power_of_two());
+    value
+        .checked_add(align - 1)
+        .map(|v| v & !(align - 1))
+        .ok_or_else(|| RhiError::AllocationFailed("alignment overflow".into()))
+}
+
+fn insert_free_range(free: &mut Vec<FreeRange>, range: FreeRange) {
+    if range.size == 0 {
+        return;
+    }
+
+    let index = free
+        .binary_search_by_key(&range.offset, |existing| existing.offset)
+        .unwrap_or_else(|index| index);
+    free.insert(index, range);
+
+    let mut i = index.saturating_sub(1);
+    while i + 1 < free.len() {
+        let current_end = free[i].offset + free[i].size;
+        if current_end < free[i + 1].offset {
+            i += 1;
+            continue;
+        }
+
+        let next_end = free[i + 1].offset + free[i + 1].size;
+        free[i].size = next_end.max(current_end) - free[i].offset;
+        free.remove(i + 1);
+    }
+}
+
+/// A persistent GPU buffer allocation.
+///
+/// Returns dual pointers: CPU mapped pointer (for upload buffers) + GPU address.
+pub struct GpuBuffer {
+    pub(crate) inner: GpuBufferInner,
+}
+
+pub(crate) enum GpuBufferInner {
+    #[cfg(feature = "vulkan")]
+    Vulkan(crate::backend::vulkan::memory::VulkanBuffer),
+    #[cfg(feature = "metal")]
+    Metal(crate::backend::metal::memory::MetalBuffer),
+}
+
+impl GpuBuffer {
+    /// Get the CPU-mapped pointer (only valid for Upload/Readback buffers).
+    pub fn mapped_ptr(&self) -> Option<*mut u8> {
+        match &self.inner {
+            #[cfg(feature = "vulkan")]
+            GpuBufferInner::Vulkan(b) => b.mapped_ptr(),
+            #[cfg(feature = "metal")]
+            GpuBufferInner::Metal(b) => b.mapped_ptr(),
+        }
+    }
+
+    /// Get the GPU virtual address for shader access.
+    pub fn gpu_address(&self) -> GpuAddress {
+        match &self.inner {
+            #[cfg(feature = "vulkan")]
+            GpuBufferInner::Vulkan(b) => b.gpu_address(),
+            #[cfg(feature = "metal")]
+            GpuBufferInner::Metal(b) => b.gpu_address(),
+        }
+    }
+
+    /// Buffer size in bytes.
+    pub fn size(&self) -> u64 {
+        match &self.inner {
+            #[cfg(feature = "vulkan")]
+            GpuBufferInner::Vulkan(b) => b.size(),
+            #[cfg(feature = "metal")]
+            GpuBufferInner::Metal(b) => b.size(),
+        }
+    }
+}
+
+/// Dual-pointer transient allocation from the bump allocator.
+#[derive(Clone, Copy, Debug)]
+pub struct TransientAllocation {
+    pub cpu_ptr: *mut u8,
+    pub gpu_address: GpuAddress,
+    pub size: u64,
+}
+
+impl TransientAllocation {
+    /// Write a value into this allocation.
+    ///
+    /// # Safety
+    /// The caller must ensure T fits within `self.size` and the pointer is valid.
+    pub unsafe fn upload<T: zerocopy::IntoBytes + zerocopy::Immutable>(&self, data: &T) {
+        let bytes = zerocopy::IntoBytes::as_bytes(data);
+        debug_assert!(bytes.len() as u64 <= self.size);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.cpu_ptr, bytes.len());
+        }
+    }
+
+    /// Write a slice of values into this allocation.
+    ///
+    /// # Safety
+    /// The caller must ensure the slice fits within `self.size`.
+    pub unsafe fn upload_slice<T: zerocopy::IntoBytes + zerocopy::Immutable>(&self, data: &[T]) {
+        let bytes = zerocopy::IntoBytes::as_bytes(data);
+        debug_assert!(bytes.len() as u64 <= self.size);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.cpu_ptr, bytes.len());
+        }
+    }
+}
+
+/// Per-frame bump allocator over a large GpuBuffer.
+pub struct BumpAllocator {
+    buffer: GpuBuffer,
+    offset: u64,
+    capacity: u64,
+}
+
+impl BumpAllocator {
+    /// Create a new bump allocator with the given buffer.
+    pub fn new(buffer: GpuBuffer) -> Self {
+        let capacity = buffer.size();
+        Self {
+            buffer,
+            offset: 0,
+            capacity,
+        }
+    }
+
+    /// Allocate `size` bytes with the given alignment.
+    /// Returns None if the allocator is full.
+    pub fn alloc(&mut self, size: u64, align: u64) -> Option<TransientAllocation> {
+        let align = align.max(1);
+        if !align.is_power_of_two() {
+            return None;
+        }
+
+        let aligned_offset = self.offset.checked_add(align - 1)? & !(align - 1);
+        let end = aligned_offset.checked_add(size)?;
+        if end > self.capacity {
+            return None;
+        }
+
+        let cpu_ptr = self.buffer.mapped_ptr()?;
+        let gpu_address = self.buffer.gpu_address().offset(aligned_offset);
+        let cpu_ptr = unsafe { cpu_ptr.add(aligned_offset as usize) };
+
+        self.offset = end;
+
+        Some(TransientAllocation {
+            cpu_ptr,
+            gpu_address,
+            size,
+        })
+    }
+
+    /// Reset the allocator for a new frame.
+    pub fn reset(&mut self) {
+        self.offset = 0;
+    }
+
+    /// Get the underlying buffer's GPU address.
+    pub fn gpu_address(&self) -> GpuAddress {
+        self.buffer.gpu_address()
+    }
+
+    /// How many bytes have been allocated so far.
+    pub fn used(&self) -> u64 {
+        self.offset
+    }
+
+    /// Total capacity in bytes.
+    pub fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    /// Consume the allocator and return the backing buffer.
+    pub fn into_buffer(self) -> GpuBuffer {
+        self.buffer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_ranges_coalesce_in_offset_order() {
+        let mut free = vec![FreeRange {
+            offset: 64,
+            size: 16,
+        }];
+
+        insert_free_range(
+            &mut free,
+            FreeRange {
+                offset: 0,
+                size: 32,
+            },
+        );
+        insert_free_range(
+            &mut free,
+            FreeRange {
+                offset: 32,
+                size: 32,
+            },
+        );
+        insert_free_range(
+            &mut free,
+            FreeRange {
+                offset: 80,
+                size: 16,
+            },
+        );
+
+        assert_eq!(
+            free,
+            vec![FreeRange {
+                offset: 0,
+                size: 96,
+            }]
+        );
+    }
+
+    #[test]
+    fn allocator_uses_absolute_gpu_address_alignment() {
+        let mut block = GpuAllocatorBlock {
+            allocation: None,
+            cpu_base: None,
+            gpu_base: GpuAddress(0x1003),
+            size: 256,
+            free: vec![FreeRange {
+                offset: 0,
+                size: 256,
+            }],
+        };
+
+        let allocation =
+            GpuAllocator::alloc_from_block(&mut block, 16, 64, 0).expect("allocation should fit");
+
+        assert_eq!(allocation.gpu_address().0 % 64, 0);
+        assert_eq!(allocation.offset(), 61);
+        assert_eq!(
+            block.free,
+            vec![
+                FreeRange {
+                    offset: 0,
+                    size: 61,
+                },
+                FreeRange {
+                    offset: 77,
+                    size: 179,
+                },
+            ]
+        );
+    }
+}

@@ -36,14 +36,14 @@ pub use accel::AccelerationStructure;
 pub use barrier::{HazardFlags, StageFlags};
 pub use command::{
     ColorAttachment, CommandBuffer, DepthAttachment, DispatchIndirectArgs, DrawIndexedIndirectArgs,
-    DrawIndexedIndirectMultiArgs, DrawIndirectArgs, LoadOp, RenderPassDesc, RenderTarget, SignalOp,
+    DrawIndirectMultiArgs, DrawIndirectArgs, LoadOp, RenderPassDesc, RenderTarget, SignalOp,
     SignalValueDesc, StoreOp, WaitOp, WaitValueDesc,
 };
 pub use device::{Backend, BindlessMode, Device, DeviceDesc};
 pub use error::{RhiError, RhiResult};
 pub use memory::{
-    BufferDesc, BufferUsage, BumpAllocator, GpuAllocation, GpuAllocator, GpuAllocatorDesc,
-    GpuBuffer, GpuSubAllocation, MemoryType, TransientAllocation,
+    BufferDesc, BumpAllocator, GpuAllocation, GpuAllocator, GpuAllocatorDesc, GpuBuffer,
+    GpuSubAllocation, MemoryType, TransientAllocation,
 };
 pub use pipeline::*;
 pub use queue::Queue;

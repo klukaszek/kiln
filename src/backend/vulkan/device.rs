@@ -1,11 +1,11 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_char};
 use std::sync::{Arc, Mutex};
 
 use ash::{
     Device, Entry, Instance,
-    ext::{debug_utils, descriptor_buffer, extended_dynamic_state, mesh_shader as vk_mesh_shader},
+    ext::{debug_utils, descriptor_buffer, mesh_shader as vk_mesh_shader},
     khr::{
         acceleration_structure as vk_accel_structure, ray_tracing_pipeline as vk_rt_pipeline,
         surface, swapchain,
@@ -18,7 +18,7 @@ use crate::command::{
 };
 use crate::device::{BindlessMode, DeviceDesc};
 use crate::error::{RhiError, RhiResult};
-use crate::memory::{BufferDesc, BufferUsage, GpuBuffer, GpuBufferInner};
+use crate::memory::{BufferDesc, GpuBuffer, GpuBufferInner, MemoryType};
 use crate::pipeline::*;
 use crate::queue::{Queue, QueueInner, SubmitDesc};
 use crate::sampler::{Sampler, SamplerDesc};
@@ -82,8 +82,25 @@ pub(crate) struct DescriptorBufferHeap {
     pub storage_image_stride: u64,
 }
 
-pub(crate) type SharedAllocations = Arc<Mutex<Vec<BufferAllocation>>>;
+/// Buffer allocations keyed by GPU base address, enabling O(log n) address->buffer
+/// resolution instead of a linear scan on every indirect/copy/index command.
+pub(crate) type SharedAllocations = Arc<Mutex<BTreeMap<u64, BufferAllocation>>>;
 pub(crate) type SharedTextures = Arc<Mutex<Vec<Option<VulkanTexture>>>>;
+
+/// Components produced by `build_swapchain_contents` (shared between create and recreate).
+struct SwapchainContents {
+    swapchain: vk::SwapchainKHR,
+    images: Vec<vk::Image>,
+    image_views: Vec<vk::ImageView>,
+    extent: vk::Extent2D,
+    depth_image: vk::Image,
+    depth_image_view: vk::ImageView,
+    depth_image_memory: vk::DeviceMemory,
+    present_complete_semaphores: Vec<vk::Semaphore>,
+    rendering_complete_semaphores: Vec<vk::Semaphore>,
+    in_flight_fences: Vec<vk::Fence>,
+    in_flight_cmd_buffers: Vec<vk::CommandBuffer>,
+}
 
 /// Ray tracing pipeline properties — owned copy (no lifetime dependency).
 #[derive(Clone, Copy)]
@@ -277,84 +294,51 @@ impl VulkanQueue {
         cmd: VulkanCommandBuffer,
         desc: &SubmitDesc<'_>,
     ) -> RhiResult<()> {
-        let command_buffers = [cmd.command_buffer];
-        let mut wait_map: HashMap<vk::Semaphore, u64> = HashMap::new();
-        for (semaphore, value) in desc.wait_semaphores {
-            match &semaphore.inner {
-                TimelineSemaphoreInner::Vulkan(vk_semaphore) => {
-                    wait_map
-                        .entry(vk_semaphore.semaphore)
-                        .and_modify(|v| *v = (*v).max(*value))
-                        .or_insert(*value);
-                }
-                #[allow(unreachable_patterns)]
-                _ => {
-                    return Err(RhiError::SyncError(
-                        "Timeline wait semaphore backend mismatch on Vulkan queue submit".into(),
-                    ));
-                }
-            }
-        }
-        for (semaphore, value) in self.collect_value_waits(&cmd.pending_value_waits)? {
-            wait_map
-                .entry(semaphore)
-                .and_modify(|v| *v = (*v).max(value))
-                .or_insert(value);
-        }
+        let mut waits = timeline_pairs(desc.wait_semaphores, "wait")?;
+        waits.extend(self.collect_value_waits(&cmd.pending_value_waits)?);
+        let mut signals = timeline_pairs(desc.signal_semaphores, "signal")?;
+        signals.extend(self.collect_value_signals(&cmd.pending_value_signals)?);
+        let wait_stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
+        self.submit_timeline(
+            cmd.command_buffer,
+            &waits,
+            &wait_stages,
+            &signals,
+            vk::Fence::null(),
+        )
+    }
 
-        let mut signal_map: HashMap<vk::Semaphore, u64> = HashMap::new();
-        for (semaphore, value) in desc.signal_semaphores {
-            match &semaphore.inner {
-                TimelineSemaphoreInner::Vulkan(vk_semaphore) => {
-                    signal_map
-                        .entry(vk_semaphore.semaphore)
-                        .and_modify(|v| *v = (*v).max(*value))
-                        .or_insert(*value);
-                }
-                #[allow(unreachable_patterns)]
-                _ => {
-                    return Err(RhiError::SyncError(
-                        "Timeline signal semaphore backend mismatch on Vulkan queue submit".into(),
-                    ));
-                }
-            }
-        }
-        for (semaphore, value) in self.collect_value_signals(&cmd.pending_value_signals)? {
-            signal_map
-                .entry(semaphore)
-                .and_modify(|v| *v = (*v).max(value))
-                .or_insert(value);
-        }
-
-        let mut wait_semaphores = Vec::with_capacity(wait_map.len());
-        let mut wait_values = Vec::with_capacity(wait_map.len());
-        for (semaphore, value) in wait_map {
-            wait_semaphores.push(semaphore);
-            wait_values.push(value);
-        }
-
-        let mut signal_semaphores = Vec::with_capacity(signal_map.len());
-        let mut signal_values = Vec::with_capacity(signal_map.len());
-        for (semaphore, value) in signal_map {
-            signal_semaphores.push(semaphore);
-            signal_values.push(value);
-        }
-
-        let wait_stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; wait_semaphores.len()];
+    /// Encode a `vkQueueSubmit` with timeline-semaphore wait/signal pairs.
+    ///
+    /// `wait_stages` must have the same length as `waits`. Pass `vk::Fence::null()` when
+    /// no completion fence is needed.
+    fn submit_timeline(
+        &self,
+        cmd: vk::CommandBuffer,
+        waits: &[(vk::Semaphore, u64)],
+        wait_stages: &[vk::PipelineStageFlags],
+        signals: &[(vk::Semaphore, u64)],
+        fence: vk::Fence,
+    ) -> RhiResult<()> {
+        let command_buffers = [cmd];
+        let wait_semaphores: Vec<vk::Semaphore> = waits.iter().map(|(s, _)| *s).collect();
+        let wait_values: Vec<u64> = waits.iter().map(|(_, v)| *v).collect();
+        let signal_semaphores: Vec<vk::Semaphore> = signals.iter().map(|(s, _)| *s).collect();
+        let signal_values: Vec<u64> = signals.iter().map(|(_, v)| *v).collect();
         let mut submit_info = vk::SubmitInfo::default()
             .wait_semaphores(&wait_semaphores)
-            .wait_dst_stage_mask(&wait_stages)
+            .wait_dst_stage_mask(wait_stages)
             .command_buffers(&command_buffers)
             .signal_semaphores(&signal_semaphores);
-        let mut timeline_submit_info = vk::TimelineSemaphoreSubmitInfo::default()
+        let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
             .wait_semaphore_values(&wait_values)
             .signal_semaphore_values(&signal_values);
         if !wait_values.is_empty() || !signal_values.is_empty() {
-            submit_info = submit_info.push_next(&mut timeline_submit_info);
+            submit_info = submit_info.push_next(&mut timeline_info);
         }
         unsafe {
             self.device
-                .queue_submit(self.queue, &[submit_info], vk::Fence::null())
+                .queue_submit(self.queue, &[submit_info], fence)
                 .map_err(|e| RhiError::QueueSubmit(e.to_string()))?;
         }
         Ok(())
@@ -437,49 +421,24 @@ impl VulkanQueue {
         frame_index: usize,
         image_index: u32,
     ) -> RhiResult<()> {
-        let value_waits = self.collect_value_waits(&cmd.pending_value_waits)?;
-        let value_signals = self.collect_value_signals(&cmd.pending_value_signals)?;
-        let command_buffers = [cmd.command_buffer];
-        let mut wait_semaphores = vec![sc.present_complete_semaphores[frame_index]];
+        // Seed with the swapchain's acquire→render→present semaphores, then append the
+        // command buffer's pending value sync. Value waits use ALL_COMMANDS; the acquire
+        // wait only needs to gate the color attachment write.
+        let mut waits = vec![(sc.present_complete_semaphores[frame_index], 0u64)];
         let mut wait_stages = vec![vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        let mut wait_values = vec![0u64];
-        for (semaphore, value) in value_waits {
-            wait_semaphores.push(semaphore);
+        for (sem, val) in self.collect_value_waits(&cmd.pending_value_waits)? {
+            waits.push((sem, val));
             wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
-            wait_values.push(value);
         }
-        let mut signal_semaphores = vec![sc.rendering_complete_semaphores[image_index as usize]];
-        let mut signal_values = vec![0u64];
-        for (semaphore, value) in value_signals {
-            signal_semaphores.push(semaphore);
-            signal_values.push(value);
-        }
+        let mut signals = vec![(sc.rendering_complete_semaphores[image_index as usize], 0u64)];
+        signals.extend(self.collect_value_signals(&cmd.pending_value_signals)?);
         let fence = sc.in_flight_fences[frame_index];
-
-        let mut submit_info = vk::SubmitInfo::default()
-            .wait_semaphores(&wait_semaphores)
-            .wait_dst_stage_mask(&wait_stages)
-            .command_buffers(&command_buffers)
-            .signal_semaphores(&signal_semaphores);
-        let mut timeline_submit_info = vk::TimelineSemaphoreSubmitInfo::default()
-            .wait_semaphore_values(&wait_values)
-            .signal_semaphore_values(&signal_values);
-        if wait_semaphores.len() > 1 || signal_semaphores.len() > 1 {
-            submit_info = submit_info.push_next(&mut timeline_submit_info);
-        }
-
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &[submit_info], fence)
-                .map_err(|e| RhiError::QueueSubmit(e.to_string()))?;
-        }
+        let raw_cmd = cmd.command_buffer;
+        self.submit_timeline(raw_cmd, &waits, &wait_stages, &signals, fence)?;
 
         // Track the command buffer so it can be freed after the fence signals.
-        {
-            let mut cmd_buffers = sc.in_flight_cmd_buffers.borrow_mut();
-            if let Some(slot) = cmd_buffers.get_mut(frame_index) {
-                *slot = cmd.command_buffer;
-            }
+        if let Some(slot) = sc.in_flight_cmd_buffers.borrow_mut().get_mut(frame_index) {
+            *slot = raw_cmd;
         }
         Ok(())
     }
@@ -489,6 +448,24 @@ impl VulkanQueue {
             let _ = self.device.queue_wait_idle(self.queue);
         }
     }
+}
+
+/// Unwrap a slice of `(TimelineSemaphore, u64)` into `(vk::Semaphore, u64)` pairs,
+/// erroring out if any handle is from a non-Vulkan backend.
+fn timeline_pairs(
+    pairs: &[(TimelineSemaphore, u64)],
+    kind: &'static str,
+) -> RhiResult<Vec<(vk::Semaphore, u64)>> {
+    pairs
+        .iter()
+        .map(|(sem, value)| match &sem.inner {
+            TimelineSemaphoreInner::Vulkan(vk_semaphore) => Ok((vk_semaphore.semaphore, *value)),
+            #[allow(unreachable_patterns)]
+            _ => Err(RhiError::SyncError(format!(
+                "Timeline {kind} semaphore backend mismatch on Vulkan queue submit"
+            ))),
+        })
+        .collect()
 }
 
 /// Debug callback for Vulkan validation layers.
@@ -730,65 +707,36 @@ impl VulkanDevice {
                     RhiError::DeviceCreation(format!("Enumerate device extensions: {e}"))
                 })?
         };
-        let supports_descriptor_buffer = device_extension_props.iter().any(|ext| {
-            let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
-            name.to_bytes() == b"VK_EXT_descriptor_buffer"
-        });
-        let supports_extended_dynamic_state = device_extension_props.iter().any(|ext| {
-            let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
-            name.to_bytes() == b"VK_EXT_extended_dynamic_state"
-        });
-        let supports_mesh_shader = device_extension_props.iter().any(|ext| {
-            let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
-            name.to_bytes() == b"VK_EXT_mesh_shader"
-        });
-        let supports_accel_structure = device_extension_props.iter().any(|ext| {
-            let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
-            name.to_bytes() == b"VK_KHR_acceleration_structure"
-        });
-        let supports_rt_pipeline = device_extension_props.iter().any(|ext| {
-            let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
-            name.to_bytes() == b"VK_KHR_ray_tracing_pipeline"
-        });
-        let supports_deferred_host_ops = device_extension_props.iter().any(|ext| {
-            let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
-            name.to_bytes() == b"VK_KHR_deferred_host_operations"
-        });
+        let has_ext = |needle: &[u8]| {
+            device_extension_props.iter().any(|ext| {
+                let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
+                name.to_bytes() == needle
+            })
+        };
+        let supports_descriptor_buffer = has_ext(b"VK_EXT_descriptor_buffer");
+        let supports_mesh_shader = has_ext(b"VK_EXT_mesh_shader");
         // RT requires all three extensions together.
-        let supports_rt =
-            supports_accel_structure && supports_rt_pipeline && supports_deferred_host_ops;
+        let supports_rt = has_ext(b"VK_KHR_acceleration_structure")
+            && has_ext(b"VK_KHR_ray_tracing_pipeline")
+            && has_ext(b"VK_KHR_deferred_host_operations");
         log::info!(
             "RHI: Optional extensions — mesh_shader={supports_mesh_shader} ray_tracing={supports_rt}"
         );
-        if !supports_extended_dynamic_state {
-            return Err(RhiError::FeatureNotSupported(
-                "Vulkan backend requires VK_EXT_extended_dynamic_state".into(),
+
+        if desc.bindless_mode == Some(BindlessMode::ArgumentTable) {
+            return Err(RhiError::Unsupported(
+                "Vulkan does not support Metal argument tables".into(),
             ));
         }
-
-        let requested_bindless = desc.bindless_mode.unwrap_or(BindlessMode::DescriptorBuffer);
-        let bindless_mode = match requested_bindless {
-            BindlessMode::DescriptorBuffer => {
-                if supports_descriptor_buffer {
-                    BindlessMode::DescriptorBuffer
-                } else {
-                    return Err(RhiError::FeatureNotSupported(
-                        "Vulkan descriptor buffer is required but not supported".into(),
-                    ));
-                }
-            }
-            BindlessMode::ArgumentTable => {
-                return Err(RhiError::Unsupported(
-                    "Vulkan does not support Metal argument tables".into(),
-                ));
-            }
-        };
+        if !supports_descriptor_buffer {
+            return Err(RhiError::Unsupported(
+                "Vulkan descriptor buffer is required but not supported".into(),
+            ));
+        }
+        let bindless_mode = BindlessMode::DescriptorBuffer;
 
         // Device extensions
-        let mut device_extension_names: Vec<*const c_char> = vec![
-            swapchain::NAME.as_ptr(),
-            extended_dynamic_state::NAME.as_ptr(),
-        ];
+        let mut device_extension_names: Vec<*const c_char> = vec![swapchain::NAME.as_ptr()];
 
         device_extension_names.push(descriptor_buffer::NAME.as_ptr());
         if supports_mesh_shader {
@@ -805,27 +753,19 @@ impl VulkanDevice {
             device_extension_names.push(ash::khr::portability_subset::NAME.as_ptr());
         }
 
-        // Enable features via pNext chain
-        let mut buffer_device_address_features =
-            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
-
-        let mut dynamic_rendering_features =
-            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
-
-        let mut synchronization2_features =
-            vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
-
-        let mut timeline_semaphore_features =
-            vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+        // All required features that were promoted to Vulkan 1.2/1.3 core go through the
+        // consolidated PhysicalDeviceVulkan1{2,3}Features structs — no separate per-feature
+        // structs needed since we require Vulkan 1.3.
+        let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default()
+            .buffer_device_address(true)
+            .timeline_semaphore(true)
+            .draw_indirect_count(true);
+        let mut vulkan13_features = vk::PhysicalDeviceVulkan13Features::default()
+            .dynamic_rendering(true)
+            .synchronization2(true);
 
         let mut descriptor_buffer_features =
             vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
-
-        let mut extended_dynamic_state_features =
-            vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default()
-                .extended_dynamic_state(true);
-        let mut vulkan12_features =
-            vk::PhysicalDeviceVulkan12Features::default().draw_indirect_count(true);
 
         // Optional: mesh shader and ray tracing feature structs (declared unconditionally
         // so they outlive `features2`, then conditionally chained below).
@@ -847,14 +787,10 @@ impl VulkanDevice {
 
         let mut features2 = vk::PhysicalDeviceFeatures2::default()
             .features(features)
-            .push_next(&mut buffer_device_address_features)
-            .push_next(&mut dynamic_rendering_features)
-            .push_next(&mut synchronization2_features)
-            .push_next(&mut timeline_semaphore_features)
-            .push_next(&mut extended_dynamic_state_features)
-            .push_next(&mut vulkan12_features);
+            .push_next(&mut vulkan12_features)
+            .push_next(&mut vulkan13_features)
+            .push_next(&mut descriptor_buffer_features);
 
-        let _ = features2.push_next(&mut descriptor_buffer_features);
         if supports_mesh_shader {
             let _ = features2.push_next(&mut mesh_shader_features);
         }
@@ -982,7 +918,7 @@ impl VulkanDevice {
             descriptor_buffer_heap,
             textures: Arc::new(Mutex::new(Vec::new())),
             next_texture_id: RefCell::new(0),
-            allocations: Arc::new(Mutex::new(Vec::new())),
+            allocations: Arc::new(Mutex::new(BTreeMap::new())),
             samplers: RefCell::new(Vec::new()),
             next_sampler_id: RefCell::new(0),
             shader_modules: RefCell::new(Vec::new()),
@@ -1061,7 +997,6 @@ impl VulkanDevice {
                 .get_physical_device_surface_formats(self.physical_device, vk_surface)
                 .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
         };
-
         let desired_vk_format = format_to_vk(desc.format);
         let surface_format = surface_formats
             .iter()
@@ -1069,115 +1004,19 @@ impl VulkanDevice {
             .cloned()
             .unwrap_or(surface_formats[0]);
 
-        let surface_capabilities = unsafe {
-            self.surface_loader
-                .get_physical_device_surface_capabilities(self.physical_device, vk_surface)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
-        };
-
-        let mut desired_image_count = desc.image_count.max(surface_capabilities.min_image_count);
-        if surface_capabilities.max_image_count > 0 {
-            desired_image_count = desired_image_count.min(surface_capabilities.max_image_count);
-        }
-
-        let extent = match surface_capabilities.current_extent.width {
-            u32::MAX => vk::Extent2D {
-                width: desc.width,
-                height: desc.height,
-            },
-            _ => surface_capabilities.current_extent,
-        };
-
-        let pre_transform = if surface_capabilities
-            .supported_transforms
-            .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
-        {
-            vk::SurfaceTransformFlagsKHR::IDENTITY
-        } else {
-            surface_capabilities.current_transform
-        };
-
-        let present_modes = unsafe {
-            self.surface_loader
-                .get_physical_device_surface_present_modes(self.physical_device, vk_surface)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
-        };
-        let present_mode = if desc.vsync {
-            vk::PresentModeKHR::FIFO
-        } else {
-            present_modes
-                .iter()
-                .cloned()
-                .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
-                .unwrap_or(vk::PresentModeKHR::FIFO)
-        };
-
-        let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
-            .surface(vk_surface)
-            .min_image_count(desired_image_count)
-            .image_color_space(surface_format.color_space)
-            .image_format(surface_format.format)
-            .image_extent(extent)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .pre_transform(pre_transform)
-            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(present_mode)
-            .clipped(true)
-            .image_array_layers(1);
-
-        let swapchain = unsafe {
-            self.swapchain_loader
-                .create_swapchain(&swapchain_create_info, None)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
-        };
-
-        let images = unsafe {
-            self.swapchain_loader
-                .get_swapchain_images(swapchain)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
-        };
-
-        let image_views = self.create_swapchain_image_views(&images, surface_format.format)?;
-
-        // Create depth buffer
-        let (depth_image, depth_image_view, depth_image_memory) =
-            self.create_depth_buffer(extent.width, extent.height)?;
-
-        // Create sync objects
-        let image_count = images.len();
-        let frames_in_flight = MAX_FRAMES_IN_FLIGHT;
-
-        let semaphore_info = vk::SemaphoreCreateInfo::default();
-        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-
-        let mut present_complete_semaphores = Vec::with_capacity(frames_in_flight);
-        let mut rendering_complete_semaphores = Vec::with_capacity(image_count);
-        let mut in_flight_fences = Vec::with_capacity(frames_in_flight);
-        let mut in_flight_cmd_buffers = Vec::with_capacity(frames_in_flight);
-
-        for _ in 0..frames_in_flight {
-            present_complete_semaphores.push(unsafe {
-                self.device
-                    .create_semaphore(&semaphore_info, None)
-                    .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
-            });
-            in_flight_fences.push(unsafe {
-                self.device
-                    .create_fence(&fence_info, None)
-                    .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
-            });
-            in_flight_cmd_buffers.push(vk::CommandBuffer::null());
-        }
-        for _ in 0..image_count {
-            rendering_complete_semaphores.push(unsafe {
-                self.device
-                    .create_semaphore(&semaphore_info, None)
-                    .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
-            });
-        }
-
-        let format = vk_to_format(surface_format.format);
+        let SwapchainContents {
+            swapchain,
+            images,
+            image_views,
+            extent,
+            depth_image,
+            depth_image_view,
+            depth_image_memory,
+            present_complete_semaphores,
+            rendering_complete_semaphores,
+            in_flight_fences,
+            in_flight_cmd_buffers,
+        } = self.build_swapchain_contents(vk_surface, surface_format, desc, vk::SwapchainKHR::null())?;
 
         Ok(Swapchain {
             inner: SwapchainInner::Vulkan(VulkanSwapchain {
@@ -1185,7 +1024,7 @@ impl VulkanDevice {
                 surface: vk_surface,
                 images,
                 image_views,
-                format,
+                format: vk_to_format(surface_format.format),
                 surface_format,
                 extent,
                 depth_image,
@@ -1217,27 +1056,25 @@ impl VulkanDevice {
         };
 
         let old_swapchain = sc.swapchain;
+        let surface = sc.surface;
+        let surface_format = sc.surface_format;
 
-        // Cleanup old image views and depth buffer
+        // Tear down old image views, depth buffer, in-flight command buffers, and sync objects.
         unsafe {
             self.device.free_memory(sc.depth_image_memory, None);
             self.device.destroy_image_view(sc.depth_image_view, None);
             self.device.destroy_image(sc.depth_image, None);
-
             for &view in &sc.image_views {
                 self.device.destroy_image_view(view, None);
             }
         }
-
-        // Free any in-flight command buffers associated with the old swapchain.
         {
             let mut cmd_buffers = sc.in_flight_cmd_buffers.borrow_mut();
-            let mut to_free = Vec::new();
-            for &cmd in cmd_buffers.iter() {
-                if cmd != vk::CommandBuffer::null() {
-                    to_free.push(cmd);
-                }
-            }
+            let to_free: Vec<_> = cmd_buffers
+                .iter()
+                .copied()
+                .filter(|c| *c != vk::CommandBuffer::null())
+                .collect();
             if !to_free.is_empty() {
                 unsafe {
                     self.device
@@ -1246,91 +1083,6 @@ impl VulkanDevice {
             }
             cmd_buffers.clear();
         }
-
-        // Query updated surface capabilities
-        let surface_capabilities = unsafe {
-            self.surface_loader
-                .get_physical_device_surface_capabilities(self.physical_device, sc.surface)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
-        };
-
-        let extent = match surface_capabilities.current_extent.width {
-            u32::MAX => vk::Extent2D {
-                width: desc.width,
-                height: desc.height,
-            },
-            _ => surface_capabilities.current_extent,
-        };
-
-        let mut desired_image_count = desc.image_count.max(surface_capabilities.min_image_count);
-        if surface_capabilities.max_image_count > 0 {
-            desired_image_count = desired_image_count.min(surface_capabilities.max_image_count);
-        }
-
-        let pre_transform = if surface_capabilities
-            .supported_transforms
-            .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
-        {
-            vk::SurfaceTransformFlagsKHR::IDENTITY
-        } else {
-            surface_capabilities.current_transform
-        };
-
-        let present_modes = unsafe {
-            self.surface_loader
-                .get_physical_device_surface_present_modes(self.physical_device, sc.surface)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
-        };
-        let present_mode = if desc.vsync {
-            vk::PresentModeKHR::FIFO
-        } else {
-            present_modes
-                .iter()
-                .cloned()
-                .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
-                .unwrap_or(vk::PresentModeKHR::FIFO)
-        };
-
-        // Create new swapchain, passing old_swapchain for driver-side resource reuse
-        let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
-            .surface(sc.surface)
-            .min_image_count(desired_image_count)
-            .image_color_space(sc.surface_format.color_space)
-            .image_format(sc.surface_format.format)
-            .image_extent(extent)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .pre_transform(pre_transform)
-            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(present_mode)
-            .clipped(true)
-            .image_array_layers(1)
-            .old_swapchain(old_swapchain);
-
-        let new_swapchain = unsafe {
-            self.swapchain_loader
-                .create_swapchain(&swapchain_create_info, None)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
-        };
-
-        // Destroy old swapchain (after new one is created from it)
-        unsafe {
-            self.swapchain_loader.destroy_swapchain(old_swapchain, None);
-        }
-
-        // Get new images and create views
-        let images = unsafe {
-            self.swapchain_loader
-                .get_swapchain_images(new_swapchain)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
-        };
-        let image_views = self.create_swapchain_image_views(&images, sc.surface_format.format)?;
-
-        // Recreate depth buffer
-        let (depth_image, depth_image_view, depth_image_memory) =
-            self.create_depth_buffer(extent.width, extent.height)?;
-
-        // Destroy old sync objects and create new ones (image count may have changed)
         unsafe {
             for &sem in &sc.present_complete_semaphores {
                 self.device.destroy_semaphore(sem, None);
@@ -1343,51 +1095,143 @@ impl VulkanDevice {
             }
         }
 
-        let image_count = images.len();
-        let frames_in_flight = MAX_FRAMES_IN_FLIGHT;
-        let semaphore_info = vk::SemaphoreCreateInfo::default();
-        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        let contents =
+            self.build_swapchain_contents(surface, surface_format, desc, old_swapchain)?;
 
-        let mut present_complete_semaphores = Vec::with_capacity(frames_in_flight);
-        let mut rendering_complete_semaphores = Vec::with_capacity(image_count);
-        let mut in_flight_fences = Vec::with_capacity(frames_in_flight);
-        let mut in_flight_cmd_buffers = Vec::with_capacity(frames_in_flight);
-
-        for _ in 0..frames_in_flight {
-            present_complete_semaphores.push(unsafe {
-                self.device
-                    .create_semaphore(&semaphore_info, None)
-                    .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
-            });
-            in_flight_fences.push(unsafe {
-                self.device
-                    .create_fence(&fence_info, None)
-                    .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
-            });
-            in_flight_cmd_buffers.push(vk::CommandBuffer::null());
-        }
-        for _ in 0..image_count {
-            rendering_complete_semaphores.push(unsafe {
-                self.device
-                    .create_semaphore(&semaphore_info, None)
-                    .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
-            });
+        unsafe {
+            self.swapchain_loader.destroy_swapchain(old_swapchain, None);
         }
 
-        // Update the swapchain in-place
-        sc.swapchain = new_swapchain;
-        sc.images = images;
-        sc.image_views = image_views;
-        sc.extent = extent;
-        sc.depth_image = depth_image;
-        sc.depth_image_view = depth_image_view;
-        sc.depth_image_memory = depth_image_memory;
-        sc.present_complete_semaphores = present_complete_semaphores;
-        sc.rendering_complete_semaphores = rendering_complete_semaphores;
-        sc.in_flight_fences = in_flight_fences;
-        sc.in_flight_cmd_buffers = RefCell::new(in_flight_cmd_buffers);
+        sc.swapchain = contents.swapchain;
+        sc.images = contents.images;
+        sc.image_views = contents.image_views;
+        sc.extent = contents.extent;
+        sc.depth_image = contents.depth_image;
+        sc.depth_image_view = contents.depth_image_view;
+        sc.depth_image_memory = contents.depth_image_memory;
+        sc.present_complete_semaphores = contents.present_complete_semaphores;
+        sc.rendering_complete_semaphores = contents.rendering_complete_semaphores;
+        sc.in_flight_fences = contents.in_flight_fences;
+        sc.in_flight_cmd_buffers = RefCell::new(contents.in_flight_cmd_buffers);
 
         Ok(())
+    }
+
+    fn build_swapchain_contents(
+        &self,
+        surface: vk::SurfaceKHR,
+        surface_format: vk::SurfaceFormatKHR,
+        desc: &SwapchainDesc,
+        old_swapchain: vk::SwapchainKHR,
+    ) -> RhiResult<SwapchainContents> {
+        let caps = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_capabilities(self.physical_device, surface)
+                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
+        };
+
+        let mut image_count = desc.image_count.max(caps.min_image_count);
+        if caps.max_image_count > 0 {
+            image_count = image_count.min(caps.max_image_count);
+        }
+
+        let extent = if caps.current_extent.width == u32::MAX {
+            vk::Extent2D {
+                width: desc.width,
+                height: desc.height,
+            }
+        } else {
+            caps.current_extent
+        };
+
+        let pre_transform = if caps
+            .supported_transforms
+            .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
+        {
+            vk::SurfaceTransformFlagsKHR::IDENTITY
+        } else {
+            caps.current_transform
+        };
+
+        let present_mode = if desc.vsync {
+            vk::PresentModeKHR::FIFO
+        } else {
+            unsafe {
+                self.surface_loader
+                    .get_physical_device_surface_present_modes(self.physical_device, surface)
+                    .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
+            }
+            .into_iter()
+            .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
+            .unwrap_or(vk::PresentModeKHR::FIFO)
+        };
+
+        let create_info = vk::SwapchainCreateInfoKHR::default()
+            .surface(surface)
+            .min_image_count(image_count)
+            .image_color_space(surface_format.color_space)
+            .image_format(surface_format.format)
+            .image_extent(extent)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .pre_transform(pre_transform)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .present_mode(present_mode)
+            .clipped(true)
+            .image_array_layers(1)
+            .old_swapchain(old_swapchain);
+
+        let swapchain = unsafe {
+            self.swapchain_loader
+                .create_swapchain(&create_info, None)
+                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
+        };
+        let images = unsafe {
+            self.swapchain_loader
+                .get_swapchain_images(swapchain)
+                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
+        };
+        let image_views = self.create_swapchain_image_views(&images, surface_format.format)?;
+        let (depth_image, depth_image_view, depth_image_memory) =
+            self.create_depth_buffer(extent.width, extent.height)?;
+
+        let sem_info = vk::SemaphoreCreateInfo::default();
+        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        let mk_sem = || unsafe {
+            self.device
+                .create_semaphore(&sem_info, None)
+                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))
+        };
+        let mk_fence = || unsafe {
+            self.device
+                .create_fence(&fence_info, None)
+                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))
+        };
+
+        let mut present_complete_semaphores = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        let mut in_flight_fences = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            present_complete_semaphores.push(mk_sem()?);
+            in_flight_fences.push(mk_fence()?);
+        }
+        let mut rendering_complete_semaphores = Vec::with_capacity(images.len());
+        for _ in 0..images.len() {
+            rendering_complete_semaphores.push(mk_sem()?);
+        }
+
+        Ok(SwapchainContents {
+            swapchain,
+            images,
+            image_views,
+            extent,
+            depth_image,
+            depth_image_view,
+            depth_image_memory,
+            present_complete_semaphores,
+            rendering_complete_semaphores,
+            in_flight_fences,
+            in_flight_cmd_buffers: vec![vk::CommandBuffer::null(); MAX_FRAMES_IN_FLIGHT],
+        })
     }
 
     // -- Buffer --
@@ -1414,12 +1258,12 @@ impl VulkanDevice {
 
         let mem_requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
 
-        let mem_flags = match desc.usage {
-            BufferUsage::GpuOnly => vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            BufferUsage::Default => {
+        let mem_flags = match desc.memory {
+            MemoryType::GpuOnly => vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            MemoryType::Default => {
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
             }
-            BufferUsage::Readback => {
+            MemoryType::Readback => {
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_CACHED
             }
         };
@@ -1453,8 +1297,8 @@ impl VulkanDevice {
         let gpu_addr = unsafe { self.device.get_buffer_device_address(&addr_info) };
 
         // Map if host-visible
-        let mapped_ptr = match desc.usage {
-            BufferUsage::Default | BufferUsage::Readback => {
+        let mapped_ptr = match desc.memory {
+            MemoryType::Default | MemoryType::Readback => {
                 let ptr = unsafe {
                     self.device
                         .map_memory(memory, 0, desc.size, vk::MemoryMapFlags::empty())
@@ -1462,7 +1306,7 @@ impl VulkanDevice {
                 };
                 Some(ptr as *mut u8)
             }
-            BufferUsage::GpuOnly => None,
+            MemoryType::GpuOnly => None,
         };
 
         let vk_buffer = VulkanBuffer {
@@ -1475,14 +1319,17 @@ impl VulkanDevice {
 
         {
             let mut allocations = self.allocations.lock().expect("allocations lock poisoned");
-            allocations.push(BufferAllocation {
-                base: vk_buffer.gpu_address,
-                size: vk_buffer.size,
-                buffer: vk_buffer.buffer,
-                memory: vk_buffer.memory,
-                memory_type_index: mem_type_index,
-                mapped_ptr: vk_buffer.mapped_ptr,
-            });
+            allocations.insert(
+                vk_buffer.gpu_address.0,
+                BufferAllocation {
+                    base: vk_buffer.gpu_address,
+                    size: vk_buffer.size,
+                    buffer: vk_buffer.buffer,
+                    memory: vk_buffer.memory,
+                    memory_type_index: mem_type_index,
+                    mapped_ptr: vk_buffer.mapped_ptr,
+                },
+            );
         }
 
         Ok(GpuBuffer {
@@ -1496,7 +1343,7 @@ impl VulkanDevice {
         }
         let ptr = cpu_ptr as usize;
         let allocations = self.allocations.lock().expect("allocations lock poisoned");
-        for alloc in allocations.iter() {
+        for alloc in allocations.values() {
             if let Some(mapped) = alloc.mapped_ptr {
                 let base = mapped as usize;
                 let end = base + alloc.size as usize;
@@ -1512,38 +1359,46 @@ impl VulkanDevice {
     // -- Texture --
 
     pub fn texture_size_align(&self, desc: &TextureDesc) -> RhiResult<TextureSizeAlign> {
+        // Create a throwaway image just to query the driver's size/alignment requirements.
+        let (image, _, _) = self.create_image_for_desc(desc)?;
+        let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
+        unsafe {
+            self.device.destroy_image(image, None);
+        }
+        Ok(TextureSizeAlign {
+            size: mem_reqs.size,
+            align: mem_reqs.alignment,
+        })
+    }
+
+    /// Build the `vk::ImageCreateInfo` for `desc` and create the image.
+    /// Returns the image plus the effective `array_layers` (cube → ×6) and the format.
+    fn create_image_for_desc(
+        &self,
+        desc: &TextureDesc,
+    ) -> RhiResult<(vk::Image, u32, vk::Format)> {
         let vk_format = format_to_vk(desc.format);
 
         let mut usage = vk::ImageUsageFlags::empty();
-        if desc.usage.contains(crate::texture::TextureUsage::SAMPLED) {
-            usage |= vk::ImageUsageFlags::SAMPLED;
-        }
-        if desc.usage.contains(crate::texture::TextureUsage::STORAGE) {
-            usage |= vk::ImageUsageFlags::STORAGE;
-        }
-        if desc
-            .usage
-            .contains(crate::texture::TextureUsage::COLOR_ATTACHMENT)
-        {
-            usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
-        }
-        if desc
-            .usage
-            .contains(crate::texture::TextureUsage::DEPTH_STENCIL_ATTACHMENT)
-        {
-            usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
-        }
-        if desc
-            .usage
-            .contains(crate::texture::TextureUsage::TRANSFER_SRC)
-        {
-            usage |= vk::ImageUsageFlags::TRANSFER_SRC;
-        }
-        if desc
-            .usage
-            .contains(crate::texture::TextureUsage::TRANSFER_DST)
-        {
-            usage |= vk::ImageUsageFlags::TRANSFER_DST;
+        use crate::texture::TextureUsage;
+        let pairs = [
+            (TextureUsage::SAMPLED, vk::ImageUsageFlags::SAMPLED),
+            (TextureUsage::STORAGE, vk::ImageUsageFlags::STORAGE),
+            (
+                TextureUsage::COLOR_ATTACHMENT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            ),
+            (
+                TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            ),
+            (TextureUsage::TRANSFER_SRC, vk::ImageUsageFlags::TRANSFER_SRC),
+            (TextureUsage::TRANSFER_DST, vk::ImageUsageFlags::TRANSFER_DST),
+        ];
+        for (flag, vk_flag) in pairs {
+            if desc.usage.contains(flag) {
+                usage |= vk_flag;
+            }
         }
 
         let image_type = match desc.dimension {
@@ -1554,7 +1409,6 @@ impl VulkanDevice {
             | TextureDimension::CubeArray => vk::ImageType::TYPE_2D,
             TextureDimension::D3 => vk::ImageType::TYPE_3D,
         };
-
         let samples = match desc.sample_count {
             SampleCount::S1 => vk::SampleCountFlags::TYPE_1,
             SampleCount::S2 => vk::SampleCountFlags::TYPE_2,
@@ -1562,11 +1416,9 @@ impl VulkanDevice {
             SampleCount::S8 => vk::SampleCountFlags::TYPE_8,
             SampleCount::S16 => vk::SampleCountFlags::TYPE_16,
         };
-
+        // A single cubemap = 6 faces; n cubes = n × 6. CubeArray callers supply the total.
         let array_layers = match desc.dimension {
-            // A single cubemap = 6 faces; n cubes = n*6 faces.
             TextureDimension::Cube => desc.array_layers * 6,
-            // CubeArray: caller provides total face count (n * 6) directly.
             _ => desc.array_layers,
         };
         let image_flags = match desc.dimension {
@@ -1598,16 +1450,7 @@ impl VulkanDevice {
                 .create_image(&image_info, None)
                 .map_err(|e| RhiError::TextureCreation(e.to_string()))?
         };
-
-        let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
-        unsafe {
-            self.device.destroy_image(image, None);
-        }
-
-        Ok(TextureSizeAlign {
-            size: mem_reqs.size,
-            align: mem_reqs.alignment,
-        })
+        Ok((image, array_layers, vk_format))
     }
 
     pub fn create_texture(
@@ -1621,124 +1464,32 @@ impl VulkanDevice {
             ));
         }
 
-        let vk_format = format_to_vk(desc.format);
-
-        let mut usage = vk::ImageUsageFlags::empty();
-        if desc.usage.contains(crate::texture::TextureUsage::SAMPLED) {
-            usage |= vk::ImageUsageFlags::SAMPLED;
-        }
-        if desc.usage.contains(crate::texture::TextureUsage::STORAGE) {
-            usage |= vk::ImageUsageFlags::STORAGE;
-        }
-        if desc
-            .usage
-            .contains(crate::texture::TextureUsage::COLOR_ATTACHMENT)
-        {
-            usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
-        }
-        if desc
-            .usage
-            .contains(crate::texture::TextureUsage::DEPTH_STENCIL_ATTACHMENT)
-        {
-            usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
-        }
-        if desc
-            .usage
-            .contains(crate::texture::TextureUsage::TRANSFER_SRC)
-        {
-            usage |= vk::ImageUsageFlags::TRANSFER_SRC;
-        }
-        if desc
-            .usage
-            .contains(crate::texture::TextureUsage::TRANSFER_DST)
-        {
-            usage |= vk::ImageUsageFlags::TRANSFER_DST;
-        }
-
-        let image_type = match desc.dimension {
-            TextureDimension::D1 => vk::ImageType::TYPE_1D,
-            TextureDimension::D2
-            | TextureDimension::D2Array
-            | TextureDimension::Cube
-            | TextureDimension::CubeArray => vk::ImageType::TYPE_2D,
-            TextureDimension::D3 => vk::ImageType::TYPE_3D,
-        };
-
-        let samples = match desc.sample_count {
-            SampleCount::S1 => vk::SampleCountFlags::TYPE_1,
-            SampleCount::S2 => vk::SampleCountFlags::TYPE_2,
-            SampleCount::S4 => vk::SampleCountFlags::TYPE_4,
-            SampleCount::S8 => vk::SampleCountFlags::TYPE_8,
-            SampleCount::S16 => vk::SampleCountFlags::TYPE_16,
-        };
-
-        let array_layers = match desc.dimension {
-            // A single cubemap = 6 faces; n cubes = n*6 faces.
-            TextureDimension::Cube => desc.array_layers * 6,
-            // CubeArray: caller provides total face count (n * 6) directly.
-            _ => desc.array_layers,
-        };
-        let image_flags = match desc.dimension {
-            TextureDimension::Cube | TextureDimension::CubeArray => {
-                vk::ImageCreateFlags::CUBE_COMPATIBLE
-            }
-            _ => vk::ImageCreateFlags::empty(),
-        };
-
-        let image_info = vk::ImageCreateInfo::default()
-            .flags(image_flags)
-            .image_type(image_type)
-            .format(vk_format)
-            .extent(vk::Extent3D {
-                width: desc.width,
-                height: desc.height,
-                depth: desc.depth,
-            })
-            .mip_levels(desc.mip_levels)
-            .array_layers(array_layers)
-            .samples(samples)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-
-        let image = unsafe {
-            self.device
-                .create_image(&image_info, None)
-                .map_err(|e| RhiError::TextureCreation(e.to_string()))?
-        };
-
+        let (image, array_layers, vk_format) = self.create_image_for_desc(desc)?;
         let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
 
-        let (memory, memory_offset) = {
+        // Resolve the caller-supplied GPU address against the allocation registry.
+        // Any validation failure here is fatal — destroy the partially-built image first.
+        let resolve = || -> RhiResult<(vk::DeviceMemory, u64)> {
             let allocations = self.allocations.lock().expect("allocations lock poisoned");
             let alloc = allocations
-                .iter()
-                .find(|alloc| {
-                    texture_gpu.0 >= alloc.base.0
-                        && texture_gpu.0.saturating_sub(alloc.base.0) < alloc.size
-                })
+                .range(..=texture_gpu.0)
+                .next_back()
+                .map(|(_, alloc)| alloc)
+                .filter(|alloc| texture_gpu.0 < alloc.base.0 + alloc.size)
                 .ok_or_else(|| {
                     RhiError::TextureCreation(format!(
                         "texture allocation address 0x{:x} was not returned by gpuMalloc",
                         texture_gpu.0
                     ))
                 })?;
-
             let offset = texture_gpu.0 - alloc.base.0;
             if !offset.is_multiple_of(mem_reqs.alignment) {
-                unsafe {
-                    self.device.destroy_image(image, None);
-                }
                 return Err(RhiError::TextureCreation(format!(
                     "texture allocation address 0x{:x} has memory offset {offset}, expected alignment {}",
                     texture_gpu.0, mem_reqs.alignment
                 )));
             }
             if offset + mem_reqs.size > alloc.size {
-                unsafe {
-                    self.device.destroy_image(image, None);
-                }
                 return Err(RhiError::TextureCreation(format!(
                     "texture allocation address 0x{:x} has {} bytes available, needs {}",
                     texture_gpu.0,
@@ -1747,15 +1498,18 @@ impl VulkanDevice {
                 )));
             }
             if mem_reqs.memory_type_bits & (1 << alloc.memory_type_index) == 0 {
-                unsafe {
-                    self.device.destroy_image(image, None);
-                }
                 return Err(RhiError::TextureCreation(
                     "texture allocation memory type is not compatible with this image".into(),
                 ));
             }
-
-            (alloc.memory, offset)
+            Ok((alloc.memory, offset))
+        };
+        let (memory, memory_offset) = match resolve() {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe { self.device.destroy_image(image, None) };
+                return Err(e);
+            }
         };
 
         unsafe {
@@ -1810,10 +1564,10 @@ impl VulkanDevice {
         self.transition_image_to_general(image, aspect, desc.mip_levels, array_layers)?;
 
         if desc.usage.contains(crate::texture::TextureUsage::SAMPLED) {
-            self.write_sampled_image_descriptor(texture_id, image_view, vk::ImageLayout::GENERAL)?;
+            self.write_image_descriptor(texture_id, image_view, vk::ImageLayout::GENERAL, false)?;
         }
         if desc.usage.contains(crate::texture::TextureUsage::STORAGE) {
-            self.write_storage_image_descriptor(texture_id, image_view, vk::ImageLayout::GENERAL)?;
+            self.write_image_descriptor(texture_id, image_view, vk::ImageLayout::GENERAL, true)?;
         }
 
         // Store texture data
@@ -2355,14 +2109,7 @@ impl VulkanDevice {
     }
 
     pub fn create_blas(&self, desc: &BlasDesc) -> RhiResult<AccelerationStructure> {
-        let accel_loader = match &self.acceleration_structure {
-            Some(a) => a,
-            None => {
-                return Err(RhiError::Unsupported(
-                    "VK_KHR_acceleration_structure not available on this device".into(),
-                ));
-            }
-        };
+        let accel_loader = self.require_accel_loader()?;
 
         // Build geometry descriptors.
         let geometries: Vec<vk::AccelerationStructureGeometryKHR> = desc
@@ -2447,52 +2194,15 @@ impl VulkanDevice {
             );
         }
 
-        let (buffer, memory) = self.allocate_accel_buffer(size_info.acceleration_structure_size)?;
-        let create_info = vk::AccelerationStructureCreateInfoKHR::default()
-            .buffer(buffer)
-            .size(size_info.acceleration_structure_size)
-            .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL);
-        let acceleration_structure = unsafe {
-            accel_loader
-                .create_acceleration_structure(&create_info, None)
-                .map_err(|e| RhiError::AllocationFailed(e.to_string()))?
-        };
-        let device_address = unsafe {
-            accel_loader.get_acceleration_structure_device_address(
-                &vk::AccelerationStructureDeviceAddressInfoKHR::default()
-                    .acceleration_structure(acceleration_structure),
-            )
-        };
-
-        let id = {
-            let mut next = self.accel_counter.borrow_mut();
-            let id = *next;
-            *next += 1;
-            AccelerationStructureId(id)
-        };
-
-        Ok(AccelerationStructure {
-            id,
-            inner: AccelInner::Vulkan(Box::new(VulkanAccelerationStructure {
-                acceleration_structure,
-                buffer,
-                buffer_memory: memory,
-                device_address,
-                device: self.device.clone(),
-                accel_loader: accel_loader.clone(),
-            })),
-        })
+        self.finalize_accel_structure(
+            accel_loader,
+            size_info.acceleration_structure_size,
+            vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+        )
     }
 
     pub fn create_tlas(&self, desc: &TlasDesc) -> RhiResult<AccelerationStructure> {
-        let accel_loader = match &self.acceleration_structure {
-            Some(a) => a,
-            None => {
-                return Err(RhiError::Unsupported(
-                    "VK_KHR_acceleration_structure not available on this device".into(),
-                ));
-            }
-        };
+        let accel_loader = self.require_accel_loader()?;
 
         let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::default()
             .array_of_pointers(false)
@@ -2523,11 +2233,36 @@ impl VulkanDevice {
             );
         }
 
-        let (buffer, memory) = self.allocate_accel_buffer(size_info.acceleration_structure_size)?;
+        self.finalize_accel_structure(
+            accel_loader,
+            size_info.acceleration_structure_size,
+            vk::AccelerationStructureTypeKHR::TOP_LEVEL,
+        )
+    }
+
+    fn require_accel_loader(&self) -> RhiResult<&vk_accel_structure::Device> {
+        self.acceleration_structure.as_ref().ok_or_else(|| {
+            RhiError::Unsupported(
+                "VK_KHR_acceleration_structure not available on this device".into(),
+            )
+        })
+    }
+
+    /// Allocate the backing buffer, create the acceleration structure, query its
+    /// device address, and wrap everything into the public `AccelerationStructure`.
+    /// Shared by `create_blas` / `create_tlas` — both only differ in the geometry
+    /// build info (which feeds size_info before this is called).
+    fn finalize_accel_structure(
+        &self,
+        accel_loader: &vk_accel_structure::Device,
+        size: u64,
+        ty: vk::AccelerationStructureTypeKHR,
+    ) -> RhiResult<AccelerationStructure> {
+        let (buffer, memory) = self.allocate_accel_buffer(size)?;
         let create_info = vk::AccelerationStructureCreateInfoKHR::default()
             .buffer(buffer)
-            .size(size_info.acceleration_structure_size)
-            .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL);
+            .size(size)
+            .ty(ty);
         let acceleration_structure = unsafe {
             accel_loader
                 .create_acceleration_structure(&create_info, None)
@@ -2781,9 +2516,7 @@ impl VulkanDevice {
                 {
                     let mut allocations =
                         self.allocations.lock().expect("allocations lock poisoned");
-                    if let Some(pos) = allocations.iter().position(|a| a.buffer == b.buffer) {
-                        allocations.swap_remove(pos);
-                    }
+                    allocations.remove(&b.gpu_address.0);
                 }
                 if b.mapped_ptr.is_some() {
                     self.device.unmap_memory(b.memory);
@@ -2907,11 +2640,7 @@ impl VulkanDevice {
             tid
         };
 
-        if storage {
-            self.write_storage_image_descriptor(texture_id, image_view, vk::ImageLayout::GENERAL)?;
-        } else {
-            self.write_sampled_image_descriptor(texture_id, image_view, vk::ImageLayout::GENERAL)?;
-        }
+        self.write_image_descriptor(texture_id, image_view, vk::ImageLayout::GENERAL, storage)?;
 
         let vk_texture = VulkanTexture {
             image: vk::Image::null(),
@@ -2932,11 +2661,12 @@ impl VulkanDevice {
 
     // -- Private helpers --
 
-    fn write_sampled_image_descriptor(
+    fn write_image_descriptor(
         &self,
         id: TextureId,
         image_view: vk::ImageView,
         layout: vk::ImageLayout,
+        storage: bool,
     ) -> RhiResult<()> {
         let heap = self
             .descriptor_buffer_heap
@@ -2947,72 +2677,52 @@ impl VulkanDevice {
             .as_ref()
             .ok_or_else(|| RhiError::Backend("Descriptor buffer loader missing".into()))?;
 
-        let offset = heap.sampled_image_offset + (id.0 as u64) * heap.sampled_image_stride;
-        if offset + heap.sampled_image_stride > heap.size {
-            return Err(RhiError::Backend(
-                "Sampled image descriptor heap overflow".into(),
-            ));
+        let (base, stride, ty, kind) = if storage {
+            (
+                heap.storage_image_offset,
+                heap.storage_image_stride,
+                vk::DescriptorType::STORAGE_IMAGE,
+                "Storage",
+            )
+        } else {
+            (
+                heap.sampled_image_offset,
+                heap.sampled_image_stride,
+                vk::DescriptorType::SAMPLED_IMAGE,
+                "Sampled",
+            )
+        };
+
+        let offset = base + (id.0 as u64) * stride;
+        if offset + stride > heap.size {
+            return Err(RhiError::Backend(format!(
+                "{kind} image descriptor heap overflow"
+            )));
         }
 
         let image_info = vk::DescriptorImageInfo::default()
             .image_view(image_view)
             .image_layout(layout);
-        let get_info = vk::DescriptorGetInfoEXT::default()
-            .ty(vk::DescriptorType::SAMPLED_IMAGE)
-            .data(vk::DescriptorDataEXT {
-                p_sampled_image: &image_info,
-            });
-
-        unsafe {
-            let dst = std::slice::from_raw_parts_mut(
-                heap.mapped_ptr.add(offset as usize),
-                heap.sampled_image_stride as usize,
-            );
-            loader.get_descriptor(&get_info, dst);
-        }
-
-        Ok(())
-    }
-
-    fn write_storage_image_descriptor(
-        &self,
-        id: TextureId,
-        image_view: vk::ImageView,
-        layout: vk::ImageLayout,
-    ) -> RhiResult<()> {
-        let heap = self
-            .descriptor_buffer_heap
-            .as_ref()
-            .ok_or_else(|| RhiError::Backend("Descriptor buffer heap missing".into()))?;
-        let loader = self
-            .descriptor_buffer_loader
-            .as_ref()
-            .ok_or_else(|| RhiError::Backend("Descriptor buffer loader missing".into()))?;
-
-        let offset = heap.storage_image_offset + (id.0 as u64) * heap.storage_image_stride;
-        if offset + heap.storage_image_stride > heap.size {
-            return Err(RhiError::Backend(
-                "Storage image descriptor heap overflow".into(),
-            ));
-        }
-
-        let image_info = vk::DescriptorImageInfo::default()
-            .image_view(image_view)
-            .image_layout(layout);
-        let get_info = vk::DescriptorGetInfoEXT::default()
-            .ty(vk::DescriptorType::STORAGE_IMAGE)
-            .data(vk::DescriptorDataEXT {
+        // Both p_sampled_image and p_storage_image are the same union variant — a pointer
+        // to vk::DescriptorImageInfo. The descriptor type tag selects the layout written.
+        let data = if storage {
+            vk::DescriptorDataEXT {
                 p_storage_image: &image_info,
-            });
+            }
+        } else {
+            vk::DescriptorDataEXT {
+                p_sampled_image: &image_info,
+            }
+        };
+        let get_info = vk::DescriptorGetInfoEXT::default().ty(ty).data(data);
 
         unsafe {
             let dst = std::slice::from_raw_parts_mut(
                 heap.mapped_ptr.add(offset as usize),
-                heap.storage_image_stride as usize,
+                stride as usize,
             );
             loader.get_descriptor(&get_info, dst);
         }
-
         Ok(())
     }
 
@@ -3157,62 +2867,25 @@ impl VulkanDevice {
     }
 
     fn transition_depth_image(&self, depth_image: vk::Image) -> RhiResult<()> {
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-        unsafe {
-            self.device
-                .reset_command_buffer(
-                    self.setup_command_buffer,
-                    vk::CommandBufferResetFlags::empty(),
-                )
-                .map_err(|e| RhiError::CommandBuffer(e.to_string()))?;
-
-            self.device
-                .begin_command_buffer(self.setup_command_buffer, &begin_info)
-                .map_err(|e| RhiError::CommandBuffer(e.to_string()))?;
-
-            let barrier = vk::ImageMemoryBarrier::default()
-                .image(depth_image)
-                .dst_access_mask(
-                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
-                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                )
-                .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                        .layer_count(1)
-                        .level_count(1),
-                );
-
-            self.device.cmd_pipeline_barrier(
-                self.setup_command_buffer,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
+        let barrier = vk::ImageMemoryBarrier::default()
+            .image(depth_image)
+            .dst_access_mask(
+                vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            )
+            .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                    .layer_count(1)
+                    .level_count(1),
             );
-
-            self.device
-                .end_command_buffer(self.setup_command_buffer)
-                .map_err(|e| RhiError::CommandBuffer(e.to_string()))?;
-
-            let submit_info = vk::SubmitInfo::default()
-                .command_buffers(std::slice::from_ref(&self.setup_command_buffer));
-
-            self.device
-                .queue_submit(self.present_queue, &[submit_info], vk::Fence::null())
-                .map_err(|e| RhiError::QueueSubmit(e.to_string()))?;
-            self.device
-                .queue_wait_idle(self.present_queue)
-                .map_err(|e| RhiError::QueueSubmit(e.to_string()))?;
-        }
-
-        Ok(())
+        self.submit_setup_barrier(
+            barrier,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+        )
     }
 
     fn transition_image_to_general(
@@ -3222,9 +2895,36 @@ impl VulkanDevice {
         mip_levels: u32,
         layer_count: u32,
     ) -> RhiResult<()> {
+        let barrier = vk::ImageMemoryBarrier::default()
+            .image(image)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(aspect)
+                    .level_count(mip_levels)
+                    .layer_count(layer_count),
+            );
+        self.submit_setup_barrier(
+            barrier,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+        )
+    }
+
+    /// Record a single image barrier on the setup command buffer, submit it, and
+    /// block on the queue. Used for one-shot UNDEFINED → initial-layout transitions
+    /// that happen outside the normal command-buffer flow.
+    fn submit_setup_barrier(
+        &self,
+        barrier: vk::ImageMemoryBarrier<'_>,
+        src_stage: vk::PipelineStageFlags,
+        dst_stage: vk::PipelineStageFlags,
+    ) -> RhiResult<()> {
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
         unsafe {
             self.device
                 .reset_command_buffer(
@@ -3232,41 +2932,23 @@ impl VulkanDevice {
                     vk::CommandBufferResetFlags::empty(),
                 )
                 .map_err(|e| RhiError::CommandBuffer(e.to_string()))?;
-
             self.device
                 .begin_command_buffer(self.setup_command_buffer, &begin_info)
                 .map_err(|e| RhiError::CommandBuffer(e.to_string()))?;
-
-            let barrier = vk::ImageMemoryBarrier::default()
-                .image(image)
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(aspect)
-                        .level_count(mip_levels)
-                        .layer_count(layer_count),
-                );
-
             self.device.cmd_pipeline_barrier(
                 self.setup_command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::ALL_COMMANDS,
+                src_stage,
+                dst_stage,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
                 &[barrier],
             );
-
             self.device
                 .end_command_buffer(self.setup_command_buffer)
                 .map_err(|e| RhiError::CommandBuffer(e.to_string()))?;
-
             let submit_info = vk::SubmitInfo::default()
                 .command_buffers(std::slice::from_ref(&self.setup_command_buffer));
-
             self.device
                 .queue_submit(self.present_queue, &[submit_info], vk::Fence::null())
                 .map_err(|e| RhiError::QueueSubmit(e.to_string()))?;
@@ -3274,7 +2956,6 @@ impl VulkanDevice {
                 .queue_wait_idle(self.present_queue)
                 .map_err(|e| RhiError::QueueSubmit(e.to_string()))?;
         }
-
         Ok(())
     }
 }

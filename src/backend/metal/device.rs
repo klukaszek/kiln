@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -25,7 +25,7 @@ use crate::accel::{AccelInner, AccelerationStructure};
 use crate::command::{CommandBuffer, SignalOp, SignalValueDesc, WaitOp, WaitValueDesc};
 use crate::device::{BindlessMode, DeviceDesc};
 use crate::error::{RhiError, RhiResult};
-use crate::memory::{BufferDesc, BufferUsage, GpuBuffer, GpuBufferInner};
+use crate::memory::{BufferDesc, MemoryType, GpuBuffer, GpuBufferInner};
 use crate::pipeline::*;
 use crate::queue::{Queue, QueueInner, SubmitDesc};
 use crate::sampler::{Sampler, SamplerDesc};
@@ -50,7 +50,9 @@ type InFlightFrameCommands = Rc<RefCell<Vec<Option<MetalCommandBuffer>>>>;
 type PendingSubmissions = Rc<RefCell<Vec<(u64, MetalCommandBuffer)>>>;
 pub(crate) type SharedTextures = Rc<RefCell<Vec<Option<Retained<ProtocolObject<dyn MTLTexture>>>>>>;
 pub(crate) type SharedSamplers = Rc<RefCell<Vec<Retained<ProtocolObject<dyn MTLSamplerState>>>>>;
-pub(crate) type SharedAllocations = Rc<RefCell<Vec<BufferAllocation>>>;
+/// Buffer allocations keyed by GPU base address, enabling O(log n) address->buffer
+/// resolution for blit copies and indirect draws instead of a linear scan.
+pub(crate) type SharedAllocations = Rc<RefCell<BTreeMap<u64, BufferAllocation>>>;
 type ValueSyncMap = RefCell<HashMap<u64, MetalValueSyncState>>;
 type MetalEventWaits = Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>;
 
@@ -91,7 +93,6 @@ pub struct MetalDevice {
     /// Monotonic counter for AccelerationStructureId assignment.
     accel_counter: RefCell<u32>,
     mdi_icb_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    mdi_icb_function: Retained<ProtocolObject<dyn MTLFunction>>,
 }
 
 pub struct MetalQueue {
@@ -427,18 +428,11 @@ const METAL_MDI_ICB_SOURCE: &str = r#"
 #include <metal_command_buffer>
 using namespace metal;
 
-struct RhiDrawIndexedIndirectMultiArgs {
-    device uint* index_buffer;
-    uint index_count;
+struct RhiDrawIndirectMultiArgs {
+    uint vertex_count;
     uint instance_count;
-    uint first_index;
-    int vertex_offset;
+    uint first_vertex;
     uint first_instance;
-    uint _pad;
-};
-
-struct RhiIcbContainer {
-    command_buffer commandBuffer [[id(0)]];
 };
 
 struct RhiIcbRange {
@@ -456,11 +450,18 @@ static inline primitive_type rhi_primitive_type(uint id) {
     }
 }
 
-kernel void rhi_encode_indexed_mdi_icb(
-    device const RhiDrawIndexedIndirectMultiArgs* draws [[buffer(0)]],
+// Encodes non-indexed multi-draw indirect into an MTLIndirectCommandBuffer.
+// Per NoGraphicsApi.md (lines 904-907, 1124, 59, 1152) the architecture's MDI
+// is fully GPU-driven and non-indexed at the hardware level: vertex shaders
+// perform programmable index fetch from a pointer inside per-draw root data,
+// selected by [[draw_id]] + stride.
+//
+// The ICB is bound directly via Metal 4's setResource_atBufferIndex (no argument buffer).
+kernel void rhi_encode_mdi_icb(
+    device const RhiDrawIndirectMultiArgs* draws [[buffer(0)]],
     device atomic_uint* drawCount [[buffer(1)]],
     device RhiIcbRange* range [[buffer(2)]],
-    device RhiIcbContainer& icbContainer [[buffer(3)]],
+    command_buffer icb [[buffer(3)]],
     constant uint& maxDrawCount [[buffer(4)]],
     constant uint& primitiveType [[buffer(5)]],
     uint tid [[thread_position_in_grid]])
@@ -474,28 +475,33 @@ kernel void rhi_encode_indexed_mdi_icb(
         return;
     }
 
-    RhiDrawIndexedIndirectMultiArgs draw = draws[tid];
-    device uint* indexBuffer = draw.index_buffer + draw.first_index;
+    RhiDrawIndirectMultiArgs draw = draws[tid];
 
-    render_command cmd(icbContainer.commandBuffer, tid);
-    cmd.draw_indexed_primitives(
+    render_command cmd(icb, tid);
+    cmd.draw_primitives(
         rhi_primitive_type(primitiveType),
-        draw.index_count,
-        indexBuffer,
+        draw.first_vertex,
+        draw.vertex_count,
         draw.instance_count,
-        uint(draw.vertex_offset),
         draw.first_instance);
 }
 "#;
 
-struct MdiIcbPipeline {
-    pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    function: Retained<ProtocolObject<dyn MTLFunction>>,
+/// Translate the unified `Cull` value into Metal's `(cull_mode, front-face winding)` pair.
+/// All variants imply CCW as the front-face convention. `Cull::All` is approximated as
+/// Back + CW since Metal has no FRONT_AND_BACK cull mode.
+fn cull_to_mtl(cull: Cull) -> (MTLCullMode, MTLWinding) {
+    match cull {
+        Cull::None => (MTLCullMode::None, MTLWinding::CounterClockwise),
+        Cull::Cw => (MTLCullMode::Back, MTLWinding::CounterClockwise),
+        Cull::Ccw => (MTLCullMode::Front, MTLWinding::CounterClockwise),
+        Cull::All => (MTLCullMode::Back, MTLWinding::Clockwise),
+    }
 }
 
 fn create_mdi_icb_pipeline(
     device: &ProtocolObject<dyn MTLDevice>,
-) -> RhiResult<MdiIcbPipeline> {
+) -> RhiResult<Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
     let options = MTLCompileOptions::new();
     options.setLanguageVersion(MTLLanguageVersion::Version4_0);
     let source = NSString::from_str(METAL_MDI_ICB_SOURCE);
@@ -503,25 +509,24 @@ fn create_mdi_icb_pipeline(
         .newLibraryWithSource_options_error(&source, Some(&options))
         .map_err(|e| {
             RhiError::PipelineCreation(format!(
-                "Metal indexed MDI ICB encoder library compilation failed: {e}"
+                "Metal MDI ICB encoder library compilation failed: {e}"
             ))
         })?;
-    let function_name = NSString::from_str("rhi_encode_indexed_mdi_icb");
+    let function_name = NSString::from_str("rhi_encode_mdi_icb");
     let function = library
         .newFunctionWithName(&function_name)
         .ok_or_else(|| {
             RhiError::PipelineCreation(
-                "Metal indexed MDI ICB encoder function was not found".into(),
+                "Metal MDI ICB encoder function was not found".into(),
             )
         })?;
-    let pipeline = device
+    device
         .newComputePipelineStateWithFunction_error(&function)
         .map_err(|e| {
             RhiError::PipelineCreation(format!(
-                "Metal indexed MDI ICB encoder pipeline creation failed: {e}"
+                "Metal MDI ICB encoder pipeline creation failed: {e}"
             ))
-        })?;
-    Ok(MdiIcbPipeline { pipeline, function })
+        })
 }
 
 impl MetalDevice {
@@ -578,14 +583,12 @@ impl MetalDevice {
 
         log::info!("Metal device created: {}", device.name());
 
-        let bindless_mode = match desc.bindless_mode.unwrap_or(BindlessMode::ArgumentTable) {
-            BindlessMode::ArgumentTable => BindlessMode::ArgumentTable,
-            BindlessMode::DescriptorBuffer => {
-                return Err(RhiError::Unsupported(
-                    "Metal requires argument-table bindless mode".into(),
-                ));
-            }
-        };
+        if desc.bindless_mode == Some(BindlessMode::DescriptorBuffer) {
+            return Err(RhiError::Unsupported(
+                "Metal requires argument-table bindless mode".into(),
+            ));
+        }
+        let bindless_mode = BindlessMode::ArgumentTable;
         let mdi_icb = create_mdi_icb_pipeline(device.as_ref())?;
 
         let device = Self {
@@ -595,14 +598,13 @@ impl MetalDevice {
             residency_dirty,
             textures: Rc::new(RefCell::new(Vec::new())),
             samplers: Rc::new(RefCell::new(Vec::new())),
-            allocations: Rc::new(RefCell::new(Vec::new())),
+            allocations: Rc::new(RefCell::new(BTreeMap::new())),
             shader_modules: RefCell::new(Vec::new()),
             frame_fence_values,
             frame_event,
             bindless_mode,
             accel_counter: RefCell::new(0),
-            mdi_icb_pipeline: mdi_icb.pipeline,
-            mdi_icb_function: mdi_icb.function,
+            mdi_icb_pipeline: mdi_icb,
         };
 
         Ok(device)
@@ -731,9 +733,9 @@ impl MetalDevice {
     }
 
     pub fn create_buffer(&self, desc: &BufferDesc) -> RhiResult<GpuBuffer> {
-        let options = match desc.usage {
-            BufferUsage::Default | BufferUsage::Readback => MTLResourceOptions::StorageModeShared,
-            BufferUsage::GpuOnly => MTLResourceOptions::StorageModePrivate,
+        let options = match desc.memory {
+            MemoryType::Default | MemoryType::Readback => MTLResourceOptions::StorageModeShared,
+            MemoryType::GpuOnly => MTLResourceOptions::StorageModePrivate,
         };
 
         let buffer_size = self
@@ -769,7 +771,7 @@ impl MetalDevice {
             buffer.setLabel(Some(&ns_label));
         }
 
-        let is_shared = matches!(desc.usage, BufferUsage::Default | BufferUsage::Readback);
+        let is_shared = matches!(desc.memory, MemoryType::Default | MemoryType::Readback);
 
         let metal_buffer = MetalBuffer {
             buffer,
@@ -780,13 +782,16 @@ impl MetalDevice {
 
         {
             let mut allocations = self.allocations.borrow_mut();
-            allocations.push(BufferAllocation {
-                base: metal_buffer.gpu_address(),
-                size: metal_buffer.size,
-                buffer: metal_buffer.buffer.clone(),
-                heap: metal_buffer.heap.clone(),
-                mapped_ptr: metal_buffer.mapped_ptr(),
-            });
+            allocations.insert(
+                metal_buffer.gpu_address().0,
+                BufferAllocation {
+                    base: metal_buffer.gpu_address(),
+                    size: metal_buffer.size,
+                    buffer: metal_buffer.buffer.clone(),
+                    heap: metal_buffer.heap.clone(),
+                    mapped_ptr: metal_buffer.mapped_ptr(),
+                },
+            );
         }
 
         Ok(GpuBuffer {
@@ -800,7 +805,7 @@ impl MetalDevice {
         }
         let ptr = cpu_ptr as usize;
         let allocations = self.allocations.borrow();
-        for alloc in allocations.iter() {
+        for alloc in allocations.values() {
             if let Some(mapped) = alloc.mapped_ptr {
                 let base = mapped as usize;
                 let end = base + alloc.size as usize;
@@ -813,20 +818,14 @@ impl MetalDevice {
         None
     }
 
-    pub fn texture_size_align(&self, desc: &TextureDesc) -> RhiResult<TextureSizeAlign> {
+    /// Build the native `MTLTextureDescriptor` for a `TextureDesc`. Shared by
+    /// `texture_size_align` and `create_texture` so the mapping lives in one place.
+    fn build_texture_descriptor(&self, desc: &TextureDesc) -> Retained<MTLTextureDescriptor> {
         let mtl_desc = MTLTextureDescriptor::new();
 
         let texture_type = match desc.dimension {
             TextureDimension::D1 => MTLTextureType::Type1D,
-            // D2 with array_layers > 1 is still D2Array internally; explicit D2Array
-            // is preferred but we keep the implicit path for backward compat.
-            TextureDimension::D2 => {
-                if desc.array_layers > 1 {
-                    MTLTextureType::Type2DArray
-                } else {
-                    MTLTextureType::Type2D
-                }
-            }
+            TextureDimension::D2 => MTLTextureType::Type2D,
             TextureDimension::D2Array => MTLTextureType::Type2DArray,
             TextureDimension::D3 => MTLTextureType::Type3D,
             TextureDimension::Cube => MTLTextureType::TypeCube,
@@ -868,6 +867,11 @@ impl MetalDevice {
             mtl_desc.setStorageMode(MTLStorageMode::Private);
         }
 
+        mtl_desc
+    }
+
+    pub fn texture_size_align(&self, desc: &TextureDesc) -> RhiResult<TextureSizeAlign> {
+        let mtl_desc = self.build_texture_descriptor(desc);
         let size_align = self.device.heapTextureSizeAndAlignWithDescriptor(&mtl_desc);
         Ok(TextureSizeAlign {
             size: size_align.size as u64,
@@ -886,69 +890,15 @@ impl MetalDevice {
             ));
         }
 
-        let mtl_desc = MTLTextureDescriptor::new();
-
-        let texture_type = match desc.dimension {
-            TextureDimension::D1 => MTLTextureType::Type1D,
-            // D2 with array_layers > 1 is still D2Array internally; explicit D2Array
-            // is preferred but we keep the implicit path for backward compat.
-            TextureDimension::D2 => {
-                if desc.array_layers > 1 {
-                    MTLTextureType::Type2DArray
-                } else {
-                    MTLTextureType::Type2D
-                }
-            }
-            TextureDimension::D2Array => MTLTextureType::Type2DArray,
-            TextureDimension::D3 => MTLTextureType::Type3D,
-            TextureDimension::Cube => MTLTextureType::TypeCube,
-            TextureDimension::CubeArray => MTLTextureType::TypeCubeArray,
-        };
-
-        let sample_count = match desc.sample_count {
-            SampleCount::S1 => 1usize,
-            SampleCount::S2 => 2,
-            SampleCount::S4 => 4,
-            SampleCount::S8 => 8,
-            SampleCount::S16 => 16,
-        };
-
-        let mut usage = MtlTextureUsage::empty();
-        if desc.usage.contains(TextureUsage::SAMPLED) {
-            usage |= MtlTextureUsage::ShaderRead;
-        }
-        if desc.usage.contains(TextureUsage::STORAGE) {
-            usage |= MtlTextureUsage::ShaderRead | MtlTextureUsage::ShaderWrite;
-        }
-        if desc.usage.contains(TextureUsage::COLOR_ATTACHMENT) {
-            usage |= MtlTextureUsage::RenderTarget;
-        }
-        if desc.usage.contains(TextureUsage::DEPTH_STENCIL_ATTACHMENT) {
-            usage |= MtlTextureUsage::RenderTarget;
-        }
-
-        unsafe {
-            mtl_desc.setPixelFormat(format_to_mtl(desc.format));
-            mtl_desc.setWidth(desc.width as usize);
-            mtl_desc.setHeight(desc.height as usize);
-            mtl_desc.setDepth(desc.depth as usize);
-            mtl_desc.setMipmapLevelCount(desc.mip_levels as usize);
-            mtl_desc.setArrayLength(desc.array_layers as usize);
-            mtl_desc.setTextureType(texture_type);
-            mtl_desc.setSampleCount(sample_count);
-            mtl_desc.setUsage(usage);
-            mtl_desc.setStorageMode(MTLStorageMode::Private);
-        }
-
+        let mtl_desc = self.build_texture_descriptor(desc);
         let size_align = self.device.heapTextureSizeAndAlignWithDescriptor(&mtl_desc);
         let (heap, heap_offset) = {
             let allocations = self.allocations.borrow();
             let alloc = allocations
-                .iter()
-                .find(|alloc| {
-                    texture_gpu.0 >= alloc.base.0
-                        && texture_gpu.0.saturating_sub(alloc.base.0) < alloc.size
-                })
+                .range(..=texture_gpu.0)
+                .next_back()
+                .map(|(_, alloc)| alloc)
+                .filter(|alloc| texture_gpu.0 < alloc.base.0 + alloc.size)
                 .ok_or_else(|| {
                     RhiError::TextureCreation(format!(
                         "texture allocation address 0x{:x} was not returned by gpuMalloc",
@@ -1091,18 +1041,6 @@ impl MetalDevice {
             .get(desc.pixel_shader)
             .ok_or_else(|| RhiError::PipelineCreation("Invalid fragment shader index".into()))?;
 
-        let frag_fn_name = NSString::from_str(&frag_module.entry_point);
-
-        let frag_fn = frag_module
-            .library
-            .newFunctionWithName(&frag_fn_name)
-            .ok_or_else(|| {
-                RhiError::PipelineCreation(format!(
-                    "Fragment function '{}' not found in library",
-                    frag_module.entry_point
-                ))
-            })?;
-
         let compiler_desc = MTL4CompilerDescriptor::new();
         let compiler = self
             .device
@@ -1169,26 +1107,7 @@ impl MetalDevice {
             })
             .unwrap_or_default();
 
-        // Derive MTLCullMode + MTLWinding from the unified Cull value.
-        // All variants imply CCW as front face. Cull::All approximated as Back+CW (Metal has no FRONT_AND_BACK).
-        let (cull_mode, winding) = match desc.cull {
-            Cull::None => (
-                objc2_metal::MTLCullMode::None,
-                objc2_metal::MTLWinding::CounterClockwise,
-            ),
-            Cull::Cw => (
-                objc2_metal::MTLCullMode::Back,
-                objc2_metal::MTLWinding::CounterClockwise,
-            ),
-            Cull::Ccw => (
-                objc2_metal::MTLCullMode::Front,
-                objc2_metal::MTLWinding::CounterClockwise,
-            ),
-            Cull::All => (
-                objc2_metal::MTLCullMode::Back,
-                objc2_metal::MTLWinding::Clockwise,
-            ),
-        };
+        let (cull_mode, winding) = cull_to_mtl(desc.cull);
 
         let topology = match desc.topology {
             Topology::TriangleList => objc2_metal::MTLPrimitiveType::Triangle,
@@ -1216,7 +1135,6 @@ impl MetalDevice {
                 vertex_entry_point: vert_module.entry_point.clone(),
                 fragment_library: frag_module.library.clone(),
                 fragment_entry_point: frag_module.entry_point.clone(),
-                frag_fn,
                 color_formats,
                 depth_format: depth_format_mtl,
                 stencil_format: stencil_format_mtl,
@@ -1236,16 +1154,6 @@ impl MetalDevice {
             .ok_or_else(|| RhiError::PipelineCreation("Invalid compute shader index".into()))?;
 
         let fn_name = NSString::from_str(&compute_module.entry_point);
-        let compute_fn = compute_module
-            .library
-            .newFunctionWithName(&fn_name)
-            .ok_or_else(|| {
-                RhiError::PipelineCreation(format!(
-                    "Compute function '{}' not found in library",
-                    compute_module.entry_point
-                ))
-            })?;
-
         let compiler_desc = MTL4CompilerDescriptor::new();
         let compiler = self
             .device
@@ -1303,7 +1211,6 @@ impl MetalDevice {
             inner: ComputePsoInner::Metal(MetalComputePso {
                 pipeline: pipeline_state,
                 threads_per_threadgroup: desc.threads_per_threadgroup,
-                compute_fn,
                 root_constant_size: desc.root_constant_size,
                 compute_argument_buffer_slots,
             }),
@@ -1381,16 +1288,6 @@ impl MetalDevice {
         pipeline_desc.setOptions(Some(&pipeline_options));
 
         // Fragment function — needed by the argument encoder to build bindless heap layouts.
-        let frag_fn = frag_module
-            .library
-            .newFunctionWithName(&NSString::from_str(&frag_module.entry_point))
-            .ok_or_else(|| {
-                RhiError::PipelineCreation(format!(
-                    "Mesh PSO: fragment function '{}' not found in library",
-                    frag_module.entry_point
-                ))
-            })?;
-
         // MTL4MeshRenderPipelineDescriptor inherits from MTL4PipelineDescriptor.
         let base_desc: &MTL4PipelineDescriptor = pipeline_desc.as_ref();
         let default_pipeline = compiler
@@ -1421,12 +1318,7 @@ impl MetalDevice {
             })
             .unwrap_or_default();
 
-        let (cull_mode, winding) = match desc.cull {
-            Cull::None => (MTLCullMode::None, MTLWinding::CounterClockwise),
-            Cull::Cw => (MTLCullMode::Back, MTLWinding::CounterClockwise),
-            Cull::Ccw => (MTLCullMode::Front, MTLWinding::CounterClockwise),
-            Cull::All => (MTLCullMode::Back, MTLWinding::Clockwise),
-        };
+        let (cull_mode, winding) = cull_to_mtl(desc.cull);
 
         Ok(MeshletPso {
             inner: crate::pipeline::MeshletPsoInner::Metal(Box::new(MetalMeshletPso {
@@ -1444,7 +1336,6 @@ impl MetalDevice {
                     .map(super::texture::format_to_mtl)
                     .unwrap_or(MTLPixelFormat::Invalid),
                 root_constant_size: desc.root_constant_size,
-                frag_fn,
                 argument_buffer_slots,
                 blend_pipelines: std::cell::RefCell::new(std::collections::HashMap::new()),
                 default_pipeline,
@@ -1490,15 +1381,6 @@ impl MetalDevice {
             })?;
         let raygen_module = module_for_group_shader(raygen_shader)?;
         let raygen_name = NSString::from_str(&raygen_module.entry_point);
-        let raygen_fn = raygen_module
-            .library
-            .newFunctionWithName(&raygen_name)
-            .ok_or_else(|| {
-                RhiError::PipelineCreation(format!(
-                    "RayGen compute function '{}' not found in library",
-                    raygen_module.entry_point
-                ))
-            })?;
 
         let compiler_desc = MTL4CompilerDescriptor::new();
         let compiler = self
@@ -1727,7 +1609,6 @@ impl MetalDevice {
         Ok(RayTracingPso {
             inner: RayTracingPsoInner::Metal(Box::new(MetalRayTracingPso {
                 pipeline: pipeline_state,
-                raygen_fn,
                 threads_per_threadgroup: [8, 8, 1],
                 root_constant_size: 88,
                 compute_argument_buffer_slots,
@@ -1740,83 +1621,24 @@ impl MetalDevice {
     // -- Acceleration structures --
 
     pub fn create_blas(&self, desc: &BlasDesc) -> RhiResult<AccelerationStructure> {
-        use super::accel::{MetalAccelerationStructure, make_blas_geometry_descriptors};
-        use objc2_metal::{
-            MTL4PrimitiveAccelerationStructureDescriptor, MTLDevice, MTLResourceOptions,
-        };
+        use super::accel::make_blas_geometry_descriptors;
+        use objc2_metal::MTL4PrimitiveAccelerationStructureDescriptor;
 
         let geometries = make_blas_geometry_descriptors(desc)?;
-
         let primitive_desc = MTL4PrimitiveAccelerationStructureDescriptor::new();
         primitive_desc.setGeometryDescriptors(Some(&geometries.array));
 
-        // Query sizes.
         let sizes = unsafe {
             self.device.accelerationStructureSizesWithDescriptor(
-                // MTL4PrimitiveAccelerationStructureDescriptor → MTLAccelerationStructureDescriptor
                 &*(primitive_desc.as_ref() as *const MTL4PrimitiveAccelerationStructureDescriptor
                     as *const objc2_metal::MTLAccelerationStructureDescriptor),
             )
         };
-
-        // Allocate the acceleration structure.
-        let accel = self
-            .device
-            .newAccelerationStructureWithSize(sizes.accelerationStructureSize)
-            .ok_or_else(|| RhiError::AllocationFailed("Failed to allocate Metal BLAS".into()))?;
-
-        // Allocate scratch buffer (device-private + GPU address).
-        let scratch = self
-            .device
-            .newBufferWithLength_options(
-                sizes.buildScratchBufferSize,
-                MTLResourceOptions::StorageModePrivate,
-            )
-            .ok_or_else(|| {
-                RhiError::AllocationFailed("Failed to allocate BLAS scratch buffer".into())
-            })?;
-
-        let accel_allocation = unsafe {
-            &*(accel.as_ref() as *const ProtocolObject<dyn objc2_metal::MTLAccelerationStructure>
-                as *const ProtocolObject<dyn MTLAllocation>)
-        };
-        self.residency_set.addAllocation(accel_allocation);
-        let scratch_allocation = unsafe {
-            &*(scratch.as_ref() as *const ProtocolObject<dyn MTLBuffer>
-                as *const ProtocolObject<dyn MTLAllocation>)
-        };
-        self.residency_set.addAllocation(scratch_allocation);
-        self.residency_dirty.set(true);
-
-        // GPU resource ID — valid after allocation, identifies the AS in shader code.
-        // MTLAccelerationStructure trait must be in scope for gpuResourceID().
-        let gpu_resource_id = {
-            use objc2_metal::MTLAccelerationStructure as _;
-            accel.gpuResourceID().to_raw()
-        };
-
-        let id = {
-            let mut counter = self.accel_counter.borrow_mut();
-            let id = *counter;
-            *counter += 1;
-            AccelerationStructureId(id)
-        };
-
-        Ok(AccelerationStructure {
-            id,
-            inner: AccelInner::Metal(Box::new(MetalAccelerationStructure {
-                acceleration_structure: accel,
-                gpu_resource_id,
-                scratch_buffer: Some(scratch),
-            })),
-        })
+        self.finalize_accel_structure(sizes, "BLAS")
     }
 
     pub fn create_tlas(&self, desc: &TlasDesc) -> RhiResult<AccelerationStructure> {
-        use super::accel::MetalAccelerationStructure;
-        use objc2_metal::{
-            MTL4InstanceAccelerationStructureDescriptor, MTLDevice, MTLResourceOptions,
-        };
+        use objc2_metal::MTL4InstanceAccelerationStructureDescriptor;
 
         let instance_desc = MTL4InstanceAccelerationStructureDescriptor::new();
         unsafe {
@@ -1829,21 +1651,32 @@ impl MetalDevice {
             instance_desc.setInstanceCount(desc.instance_count as usize);
         }
 
-        // Query sizes.
         let sizes = unsafe {
             self.device.accelerationStructureSizesWithDescriptor(
                 &*(instance_desc.as_ref() as *const MTL4InstanceAccelerationStructureDescriptor
                     as *const objc2_metal::MTLAccelerationStructureDescriptor),
             )
         };
+        self.finalize_accel_structure(sizes, "TLAS")
+    }
 
-        // Allocate the acceleration structure.
+    /// Allocate the acceleration structure + scratch buffer for `sizes`, register both
+    /// with the residency set, query the GPU resource ID, mint an `AccelerationStructureId`,
+    /// and wrap into the public handle. Shared by `create_blas` / `create_tlas`.
+    fn finalize_accel_structure(
+        &self,
+        sizes: objc2_metal::MTLAccelerationStructureSizes,
+        label: &'static str,
+    ) -> RhiResult<AccelerationStructure> {
+        use super::accel::MetalAccelerationStructure;
+        use objc2_metal::{MTLAccelerationStructure as _, MTLDevice, MTLResourceOptions};
+
         let accel = self
             .device
             .newAccelerationStructureWithSize(sizes.accelerationStructureSize)
-            .ok_or_else(|| RhiError::AllocationFailed("Failed to allocate Metal TLAS".into()))?;
-
-        // Scratch buffer.
+            .ok_or_else(|| {
+                RhiError::AllocationFailed(format!("Failed to allocate Metal {label}"))
+            })?;
         let scratch = self
             .device
             .newBufferWithLength_options(
@@ -1851,31 +1684,27 @@ impl MetalDevice {
                 MTLResourceOptions::StorageModePrivate,
             )
             .ok_or_else(|| {
-                RhiError::AllocationFailed("Failed to allocate TLAS scratch buffer".into())
+                RhiError::AllocationFailed(format!("Failed to allocate {label} scratch buffer"))
             })?;
 
-        let accel_allocation = unsafe {
-            &*(accel.as_ref() as *const ProtocolObject<dyn objc2_metal::MTLAccelerationStructure>
-                as *const ProtocolObject<dyn MTLAllocation>)
-        };
-        self.residency_set.addAllocation(accel_allocation);
-        let scratch_allocation = unsafe {
-            &*(scratch.as_ref() as *const ProtocolObject<dyn MTLBuffer>
-                as *const ProtocolObject<dyn MTLAllocation>)
-        };
-        self.residency_set.addAllocation(scratch_allocation);
+        unsafe {
+            let accel_alloc = &*(accel.as_ref()
+                as *const ProtocolObject<dyn objc2_metal::MTLAccelerationStructure>
+                as *const ProtocolObject<dyn MTLAllocation>);
+            self.residency_set.addAllocation(accel_alloc);
+            let scratch_alloc = &*(scratch.as_ref() as *const ProtocolObject<dyn MTLBuffer>
+                as *const ProtocolObject<dyn MTLAllocation>);
+            self.residency_set.addAllocation(scratch_alloc);
+        }
         self.residency_dirty.set(true);
 
-        let gpu_resource_id = {
-            use objc2_metal::MTLAccelerationStructure as _;
-            accel.gpuResourceID().to_raw()
-        };
+        let gpu_resource_id = accel.gpuResourceID().to_raw();
 
         let id = {
             let mut counter = self.accel_counter.borrow_mut();
-            let id = *counter;
+            let next = *counter;
             *counter += 1;
-            AccelerationStructureId(id)
+            AccelerationStructureId(next)
         };
 
         Ok(AccelerationStructure {
@@ -1908,7 +1737,6 @@ impl MetalDevice {
             self.samplers.clone(),
             self.allocations.clone(),
             self.mdi_icb_pipeline.clone(),
-            self.mdi_icb_function.clone(),
         )?;
 
         Ok(CommandBuffer {
@@ -1953,9 +1781,7 @@ impl MetalDevice {
         if let GpuBufferInner::Metal(mtl) = buffer.inner {
             {
                 let mut allocations = self.allocations.borrow_mut();
-                if let Some(pos) = allocations.iter().position(|a| a.base == mtl.gpu_address()) {
-                    allocations.swap_remove(pos);
-                }
+                allocations.remove(&mtl.gpu_address().0);
             }
             let allocation = unsafe {
                 &*(mtl.buffer.as_ref() as *const ProtocolObject<dyn MTLBuffer>

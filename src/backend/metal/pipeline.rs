@@ -9,7 +9,7 @@ use objc2_metal::{
     MTL4LibraryFunctionDescriptor, MTL4PipelineDescriptor, MTL4PipelineOptions,
     MTL4RenderPipelineColorAttachmentDescriptor, MTL4RenderPipelineDescriptor,
     MTL4ShaderReflection, MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask,
-    MTLComputePipelineState, MTLCullMode, MTLFunction, MTLIntersectionFunctionTable, MTLLibrary,
+    MTLComputePipelineState, MTLCullMode, MTLIntersectionFunctionTable, MTLLibrary,
     MTLPrimitiveType, MTLRenderPipelineState, MTLVisibleFunctionTable, MTLWinding,
 };
 
@@ -25,7 +25,6 @@ pub struct MetalGraphicsPso {
     pub(crate) vertex_entry_point: String,
     pub(crate) fragment_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pub(crate) fragment_entry_point: String,
-    pub(crate) frag_fn: Retained<ProtocolObject<dyn MTLFunction>>,
     pub(crate) color_formats: Vec<objc2_metal::MTLPixelFormat>,
     /// Stored for render-pass construction; not baked into the MTL4 PSO at compile time.
     #[allow(dead_code)]
@@ -44,7 +43,6 @@ pub struct MetalGraphicsPso {
 pub struct MetalComputePso {
     pub(crate) pipeline: Retained<ProtocolObject<dyn objc2_metal::MTLComputePipelineState>>,
     pub(crate) threads_per_threadgroup: [u32; 3],
-    pub(crate) compute_fn: Retained<ProtocolObject<dyn MTLFunction>>,
     pub(crate) root_constant_size: u32,
     pub(crate) compute_argument_buffer_slots: Vec<usize>,
 }
@@ -227,10 +225,8 @@ pub struct MetalMeshletPso {
     #[allow(dead_code)]
     pub(crate) stencil_format: objc2_metal::MTLPixelFormat,
     pub(crate) root_constant_size: u32,
-    /// Compiled fragment function (needed for argument-encoder based bindless heap setup).
-    pub(crate) frag_fn: Retained<ProtocolObject<dyn MTLFunction>>,
-    /// Buffer-index slots that the mesh+fragment shader declares as argument buffers.
-    /// Used to drive selective bindless heap refresh (texture=1, sampler=2, storage=3).
+    /// Buffer-index slots the mesh+fragment shader declares for bindless heap pointers.
+    /// Used to drive selective heap refresh (texture=1, sampler=2).
     pub(crate) argument_buffer_slots: Vec<usize>,
     /// Blend pipeline variants (same flyweight mechanism as graphics PSOs).
     #[allow(dead_code)]
@@ -242,7 +238,6 @@ pub struct MetalMeshletPso {
 
 pub struct MetalRayTracingPso {
     pub(crate) pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    pub(crate) raygen_fn: Retained<ProtocolObject<dyn MTLFunction>>,
     pub(crate) threads_per_threadgroup: [u32; 3],
     pub(crate) root_constant_size: u32,
     pub(crate) compute_argument_buffer_slots: Vec<usize>,

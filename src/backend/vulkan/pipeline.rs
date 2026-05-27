@@ -77,17 +77,7 @@ impl VulkanGraphicsPso {
             .viewport_count(1)
             .scissor_count(1);
 
-        // Derive cull flags and front-face from the unified Cull value.
-        // All variants use CCW as the implied front-face convention.
-        let (cull_mode, front_face) = match self.desc.cull {
-            Cull::None => (vk::CullModeFlags::NONE, vk::FrontFace::COUNTER_CLOCKWISE),
-            Cull::Cw => (vk::CullModeFlags::BACK, vk::FrontFace::COUNTER_CLOCKWISE),
-            Cull::Ccw => (vk::CullModeFlags::FRONT, vk::FrontFace::COUNTER_CLOCKWISE),
-            Cull::All => (
-                vk::CullModeFlags::FRONT_AND_BACK,
-                vk::FrontFace::COUNTER_CLOCKWISE,
-            ),
-        };
+        let (cull_mode, front_face) = cull_to_vk(self.desc.cull);
 
         let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
@@ -194,6 +184,18 @@ impl Drop for VulkanGraphicsPso {
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
         }
+    }
+}
+
+/// Translate the unified `Cull` value into Vulkan's `(cull_mode_flags, front_face)`.
+/// All variants use CCW as the implied front-face convention.
+fn cull_to_vk(cull: Cull) -> (vk::CullModeFlags, vk::FrontFace) {
+    let front = vk::FrontFace::COUNTER_CLOCKWISE;
+    match cull {
+        Cull::None => (vk::CullModeFlags::NONE, front),
+        Cull::Cw => (vk::CullModeFlags::BACK, front),
+        Cull::Ccw => (vk::CullModeFlags::FRONT, front),
+        Cull::All => (vk::CullModeFlags::FRONT_AND_BACK, front),
     }
 }
 

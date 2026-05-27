@@ -44,9 +44,6 @@ pub enum RhiError {
     #[error("No suitable GPU found")]
     NoSuitableGpu,
 
-    #[error("Feature not supported: {0}")]
-    FeatureNotSupported(String),
-
     #[error("Unsupported: {0}")]
     Unsupported(String),
 

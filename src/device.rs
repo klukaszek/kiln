@@ -1,8 +1,8 @@
 use crate::accel::AccelerationStructure;
 use crate::command::CommandBuffer;
-use crate::error::{RhiError, RhiResult};
+use crate::error::RhiResult;
 use crate::memory::{
-    BufferDesc, BufferUsage, GpuAllocation, GpuAllocator, GpuAllocatorDesc, GpuBuffer, MemoryType,
+    BufferDesc, GpuAllocation, GpuAllocator, GpuAllocatorDesc, GpuBuffer, MemoryType,
 };
 use crate::pipeline::{
     ComputePso, ComputePsoDesc, GraphicsPso, GraphicsPsoDesc, MeshletPso, MeshletPsoDesc,
@@ -221,38 +221,22 @@ impl Device {
         align: u64,
         memory: MemoryType,
     ) -> RhiResult<GpuAllocation> {
-        let usage = match memory {
-            MemoryType::Default => BufferUsage::Default,
-            MemoryType::GpuOnly => BufferUsage::GpuOnly,
-            MemoryType::Readback => BufferUsage::Readback,
-        };
-
         let align = align.max(1);
-        if !align.is_power_of_two() {
-            return Err(RhiError::AllocationFailed(format!(
-                "alignment must be a power of two, got {align}"
-            )));
-        }
+        assert!(align.is_power_of_two(), "alignment must be a power of two");
 
         let buffer = self.create_buffer(&BufferDesc {
             size,
-            usage,
+            memory,
             label: None,
         })?;
 
-        let base = buffer.gpu_address().0;
-        if base & (align - 1) != 0 {
-            self.destroy_buffer(buffer);
-            return Err(RhiError::AllocationFailed(format!(
-                "backend returned GPU address 0x{base:x}, which does not satisfy {align}-byte alignment"
-            )));
-        }
+        debug_assert_eq!(
+            buffer.gpu_address().0 & (align - 1),
+            0,
+            "backend returned a misaligned GPU address for malloc_aligned",
+        );
 
-        Ok(GpuAllocation {
-            buffer,
-            offset: 0,
-            size,
-        })
+        Ok(GpuAllocation { buffer, size })
     }
 
     /// Free a pointer-first allocation.

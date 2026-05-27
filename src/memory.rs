@@ -1,14 +1,18 @@
 use crate::types::GpuAddress;
 use crate::{Device, RhiError, RhiResult};
 
-/// Usage hints for GPU buffer allocation.
+/// Memory residency for GPU allocations. Matches `NoGraphicsApi.md` `MEMORY_*` (line 95).
+///
+/// - `Default`: CPU-mapped GPU memory (write-combined). Fast for GPU read, CPU can write
+///   directly. Use for uniforms, staging, transient draw arguments, descriptors.
+/// - `GpuOnly`: device-local, not CPU-mapped. Required for textures (Morton swizzle, DCC)
+///   and large persistent buffers that benefit from lossless compression.
+/// - `Readback`: GPU-writable, CPU-cached on read. Slower GPU writes due to coherence.
+///   Use for screenshots, virtual-texture feedback, GPGPU output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BufferUsage {
-    /// General-purpose GPU buffer (vertex, index, storage).
-    GpuOnly,
-    /// CPU-writable, GPU-readable (uniforms, staging, transient).
+pub enum MemoryType {
     Default,
-    /// GPU-writable, CPU-readable (readback).
+    GpuOnly,
     Readback,
 }
 
@@ -16,39 +20,26 @@ pub enum BufferUsage {
 #[derive(Clone, Debug)]
 pub struct BufferDesc {
     pub size: u64,
-    pub usage: BufferUsage,
+    pub memory: MemoryType,
     pub label: Option<String>,
 }
 
-/// Memory type for pointer-first allocations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MemoryType {
-    /// CPU-mapped GPU memory (default).
-    Default,
-    /// GPU-only memory (not CPU-mapped).
-    GpuOnly,
-    /// GPU-writable, CPU-readable memory.
-    Readback,
-}
-
-/// Pointer-first GPU allocation (wraps a backing GpuBuffer).
+/// Pointer-first GPU allocation. Each one wraps an exclusive `GpuBuffer`
+/// returned by `Device::malloc` / `malloc_aligned`.
 pub struct GpuAllocation {
     pub(crate) buffer: GpuBuffer,
-    pub(crate) offset: u64,
     pub(crate) size: u64,
 }
 
 impl GpuAllocation {
-    /// CPU-mapped pointer for this allocation (if available).
+    /// CPU-mapped pointer (only valid for `MemoryType::Default` / `Readback`).
     pub fn mapped_ptr(&self) -> Option<*mut u8> {
-        self.buffer
-            .mapped_ptr()
-            .map(|ptr| unsafe { ptr.add(self.offset as usize) })
+        self.buffer.mapped_ptr()
     }
 
-    /// GPU virtual address for this allocation.
+    /// GPU virtual address.
     pub fn gpu_address(&self) -> GpuAddress {
-        self.buffer.gpu_address().offset(self.offset)
+        self.buffer.gpu_address()
     }
 
     /// Allocation size in bytes.

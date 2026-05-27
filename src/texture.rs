@@ -80,15 +80,6 @@ impl Texture {
     pub fn desc(&self) -> &TextureDesc {
         &self.desc
     }
-
-    /// Create a handle from just an ID (for destruction when the desc is not available).
-    pub fn from_id(id: TextureId) -> Self {
-        Self {
-            id,
-            gpu_address: GpuAddress::NULL,
-            desc: TextureDesc::default(),
-        }
-    }
 }
 
 /// View descriptor for creating a non-default view of an existing texture.

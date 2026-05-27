@@ -5,14 +5,14 @@ bitflags::bitflags! {
     /// Stage-only barriers — no per-resource state tracking.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct StageFlags: u32 {
-        const VERTEX_SHADER     = 0x0001;
-        const PIXEL_SHADER      = 0x0002;
-        const COMPUTE           = 0x0004;
-        const RASTER_COLOR_OUT  = 0x0008;
-        const RASTER_DEPTH_OUT  = 0x0010;
-        const TRANSFER          = 0x0020;
-        const ALL_GRAPHICS      = 0x00FF;
-        const ALL_COMMANDS      = 0xFFFF;
+        const VERTEX_SHADER     = 0x01;
+        const PIXEL_SHADER      = 0x02;
+        const COMPUTE           = 0x04;
+        const RASTER_COLOR_OUT  = 0x08;
+        const RASTER_DEPTH_OUT  = 0x10;
+        const TRANSFER          = 0x20;
+        const ALL_GRAPHICS      = 0x1B; // VERTEX | PIXEL | RASTER_COLOR_OUT | RASTER_DEPTH_OUT
+        const ALL_COMMANDS      = 0x3F; // all six stages
     }
 }
 

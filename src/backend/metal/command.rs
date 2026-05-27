@@ -4,17 +4,17 @@ use objc2_foundation::NSRange;
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
     MTL4CommandEncoder, MTL4ComputeCommandEncoder, MTL4RenderCommandEncoder,
-    MTL4RenderPassDescriptor, MTL4VisibilityOptions, MTLAllocation, MTLArgumentEncoder, MTLBuffer,
-    MTLComputePipelineState, MTLDepthStencilState, MTLDevice, MTLFunction, MTLGPUAddress,
+    MTL4RenderPassDescriptor, MTL4VisibilityOptions, MTLAllocation, MTLBuffer,
+    MTLComputePipelineState, MTLDepthStencilState, MTLDevice, MTLGPUAddress,
     MTLIndexType, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor,
     MTLIndirectCommandType, MTLLoadAction, MTLOrigin, MTLPrimitiveType, MTLRenderPipelineState,
-    MTLRenderStages, MTLResidencySet, MTLResourceOptions, MTLScissorRect, MTLSize, MTLStages,
-    MTLStencilOperation, MTLStoreAction, MTLTexture, MTLViewport,
+    MTLRenderStages, MTLResidencySet, MTLResourceOptions, MTLSamplerState, MTLScissorRect, MTLSize,
+    MTLStages, MTLStencilOperation, MTLStoreAction, MTLTexture, MTLViewport,
 };
 
 use crate::barrier::{HazardFlags, StageFlags};
 use crate::command::{
-    DrawIndexedIndirectArgs, DrawIndexedIndirectMultiArgs, LoadOp, RenderPassDesc, RenderTarget,
+    DrawIndirectMultiArgs, LoadOp, RenderPassDesc, RenderTarget,
     SignalValueDesc, StoreOp, WaitValueDesc,
 };
 use crate::error::{RhiError, RhiResult};
@@ -34,82 +34,20 @@ const METAL_BINDLESS_TEXTURE_CAPACITY: usize = 65_536;
 const METAL_BINDLESS_SAMPLER_CAPACITY: usize = 256;
 const MDI_ICB_THREADGROUP_SIZE: usize = 64;
 
-struct DeferredRenderPass {
-    desc: RenderPassDesc,
-    commands: Vec<MetalRenderCommand>,
-}
-
 #[derive(Clone)]
 struct MetalPipelineBinding {
     pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     cull_mode: objc2_metal::MTLCullMode,
     winding: objc2_metal::MTLWinding,
-    topology: MTLPrimitiveType,
-    root_constant_size: u32,
     texture_heap_slot: bool,
     sampler_heap_slot: bool,
-    storage_heap_slot: bool,
     stages: MTLRenderStages,
-}
-
-enum MetalRenderCommand {
-    SetPipeline(MetalPipelineBinding),
-    SetDepthStencil {
-        state: Retained<ProtocolObject<dyn MTLDepthStencilState>>,
-        depth_bias: Option<(f32, f32, f32)>,
-    },
-    SetViewport(MTLViewport),
-    SetScissor(MTLScissorRect),
-    Draw {
-        root_table: MTLGPUAddress,
-        topology: MTLPrimitiveType,
-        vertex_count: u32,
-        instance_count: u32,
-        first_vertex: u32,
-        first_instance: u32,
-    },
-    DrawIndexed {
-        root_table: MTLGPUAddress,
-        topology: MTLPrimitiveType,
-        index_buffer: MTLGPUAddress,
-        index_buffer_len: u64,
-        index_count: u32,
-        instance_count: u32,
-    },
-    DrawIndexedIndirect {
-        root_table: MTLGPUAddress,
-        topology: MTLPrimitiveType,
-        index_buffer: MTLGPUAddress,
-        index_buffer_len: u64,
-        args: MTLGPUAddress,
-    },
-    DrawIndexedIndirectMulti {
-        root_table: MTLGPUAddress,
-        topology: MTLPrimitiveType,
-        args: GpuAddress,
-        draw_count: GpuAddress,
-        max_draw_count: u32,
-        generated: Option<GeneratedMdiIcb>,
-    },
-    DrawMeshlets {
-        root_table: MTLGPUAddress,
-        groups: MTLSize,
-        object_tpg: MTLSize,
-        mesh_tpg: MTLSize,
-    },
-    DrawMeshletsIndirect {
-        root_table: MTLGPUAddress,
-        args: MTLGPUAddress,
-        object_tpg: MTLSize,
-        mesh_tpg: MTLSize,
-    },
 }
 
 #[allow(dead_code)]
 struct GeneratedMdiIcb {
     icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
     range_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    argument_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     max_draw_count_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     primitive_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
@@ -146,15 +84,15 @@ pub struct MetalCommandBuffer {
     root_table_gpu_base: MTLGPUAddress,
     root_table_cursor: usize,
     root_table_capacity: usize,
-    /// Encoded bindless texture heap argument buffer.
+    /// Bindless texture heap: flat array of MTLTexture gpuResourceIDs (u64 each), indexed by `TextureId`.
+    /// Per `NoGraphicsApi.md` line 266, Metal 4 textures expose a 64-bit `gpuResourceID`
+    /// that goes straight into shader-visible memory — no argument-buffer indirection.
     texture_heap_buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
-    /// Encoded bindless sampler heap argument buffer.
+    /// Bindless sampler heap: flat array of MTLSamplerState gpuResourceIDs (u64 each), indexed by `SamplerId`.
     sampler_heap_buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
-    /// Encoded bindless storage texture heap argument buffer.
-    storage_heap_buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
-    /// Shared texture list for argument buffer population.
+    /// Shared texture list for heap population.
     pub(crate) textures: SharedTextures,
-    /// Shared sampler list for argument buffer population.
+    /// Shared sampler list for heap population.
     pub(crate) samplers: SharedSamplers,
     /// Shared buffer allocation registry for GPU pointer resolution.
     pub(crate) allocations: SharedAllocations,
@@ -184,12 +122,20 @@ pub struct MetalCommandBuffer {
     pub(crate) pending_value_signals: Vec<SignalValueDesc>,
     active_texture_heap_slot_enabled: bool,
     active_sampler_heap_slot_enabled: bool,
-    active_storage_heap_slot_enabled: bool,
     active_texture_heap_ptr_override: Option<MTLGPUAddress>,
-    active_render_pass: Option<DeferredRenderPass>,
+    /// Render pass description, kept while a pass is open so the encoder can be reopened
+    /// (with Load actions) when an MDI draw splits the pass for GPU-side ICB generation.
+    render_pass_desc: Option<RenderPassDesc>,
     current_root_table: MTLGPUAddress,
+    /// Render state tracked so it can be re-applied to a fresh encoder after an MDI split.
+    current_pipeline: Option<MetalPipelineBinding>,
+    current_depth_stencil: Option<(
+        Retained<ProtocolObject<dyn MTLDepthStencilState>>,
+        Option<(f32, f32, f32)>,
+    )>,
+    current_viewport: Option<MTLViewport>,
+    current_scissor: Option<MTLScissorRect>,
     mdi_icb_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    mdi_icb_function: Retained<ProtocolObject<dyn MTLFunction>>,
     mdi_icb_resources: Vec<GeneratedMdiIcb>,
 }
 
@@ -201,27 +147,25 @@ impl MetalCommandBuffer {
     ) -> (Retained<ProtocolObject<dyn MTLBuffer>>, u64) {
         let addr_u64 = addr.0;
         let allocations = self.allocations.borrow();
-        for alloc in allocations.iter() {
-            let base = alloc.base.0;
-            let end = base + alloc.size;
-            if addr_u64 >= base && addr_u64 + size <= end {
-                return (alloc.buffer.clone(), addr_u64 - base);
-            }
+        if let Some((&base, alloc)) = allocations.range(..=addr_u64).next_back()
+            && addr_u64 + size <= base + alloc.size
+        {
+            return (alloc.buffer.clone(), addr_u64 - base);
         }
         panic!("GPU address {addr_u64:#x} not found in allocation registry");
     }
 
-    fn resolve_gpu_address(&self, addr: GpuAddress, size: u64) -> (MTLGPUAddress, u64) {
+    /// Bytes available from `addr` to the end of its allocation. Used only where the
+    /// element count is GPU-driven (indirect indexed draws, MDI capacity) and the CPU
+    /// cannot compute an exact length. Metal 4 consumes the GPU address directly, so
+    /// non-indirect draws pass their addresses through without any lookup.
+    fn allocation_remaining(&self, addr: GpuAddress) -> u64 {
         let addr_u64 = addr.0;
         let allocations = self.allocations.borrow();
-        for alloc in allocations.iter() {
-            let base = alloc.base.0;
-            let end = base + alloc.size;
-            if addr_u64 >= base && addr_u64 + size <= end {
-                let offset = addr_u64 - base;
-                let remaining = alloc.size - offset;
-                return (addr_u64 as MTLGPUAddress, remaining);
-            }
+        if let Some((&base, alloc)) = allocations.range(..=addr_u64).next_back()
+            && addr_u64 < base + alloc.size
+        {
+            return base + alloc.size - addr_u64;
         }
         panic!("GPU address {addr_u64:#x} not found in allocation registry");
     }
@@ -238,38 +182,23 @@ impl MetalCommandBuffer {
     fn refresh_argument_table(&mut self) {
         unsafe {
             self.argument_table.setAddress_atIndex(0, 0);
-            if self.active_texture_heap_slot_enabled {
-                if let Some(override_ptr) = self.active_texture_heap_ptr_override {
-                    self.argument_table.setAddress_atIndex(override_ptr, 1);
-                } else if let Some(tex_heap) = self.texture_heap_buffer.as_ref() {
-                    self.argument_table
-                        .setAddress_atIndex(tex_heap.gpuAddress(), 1);
-                } else {
-                    self.argument_table.setAddress_atIndex(0, 1);
-                }
+            let tex_addr = if self.active_texture_heap_slot_enabled {
+                self.active_texture_heap_ptr_override
+                    .or_else(|| self.texture_heap_buffer.as_ref().map(|b| b.gpuAddress()))
+                    .unwrap_or(0)
             } else {
-                self.argument_table.setAddress_atIndex(0, 1);
-            }
-            if self.active_sampler_heap_slot_enabled {
-                if let Some(sampler_heap) = self.sampler_heap_buffer.as_ref() {
-                    self.argument_table
-                        .setAddress_atIndex(sampler_heap.gpuAddress(), 2);
-                } else {
-                    self.argument_table.setAddress_atIndex(0, 2);
-                }
+                0
+            };
+            self.argument_table.setAddress_atIndex(tex_addr, 1);
+            let sampler_addr = if self.active_sampler_heap_slot_enabled {
+                self.sampler_heap_buffer
+                    .as_ref()
+                    .map(|b| b.gpuAddress())
+                    .unwrap_or(0)
             } else {
-                self.argument_table.setAddress_atIndex(0, 2);
-            }
-            if self.active_storage_heap_slot_enabled {
-                if let Some(storage_heap) = self.storage_heap_buffer.as_ref() {
-                    self.argument_table
-                        .setAddress_atIndex(storage_heap.gpuAddress(), 3);
-                } else {
-                    self.argument_table.setAddress_atIndex(0, 3);
-                }
-            } else {
-                self.argument_table.setAddress_atIndex(0, 3);
-            }
+                0
+            };
+            self.argument_table.setAddress_atIndex(sampler_addr, 2);
         }
     }
 
@@ -289,14 +218,6 @@ impl MetalCommandBuffer {
         };
         self.residency_set.removeAllocation(allocation);
         self.residency_dirty.set(true);
-    }
-
-    fn deferred_commands_mut(&mut self) -> &mut Vec<MetalRenderCommand> {
-        &mut self
-            .active_render_pass
-            .as_mut()
-            .expect("No active deferred render pass")
-            .commands
     }
 
     fn make_command_buffer_resource(
@@ -326,52 +247,6 @@ impl MetalCommandBuffer {
         }
     }
 
-    fn generate_deferred_mdi_icbs(&mut self, pass: &mut DeferredRenderPass) {
-        let mut indices = Vec::new();
-        for (i, cmd) in pass.commands.iter().enumerate() {
-            if matches!(cmd, MetalRenderCommand::DrawIndexedIndirectMulti { .. }) {
-                indices.push(i);
-            }
-        }
-        if indices.is_empty() {
-            return;
-        }
-
-        let encoder = self
-            .command_buffer
-            .computeCommandEncoder()
-            .expect("Failed to create Metal compute encoder for ICB generation");
-        self.apply_pending_queue_barrier_compute(&encoder);
-        encoder.setComputePipelineState(&self.mdi_icb_pipeline);
-
-        for index in indices {
-            let generated = match &pass.commands[index] {
-                MetalRenderCommand::DrawIndexedIndirectMulti {
-                    topology,
-                    args,
-                    draw_count,
-                    max_draw_count,
-                    ..
-                } => self.generate_one_mdi_icb(&encoder, *topology, *args, *draw_count, *max_draw_count),
-                _ => unreachable!(),
-            };
-            if let MetalRenderCommand::DrawIndexedIndirectMulti {
-                generated: slot, ..
-            } = &mut pass.commands[index]
-            {
-                *slot = Some(generated);
-            }
-        }
-
-        encoder.endEncoding();
-        self.compute_encoder = None;
-        self.enqueue_queue_barrier(
-            MTLStages::Dispatch,
-            MTLStages::Vertex | MTLStages::Fragment,
-            MTL4VisibilityOptions::Device,
-        );
-    }
-
     fn generate_one_mdi_icb(
         &mut self,
         encoder: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
@@ -380,15 +255,11 @@ impl MetalCommandBuffer {
         draw_count: GpuAddress,
         max_draw_count: u32,
     ) -> GeneratedMdiIcb {
-        let (args_addr, _) = self.resolve_gpu_address(
-            args,
-            std::mem::size_of::<DrawIndexedIndirectMultiArgs>() as u64,
-        );
-        let (draw_count_addr, _) =
-            self.resolve_gpu_address(draw_count, std::mem::size_of::<u32>() as u64);
+        let args_addr: MTLGPUAddress = args.0;
+        let draw_count_addr: MTLGPUAddress = draw_count.0;
 
         let icb_desc = MTLIndirectCommandBufferDescriptor::new();
-        icb_desc.setCommandTypes(MTLIndirectCommandType::DrawIndexed);
+        icb_desc.setCommandTypes(MTLIndirectCommandType::Draw);
         icb_desc.setInheritPipelineState(true);
         icb_desc.setInheritBuffers(true);
         icb_desc.setInheritDepthStencilState(true);
@@ -408,7 +279,7 @@ impl MetalCommandBuffer {
                     MTLResourceOptions::StorageModePrivate,
                 )
         }
-        .expect("Failed to create Metal ICB for indexed MDI");
+        .expect("Failed to create Metal ICB for MDI");
         let icb_allocation = unsafe {
             &*(icb.as_ref() as *const ProtocolObject<dyn MTLIndirectCommandBuffer>
                 as *const ProtocolObject<dyn MTLAllocation>)
@@ -440,16 +311,6 @@ impl MetalCommandBuffer {
             );
         }
 
-        let icb_arg_encoder = unsafe { self.mdi_icb_function.newArgumentEncoderWithBufferIndex(3) };
-        let argument_buffer = self.make_command_buffer_resource(
-            icb_arg_encoder.encodedLength(),
-            MTLResourceOptions::StorageModeShared,
-        );
-        unsafe {
-            icb_arg_encoder.setArgumentBuffer_offset(Some(&argument_buffer), 0);
-            icb_arg_encoder.setIndirectCommandBuffer_atIndex(Some(&icb), 0);
-        }
-
         unsafe {
             encoder.resetCommandsInBuffer_withRange(
                 &icb,
@@ -459,8 +320,9 @@ impl MetalCommandBuffer {
             self.argument_table.setAddress_atIndex(draw_count_addr, 1);
             self.argument_table
                 .setAddress_atIndex(range_buffer.gpuAddress(), 2);
+            // Bind the ICB directly via its gpuResourceID — Metal 4 native binding (no argument buffer).
             self.argument_table
-                .setAddress_atIndex(argument_buffer.gpuAddress(), 3);
+                .setResource_atBufferIndex(icb.gpuResourceID(), 3);
             self.argument_table
                 .setAddress_atIndex(max_draw_count_buffer.gpuAddress(), 4);
             self.argument_table
@@ -487,163 +349,106 @@ impl MetalCommandBuffer {
         GeneratedMdiIcb {
             icb,
             range_buffer,
-            argument_buffer,
             max_draw_count_buffer,
             primitive_buffer,
         }
     }
 
-    fn ensure_texture_heap_buffer(&mut self, required_len: usize) {
-        let needs_realloc = self
-            .texture_heap_buffer
-            .as_ref()
-            .map(|b| b.length() < required_len)
-            .unwrap_or(true);
-        if !needs_realloc {
-            return;
-        }
-        if let Some(old) = self.texture_heap_buffer.take() {
-            self.remove_allocation_from_residency(old.as_ref());
-        }
-        let new_buf = self
-            .device
-            .newBufferWithLength_options(required_len, MTLResourceOptions::StorageModeShared)
-            .expect("Failed to allocate Metal texture heap argument buffer");
-        self.add_allocation_to_residency(new_buf.as_ref());
-        self.texture_heap_buffer = Some(new_buf);
-    }
-
-    fn ensure_sampler_heap_buffer(&mut self, required_len: usize) {
-        let needs_realloc = self
-            .sampler_heap_buffer
-            .as_ref()
-            .map(|b| b.length() < required_len)
-            .unwrap_or(true);
-        if !needs_realloc {
-            return;
-        }
-        if let Some(old) = self.sampler_heap_buffer.take() {
-            self.remove_allocation_from_residency(old.as_ref());
-        }
-        let new_buf = self
-            .device
-            .newBufferWithLength_options(required_len, MTLResourceOptions::StorageModeShared)
-            .expect("Failed to allocate Metal sampler heap argument buffer");
-        self.add_allocation_to_residency(new_buf.as_ref());
-        self.sampler_heap_buffer = Some(new_buf);
-    }
-
-    fn ensure_storage_heap_buffer(&mut self, required_len: usize) {
-        let needs_realloc = self
-            .storage_heap_buffer
-            .as_ref()
-            .map(|b| b.length() < required_len)
-            .unwrap_or(true);
-        if !needs_realloc {
-            return;
-        }
-        if let Some(old) = self.storage_heap_buffer.take() {
-            self.remove_allocation_from_residency(old.as_ref());
-        }
-        let new_buf = self
-            .device
-            .newBufferWithLength_options(required_len, MTLResourceOptions::StorageModeShared)
-            .expect("Failed to allocate Metal storage heap argument buffer");
-        self.add_allocation_to_residency(new_buf.as_ref());
-        self.storage_heap_buffer = Some(new_buf);
-    }
-
-    fn refresh_bindless_heaps(
-        &mut self,
-        frag_fn: &ProtocolObject<dyn MTLFunction>,
-        refresh_texture_heap: bool,
-        refresh_sampler_heap: bool,
+    /// Ensure `slot` holds a shared-storage MTLBuffer of at least `required_len` bytes,
+    /// reallocating (and re-registering with the residency set) if needed.
+    fn ensure_heap_buffer(
+        slot: &mut Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+        device: &ProtocolObject<dyn MTLDevice>,
+        residency_set: &ProtocolObject<dyn MTLResidencySet>,
+        residency_dirty: &std::rc::Rc<std::cell::Cell<bool>>,
+        required_len: usize,
+        label: &'static str,
     ) {
-        unsafe {
-            if refresh_texture_heap {
-                let texture_encoder = frag_fn.newArgumentEncoderWithBufferIndex(1);
-                let texture_bytes = texture_encoder.encodedLength();
-                self.ensure_texture_heap_buffer(texture_bytes);
-                let texture_heap = self
-                    .texture_heap_buffer
-                    .as_ref()
-                    .expect("texture heap buffer must exist after allocation");
-                texture_encoder.setArgumentBuffer_offset(Some(texture_heap), 0);
-                let textures = self.textures.borrow();
-                if textures.len() > METAL_BINDLESS_TEXTURE_CAPACITY {
-                    panic!(
-                        "Metal texture heap overflow: {} textures exceed shader capacity {}",
-                        textures.len(),
-                        METAL_BINDLESS_TEXTURE_CAPACITY
-                    );
-                }
-                for (i, tex_opt) in textures.iter().enumerate() {
-                    texture_encoder.setTexture_atIndex(tex_opt.as_deref(), i);
-                }
-                drop(textures);
-            }
-
-            if refresh_sampler_heap {
-                let sampler_encoder = frag_fn.newArgumentEncoderWithBufferIndex(2);
-                let sampler_bytes = sampler_encoder.encodedLength();
-                self.ensure_sampler_heap_buffer(sampler_bytes);
-                let sampler_heap = self
-                    .sampler_heap_buffer
-                    .as_ref()
-                    .expect("sampler heap buffer must exist after allocation");
-                sampler_encoder.setArgumentBuffer_offset(Some(sampler_heap), 0);
-                let samplers = self.samplers.borrow();
-                if samplers.len() > METAL_BINDLESS_SAMPLER_CAPACITY {
-                    panic!(
-                        "Metal sampler heap overflow: {} samplers exceed shader capacity {}",
-                        samplers.len(),
-                        METAL_BINDLESS_SAMPLER_CAPACITY
-                    );
-                }
-                for (i, sampler) in samplers.iter().enumerate() {
-                    sampler_encoder.setSamplerState_atIndex(Some(sampler), i);
-                }
-                // Bound through argument table refresh.
-            }
+        if slot.as_ref().is_some_and(|b| b.length() >= required_len) {
+            return;
         }
+        if let Some(old) = slot.take() {
+            let old_alloc = unsafe {
+                &*(old.as_ref() as *const ProtocolObject<dyn MTLBuffer>
+                    as *const ProtocolObject<dyn MTLAllocation>)
+            };
+            residency_set.removeAllocation(old_alloc);
+            residency_dirty.set(true);
+        }
+        let new_buf = device
+            .newBufferWithLength_options(required_len, MTLResourceOptions::StorageModeShared)
+            .unwrap_or_else(|| panic!("Failed to allocate Metal {label} argument buffer"));
+        let new_alloc = unsafe {
+            &*(new_buf.as_ref() as *const ProtocolObject<dyn MTLBuffer>
+                as *const ProtocolObject<dyn MTLAllocation>)
+        };
+        residency_set.addAllocation(new_alloc);
+        residency_dirty.set(true);
+        *slot = Some(new_buf);
     }
 
-    fn refresh_storage_heap(&mut self, function: &ProtocolObject<dyn MTLFunction>) {
-        unsafe {
-            let storage_encoder = function.newArgumentEncoderWithBufferIndex(3);
-            let storage_bytes = storage_encoder.encodedLength();
-            self.ensure_storage_heap_buffer(storage_bytes);
-            let storage_heap = self
-                .storage_heap_buffer
-                .as_ref()
-                .expect("storage heap buffer must exist after allocation");
-            storage_encoder.setArgumentBuffer_offset(Some(storage_heap), 0);
+    /// Refresh the bindless texture and/or sampler heaps. The heaps are flat `[u64]` arrays
+    /// of `gpuResourceID`s, indexed by `TextureId` / `SamplerId`. The shader binds them as
+    /// `device const ulong* heap [[buffer(N)]]` and casts the loaded `ulong` into the
+    /// appropriate `texture<...>` / `sampler` handle using Metal 4 syntax.
+    fn refresh_bindless_heaps(&mut self, refresh_textures: bool, refresh_samplers: bool) {
+        if refresh_textures {
             let textures = self.textures.borrow();
-            if textures.len() > METAL_BINDLESS_TEXTURE_CAPACITY {
-                panic!(
-                    "Metal storage heap overflow: {} textures exceed shader capacity {}",
-                    textures.len(),
-                    METAL_BINDLESS_TEXTURE_CAPACITY
-                );
-            }
+            assert!(
+                textures.len() <= METAL_BINDLESS_TEXTURE_CAPACITY,
+                "Metal texture heap overflow: {} textures exceed capacity {}",
+                textures.len(),
+                METAL_BINDLESS_TEXTURE_CAPACITY,
+            );
+            Self::ensure_heap_buffer(
+                &mut self.texture_heap_buffer,
+                &self.device,
+                &self.residency_set,
+                &self.residency_dirty,
+                METAL_BINDLESS_TEXTURE_CAPACITY * std::mem::size_of::<u64>(),
+                "texture heap",
+            );
+            let dst = self
+                .texture_heap_buffer
+                .as_ref()
+                .expect("texture heap buffer must exist after allocation")
+                .contents()
+                .as_ptr() as *mut u64;
             for (i, tex_opt) in textures.iter().enumerate() {
-                let tex = match tex_opt.as_deref() {
-                    Some(tex) => tex,
-                    None => {
-                        storage_encoder.setTexture_atIndex(None, i);
-                        continue;
-                    }
-                };
-                if tex
-                    .usage()
-                    .contains(objc2_metal::MTLTextureUsage::ShaderWrite)
-                {
-                    storage_encoder.setTexture_atIndex(Some(tex), i);
-                } else {
-                    storage_encoder.setTexture_atIndex(None, i);
-                }
+                let id = tex_opt
+                    .as_deref()
+                    .map(|t| t.gpuResourceID().to_raw())
+                    .unwrap_or(0);
+                unsafe { std::ptr::write_unaligned(dst.add(i), id) };
             }
-            // Bound through argument table refresh.
+        }
+
+        if refresh_samplers {
+            let samplers = self.samplers.borrow();
+            assert!(
+                samplers.len() <= METAL_BINDLESS_SAMPLER_CAPACITY,
+                "Metal sampler heap overflow: {} samplers exceed capacity {}",
+                samplers.len(),
+                METAL_BINDLESS_SAMPLER_CAPACITY,
+            );
+            Self::ensure_heap_buffer(
+                &mut self.sampler_heap_buffer,
+                &self.device,
+                &self.residency_set,
+                &self.residency_dirty,
+                METAL_BINDLESS_SAMPLER_CAPACITY * std::mem::size_of::<u64>(),
+                "sampler heap",
+            );
+            let dst = self
+                .sampler_heap_buffer
+                .as_ref()
+                .expect("sampler heap buffer must exist after allocation")
+                .contents()
+                .as_ptr() as *mut u64;
+            for (i, sampler) in samplers.iter().enumerate() {
+                let id = sampler.gpuResourceID().to_raw();
+                unsafe { std::ptr::write_unaligned(dst.add(i), id) };
+            }
         }
     }
 
@@ -677,7 +482,6 @@ impl MetalCommandBuffer {
         samplers: SharedSamplers,
         allocations: SharedAllocations,
         mdi_icb_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-        mdi_icb_function: Retained<ProtocolObject<dyn MTLFunction>>,
     ) -> crate::error::RhiResult<Self> {
         command_buffer.beginCommandBufferWithAllocator(&command_allocator);
         command_buffer.useResidencySet(&residency_set);
@@ -733,7 +537,6 @@ impl MetalCommandBuffer {
             root_table_capacity: ROOT_TABLE_RING_BYTES,
             texture_heap_buffer: None,
             sampler_heap_buffer: None,
-            storage_heap_buffer: None,
             textures,
             samplers,
             allocations,
@@ -759,12 +562,14 @@ impl MetalCommandBuffer {
             pending_value_signals: Vec::new(),
             active_texture_heap_slot_enabled: false,
             active_sampler_heap_slot_enabled: false,
-            active_storage_heap_slot_enabled: false,
             active_texture_heap_ptr_override: None,
-            active_render_pass: None,
+            render_pass_desc: None,
             current_root_table: 0,
+            current_pipeline: None,
+            current_depth_stencil: None,
+            current_viewport: None,
+            current_scissor: None,
             mdi_icb_pipeline,
-            mdi_icb_function,
             mdi_icb_resources: Vec::new(),
         };
 
@@ -774,18 +579,26 @@ impl MetalCommandBuffer {
 
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc) {
         self.end_active_encoders();
-        if self.active_render_pass.is_some() {
-            panic!("begin_render_pass called while a deferred render pass is active");
-        }
-        self.active_render_pass = Some(DeferredRenderPass {
-            desc: desc.clone(),
-            commands: Vec::new(),
-        });
+        // Open the render encoder eagerly and encode draws directly into it. The only
+        // case that needs a buffered/replayed command list is MDI (see draw_indirect_multi),
+        // which splits the pass on demand because its ICB must be generated by a compute
+        // pass that precedes the render encoder.
+        let encoder = self.begin_metal_render_encoder(desc, false);
+        self.render_encoder = Some(encoder);
+        self.render_pass_desc = Some(desc.clone());
+        self.current_pipeline = None;
+        self.current_depth_stencil = None;
+        self.current_viewport = None;
+        self.current_scissor = None;
     }
 
+    /// Build a Metal render command encoder for `desc`. When `force_load` is set, every
+    /// attachment's load action is forced to Load (preserving prior contents) — used when
+    /// reopening the encoder after an MDI split so the already-rendered pixels survive.
     fn begin_metal_render_encoder(
         &mut self,
         desc: &RenderPassDesc,
+        force_load: bool,
     ) -> Retained<ProtocolObject<dyn MTL4RenderCommandEncoder>> {
         let pass_desc = MTL4RenderPassDescriptor::new();
 
@@ -807,10 +620,14 @@ impl MetalCommandBuffer {
                 }
             }
 
-            attachment.setLoadAction(match color_att.load_op {
-                LoadOp::Clear => MTLLoadAction::Clear,
-                LoadOp::Load => MTLLoadAction::Load,
-                LoadOp::DontCare => MTLLoadAction::DontCare,
+            attachment.setLoadAction(if force_load {
+                MTLLoadAction::Load
+            } else {
+                match color_att.load_op {
+                    LoadOp::Clear => MTLLoadAction::Clear,
+                    LoadOp::Load => MTLLoadAction::Load,
+                    LoadOp::DontCare => MTLLoadAction::DontCare,
+                }
             });
 
             attachment.setStoreAction(match color_att.store_op {
@@ -818,7 +635,7 @@ impl MetalCommandBuffer {
                 StoreOp::DontCare => MTLStoreAction::DontCare,
             });
 
-            if color_att.load_op == LoadOp::Clear {
+            if !force_load && color_att.load_op == LoadOp::Clear {
                 let c = color_att.clear_color;
                 attachment.setClearColor(objc2_metal::MTLClearColor {
                     red: c[0] as f64,
@@ -845,10 +662,14 @@ impl MetalCommandBuffer {
                 }
             }
 
-            depth.setLoadAction(match depth_att.load_op {
-                LoadOp::Clear => MTLLoadAction::Clear,
-                LoadOp::Load => MTLLoadAction::Load,
-                LoadOp::DontCare => MTLLoadAction::DontCare,
+            depth.setLoadAction(if force_load {
+                MTLLoadAction::Load
+            } else {
+                match depth_att.load_op {
+                    LoadOp::Clear => MTLLoadAction::Clear,
+                    LoadOp::Load => MTLLoadAction::Load,
+                    LoadOp::DontCare => MTLLoadAction::DontCare,
+                }
             });
 
             depth.setStoreAction(match depth_att.store_op {
@@ -856,7 +677,7 @@ impl MetalCommandBuffer {
                 StoreOp::DontCare => MTLStoreAction::DontCare,
             });
 
-            if depth_att.load_op == LoadOp::Clear {
+            if !force_load && depth_att.load_op == LoadOp::Clear {
                 depth.setClearDepth(depth_att.clear_depth as f64);
             }
         }
@@ -873,165 +694,35 @@ impl MetalCommandBuffer {
     }
 
     pub fn end_render_pass(&mut self) {
-        if let Some(mut pass) = self.active_render_pass.take() {
-            self.generate_deferred_mdi_icbs(&mut pass);
-            let encoder = self.begin_metal_render_encoder(&pass.desc);
-            self.replay_deferred_render_pass(&encoder, pass);
-            encoder.endEncoding();
-            return;
-        }
         if let Some(encoder) = self.render_encoder.take() {
             encoder.endEncoding();
         }
+        self.render_pass_desc = None;
     }
 
-    fn replay_deferred_render_pass(
-        &mut self,
-        encoder: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
-        pass: DeferredRenderPass,
-    ) {
-        for command in pass.commands {
-            match command {
-                MetalRenderCommand::SetPipeline(binding) => {
-                    encoder.setRenderPipelineState(&binding.pipeline);
-                    encoder.setCullMode(binding.cull_mode);
-                    encoder.setFrontFacingWinding(binding.winding);
-                    self.current_topology = binding.topology;
-                    self.root_constant_size = binding.root_constant_size;
-                    self.active_texture_heap_slot_enabled = binding.texture_heap_slot;
-                    self.active_sampler_heap_slot_enabled = binding.sampler_heap_slot;
-                    self.active_storage_heap_slot_enabled = binding.storage_heap_slot;
-                    self.refresh_argument_table();
-                    encoder.setArgumentTable_atStages(&self.argument_table, binding.stages);
-                }
-                MetalRenderCommand::SetDepthStencil { state, depth_bias } => {
-                    encoder.setDepthStencilState(Some(&state));
-                    if let Some((bias, slope, clamp)) = depth_bias {
-                        encoder.setDepthBias_slopeScale_clamp(bias, slope, clamp);
-                    }
-                }
-                MetalRenderCommand::SetViewport(viewport) => {
-                    encoder.setViewport(viewport);
-                }
-                MetalRenderCommand::SetScissor(scissor) => {
-                    encoder.setScissorRect(scissor);
-                }
-                MetalRenderCommand::Draw {
-                    root_table,
-                    topology,
-                    vertex_count,
-                    instance_count,
-                    first_vertex,
-                    first_instance,
-                } => unsafe {
-                    self.argument_table.setAddress_atIndex(root_table, 0);
-                    encoder.setArgumentTable_atStages(
-                        &self.argument_table,
-                        MTLRenderStages::Vertex | MTLRenderStages::Fragment,
-                    );
-                    encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
-                        topology,
-                        first_vertex as usize,
-                        vertex_count as usize,
-                        instance_count as usize,
-                        first_instance as usize,
-                    );
-                },
-                MetalRenderCommand::DrawIndexed {
-                    root_table,
-                    topology,
-                    index_buffer,
-                    index_buffer_len,
-                    index_count,
-                    instance_count,
-                } => unsafe {
-                    self.argument_table.setAddress_atIndex(root_table, 0);
-                    encoder.setArgumentTable_atStages(
-                        &self.argument_table,
-                        MTLRenderStages::Vertex | MTLRenderStages::Fragment,
-                    );
-                    encoder
-                        .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferLength_instanceCount_baseVertex_baseInstance(
-                            topology,
-                            index_count as usize,
-                            MTLIndexType::UInt32,
-                            index_buffer,
-                            index_buffer_len as usize,
-                            instance_count as usize,
-                            0,
-                            0,
-                        );
-                },
-                MetalRenderCommand::DrawIndexedIndirect {
-                    root_table,
-                    topology,
-                    index_buffer,
-                    index_buffer_len,
-                    args,
-                } => unsafe {
-                    self.argument_table.setAddress_atIndex(root_table, 0);
-                    encoder.setArgumentTable_atStages(
-                        &self.argument_table,
-                        MTLRenderStages::Vertex | MTLRenderStages::Fragment,
-                    );
-                    encoder.drawIndexedPrimitives_indexType_indexBuffer_indexBufferLength_indirectBuffer(
-                        topology,
-                        MTLIndexType::UInt32,
-                        index_buffer,
-                        index_buffer_len as usize,
-                        args,
-                    );
-                },
-                MetalRenderCommand::DrawIndexedIndirectMulti {
-                    root_table,
-                    generated,
-                    ..
-                } => {
-                    let generated = generated.expect("deferred MDI ICB was not generated");
-                    unsafe {
-                        self.argument_table.setAddress_atIndex(root_table, 0);
-                        encoder.setArgumentTable_atStages(
-                            &self.argument_table,
-                            MTLRenderStages::Vertex | MTLRenderStages::Fragment,
-                        );
-                        encoder.executeCommandsInBuffer_indirectBuffer(
-                            &generated.icb,
-                            generated.range_buffer.gpuAddress(),
-                        );
-                    }
-                    self.mdi_icb_resources.push(generated);
-                }
-                MetalRenderCommand::DrawMeshlets {
-                    root_table,
-                    groups,
-                    object_tpg,
-                    mesh_tpg,
-                } => unsafe {
-                    self.argument_table.setAddress_atIndex(root_table, 0);
-                    encoder.setArgumentTable_atStages(
-                        &self.argument_table,
-                        MTLRenderStages::Mesh | MTLRenderStages::Fragment,
-                    );
-                    encoder.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
-                        groups, object_tpg, mesh_tpg,
-                    );
-                }
-                MetalRenderCommand::DrawMeshletsIndirect {
-                    root_table,
-                    args,
-                    object_tpg,
-                    mesh_tpg,
-                } => unsafe {
-                    self.argument_table.setAddress_atIndex(root_table, 0);
-                    encoder.setArgumentTable_atStages(
-                        &self.argument_table,
-                        MTLRenderStages::Mesh | MTLRenderStages::Fragment,
-                    );
-                    encoder.drawMeshThreadgroupsWithIndirectBuffer_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
-                        args, object_tpg, mesh_tpg,
-                    );
-                }
+    /// Re-apply the tracked render state to a freshly-opened encoder. Used after an MDI
+    /// split, where the new encoder starts with no pipeline/depth/viewport/scissor bound.
+    fn reapply_render_state(&mut self, encoder: &ProtocolObject<dyn MTL4RenderCommandEncoder>) {
+        if let Some(binding) = self.current_pipeline.clone() {
+            encoder.setRenderPipelineState(&binding.pipeline);
+            encoder.setCullMode(binding.cull_mode);
+            encoder.setFrontFacingWinding(binding.winding);
+            self.active_texture_heap_slot_enabled = binding.texture_heap_slot;
+            self.active_sampler_heap_slot_enabled = binding.sampler_heap_slot;
+            self.refresh_argument_table();
+            encoder.setArgumentTable_atStages(&self.argument_table, binding.stages);
+        }
+        if let Some((ds_state, depth_bias)) = self.current_depth_stencil.clone() {
+            encoder.setDepthStencilState(Some(&ds_state));
+            if let Some((bias, slope, clamp)) = depth_bias {
+                encoder.setDepthBias_slopeScale_clamp(bias, slope, clamp);
             }
+        }
+        if let Some(viewport) = self.current_viewport {
+            encoder.setViewport(viewport);
+        }
+        if let Some(scissor) = self.current_scissor {
+            encoder.setScissorRect(scissor);
         }
     }
 
@@ -1042,10 +733,8 @@ impl MetalCommandBuffer {
             winding,
             topology,
             root_constant_size,
-            frag_fn,
             has_texture_heap_slot,
             has_sampler_heap_slot,
-            has_storage_heap_slot,
         ) = match &pso.inner {
             crate::pipeline::GraphicsPsoInner::Metal(mtl_pso) => {
                 let pipeline = mtl_pso.pipeline_for_blend(&self.current_blend_state);
@@ -1056,10 +745,8 @@ impl MetalCommandBuffer {
                     mtl_pso.winding,
                     mtl_pso.topology,
                     mtl_pso.root_constant_size,
-                    mtl_pso.frag_fn.clone(),
                     has_slot(1),
                     has_slot(2),
-                    has_slot(3),
                 )
             }
             #[allow(unreachable_patterns)]
@@ -1069,32 +756,17 @@ impl MetalCommandBuffer {
         self.root_constant_size = root_constant_size;
         self.active_texture_heap_slot_enabled = has_texture_heap_slot;
         self.active_sampler_heap_slot_enabled = has_sampler_heap_slot;
-        self.active_storage_heap_slot_enabled = has_storage_heap_slot;
-        self.refresh_bindless_heaps(
-            frag_fn.as_ref(),
-            has_texture_heap_slot,
-            has_sampler_heap_slot,
-        );
-        if has_storage_heap_slot {
-            self.refresh_storage_heap(frag_fn.as_ref());
-        }
+        self.refresh_bindless_heaps(has_texture_heap_slot, has_sampler_heap_slot);
         self.refresh_argument_table();
         let binding = MetalPipelineBinding {
             pipeline: pipeline.clone(),
             cull_mode,
             winding,
-            topology,
-            root_constant_size,
             texture_heap_slot: has_texture_heap_slot,
             sampler_heap_slot: has_sampler_heap_slot,
-            storage_heap_slot: has_storage_heap_slot,
             stages: MTLRenderStages::Vertex | MTLRenderStages::Fragment,
         };
-        if self.active_render_pass.is_some() {
-            self.deferred_commands_mut()
-                .push(MetalRenderCommand::SetPipeline(binding));
-            return;
-        }
+        self.current_pipeline = Some(binding.clone());
         let encoder = self.render_encoder.as_ref().expect("No active render encoder");
         encoder.setRenderPipelineState(&pipeline);
         encoder.setCullMode(cull_mode);
@@ -1103,47 +775,30 @@ impl MetalCommandBuffer {
     }
 
     pub fn set_compute_pipeline(&mut self, pso: &ComputePso) {
-        self.end_active_encoders();
+        let mtl_pso = match &pso.inner {
+            crate::pipeline::ComputePsoInner::Metal(p) => p,
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("wrong backend"),
+        };
 
+        self.end_active_encoders();
         let encoder = self
             .command_buffer
             .computeCommandEncoder()
             .expect("Failed to create Metal compute command encoder");
-
         self.apply_pending_queue_barrier_compute(&encoder);
-        self.compute_encoder = Some(encoder);
+        encoder.setComputePipelineState(&mtl_pso.pipeline);
 
-        {
-            let encoder = self.compute_encoder.as_ref().expect("No compute encoder");
-            match &pso.inner {
-                crate::pipeline::ComputePsoInner::Metal(mtl_pso) => {
-                    encoder.setComputePipelineState(&mtl_pso.pipeline);
-                    self.current_threads_per_threadgroup = mtl_pso.threads_per_threadgroup;
-                    self.root_constant_size = mtl_pso.root_constant_size;
-                    let has_slot =
-                        |slot: usize| mtl_pso.compute_argument_buffer_slots.contains(&slot);
-                    let has_texture_heap_slot = has_slot(1);
-                    let has_sampler_heap_slot = has_slot(2);
-                    let has_storage_heap_slot = has_slot(3);
-                    self.active_texture_heap_slot_enabled = has_texture_heap_slot;
-                    self.active_sampler_heap_slot_enabled = has_sampler_heap_slot;
-                    self.active_storage_heap_slot_enabled = has_storage_heap_slot;
-                    self.refresh_bindless_heaps(
-                        mtl_pso.compute_fn.as_ref(),
-                        has_texture_heap_slot,
-                        has_sampler_heap_slot,
-                    );
-                    if has_storage_heap_slot {
-                        self.refresh_storage_heap(mtl_pso.compute_fn.as_ref());
-                    }
-                }
-                #[allow(unreachable_patterns)]
-                _ => unreachable!("wrong backend"),
-            }
-        }
+        self.current_threads_per_threadgroup = mtl_pso.threads_per_threadgroup;
+        self.root_constant_size = mtl_pso.root_constant_size;
+        let has_slot = |slot: usize| mtl_pso.compute_argument_buffer_slots.contains(&slot);
+        self.active_texture_heap_slot_enabled = has_slot(1);
+        self.active_sampler_heap_slot_enabled = has_slot(2);
+        self.refresh_bindless_heaps(has_slot(1), has_slot(2));
         self.refresh_argument_table();
-        let encoder = self.compute_encoder.as_ref().expect("No compute encoder");
         encoder.setArgumentTable(Some(&self.argument_table));
+
+        self.compute_encoder = Some(encoder);
     }
 
     pub fn set_depth_stencil_state(&mut self, state: &DepthStencilState) {
@@ -1178,44 +833,25 @@ impl MetalCommandBuffer {
         }
 
         if let Some(ds_state) = self.device.newDepthStencilStateWithDescriptor(&ds_desc) {
-            if self.active_render_pass.is_some() {
-                self.deferred_commands_mut()
-                    .push(MetalRenderCommand::SetDepthStencil {
-                        state: ds_state.clone(),
-                        depth_bias: if state.depth_bias != 0.0
-                            || state.depth_bias_slope_factor != 0.0
-                        {
-                            Some((
-                                state.depth_bias,
-                                state.depth_bias_slope_factor,
-                                state.depth_bias_clamp,
-                            ))
-                        } else {
-                            None
-                        },
-                    });
-                self.depth_stencil_states.push(ds_state);
-                return;
-            }
+            let depth_bias = if state.depth_bias != 0.0 || state.depth_bias_slope_factor != 0.0 {
+                Some((
+                    state.depth_bias,
+                    state.depth_bias_slope_factor,
+                    state.depth_bias_clamp,
+                ))
+            } else {
+                None
+            };
             let encoder = self
                 .render_encoder
                 .as_ref()
                 .expect("No active render encoder");
             encoder.setDepthStencilState(Some(&ds_state));
+            if let Some((bias, slope, clamp)) = depth_bias {
+                encoder.setDepthBias_slopeScale_clamp(bias, slope, clamp);
+            }
+            self.current_depth_stencil = Some((ds_state.clone(), depth_bias));
             self.depth_stencil_states.push(ds_state);
-        }
-
-        // Depth bias (Metal: set directly on the encoder)
-        if state.depth_bias != 0.0 || state.depth_bias_slope_factor != 0.0 {
-            let encoder = self
-                .render_encoder
-                .as_ref()
-                .expect("No active render encoder");
-            encoder.setDepthBias_slopeScale_clamp(
-                state.depth_bias,
-                state.depth_bias_slope_factor,
-                state.depth_bias_clamp,
-            );
         }
     }
 
@@ -1237,7 +873,7 @@ impl MetalCommandBuffer {
         pixel_stride: u32,
     ) {
         debug_assert!(
-            self.render_encoder.is_some() || self.active_render_pass.is_some(),
+            self.render_encoder.is_some(),
             "set_root_table called outside a render pass"
         );
         if self.root_constant_size < ROOT_TABLE_BYTES as u32 {
@@ -1293,26 +929,20 @@ impl MetalCommandBuffer {
         first_vertex: u32,
         first_instance: u32,
     ) {
-        if self.active_render_pass.is_some() {
-            let root_table = self.current_root_table;
-            let topology = self.current_topology;
-            self.deferred_commands_mut().push(MetalRenderCommand::Draw {
-                root_table,
-                topology,
-                vertex_count,
-                instance_count,
-                first_vertex,
-                first_instance,
-            });
-            return;
-        }
+        let root_table = self.current_root_table;
+        let topology = self.current_topology;
         let encoder = self
             .render_encoder
             .as_ref()
             .expect("No active render encoder");
         unsafe {
+            self.argument_table.setAddress_atIndex(root_table, 0);
+            encoder.setArgumentTable_atStages(
+                &self.argument_table,
+                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+            );
             encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
-                self.current_topology,
+                topology,
                 first_vertex as usize,
                 vertex_count as usize,
                 instance_count as usize,
@@ -1323,31 +953,25 @@ impl MetalCommandBuffer {
 
     pub fn draw_indexed(&mut self, indices: GpuAddress, index_count: u32, instance_count: u32) {
         // Index format is always U32 — the spec has no IndexFormat concept.
-        let bytes_needed = (index_count as u64) * 4;
-        let (index_addr_gpu, index_len) = self.resolve_gpu_address(indices, bytes_needed);
-        if self.active_render_pass.is_some() {
-            let root_table = self.current_root_table;
-            let topology = self.current_topology;
-            self.deferred_commands_mut()
-                .push(MetalRenderCommand::DrawIndexed {
-                    root_table,
-                    topology,
-                    index_buffer: index_addr_gpu,
-                    index_buffer_len: index_len,
-                    index_count,
-                    instance_count,
-                });
-            return;
-        }
-
+        // Metal 4 takes the index buffer as a raw GPU address; the exact byte span it
+        // reads is index_count * 4, so no allocation lookup is needed.
+        let index_addr_gpu: MTLGPUAddress = indices.0;
+        let index_len = (index_count as u64) * 4;
+        let root_table = self.current_root_table;
+        let topology = self.current_topology;
         let encoder = self
             .render_encoder
             .as_ref()
             .expect("No active render encoder");
         unsafe {
+            self.argument_table.setAddress_atIndex(root_table, 0);
+            encoder.setArgumentTable_atStages(
+                &self.argument_table,
+                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+            );
             encoder
                 .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferLength_instanceCount_baseVertex_baseInstance(
-                    self.current_topology,
+                    topology,
                     index_count as usize,
                     MTLIndexType::UInt32,
                     index_addr_gpu,
@@ -1383,10 +1007,7 @@ impl MetalCommandBuffer {
             .compute_encoder
             .as_ref()
             .expect("No active compute encoder");
-        let (arg_addr_gpu, _arg_len) = self.resolve_gpu_address(
-            args,
-            std::mem::size_of::<crate::command::DispatchIndirectArgs>() as u64,
-        );
+        let arg_addr_gpu: MTLGPUAddress = args.0;
         let threads_per_group = self.current_threads_per_threadgroup;
         let tg = MTLSize {
             width: threads_per_group[0] as usize,
@@ -1400,30 +1021,25 @@ impl MetalCommandBuffer {
 
     pub fn draw_indexed_indirect(&mut self, indices: GpuAddress, args: GpuAddress) {
         // Index format is always U32.
-        let (index_addr_gpu, index_len) = self.resolve_gpu_address(indices, 4);
-        let (arg_addr_gpu, _arg_len) =
-            self.resolve_gpu_address(args, std::mem::size_of::<DrawIndexedIndirectArgs>() as u64);
-        if self.active_render_pass.is_some() {
-            let root_table = self.current_root_table;
-            let topology = self.current_topology;
-            self.deferred_commands_mut()
-                .push(MetalRenderCommand::DrawIndexedIndirect {
-                    root_table,
-                    topology,
-                    index_buffer: index_addr_gpu,
-                    index_buffer_len: index_len,
-                    args: arg_addr_gpu,
-                });
-            return;
-        }
-
+        let index_addr_gpu: MTLGPUAddress = indices.0;
+        // The index count is GPU-driven, so bound the index buffer length by the bytes
+        // remaining in the allocation.
+        let index_len = self.allocation_remaining(indices);
+        let arg_addr_gpu: MTLGPUAddress = args.0;
+        let root_table = self.current_root_table;
+        let topology = self.current_topology;
         let encoder = self
             .render_encoder
             .as_ref()
             .expect("No active render encoder");
         unsafe {
+            self.argument_table.setAddress_atIndex(root_table, 0);
+            encoder.setArgumentTable_atStages(
+                &self.argument_table,
+                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+            );
             encoder.drawIndexedPrimitives_indexType_indexBuffer_indexBufferLength_indirectBuffer(
-                self.current_topology,
+                topology,
                 MTLIndexType::UInt32,
                 index_addr_gpu,
                 index_len as usize,
@@ -1432,7 +1048,7 @@ impl MetalCommandBuffer {
         }
     }
 
-    pub fn draw_indexed_indirect_multi(
+    pub fn draw_indirect_multi(
         &mut self,
         vertex_root: GpuAddress,
         vertex_stride: u32,
@@ -1441,64 +1057,63 @@ impl MetalCommandBuffer {
         args: GpuAddress,
         draw_count: GpuAddress,
     ) -> RhiResult<()> {
-        self.draw_indexed_indirect_multi_root_table(
-            vertex_root,
-            vertex_stride,
-            pixel_root,
-            pixel_stride,
-            args,
-            draw_count,
-        )
-    }
+        let desc = self
+            .render_pass_desc
+            .clone()
+            .expect("draw_indirect_multi must be recorded inside a render pass");
+        self.set_root_table(vertex_root, vertex_stride, pixel_root, pixel_stride);
 
-    pub fn draw_indexed_indirect_multi_root_table(
-        &mut self,
-        vertex_root_base: GpuAddress,
-        vertex_stride: u32,
-        pixel_root_base: GpuAddress,
-        pixel_stride: u32,
-        args: GpuAddress,
-        draw_count: GpuAddress,
-    ) -> RhiResult<()> {
-        self.set_root_table(
-            vertex_root_base,
-            vertex_stride,
-            pixel_root_base,
-            pixel_stride,
-        );
-        let _ = self.resolve_gpu_address(
-            args,
-            std::mem::size_of::<DrawIndexedIndirectMultiArgs>() as u64,
-        );
-        let (_, arg_remaining) = self.resolve_gpu_address(
-            args,
-            std::mem::size_of::<DrawIndexedIndirectMultiArgs>() as u64,
-        );
-        let _ = self.resolve_gpu_address(draw_count, std::mem::size_of::<u32>() as u64);
-        let max_draw_count = (arg_remaining
-            / std::mem::size_of::<DrawIndexedIndirectMultiArgs>() as u64)
-            .min(u32::MAX as u64) as u32;
+        let stride = std::mem::size_of::<DrawIndirectMultiArgs>() as u64;
+        let arg_remaining = self.allocation_remaining(args);
+        let max_draw_count = u32::try_from(arg_remaining / stride).unwrap_or(u32::MAX);
         if max_draw_count == 0 {
             return Err(RhiError::CommandBuffer(
-                "draw_indexed_indirect_multi args allocation has no complete draw records".into(),
+                "draw_indirect_multi args allocation has no complete draw records".into(),
             ));
         }
-        if self.active_render_pass.is_none() {
-            return Err(RhiError::CommandBuffer(
-                "draw_indexed_indirect_multi must be recorded inside a render pass".into(),
-            ));
-        }
-        let root_table = self.current_root_table;
+
         let topology = self.current_topology;
-        self.deferred_commands_mut()
-            .push(MetalRenderCommand::DrawIndexedIndirectMulti {
-                root_table,
-                topology,
-                args,
-                draw_count,
-                max_draw_count,
-                generated: None,
-            });
+        let root_table = self.current_root_table;
+
+        // MDI needs its ICB generated by a compute pass that runs *before* the render
+        // encoder executes it. Split the pass: end the current render encoder (storing
+        // what was drawn so far), run the ICB-generation compute dispatch, then reopen the
+        // render encoder with Load actions (preserving prior contents) and execute the
+        // generated commands. Subsequent draws continue on the reopened encoder.
+        if let Some(encoder) = self.render_encoder.take() {
+            encoder.endEncoding();
+        }
+
+        let compute = self
+            .command_buffer
+            .computeCommandEncoder()
+            .expect("Failed to create Metal compute encoder for ICB generation");
+        self.apply_pending_queue_barrier_compute(&compute);
+        compute.setComputePipelineState(&self.mdi_icb_pipeline);
+        let generated =
+            self.generate_one_mdi_icb(&compute, topology, args, draw_count, max_draw_count);
+        compute.endEncoding();
+        self.enqueue_queue_barrier(
+            MTLStages::Dispatch,
+            MTLStages::Vertex | MTLStages::Fragment,
+            MTL4VisibilityOptions::Device,
+        );
+
+        let encoder = self.begin_metal_render_encoder(&desc, true);
+        self.reapply_render_state(&encoder);
+        unsafe {
+            self.argument_table.setAddress_atIndex(root_table, 0);
+            encoder.setArgumentTable_atStages(
+                &self.argument_table,
+                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+            );
+            encoder.executeCommandsInBuffer_indirectBuffer(
+                &generated.icb,
+                generated.range_buffer.gpuAddress(),
+            );
+        }
+        self.mdi_icb_resources.push(generated);
+        self.render_encoder = Some(encoder);
         Ok(())
     }
 
@@ -1528,36 +1143,18 @@ impl MetalCommandBuffer {
     }
 
     pub fn copy_to_texture(&mut self, texture_gpu: GpuAddress, src: GpuAddress, texture: &Texture) {
-        assert_eq!(
-            texture_gpu,
-            texture.gpu_address(),
-            "copy_to_texture texture_gpu must match the address used to create the texture"
-        );
-        let mtl_texture = self.resolve_texture(texture.id());
-        let width = texture.desc().width;
-        let height = texture.desc().height;
-        let bpp = bytes_per_pixel(texture.desc().format)
-            .expect("Unsupported texture format for copy_to_texture");
-        let bytes_per_row = width as usize * bpp;
-        let bytes_per_image = bytes_per_row * height as usize;
-        let (src_buffer, src_offset) = self.resolve_buffer(src, bytes_per_image as u64);
+        let (mtl_texture, buffer, offset, size, origin, bytes_per_row, bytes_per_image) =
+            self.prepare_texture_copy(texture_gpu, src, texture, "copy_to_texture");
 
         self.end_active_encoders();
-        // Metal 4 routes texture copies through the compute encoder.
         let encoder = self
             .command_buffer
             .computeCommandEncoder()
             .expect("Failed to create Metal 4 copy encoder");
-        let size = MTLSize {
-            width: width as usize,
-            height: height as usize,
-            depth: 1,
-        };
-        let origin = MTLOrigin { x: 0, y: 0, z: 0 };
         unsafe {
             encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                &src_buffer,
-                src_offset as usize,
+                &buffer,
+                offset as usize,
                 bytes_per_row,
                 bytes_per_image,
                 size,
@@ -1576,32 +1173,14 @@ impl MetalCommandBuffer {
         texture_gpu: GpuAddress,
         texture: &Texture,
     ) {
-        assert_eq!(
-            texture_gpu,
-            texture.gpu_address(),
-            "copy_from_texture texture_gpu must match the address used to create the texture"
-        );
-        let mtl_texture = self.resolve_texture(texture.id());
-        let width = texture.desc().width;
-        let height = texture.desc().height;
-        let bpp = bytes_per_pixel(texture.desc().format)
-            .expect("Unsupported texture format for copy_from_texture");
-        let bytes_per_row = width as usize * bpp;
-        let bytes_per_image = bytes_per_row * height as usize;
-        let (dst_buffer, dst_offset) = self.resolve_buffer(dst, bytes_per_image as u64);
+        let (mtl_texture, buffer, offset, size, origin, bytes_per_row, bytes_per_image) =
+            self.prepare_texture_copy(texture_gpu, dst, texture, "copy_from_texture");
 
         self.end_active_encoders();
-        // Metal 4 routes texture copies through the compute encoder.
         let encoder = self
             .command_buffer
             .computeCommandEncoder()
             .expect("Failed to create Metal 4 copy encoder");
-        let size = MTLSize {
-            width: width as usize,
-            height: height as usize,
-            depth: 1,
-        };
-        let origin = MTLOrigin { x: 0, y: 0, z: 0 };
         unsafe {
             encoder.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
                 &mtl_texture,
@@ -1609,13 +1188,61 @@ impl MetalCommandBuffer {
                 0,
                 origin,
                 size,
-                &dst_buffer,
-                dst_offset as usize,
+                &buffer,
+                offset as usize,
                 bytes_per_row,
                 bytes_per_image,
             );
         }
         encoder.endEncoding();
+    }
+
+    /// Validate the texture address, resolve the linear buffer, and compute the row /
+    /// image strides for a buffer↔texture copy on the Metal 4 compute encoder.
+    #[allow(clippy::type_complexity)]
+    fn prepare_texture_copy(
+        &self,
+        texture_gpu: GpuAddress,
+        buffer_gpu: GpuAddress,
+        texture: &Texture,
+        op: &'static str,
+    ) -> (
+        Retained<ProtocolObject<dyn MTLTexture>>,
+        Retained<ProtocolObject<dyn MTLBuffer>>,
+        u64,
+        MTLSize,
+        MTLOrigin,
+        usize,
+        usize,
+    ) {
+        assert_eq!(
+            texture_gpu,
+            texture.gpu_address(),
+            "{op} texture_gpu must match the address used to create the texture"
+        );
+        let mtl_texture = self.resolve_texture(texture.id());
+        let width = texture.desc().width;
+        let height = texture.desc().height;
+        let bpp = bytes_per_pixel(texture.desc().format)
+            .unwrap_or_else(|| panic!("Unsupported texture format for {op}"));
+        let bytes_per_row = width as usize * bpp;
+        let bytes_per_image = bytes_per_row * height as usize;
+        let (buffer, offset) = self.resolve_buffer(buffer_gpu, bytes_per_image as u64);
+        let size = MTLSize {
+            width: width as usize,
+            height: height as usize,
+            depth: 1,
+        };
+        let origin = MTLOrigin { x: 0, y: 0, z: 0 };
+        (
+            mtl_texture,
+            buffer,
+            offset,
+            size,
+            origin,
+            bytes_per_row,
+            bytes_per_image,
+        )
     }
 
     pub(crate) fn end_active_encoders(&mut self) {
@@ -1684,11 +1311,7 @@ impl MetalCommandBuffer {
             znear: min_depth as f64,
             zfar: max_depth as f64,
         };
-        if self.active_render_pass.is_some() {
-            self.deferred_commands_mut()
-                .push(MetalRenderCommand::SetViewport(viewport));
-            return;
-        }
+        self.current_viewport = Some(viewport);
         let encoder = self
             .render_encoder
             .as_ref()
@@ -1703,11 +1326,7 @@ impl MetalCommandBuffer {
             width: width as usize,
             height: height as usize,
         };
-        if self.active_render_pass.is_some() {
-            self.deferred_commands_mut()
-                .push(MetalRenderCommand::SetScissor(scissor));
-            return;
-        }
+        self.current_scissor = Some(scissor);
         let encoder = self
             .render_encoder
             .as_ref()
@@ -1814,10 +1433,8 @@ impl MetalCommandBuffer {
             cull_mode,
             winding,
             root_constant_size,
-            frag_fn,
             has_texture_heap_slot,
             has_sampler_heap_slot,
-            has_storage_heap_slot,
         ) = match &pso.inner {
             crate::pipeline::MeshletPsoInner::Metal(mtl_pso) => {
                 let has_slot = |slot: usize| mtl_pso.argument_buffer_slots.contains(&slot);
@@ -1826,10 +1443,8 @@ impl MetalCommandBuffer {
                     mtl_pso.cull_mode,
                     mtl_pso.winding,
                     mtl_pso.root_constant_size,
-                    mtl_pso.frag_fn.clone(),
                     has_slot(1),
                     has_slot(2),
-                    has_slot(3),
                 )
             }
             #[allow(unreachable_patterns)]
@@ -1849,33 +1464,18 @@ impl MetalCommandBuffer {
 
         self.active_texture_heap_slot_enabled = has_texture_heap_slot;
         self.active_sampler_heap_slot_enabled = has_sampler_heap_slot;
-        self.active_storage_heap_slot_enabled = has_storage_heap_slot;
-        self.refresh_bindless_heaps(
-            frag_fn.as_ref(),
-            has_texture_heap_slot,
-            has_sampler_heap_slot,
-        );
-        if has_storage_heap_slot {
-            self.refresh_storage_heap(frag_fn.as_ref());
-        }
+        self.refresh_bindless_heaps(has_texture_heap_slot, has_sampler_heap_slot);
         self.refresh_argument_table();
 
         let binding = MetalPipelineBinding {
             pipeline: pipeline.clone(),
             cull_mode,
             winding,
-            topology: self.current_topology,
-            root_constant_size,
             texture_heap_slot: has_texture_heap_slot,
             sampler_heap_slot: has_sampler_heap_slot,
-            storage_heap_slot: has_storage_heap_slot,
             stages: MTLRenderStages::Mesh | MTLRenderStages::Fragment,
         };
-        if self.active_render_pass.is_some() {
-            self.deferred_commands_mut()
-                .push(MetalRenderCommand::SetPipeline(binding));
-            return;
-        }
+        self.current_pipeline = Some(binding.clone());
         let encoder = self
             .render_encoder
             .as_ref()
@@ -1900,17 +1500,7 @@ impl MetalCommandBuffer {
             height: y as usize,
             depth: z as usize,
         };
-        if self.active_render_pass.is_some() {
-            let root_table = self.current_root_table;
-            self.deferred_commands_mut()
-                .push(MetalRenderCommand::DrawMeshlets {
-                    root_table,
-                    groups,
-                    object_tpg: tg_obj,
-                    mesh_tpg: tg_mesh,
-                });
-            return;
-        }
+        let root_table = self.current_root_table;
         let encoder = match self.render_encoder.as_ref() {
             Some(e) => e.clone(),
             None => {
@@ -1918,6 +1508,13 @@ impl MetalCommandBuffer {
                 return;
             }
         };
+        unsafe {
+            self.argument_table.setAddress_atIndex(root_table, 0);
+        }
+        encoder.setArgumentTable_atStages(
+            &self.argument_table,
+            MTLRenderStages::Mesh | MTLRenderStages::Fragment,
+        );
         encoder.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
             groups, tg_obj, tg_mesh,
         );
@@ -1929,17 +1526,7 @@ impl MetalCommandBuffer {
         use objc2_metal::MTL4RenderCommandEncoder as _;
         let tg_obj = self.current_mesh_tpg_object;
         let tg_mesh = self.current_mesh_tpg_mesh;
-        if self.active_render_pass.is_some() {
-            let root_table = self.current_root_table;
-            self.deferred_commands_mut()
-                .push(MetalRenderCommand::DrawMeshletsIndirect {
-                    root_table,
-                    args: args.0,
-                    object_tpg: tg_obj,
-                    mesh_tpg: tg_mesh,
-                });
-            return;
-        }
+        let root_table = self.current_root_table;
         let encoder = match self.render_encoder.as_ref() {
             Some(e) => e.clone(),
             None => {
@@ -1947,6 +1534,13 @@ impl MetalCommandBuffer {
                 return;
             }
         };
+        unsafe {
+            self.argument_table.setAddress_atIndex(root_table, 0);
+        }
+        encoder.setArgumentTable_atStages(
+            &self.argument_table,
+            MTLRenderStages::Mesh | MTLRenderStages::Fragment,
+        );
         // MTL4 indirect draw takes MTLGPUAddress directly.
         encoder.drawMeshThreadgroupsWithIndirectBuffer_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
             args.0,
@@ -2114,18 +1708,9 @@ impl MetalCommandBuffer {
         let has_slot = |slot: usize| mtl_pso.compute_argument_buffer_slots.contains(&slot);
         let has_texture_heap_slot = has_slot(1);
         let has_sampler_heap_slot = has_slot(2);
-        let has_storage_heap_slot = has_slot(3);
         self.active_texture_heap_slot_enabled = has_texture_heap_slot;
         self.active_sampler_heap_slot_enabled = has_sampler_heap_slot;
-        self.active_storage_heap_slot_enabled = has_storage_heap_slot;
-        self.refresh_bindless_heaps(
-            mtl_pso.raygen_fn.as_ref(),
-            has_texture_heap_slot,
-            has_sampler_heap_slot,
-        );
-        if has_storage_heap_slot {
-            self.refresh_storage_heap(mtl_pso.raygen_fn.as_ref());
-        }
+        self.refresh_bindless_heaps(has_texture_heap_slot, has_sampler_heap_slot);
 
         let mut bytes = [0u8; RT_TRACE_TABLE_BYTES];
         write_sbt_region(&mut bytes[0..24], raygen);
@@ -2181,9 +1766,6 @@ impl Drop for MetalCommandBuffer {
         }
         if let Some(sampler_heap) = self.sampler_heap_buffer.as_ref() {
             self.remove_allocation_from_residency(sampler_heap.as_ref());
-        }
-        if let Some(storage_heap) = self.storage_heap_buffer.as_ref() {
-            self.remove_allocation_from_residency(storage_heap.as_ref());
         }
     }
 }

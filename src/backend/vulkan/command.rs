@@ -2,7 +2,7 @@ use super::barrier::{to_vk_access_flags, to_vk_stage_flags};
 use super::device::{SharedAllocations, SharedTextures};
 use crate::barrier::{HazardFlags, StageFlags};
 use crate::command::{
-    DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndexedIndirectMultiArgs, LoadOp,
+    DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectMultiArgs, LoadOp,
     RenderPassDesc, RenderTarget, SignalValueDesc, StoreOp, WaitValueDesc,
 };
 use crate::error::{RhiError, RhiResult};
@@ -90,14 +90,11 @@ impl VulkanCommandBuffer {
     fn resolve_buffer_bounds(&self, addr: GpuAddress) -> (vk::Buffer, u64, u64) {
         let addr_u64 = addr.0;
         let allocations = self.allocations.lock().expect("allocations lock poisoned");
-        for alloc in allocations.iter() {
-            let base = alloc.base.0;
-            let end = base + alloc.size;
-            if addr_u64 >= base && addr_u64 < end {
-                let offset = addr_u64 - base;
-                let remaining = alloc.size - offset;
-                return (alloc.buffer, offset, remaining);
-            }
+        if let Some((&base, alloc)) = allocations.range(..=addr_u64).next_back()
+            && addr_u64 < base + alloc.size
+        {
+            let offset = addr_u64 - base;
+            return (alloc.buffer, offset, alloc.size - offset);
         }
         panic!("GPU address {addr_u64:#x} not found in allocation registry");
     }
@@ -284,50 +281,54 @@ impl VulkanCommandBuffer {
     }
 
     pub fn set_graphics_pipeline(&mut self, pso: &GraphicsPso) {
-        match &pso.inner {
-            GraphicsPsoInner::Vulkan(vk_pso) => {
-                self.pipeline_layout = vk_pso.pipeline_layout;
-                self.root_constant_size = vk_pso.root_constant_size;
-                self.push_constant_stages =
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT;
-                let pipeline = vk_pso.pipeline_for_blend(&self.current_blend_state);
-                unsafe {
-                    self.device.cmd_bind_pipeline(
-                        self.command_buffer,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        pipeline,
-                    );
-                }
-
-                self.bind_descriptor_buffer(
-                    vk::PipelineBindPoint::GRAPHICS,
-                    vk_pso.pipeline_layout,
-                );
-            }
+        let vk_pso = match &pso.inner {
+            GraphicsPsoInner::Vulkan(p) => p,
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
-        }
+        };
+        let pipeline = vk_pso.pipeline_for_blend(&self.current_blend_state);
+        self.bind_pipeline(
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline,
+            vk_pso.pipeline_layout,
+            vk_pso.root_constant_size,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+        );
     }
 
     pub fn set_compute_pipeline(&mut self, pso: &ComputePso) {
-        match &pso.inner {
-            ComputePsoInner::Vulkan(vk_pso) => {
-                self.pipeline_layout = vk_pso.pipeline_layout;
-                self.root_constant_size = vk_pso.root_constant_size;
-                self.push_constant_stages = vk::ShaderStageFlags::COMPUTE;
-                unsafe {
-                    self.device.cmd_bind_pipeline(
-                        self.command_buffer,
-                        vk::PipelineBindPoint::COMPUTE,
-                        vk_pso.pipeline,
-                    );
-                }
-
-                self.bind_descriptor_buffer(vk::PipelineBindPoint::COMPUTE, vk_pso.pipeline_layout);
-            }
+        let vk_pso = match &pso.inner {
+            ComputePsoInner::Vulkan(p) => p,
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
+        };
+        self.bind_pipeline(
+            vk::PipelineBindPoint::COMPUTE,
+            vk_pso.pipeline,
+            vk_pso.pipeline_layout,
+            vk_pso.root_constant_size,
+            vk::ShaderStageFlags::COMPUTE,
+        );
+    }
+
+    /// Bind a pipeline + descriptor buffer and record root-constant state for subsequent
+    /// `set_root_table` / `set_compute_root` push-constant writes.
+    fn bind_pipeline(
+        &mut self,
+        bind_point: vk::PipelineBindPoint,
+        pipeline: vk::Pipeline,
+        pipeline_layout: vk::PipelineLayout,
+        root_constant_size: u32,
+        push_constant_stages: vk::ShaderStageFlags,
+    ) {
+        self.pipeline_layout = pipeline_layout;
+        self.root_constant_size = root_constant_size;
+        self.push_constant_stages = push_constant_stages;
+        unsafe {
+            self.device
+                .cmd_bind_pipeline(self.command_buffer, bind_point, pipeline);
         }
+        self.bind_descriptor_buffer(bind_point, pipeline_layout);
     }
 
     pub fn set_active_texture_heap_ptr(&mut self, ptr: GpuAddress) {
@@ -516,7 +517,7 @@ impl VulkanCommandBuffer {
         }
     }
 
-    pub fn draw_indexed_indirect_multi(
+    pub fn draw_indirect_multi(
         &mut self,
         vertex_root: GpuAddress,
         vertex_stride: u32,
@@ -525,49 +526,31 @@ impl VulkanCommandBuffer {
         args: GpuAddress,
         draw_count: GpuAddress,
     ) -> RhiResult<()> {
-        self.draw_indexed_indirect_multi_root_table(
-            vertex_root,
-            vertex_stride,
-            pixel_root,
-            pixel_stride,
-            args,
-            draw_count,
-        )
-    }
-
-    pub fn draw_indexed_indirect_multi_root_table(
-        &mut self,
-        vertex_root_base: GpuAddress,
-        vertex_stride: u32,
-        pixel_root_base: GpuAddress,
-        pixel_stride: u32,
-        args: GpuAddress,
-        draw_count: GpuAddress,
-    ) -> RhiResult<()> {
-        self.set_root_table(
-            vertex_root_base,
-            vertex_stride,
-            pixel_root_base,
-            pixel_stride,
-        );
-        let (_arg_buffer, _arg_offset, arg_remaining) = self.resolve_buffer_with_remaining(
-            args,
-            std::mem::size_of::<DrawIndexedIndirectMultiArgs>() as u64,
-        );
-        let (_count_buffer, _count_offset) =
+        self.set_root_table(vertex_root, vertex_stride, pixel_root, pixel_stride);
+        let stride = std::mem::size_of::<DrawIndirectMultiArgs>() as u32;
+        let (arg_buffer, arg_offset, arg_remaining) =
+            self.resolve_buffer_with_remaining(args, stride as u64);
+        let (count_buffer, count_offset) =
             self.resolve_buffer(draw_count, std::mem::size_of::<u32>() as u64);
-        let max_draw_count = (arg_remaining
-            / std::mem::size_of::<DrawIndexedIndirectMultiArgs>() as u64)
+        let max_draw_count = (arg_remaining / stride as u64)
             .min(self.max_draw_indirect_count as u64) as u32;
         if max_draw_count == 0 {
             return Err(RhiError::CommandBuffer(
-                "draw_indexed_indirect_multi args allocation has no complete draw records".into(),
+                "draw_indirect_multi args allocation has no complete draw records".into(),
             ));
         }
-
-        Err(RhiError::Unsupported(
-            "Vulkan indexed MDI with per-draw index-buffer GPU pointers requires VK_EXT_device_generated_commands (index-buffer token + draw-indexed-count token) or an equivalent GPU command generation path; core vkCmdDrawIndexedIndirectCount would require hidden CPU-bound index-buffer state".into(),
-        ))
+        unsafe {
+            self.device.cmd_draw_indirect_count(
+                self.command_buffer,
+                arg_buffer,
+                arg_offset,
+                count_buffer,
+                count_offset,
+                max_draw_count,
+                stride,
+            );
+        }
+        Ok(())
     }
 
     fn set_root_table(
@@ -626,65 +609,18 @@ impl VulkanCommandBuffer {
     }
 
     pub fn copy_to_texture(&mut self, texture_gpu: GpuAddress, src: GpuAddress, texture: &Texture) {
-        assert_eq!(
-            texture_gpu,
-            texture.gpu_address(),
-            "copy_to_texture texture_gpu must match the address used to create the texture"
+        let (image, aspect, width, height, src_buffer, src_offset) =
+            self.prepare_texture_copy(texture_gpu, src, texture, "copy_to_texture");
+        self.transition_texture(
+            image,
+            aspect,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::PipelineStageFlags::TRANSFER,
+            false,
         );
-        let (image, _view) = self.resolve_texture(texture.id());
-        let width = texture.desc().width;
-        let height = texture.desc().height;
-        let bpp = bytes_per_pixel(texture.desc().format)
-            .expect("Unsupported texture format for copy_to_texture");
-        let size = (width as u64) * (height as u64) * (bpp as u64);
-        let (src_buffer, src_offset) = self.resolve_buffer(src, size);
-
-        let aspect = if is_depth_format(texture.desc().format) {
-            vk::ImageAspectFlags::DEPTH
-        } else {
-            vk::ImageAspectFlags::COLOR
-        };
-
-        let barrier = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .image(image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: aspect,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                self.command_buffer,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-        }
-
-        let region = vk::BufferImageCopy::default()
-            .buffer_offset(src_offset)
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: aspect,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            });
-
+        let region = build_buffer_image_region(src_offset, aspect, width, height);
         unsafe {
             self.device.cmd_copy_buffer_to_image(
                 self.command_buffer,
@@ -694,32 +630,15 @@ impl VulkanCommandBuffer {
                 std::slice::from_ref(&region),
             );
         }
-
-        let barrier2 = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-            .image(image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: aspect,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                self.command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier2],
-            );
-        }
+        self.transition_texture(
+            image,
+            aspect,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::GENERAL,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::PipelineStageFlags::TRANSFER,
+            true,
+        );
     }
 
     pub fn copy_from_texture(
@@ -728,65 +647,18 @@ impl VulkanCommandBuffer {
         texture_gpu: GpuAddress,
         texture: &Texture,
     ) {
-        assert_eq!(
-            texture_gpu,
-            texture.gpu_address(),
-            "copy_from_texture texture_gpu must match the address used to create the texture"
+        let (image, aspect, width, height, dst_buffer, dst_offset) =
+            self.prepare_texture_copy(texture_gpu, dst, texture, "copy_from_texture");
+        self.transition_texture(
+            image,
+            aspect,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::AccessFlags::TRANSFER_READ,
+            vk::PipelineStageFlags::TRANSFER,
+            false,
         );
-        let (image, _view) = self.resolve_texture(texture.id());
-        let width = texture.desc().width;
-        let height = texture.desc().height;
-        let bpp = bytes_per_pixel(texture.desc().format)
-            .expect("Unsupported texture format for copy_from_texture");
-        let size = (width as u64) * (height as u64) * (bpp as u64);
-        let (dst_buffer, dst_offset) = self.resolve_buffer(dst, size);
-
-        let aspect = if is_depth_format(texture.desc().format) {
-            vk::ImageAspectFlags::DEPTH
-        } else {
-            vk::ImageAspectFlags::COLOR
-        };
-
-        let barrier = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .image(image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: aspect,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                self.command_buffer,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-        }
-
-        let region = vk::BufferImageCopy::default()
-            .buffer_offset(dst_offset)
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: aspect,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            });
-
+        let region = build_buffer_image_region(dst_offset, aspect, width, height);
         unsafe {
             self.device.cmd_copy_image_to_buffer(
                 self.command_buffer,
@@ -796,12 +668,79 @@ impl VulkanCommandBuffer {
                 std::slice::from_ref(&region),
             );
         }
+        self.transition_texture(
+            image,
+            aspect,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::GENERAL,
+            vk::AccessFlags::TRANSFER_READ,
+            vk::PipelineStageFlags::TRANSFER,
+            true,
+        );
+    }
 
-        let barrier2 = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+    /// Validate the texture address, resolve the linear buffer, and return
+    /// `(image, aspect, w, h, buffer, offset)` for a copy command.
+    fn prepare_texture_copy(
+        &self,
+        texture_gpu: GpuAddress,
+        buffer_gpu: GpuAddress,
+        texture: &Texture,
+        op: &'static str,
+    ) -> (vk::Image, vk::ImageAspectFlags, u32, u32, vk::Buffer, u64) {
+        assert_eq!(
+            texture_gpu,
+            texture.gpu_address(),
+            "{op} texture_gpu must match the address used to create the texture"
+        );
+        let (image, _view) = self.resolve_texture(texture.id());
+        let width = texture.desc().width;
+        let height = texture.desc().height;
+        let bpp = bytes_per_pixel(texture.desc().format)
+            .unwrap_or_else(|| panic!("Unsupported texture format for {op}"));
+        let size = (width as u64) * (height as u64) * (bpp as u64);
+        let (buffer, offset) = self.resolve_buffer(buffer_gpu, size);
+        let aspect = if is_depth_format(texture.desc().format) {
+            vk::ImageAspectFlags::DEPTH
+        } else {
+            vk::ImageAspectFlags::COLOR
+        };
+        (image, aspect, width, height, buffer, offset)
+    }
+
+    /// Emit a single-mip, single-layer image layout transition. `reverse=true` swaps
+    /// pipeline stages and access masks so the same call can wrap a copy on both sides.
+    #[allow(clippy::too_many_arguments)]
+    fn transition_texture(
+        &self,
+        image: vk::Image,
+        aspect: vk::ImageAspectFlags,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+        transfer_access: vk::AccessFlags,
+        transfer_stage: vk::PipelineStageFlags,
+        reverse: bool,
+    ) {
+        let (src_stage, dst_stage, src_access, dst_access) = if reverse {
+            (
+                transfer_stage,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                transfer_access,
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+            )
+        } else {
+            (
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                transfer_stage,
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+                transfer_access,
+            )
+        };
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .src_access_mask(src_access)
+            .dst_access_mask(dst_access)
             .image(image)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: aspect,
@@ -810,16 +749,15 @@ impl VulkanCommandBuffer {
                 base_array_layer: 0,
                 layer_count: 1,
             });
-
         unsafe {
             self.device.cmd_pipeline_barrier(
                 self.command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
+                src_stage,
+                dst_stage,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[barrier2],
+                &[barrier],
             );
         }
     }
@@ -973,29 +911,19 @@ impl VulkanCommandBuffer {
     // -- Mesh shader pipeline + draws --
 
     pub fn set_meshlet_pipeline(&mut self, pso: &MeshletPso) {
-        match &pso.inner {
-            crate::pipeline::MeshletPsoInner::Vulkan(vk_pso) => {
-                self.pipeline_layout = vk_pso.pipeline_layout;
-                self.root_constant_size = vk_pso.root_constant_size;
-                // Push constants are visible to mesh + fragment stages.
-                self.push_constant_stages =
-                    vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::FRAGMENT;
-                let pipeline = vk_pso.pipeline_for_blend(&self.current_blend_state);
-                unsafe {
-                    self.device.cmd_bind_pipeline(
-                        self.command_buffer,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        pipeline,
-                    );
-                }
-                self.bind_descriptor_buffer(
-                    vk::PipelineBindPoint::GRAPHICS,
-                    vk_pso.pipeline_layout,
-                );
-            }
+        let vk_pso = match &pso.inner {
+            crate::pipeline::MeshletPsoInner::Vulkan(p) => p,
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
-        }
+        };
+        let pipeline = vk_pso.pipeline_for_blend(&self.current_blend_state);
+        self.bind_pipeline(
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline,
+            vk_pso.pipeline_layout,
+            vk_pso.root_constant_size,
+            vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::FRAGMENT,
+        );
     }
 
     pub fn draw_meshlets(&mut self, x: u32, y: u32, z: u32) {
@@ -1031,18 +959,8 @@ impl VulkanCommandBuffer {
     // -- Acceleration structure builds --
 
     pub fn build_blas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &BlasDesc) {
-        let accel_loader = match &self.acceleration_structure {
-            Some(l) => l.clone(),
-            None => {
-                log::warn!("build_blas: VK_KHR_acceleration_structure not available");
-                return;
-            }
-        };
-        let vk_as = match &accel.inner {
-            #[cfg(feature = "vulkan")]
-            crate::accel::AccelInner::Vulkan(a) => a.acceleration_structure,
-            #[allow(unreachable_patterns)]
-            _ => return,
+        let Some((accel_loader, vk_as)) = self.resolve_accel(accel, "build_blas") else {
+            return;
         };
 
         // Reconstruct geometry (same logic as create_blas; geometry is not stored to avoid lifetimes).
@@ -1146,18 +1064,8 @@ impl VulkanCommandBuffer {
     }
 
     pub fn build_tlas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &TlasDesc) {
-        let accel_loader = match &self.acceleration_structure {
-            Some(l) => l.clone(),
-            None => {
-                log::warn!("build_tlas: VK_KHR_acceleration_structure not available");
-                return;
-            }
-        };
-        let vk_as = match &accel.inner {
-            #[cfg(feature = "vulkan")]
-            crate::accel::AccelInner::Vulkan(a) => a.acceleration_structure,
-            #[allow(unreachable_patterns)]
-            _ => return,
+        let Some((accel_loader, vk_as)) = self.resolve_accel(accel, "build_tlas") else {
+            return;
         };
 
         let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::default()
@@ -1192,6 +1100,26 @@ impl VulkanCommandBuffer {
                 std::slice::from_ref(&build_info),
                 build_range_infos,
             );
+        }
+    }
+
+    /// Return the loader + raw `VkAccelerationStructureKHR` for a build command,
+    /// logging and returning `None` if the device lacks RT extensions or the handle
+    /// is not a Vulkan accel structure.
+    fn resolve_accel(
+        &self,
+        accel: &crate::accel::AccelerationStructure,
+        op: &'static str,
+    ) -> Option<(vk_accel_structure::Device, vk::AccelerationStructureKHR)> {
+        let Some(loader) = self.acceleration_structure.as_ref() else {
+            log::warn!("{op}: VK_KHR_acceleration_structure not available");
+            return None;
+        };
+        match &accel.inner {
+            #[cfg(feature = "vulkan")]
+            crate::accel::AccelInner::Vulkan(a) => Some((loader.clone(), a.acceleration_structure)),
+            #[allow(unreachable_patterns)]
+            _ => None,
         }
     }
 
@@ -1248,6 +1176,27 @@ impl VulkanCommandBuffer {
         }
         Ok(())
     }
+}
+
+fn build_buffer_image_region(
+    buffer_offset: u64,
+    aspect: vk::ImageAspectFlags,
+    width: u32,
+    height: u32,
+) -> vk::BufferImageCopy {
+    vk::BufferImageCopy::default()
+        .buffer_offset(buffer_offset)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: aspect,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
 }
 
 fn is_depth_format(format: Format) -> bool {

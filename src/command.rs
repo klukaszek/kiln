@@ -80,21 +80,21 @@ pub struct DrawIndexedIndirectArgs {
     pub first_instance: u32,
 }
 
-/// Arguments for indexed multi-draw indirect.
+/// Arguments for multi-draw indirect.
 ///
-/// `NoGraphicsApi.md` gives MDI no CPU-side `indicesGpu` parameter. To preserve
-/// the pointer-first indexed-draw model, each GPU draw record carries the index
-/// buffer GPU pointer that would otherwise be a direct draw parameter.
+/// `NoGraphicsApi.md` gives MDI no CPU-side `indicesGpu` parameter (line 1124).
+/// The architecture relies on programmable vertex fetch (lines 59, 1152): the
+/// vertex shader reads `[[draw_id]]` / `gl_DrawID`, computes its per-draw root
+/// pointer (`dataVx + draw_id * vxStride`), and loads its own index buffer from
+/// a pointer field inside that root struct. The hardware draw is non-indexed.
+/// Layout matches `VkDrawIndirectCommand`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::Immutable)]
-pub struct DrawIndexedIndirectMultiArgs {
-    pub index_buffer: GpuAddress,
-    pub index_count: u32,
+pub struct DrawIndirectMultiArgs {
+    pub vertex_count: u32,
     pub instance_count: u32,
-    pub first_index: u32,
-    pub vertex_offset: i32,
+    pub first_vertex: u32,
     pub first_instance: u32,
-    pub _pad: u32,
 }
 
 /// Arguments for indirect dispatch (matches VkDispatchIndirectCommand layout).
@@ -354,10 +354,14 @@ impl CommandBuffer {
 
     /// `gpuDrawIndexedInstancedIndirectMulti(cb, vData, vStride, pData, pStride, argsGpu, drawCountGpu)`
     ///
-    /// `args` points to an array of `DrawIndexedIndirectMultiArgs`. Root data is selected
+    /// `args` points to an array of `DrawIndirectMultiArgs`. Root data is selected
     /// by draw ID from `vertex_root + draw_id * vertex_stride` and
     /// `pixel_root + draw_id * pixel_stride`; a zero stride broadcasts one root block.
-    pub fn draw_indexed_indirect_multi(
+    ///
+    /// Drawing is non-indexed at the hardware level — per the spec the vertex shader
+    /// performs programmable index fetch from a pointer carried in its per-draw root
+    /// struct. No index buffer parameter exists.
+    pub fn draw_indirect_multi(
         &mut self,
         vertex_root: GpuAddress,
         vertex_stride: u32,
@@ -368,7 +372,7 @@ impl CommandBuffer {
     ) -> RhiResult<()> {
         match &mut self.inner {
             #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.draw_indexed_indirect_multi(
+            CommandBufferInner::Vulkan(cmd) => cmd.draw_indirect_multi(
                 vertex_root,
                 vertex_stride,
                 pixel_root,
@@ -377,45 +381,10 @@ impl CommandBuffer {
                 draw_count,
             ),
             #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.draw_indexed_indirect_multi(
+            CommandBufferInner::Metal(cmd) => cmd.draw_indirect_multi(
                 vertex_root,
                 vertex_stride,
                 pixel_root,
-                pixel_stride,
-                args,
-                draw_count,
-            ),
-        }
-    }
-
-    /// Multi-draw indirect using GPU root tables (base pointer + stride).
-    ///
-    /// This is the backend-facing form of `gpuDrawIndexedInstancedIndirectMulti`.
-    /// `args` points to `DrawIndexedIndirectMultiArgs`; `draw_count` points to a `u32`.
-    pub fn draw_indexed_indirect_multi_root_table(
-        &mut self,
-        vertex_root_base: GpuAddress,
-        vertex_stride: u32,
-        pixel_root_base: GpuAddress,
-        pixel_stride: u32,
-        args: GpuAddress,
-        draw_count: GpuAddress,
-    ) -> RhiResult<()> {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.draw_indexed_indirect_multi_root_table(
-                vertex_root_base,
-                vertex_stride,
-                pixel_root_base,
-                pixel_stride,
-                args,
-                draw_count,
-            ),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.draw_indexed_indirect_multi_root_table(
-                vertex_root_base,
-                vertex_stride,
-                pixel_root_base,
                 pixel_stride,
                 args,
                 draw_count,

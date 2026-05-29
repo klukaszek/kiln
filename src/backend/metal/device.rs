@@ -440,6 +440,13 @@ struct RhiIcbRange {
     uint length;
 };
 
+// MSL forbids `command_buffer` as a direct `[[buffer(N)]]` kernel parameter; it must be
+// referenced through an argument-buffer struct (a `command_buffer` field at `[[id(0)]]`).
+// The CPU binds an 8-byte argument buffer holding the ICB's gpuResourceID at slot 3.
+struct RhiIcbContainer {
+    command_buffer cmd [[id(0)]];
+};
+
 static inline primitive_type rhi_primitive_type(uint id) {
     switch (id) {
         case 0: return primitive_type::point;
@@ -461,7 +468,7 @@ kernel void rhi_encode_mdi_icb(
     device const RhiDrawIndirectMultiArgs* draws [[buffer(0)]],
     device atomic_uint* drawCount [[buffer(1)]],
     device RhiIcbRange* range [[buffer(2)]],
-    command_buffer icb [[buffer(3)]],
+    device const RhiIcbContainer& icb_container [[buffer(3)]],
     constant uint& maxDrawCount [[buffer(4)]],
     constant uint& primitiveType [[buffer(5)]],
     uint tid [[thread_position_in_grid]])
@@ -477,7 +484,7 @@ kernel void rhi_encode_mdi_icb(
 
     RhiDrawIndirectMultiArgs draw = draws[tid];
 
-    render_command cmd(icb, tid);
+    render_command cmd(icb_container.cmd, tid);
     cmd.draw_primitives(
         rhi_primitive_type(primitiveType),
         draw.first_vertex,

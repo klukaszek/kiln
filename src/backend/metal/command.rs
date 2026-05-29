@@ -50,6 +50,9 @@ struct GeneratedMdiIcb {
     range_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     max_draw_count_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     primitive_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// 8-byte argument buffer holding the ICB's gpuResourceID, bound at buffer slot 3 so
+    /// the encode kernel can reach the ICB through its `RhiIcbContainer` argument struct.
+    icb_arg_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 #[derive(Clone, Copy)]
@@ -299,6 +302,14 @@ impl MetalCommandBuffer {
             std::mem::size_of::<u32>(),
             MTLResourceOptions::StorageModeShared,
         );
+        // Argument buffer for the ICB: a single `command_buffer` handle at offset 0.
+        let icb_arg_buffer = self.make_command_buffer_resource(
+            std::mem::size_of::<u64>(),
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // MTLResourceID is a transparent wrapper over a u64 GPU handle.
+        let icb_resource_id: u64 = unsafe { std::mem::transmute(icb.gpuResourceID()) };
 
         unsafe {
             std::ptr::write_unaligned(
@@ -308,6 +319,10 @@ impl MetalCommandBuffer {
             std::ptr::write_unaligned(
                 primitive_buffer.contents().as_ptr() as *mut u32,
                 Self::primitive_id(topology),
+            );
+            std::ptr::write_unaligned(
+                icb_arg_buffer.contents().as_ptr() as *mut u64,
+                icb_resource_id,
             );
         }
 
@@ -320,9 +335,10 @@ impl MetalCommandBuffer {
             self.argument_table.setAddress_atIndex(draw_count_addr, 1);
             self.argument_table
                 .setAddress_atIndex(range_buffer.gpuAddress(), 2);
-            // Bind the ICB directly via its gpuResourceID — Metal 4 native binding (no argument buffer).
+            // Bind the ICB through its argument buffer (a `command_buffer` handle at id 0).
+            // MSL does not allow `command_buffer` as a direct buffer-slot parameter.
             self.argument_table
-                .setResource_atBufferIndex(icb.gpuResourceID(), 3);
+                .setAddress_atIndex(icb_arg_buffer.gpuAddress(), 3);
             self.argument_table
                 .setAddress_atIndex(max_draw_count_buffer.gpuAddress(), 4);
             self.argument_table
@@ -351,6 +367,7 @@ impl MetalCommandBuffer {
             range_buffer,
             max_draw_count_buffer,
             primitive_buffer,
+            icb_arg_buffer,
         }
     }
 
@@ -862,7 +879,25 @@ impl MetalCommandBuffer {
     }
 
     pub fn set_root_data(&mut self, vertex_root: GpuAddress, pixel_root: GpuAddress) {
-        self.set_root_table(vertex_root, 0, pixel_root, 0);
+        // Regular draws: Slang lowers each stage's `uniform T*` root to buffer(0) -> { T* }.
+        // Stash the root pointer in a holder slot and bind the slot at buffer(0) for both
+        // stages (same one-level indirection as set_compute_root). Vertex and fragment
+        // share a single argument table, so this serves a *shared* root — pass the same
+        // pointer for both stages, which the two-pointer model explicitly allows. Wholly
+        // independent vertex/pixel roots would need a per-stage argument table (future).
+        //
+        // MDI draws bypass this and call set_root_table directly, keeping the strided
+        // ROOT_TABLE layout their GPU-side draw generation depends on.
+        debug_assert!(
+            self.render_encoder.is_some(),
+            "set_root_data called outside a render pass"
+        );
+        let root = if vertex_root.0 != 0 { vertex_root } else { pixel_root };
+        let (slot_addr, slot_ptr) = self.alloc_root_bytes(std::mem::size_of::<u64>());
+        unsafe {
+            std::ptr::write_unaligned(slot_ptr as *mut u64, root.0);
+        }
+        self.current_root_table = slot_addr;
     }
 
     fn set_root_table(
@@ -909,8 +944,15 @@ impl MetalCommandBuffer {
                 root_bytes, self.root_constant_size
             );
         }
+        // Slang lowers a shader root pointer to a Metal argument-buffer slot that *contains*
+        // the pointer: buffer(0) -> { T* inner }. Vulkan instead pushes the pointer inline,
+        // so it derefs once to reach the data. To make one Slang source work on both, we
+        // add the matching indirection on Metal: stash the root pointer in a ring slot and
+        // bind the slot's address at buffer(0), so the shader's `inner` resolves to `root`.
+        let (slot_addr, slot_ptr) = self.alloc_root_bytes(std::mem::size_of::<u64>());
         unsafe {
-            self.argument_table.setAddress_atIndex(root.0, 0);
+            std::ptr::write_unaligned(slot_ptr as *mut u64, root.0);
+            self.argument_table.setAddress_atIndex(slot_addr, 0);
         }
     }
 
@@ -1130,6 +1172,10 @@ impl MetalCommandBuffer {
             .command_buffer
             .computeCommandEncoder()
             .expect("Failed to create Metal 4 copy encoder");
+        // Honor a barrier enqueued before this copy (e.g. between two transfer copies).
+        // Copy encoders are discrete and short-lived, so the dependency arrives as a
+        // pending queue barrier that must be applied as this encoder begins.
+        self.apply_pending_queue_barrier_compute(&encoder);
         unsafe {
             encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
                 &src_buffer,
@@ -1151,6 +1197,10 @@ impl MetalCommandBuffer {
             .command_buffer
             .computeCommandEncoder()
             .expect("Failed to create Metal 4 copy encoder");
+        // Honor a barrier enqueued before this copy (e.g. between two transfer copies).
+        // Copy encoders are discrete and short-lived, so the dependency arrives as a
+        // pending queue barrier that must be applied as this encoder begins.
+        self.apply_pending_queue_barrier_compute(&encoder);
         unsafe {
             encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
                 &buffer,
@@ -1181,6 +1231,10 @@ impl MetalCommandBuffer {
             .command_buffer
             .computeCommandEncoder()
             .expect("Failed to create Metal 4 copy encoder");
+        // Honor a barrier enqueued before this copy (e.g. between two transfer copies).
+        // Copy encoders are discrete and short-lived, so the dependency arrives as a
+        // pending queue barrier that must be applied as this encoder begins.
+        self.apply_pending_queue_barrier_compute(&encoder);
         unsafe {
             encoder.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
                 &mtl_texture,

@@ -1,6 +1,5 @@
 use crate::accel::AccelerationStructure;
 use crate::barrier::{HazardFlags, StageFlags};
-use crate::error::RhiResult;
 use crate::pipeline::{
     BlendState, ComputePso, DepthStencilState, GraphicsPso, MeshletPso,
 };
@@ -304,27 +303,15 @@ impl CommandBuffer {
         pixel_stride: u32,
         args: GpuAddress,
         draw_count: GpuAddress,
-    ) -> RhiResult<()> {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.draw_indirect_multi(
-                vertex_root,
-                vertex_stride,
-                pixel_root,
-                pixel_stride,
-                args,
-                draw_count,
-            ),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.draw_indirect_multi(
-                vertex_root,
-                vertex_stride,
-                pixel_root,
-                pixel_stride,
-                args,
-                draw_count,
-            ),
-        }
+    ) {
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indirect_multi(
+            vertex_root,
+            vertex_stride,
+            pixel_root,
+            pixel_stride,
+            args,
+            draw_count,
+        ))
     }
 
     // -- Transfer --
@@ -421,10 +408,12 @@ impl CommandBuffer {
     // -- Presentation --
 
     /// Transition a swapchain image to present-ready layout.
-    pub fn transition_to_present(&mut self, swapchain_image_index: u32) {
+    pub fn transition_to_present(&mut self, _swapchain_image_index: u32) {
+        // Underscored because only the Vulkan arm consumes it; Metal-only builds would
+        // otherwise see it as unused. (`_`-prefixed params are still referenceable.)
         match &mut self.inner {
             #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.transition_to_present(swapchain_image_index),
+            CommandBufferInner::Vulkan(cmd) => cmd.transition_to_present(_swapchain_image_index),
             #[cfg(feature = "metal")]
             CommandBufferInner::Metal(_cmd) => {
                 // Metal handles presentation transitions automatically.

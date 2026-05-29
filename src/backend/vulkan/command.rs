@@ -5,7 +5,6 @@ use crate::command::{
     DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectMultiArgs, LoadOp,
     RenderPassDesc, RenderTarget, SignalValueDesc, StoreOp, WaitValueDesc,
 };
-use crate::error::{RhiError, RhiResult};
 use crate::pipeline::{
     BlendState, ComputePso, ComputePsoInner, DepthStencilState, GraphicsPso, GraphicsPsoInner,
     MeshletPso,
@@ -523,20 +522,19 @@ impl VulkanCommandBuffer {
         pixel_stride: u32,
         args: GpuAddress,
         draw_count: GpuAddress,
-    ) -> RhiResult<()> {
+    ) {
         self.set_root_table(vertex_root, vertex_stride, pixel_root, pixel_stride);
         let stride = std::mem::size_of::<DrawIndirectMultiArgs>() as u32;
         let (arg_buffer, arg_offset, arg_remaining) =
             self.resolve_buffer_with_remaining(args, stride as u64);
         let (count_buffer, count_offset) =
             self.resolve_buffer(draw_count, std::mem::size_of::<u32>() as u64);
-        let max_draw_count = (arg_remaining / stride as u64)
-            .min(self.max_draw_indirect_count as u64) as u32;
-        if max_draw_count == 0 {
-            return Err(RhiError::CommandBuffer(
-                "draw_indirect_multi args allocation has no complete draw records".into(),
-            ));
-        }
+        let max_draw_count =
+            (arg_remaining / stride as u64).min(self.max_draw_indirect_count as u64) as u32;
+        assert!(
+            max_draw_count > 0,
+            "draw_indirect_multi args allocation has no complete draw records"
+        );
         unsafe {
             self.device.cmd_draw_indirect_count(
                 self.command_buffer,
@@ -548,7 +546,6 @@ impl VulkanCommandBuffer {
                 stride,
             );
         }
-        Ok(())
     }
 
     fn set_root_table(

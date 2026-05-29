@@ -8,10 +8,11 @@ pub struct GpuAddress(pub u64);
 impl GpuAddress {
     pub const NULL: Self = Self(0);
 
-    /// Offset this address by `byte_offset`.
+    /// Offset this address by `byte_offset` (pointer arithmetic; wraps like a raw pointer
+    /// rather than panicking on debug overflow).
     #[inline]
     pub fn offset(self, byte_offset: u64) -> Self {
-        Self(self.0 + byte_offset)
+        Self(self.0.wrapping_add(byte_offset))
     }
 
     #[inline]

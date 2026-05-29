@@ -6,7 +6,7 @@
 
 mod common;
 
-use spectradio_rhi::{ComputePsoDesc, MemoryType, ShaderStage, StageFlags};
+use spectradio_rhi::{gpu_struct, ComputePsoDesc, MemoryType, ShaderStage, StageFlags};
 
 // Shared host/device data contract. `Data::SLANG` is the matching Slang declaration.
 gpu_struct! {

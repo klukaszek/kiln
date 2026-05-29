@@ -6,6 +6,7 @@
 
 mod common;
 
+use spectradio_rhi::gpu_struct;
 use spectradio_rhi::{
     BlasDesc, BlasMeshDesc, BuildAccelFlags, ComputePsoDesc, GeometryFlags, GeometryType,
     GpuAddress, MemoryType, ShaderStage, StageFlags, TlasDesc, TlasInstance,
@@ -19,7 +20,8 @@ gpu_struct! {
 
 // The TLAS is a trailing entry-point parameter so the root stays at the RHI's normal slot
 // and the acceleration structure binds to the next slot (Metal buffer(1) / Vulkan descriptor).
-const RQ_BODY: &str = r#"
+const RQ_BODY: &str = /*slang*/
+    r#"
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void rqMain(uint3 tid : SV_DispatchThreadID,

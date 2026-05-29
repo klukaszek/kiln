@@ -8,11 +8,6 @@ default = ["metal"]
 vulkan = ["dep:ash", "dep:ash-window"]
 metal = ["dep:objc2-metal", "dep:objc2", "dep:objc2-foundation", "dep:objc2-quartz-core", "dep:objc2-core-foundation", "dep:dispatch2"]
 
-[dev-dependencies]
-# Same version as the dependency so Cargo unifies the instance — required for the
-# `gpu_struct!` test macro's zerocopy derives to satisfy the RHI's `GpuPod` bound.
-zerocopy = { version = "0.8", features = ["derive"] }
-
 [dependencies]
 # Common
 zerocopy = { version = "0.8", features = ["derive"] }

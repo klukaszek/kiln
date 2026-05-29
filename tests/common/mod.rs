@@ -93,42 +93,6 @@ pub fn bench(label: &str, iters: u32, mut f: impl FnMut()) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared GPU data contract
-//
-// Define a GPU-facing struct ONCE: this generates a `#[repr(C)]` Rust struct plus a
-// matching Slang declaration string (`Name::SLANG`) to prepend to the shader. Host and
-// device layouts stay in lockstep, so root data is built type-safely (`Data { .. }`)
-// instead of poking bytes at hand-computed offsets. Each field lists its Rust type and
-// the equivalent Slang type (e.g. `u64 as "uint*"`, `u32 as "uint"`, `f32 as "float"`).
-// ---------------------------------------------------------------------------
-
-#[macro_export]
-macro_rules! gpu_struct {
-    (
-        $(#[$meta:meta])*
-        $vis:vis struct $name:ident {
-            $( $fname:ident : $fty:ty as $slang:literal ),* $(,)?
-        }
-    ) => {
-        $(#[$meta])*
-        #[repr(C)]
-        #[derive(Clone, Copy, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::Immutable)]
-        $vis struct $name {
-            $( pub $fname : $fty ),*
-        }
-        impl $name {
-            /// Slang declaration matching this struct's layout; prepend to shader source.
-            pub const SLANG: &'static str = concat!(
-                "struct ", stringify!($name), " {\n",
-                $( "    ", $slang, " ", stringify!($fname), ";\n", )*
-                "};\n"
-            );
-        }
-    };
-}
-
-
-// ---------------------------------------------------------------------------
 // Backend-agnostic shading via Slang
 //
 // Tests write ONE Slang source; `compile_shader` lowers it to whatever the active

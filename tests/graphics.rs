@@ -6,6 +6,7 @@
 
 mod common;
 
+use spectradio_rhi::gpu_struct;
 use spectradio_rhi::{
     ColorAttachment, ColorTarget, Cull, Format, GraphicsPsoDesc, LoadOp, MemoryType,
     RenderPassDesc, RenderTarget, SampleCount, ShaderStage, StageFlags, StoreOp, TextureDesc,

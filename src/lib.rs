@@ -34,6 +34,11 @@ pub mod sync;
 pub mod texture;
 pub mod types;
 
+// The RHI is built around zerocopy for its GPU data contract (`GpuPod`, `gpu_struct!`,
+// the indirect-args structs). Re-export it so the `gpu_struct!` macro and downstream
+// crates share one zerocopy instance.
+pub use zerocopy;
+
 // Re-export core types at crate root for convenience
 pub use accel::AccelerationStructure;
 pub use barrier::{HazardFlags, StageFlags};

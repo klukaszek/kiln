@@ -640,11 +640,18 @@ impl MetalDevice {
                 .frame_event
                 .waitUntilSignaledValue_timeoutMS(value, u64::MAX);
         }
-        if let QueueInner::Metal(q) = &self.rhi_queue.inner {
-            if frame_index < q.in_flight_frame_commands.borrow().len() {
-                q.in_flight_frame_commands.borrow_mut()[frame_index] = None;
+        // `match` (not `if let`) so single-backend builds, where `QueueInner` has only the
+        // Metal variant, don't see an irrefutable pattern.
+        match &self.rhi_queue.inner {
+            #[cfg(feature = "metal")]
+            QueueInner::Metal(q) => {
+                if frame_index < q.in_flight_frame_commands.borrow().len() {
+                    q.in_flight_frame_commands.borrow_mut()[frame_index] = None;
+                }
+                q.reclaim_completed_submissions();
             }
-            q.reclaim_completed_submissions();
+            #[cfg(feature = "vulkan")]
+            QueueInner::Vulkan(_) => {}
         }
     }
 
@@ -1558,17 +1565,22 @@ impl MetalDevice {
     }
 
     pub fn destroy_buffer(&self, buffer: GpuBuffer) {
-        if let GpuBufferInner::Metal(mtl) = buffer.inner {
-            {
-                let mut allocations = self.allocations.borrow_mut();
-                allocations.remove(&mtl.gpu_address().0);
+        match buffer.inner {
+            #[cfg(feature = "metal")]
+            GpuBufferInner::Metal(mtl) => {
+                {
+                    let mut allocations = self.allocations.borrow_mut();
+                    allocations.remove(&mtl.gpu_address().0);
+                }
+                let allocation = unsafe {
+                    &*(mtl.buffer.as_ref() as *const ProtocolObject<dyn MTLBuffer>
+                        as *const ProtocolObject<dyn MTLAllocation>)
+                };
+                self.residency_set.removeAllocation(allocation);
+                self.residency_dirty.set(true);
             }
-            let allocation = unsafe {
-                &*(mtl.buffer.as_ref() as *const ProtocolObject<dyn MTLBuffer>
-                    as *const ProtocolObject<dyn MTLAllocation>)
-            };
-            self.residency_set.removeAllocation(allocation);
-            self.residency_dirty.set(true);
+            #[cfg(feature = "vulkan")]
+            GpuBufferInner::Vulkan(_) => {}
         }
     }
 

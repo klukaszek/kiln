@@ -17,7 +17,6 @@ use crate::command::{
     DrawIndirectMultiArgs, LoadOp, RenderPassDesc, RenderTarget,
     SignalValueDesc, StoreOp, WaitValueDesc,
 };
-use crate::error::{RhiError, RhiResult};
 use crate::pipeline::{
     BlendState, ComputePso, DepthStencilState, GraphicsPso, MeshletPso,
 };
@@ -1119,7 +1118,7 @@ impl MetalCommandBuffer {
         pixel_stride: u32,
         args: GpuAddress,
         draw_count: GpuAddress,
-    ) -> RhiResult<()> {
+    ) {
         let desc = self
             .render_pass_desc
             .clone()
@@ -1129,11 +1128,10 @@ impl MetalCommandBuffer {
         let stride = std::mem::size_of::<DrawIndirectMultiArgs>() as u64;
         let arg_remaining = self.allocation_remaining(args);
         let max_draw_count = u32::try_from(arg_remaining / stride).unwrap_or(u32::MAX);
-        if max_draw_count == 0 {
-            return Err(RhiError::CommandBuffer(
-                "draw_indirect_multi args allocation has no complete draw records".into(),
-            ));
-        }
+        assert!(
+            max_draw_count > 0,
+            "draw_indirect_multi args allocation has no complete draw records"
+        );
 
         let topology = self.current_topology;
         let root_table = self.current_root_table;
@@ -1177,7 +1175,6 @@ impl MetalCommandBuffer {
         }
         self.mdi_icb_resources.push(generated);
         self.render_encoder = Some(encoder);
-        Ok(())
     }
 
     pub fn memcpy(&mut self, dst: GpuAddress, src: GpuAddress, size: u64) {

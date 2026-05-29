@@ -8,9 +8,8 @@ use objc2_metal::{
     MTL4AlphaToCoverageState, MTL4BlendState, MTL4Compiler, MTL4IndirectCommandBufferSupportState,
     MTL4LibraryFunctionDescriptor, MTL4PipelineDescriptor, MTL4PipelineOptions,
     MTL4RenderPipelineColorAttachmentDescriptor, MTL4RenderPipelineDescriptor,
-    MTL4ShaderReflection, MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask,
-    MTLComputePipelineState, MTLCullMode, MTLIntersectionFunctionTable, MTLLibrary,
-    MTLPrimitiveType, MTLRenderPipelineState, MTLVisibleFunctionTable, MTLWinding,
+    MTL4ShaderReflection, MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode,
+    MTLLibrary, MTLPrimitiveType, MTLRenderPipelineState, MTLWinding,
 };
 
 use crate::pipeline::{BlendAttachment, BlendState};
@@ -234,15 +233,4 @@ pub struct MetalMeshletPso {
         RefCell<HashMap<BlendState, Retained<ProtocolObject<dyn MTLRenderPipelineState>>>>,
     // Hold the compiled pipeline state (default blend variant).
     pub(crate) default_pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-}
-
-pub struct MetalRayTracingPso {
-    pub(crate) pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    pub(crate) threads_per_threadgroup: [u32; 3],
-    pub(crate) root_constant_size: u32,
-    pub(crate) compute_argument_buffer_slots: Vec<usize>,
-    pub(crate) intersection_function_table:
-        Option<Retained<ProtocolObject<dyn MTLIntersectionFunctionTable>>>,
-    pub(crate) visible_function_table:
-        Option<Retained<ProtocolObject<dyn MTLVisibleFunctionTable>>>,
 }

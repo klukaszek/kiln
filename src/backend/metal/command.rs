@@ -19,7 +19,7 @@ use crate::command::{
 };
 use crate::error::{RhiError, RhiResult};
 use crate::pipeline::{
-    BlendState, ComputePso, DepthStencilState, GraphicsPso, MeshletPso, RayTracingPso,
+    BlendState, ComputePso, DepthStencilState, GraphicsPso, MeshletPso,
 };
 use crate::texture::{Texture, bytes_per_pixel};
 use crate::types::*;
@@ -27,7 +27,6 @@ use crate::types::*;
 use super::device::{SharedAllocations, SharedSamplers, SharedTextures};
 
 const ROOT_TABLE_BYTES: usize = 32;
-const RT_TRACE_TABLE_BYTES: usize = 88;
 const ROOT_TABLE_RING_ENTRIES: usize = 65_536;
 const ROOT_TABLE_RING_BYTES: usize = ROOT_TABLE_BYTES * ROOT_TABLE_RING_ENTRIES;
 const METAL_BINDLESS_TEXTURE_CAPACITY: usize = 65_536;
@@ -1746,96 +1745,6 @@ impl MetalCommandBuffer {
         encoder.endEncoding();
     }
 
-    // -- Ray tracing dispatch (Metal: compute kernel dispatch) --
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn trace_rays(
-        &mut self,
-        pso: &RayTracingPso,
-        raygen: &SbtRegion,
-        miss: &SbtRegion,
-        hit: &SbtRegion,
-        width: u32,
-        height: u32,
-        depth: u32,
-    ) -> RhiResult<()> {
-        use objc2_metal::{
-            MTL4ComputeCommandEncoder as _, MTLIntersectionFunctionTable as _,
-            MTLVisibleFunctionTable as _,
-        };
-
-        self.end_active_encoders();
-        let encoder = self
-            .command_buffer
-            .computeCommandEncoder()
-            .ok_or_else(|| RhiError::CommandBuffer("Failed to create Metal RT encoder".into()))?;
-        self.apply_pending_queue_barrier_compute(&encoder);
-
-        let mtl_pso = match &pso.inner {
-            crate::pipeline::RayTracingPsoInner::Metal(pso) => pso,
-            #[allow(unreachable_patterns)]
-            _ => {
-                return Err(RhiError::Backend(
-                    "trace_rays called with a non-Metal ray tracing pipeline".into(),
-                ));
-            }
-        };
-
-        encoder.setComputePipelineState(&mtl_pso.pipeline);
-        self.current_threads_per_threadgroup = mtl_pso.threads_per_threadgroup;
-        self.root_constant_size = mtl_pso.root_constant_size;
-
-        let has_slot = |slot: usize| mtl_pso.compute_argument_buffer_slots.contains(&slot);
-        let has_texture_heap_slot = has_slot(1);
-        let has_sampler_heap_slot = has_slot(2);
-        self.active_texture_heap_slot_enabled = has_texture_heap_slot;
-        self.active_sampler_heap_slot_enabled = has_sampler_heap_slot;
-        self.refresh_bindless_heaps(has_texture_heap_slot, has_sampler_heap_slot);
-
-        let mut bytes = [0u8; RT_TRACE_TABLE_BYTES];
-        write_sbt_region(&mut bytes[0..24], raygen);
-        write_sbt_region(&mut bytes[24..48], miss);
-        write_sbt_region(&mut bytes[48..72], hit);
-        let intersection_table_id = mtl_pso
-            .intersection_function_table
-            .as_ref()
-            .map(|table| table.gpuResourceID().to_raw())
-            .unwrap_or(0);
-        let visible_table_id = mtl_pso
-            .visible_function_table
-            .as_ref()
-            .map(|table| table.gpuResourceID().to_raw())
-            .unwrap_or(0);
-        bytes[72..80].copy_from_slice(&intersection_table_id.to_ne_bytes());
-        bytes[80..88].copy_from_slice(&visible_table_id.to_ne_bytes());
-        let (rt_args_addr, rt_args_ptr) = self.alloc_root_bytes(RT_TRACE_TABLE_BYTES);
-        self.refresh_argument_table();
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), rt_args_ptr, bytes.len());
-            self.argument_table.setAddress_atIndex(rt_args_addr, 0);
-        }
-        encoder.setArgumentTable(Some(&self.argument_table));
-
-        let tg = MTLSize {
-            width: mtl_pso.threads_per_threadgroup[0] as usize,
-            height: mtl_pso.threads_per_threadgroup[1] as usize,
-            depth: mtl_pso.threads_per_threadgroup[2] as usize,
-        };
-        let groups = MTLSize {
-            width: width.div_ceil(mtl_pso.threads_per_threadgroup[0]) as usize,
-            height: height.div_ceil(mtl_pso.threads_per_threadgroup[1]) as usize,
-            depth: depth.div_ceil(mtl_pso.threads_per_threadgroup[2]) as usize,
-        };
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, tg);
-        encoder.endEncoding();
-        Ok(())
-    }
-}
-
-fn write_sbt_region(dst: &mut [u8], region: &SbtRegion) {
-    dst[0..8].copy_from_slice(&region.device_address.0.to_ne_bytes());
-    dst[8..16].copy_from_slice(&region.stride.to_ne_bytes());
-    dst[16..24].copy_from_slice(&region.size.to_ne_bytes());
 }
 
 impl Drop for MetalCommandBuffer {

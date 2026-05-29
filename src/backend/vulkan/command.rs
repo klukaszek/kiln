@@ -8,13 +8,13 @@ use crate::command::{
 use crate::error::{RhiError, RhiResult};
 use crate::pipeline::{
     BlendState, ComputePso, ComputePsoInner, DepthStencilState, GraphicsPso, GraphicsPsoInner,
-    MeshletPso, RayTracingPso,
+    MeshletPso,
 };
 use crate::texture::{Texture, bytes_per_pixel};
 use crate::types::*;
 use ash::{
     ext::{descriptor_buffer, mesh_shader as vk_mesh_shader},
-    khr::{acceleration_structure as vk_accel_structure, ray_tracing_pipeline as vk_rt_pipeline},
+    khr::acceleration_structure as vk_accel_structure,
     vk,
 };
 
@@ -51,8 +51,6 @@ pub struct VulkanCommandBuffer {
     pub(crate) mesh_shader: Option<vk_mesh_shader::Device>,
     /// Acceleration structure extension loader (VK_KHR_acceleration_structure).
     pub(crate) acceleration_structure: Option<vk_accel_structure::Device>,
-    /// Ray tracing pipeline extension loader (VK_KHR_ray_tracing_pipeline).
-    pub(crate) ray_tracing: Option<vk_rt_pipeline::Device>,
     /// Device limit used as the native indirect-count upper bound.
     pub(crate) max_draw_indirect_count: u32,
 }
@@ -1136,59 +1134,6 @@ impl VulkanCommandBuffer {
         }
     }
 
-    // -- Ray tracing dispatch --
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn trace_rays(
-        &mut self,
-        pso: &RayTracingPso,
-        raygen: &SbtRegion,
-        miss: &SbtRegion,
-        hit: &SbtRegion,
-        width: u32,
-        height: u32,
-        depth: u32,
-    ) -> RhiResult<()> {
-        let rt_loader = match &self.ray_tracing {
-            Some(l) => l.clone(),
-            None => {
-                return Err(RhiError::Unsupported(
-                    "VK_KHR_ray_tracing_pipeline not available on this command buffer".into(),
-                ));
-            }
-        };
-        let _vk_pipeline = match &pso.inner {
-            #[cfg(feature = "vulkan")]
-            crate::pipeline::RayTracingPsoInner::Vulkan(p) => p.pipeline,
-            #[allow(unreachable_patterns)]
-            _ => {
-                return Err(RhiError::Backend(
-                    "trace_rays called with a non-Vulkan ray tracing pipeline".into(),
-                ));
-            }
-        };
-
-        let to_sbt_addr = |r: &SbtRegion| vk::StridedDeviceAddressRegionKHR {
-            device_address: r.device_address.0,
-            stride: r.stride,
-            size: r.size,
-        };
-
-        let empty = vk::StridedDeviceAddressRegionKHR::default();
-        unsafe {
-            rt_loader.cmd_trace_rays(
-                self.command_buffer,
-                &to_sbt_addr(raygen),
-                &to_sbt_addr(miss),
-                &to_sbt_addr(hit),
-                &empty, // callable SBT (not used)
-                width,
-                height,
-                depth,
-            );
-        }
-        Ok(())
-    }
 }
 
 fn build_buffer_image_region(

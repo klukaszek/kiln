@@ -12,7 +12,7 @@
 //! - Timeline semaphores for frame sync
 //! - Enum dispatch for zero-cost backend selection
 //! - Mesh shader pipelines (gpuCreateGraphicsMeshletPipeline / gpuDrawMeshlets)
-//! - Ray tracing (BLAS/TLAS, ray tracing PSO, trace_rays)
+//! - Ray tracing (BLAS/TLAS + inline ray query in compute)
 
 pub mod accel;
 pub mod backend;
@@ -56,5 +56,5 @@ pub use texture::{ALL_LAYERS, ALL_MIPS, GpuViewDesc, Texture, TextureDesc, Textu
 pub use types::*;
 pub use types::{
     AccelerationStructureId, BlasDesc, BlasMeshDesc, BuildAccelFlags, GeometryFlags, GeometryType,
-    InstanceFlags, SbtRegion, TlasDesc, TlasInstance,
+    InstanceFlags, TlasDesc, TlasInstance,
 };

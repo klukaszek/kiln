@@ -6,10 +6,7 @@ use std::sync::{Arc, Mutex};
 use ash::{
     Device, Entry, Instance,
     ext::{debug_utils, descriptor_buffer, mesh_shader as vk_mesh_shader},
-    khr::{
-        acceleration_structure as vk_accel_structure, ray_tracing_pipeline as vk_rt_pipeline,
-        surface, swapchain,
-    },
+    khr::{acceleration_structure as vk_accel_structure, surface, swapchain},
     vk,
 };
 
@@ -34,7 +31,7 @@ use super::command::VulkanCommandBuffer;
 use super::memory::VulkanBuffer;
 use super::pipeline::{
     VulkanComputePso, VulkanGraphicsPso, VulkanGraphicsPsoDesc, VulkanMeshletPso,
-    VulkanMeshletPsoDesc, VulkanRayTracingPso,
+    VulkanMeshletPsoDesc,
 };
 use super::shader::VulkanShaderModule;
 use super::surface::VulkanSurface;
@@ -102,14 +99,6 @@ struct SwapchainContents {
     in_flight_cmd_buffers: Vec<vk::CommandBuffer>,
 }
 
-/// Ray tracing pipeline properties — owned copy (no lifetime dependency).
-#[derive(Clone, Copy)]
-pub(crate) struct RayTracingProperties {
-    pub shader_group_handle_size: u32,
-    pub shader_group_handle_alignment: u32,
-    pub max_ray_recursion_depth: u32,
-}
-
 /// Vulkan backend device.
 pub struct VulkanDevice {
     pub(crate) entry: Entry,
@@ -154,10 +143,7 @@ pub struct VulkanDevice {
     /// True when `VK_EXT_mesh_shader` was enabled at device creation.
     pub(crate) mesh_shader_supported: bool,
 
-    // Ray tracing support (VK_KHR_ray_tracing_pipeline + VK_KHR_acceleration_structure)
-    /// Present when both RT extensions were enabled. Contains the loader + pipeline properties.
-    pub(crate) ray_tracing: Option<(vk_rt_pipeline::Device, RayTracingProperties)>,
-    /// Present when VK_KHR_acceleration_structure was enabled.
+    /// Present when VK_KHR_acceleration_structure was enabled (for BLAS/TLAS builds).
     pub(crate) acceleration_structure: Option<vk_accel_structure::Device>,
     /// Monotonic counter for AccelerationStructureId assignment.
     pub(crate) accel_counter: RefCell<u32>,
@@ -715,12 +701,12 @@ impl VulkanDevice {
         };
         let supports_descriptor_buffer = has_ext(b"VK_EXT_descriptor_buffer");
         let supports_mesh_shader = has_ext(b"VK_EXT_mesh_shader");
-        // RT requires all three extensions together.
-        let supports_rt = has_ext(b"VK_KHR_acceleration_structure")
-            && has_ext(b"VK_KHR_ray_tracing_pipeline")
+        // Acceleration structures (BLAS/TLAS) need VK_KHR_acceleration_structure +
+        // VK_KHR_deferred_host_operations. Ray tracing is inline ray query, not RT pipelines.
+        let supports_accel = has_ext(b"VK_KHR_acceleration_structure")
             && has_ext(b"VK_KHR_deferred_host_operations");
         log::info!(
-            "RHI: Optional extensions — mesh_shader={supports_mesh_shader} ray_tracing={supports_rt}"
+            "RHI: Optional extensions — mesh_shader={supports_mesh_shader} acceleration_structure={supports_accel}"
         );
 
         if desc.bindless_mode == Some(BindlessMode::ArgumentTable) {
@@ -742,9 +728,8 @@ impl VulkanDevice {
         if supports_mesh_shader {
             device_extension_names.push(vk_mesh_shader::NAME.as_ptr());
         }
-        if supports_rt {
+        if supports_accel {
             device_extension_names.push(vk_accel_structure::NAME.as_ptr());
-            device_extension_names.push(vk_rt_pipeline::NAME.as_ptr());
             device_extension_names.push(ash::khr::deferred_host_operations::NAME.as_ptr());
         }
 
@@ -775,8 +760,6 @@ impl VulkanDevice {
         let mut accel_structure_features =
             vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
                 .acceleration_structure(true);
-        let mut rt_pipeline_features =
-            vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
 
         let features = vk::PhysicalDeviceFeatures {
             shader_clip_distance: 1,
@@ -794,9 +777,8 @@ impl VulkanDevice {
         if supports_mesh_shader {
             let _ = features2.push_next(&mut mesh_shader_features);
         }
-        if supports_rt {
+        if supports_accel {
             let _ = features2.push_next(&mut accel_structure_features);
-            let _ = features2.push_next(&mut rt_pipeline_features);
         }
 
         let priorities = [1.0f32];
@@ -849,26 +831,9 @@ impl VulkanDevice {
 
         let descriptor_buffer_loader = Some(descriptor_buffer::Device::new(&instance, &device));
 
-        // Acceleration structure + RT pipeline loaders
-        let acceleration_structure_opt = if supports_rt {
+        // Acceleration structure loader (for BLAS/TLAS builds).
+        let acceleration_structure_opt = if supports_accel {
             Some(vk_accel_structure::Device::new(&instance, &device))
-        } else {
-            None
-        };
-        let ray_tracing_opt = if supports_rt {
-            let rt_loader = vk_rt_pipeline::Device::new(&instance, &device);
-            // Query RT pipeline properties for shader group handle size etc.
-            let mut rt_props = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
-            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut rt_props);
-            unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
-            Some((
-                rt_loader,
-                RayTracingProperties {
-                    shader_group_handle_size: rt_props.shader_group_handle_size,
-                    shader_group_handle_alignment: rt_props.shader_group_handle_alignment,
-                    max_ray_recursion_depth: rt_props.max_ray_recursion_depth,
-                },
-            ))
         } else {
             None
         };
@@ -924,7 +889,6 @@ impl VulkanDevice {
             shader_modules: RefCell::new(Vec::new()),
             setup_command_buffer,
             mesh_shader_supported: supports_mesh_shader,
-            ray_tracing: ray_tracing_opt,
             acceleration_structure: acceleration_structure_opt,
             accel_counter: RefCell::new(0),
         })
@@ -1858,234 +1822,6 @@ impl VulkanDevice {
         })
     }
 
-    // -- Ray tracing pipeline (VK_KHR_ray_tracing_pipeline) --
-
-    pub fn create_ray_tracing_pso(&self, desc: &RayTracingPsoDesc) -> RhiResult<RayTracingPso> {
-        let (rt_loader, rt_props) = match &self.ray_tracing {
-            Some(rt) => rt,
-            None => {
-                return Err(RhiError::Unsupported(
-                    "VK_KHR_ray_tracing_pipeline not available on this device".into(),
-                ));
-            }
-        };
-        if desc.max_recursion_depth > rt_props.max_ray_recursion_depth {
-            return Err(RhiError::Unsupported(format!(
-                "ray recursion depth {} exceeds device limit {}",
-                desc.max_recursion_depth, rt_props.max_ray_recursion_depth
-            )));
-        }
-
-        let modules = self.shader_modules.borrow();
-        let module_for_group_shader = |shader: usize| {
-            let module_idx = *desc.shaders.get(shader).ok_or_else(|| {
-                RhiError::PipelineCreation(format!(
-                    "ray tracing shader group index {shader} is out of range"
-                ))
-            })?;
-            modules.get(module_idx).ok_or_else(|| {
-                RhiError::PipelineCreation(format!(
-                    "ray tracing shader module index {module_idx} is out of range"
-                ))
-            })
-        };
-        let mut stage_infos: Vec<vk::PipelineShaderStageCreateInfo> = Vec::new();
-        let mut groups: Vec<vk::RayTracingShaderGroupCreateInfoKHR> = Vec::new();
-
-        for group in &desc.groups {
-            match group {
-                RayTracingShaderGroup::RayGen { shader } => {
-                    let module = module_for_group_shader(*shader)?;
-                    let idx = stage_infos.len() as u32;
-                    stage_infos.push(
-                        vk::PipelineShaderStageCreateInfo::default()
-                            .stage(vk::ShaderStageFlags::RAYGEN_KHR)
-                            .module(module.module)
-                            .name(&module.entry_point),
-                    );
-                    groups.push(
-                        vk::RayTracingShaderGroupCreateInfoKHR::default()
-                            .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-                            .general_shader(idx)
-                            .closest_hit_shader(vk::SHADER_UNUSED_KHR)
-                            .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                            .intersection_shader(vk::SHADER_UNUSED_KHR),
-                    );
-                }
-                RayTracingShaderGroup::Miss { shader } => {
-                    let module = module_for_group_shader(*shader)?;
-                    let idx = stage_infos.len() as u32;
-                    stage_infos.push(
-                        vk::PipelineShaderStageCreateInfo::default()
-                            .stage(vk::ShaderStageFlags::MISS_KHR)
-                            .module(module.module)
-                            .name(&module.entry_point),
-                    );
-                    groups.push(
-                        vk::RayTracingShaderGroupCreateInfoKHR::default()
-                            .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-                            .general_shader(idx)
-                            .closest_hit_shader(vk::SHADER_UNUSED_KHR)
-                            .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                            .intersection_shader(vk::SHADER_UNUSED_KHR),
-                    );
-                }
-                RayTracingShaderGroup::TriangleHit {
-                    closest_hit,
-                    any_hit,
-                } => {
-                    let chit_module = module_for_group_shader(*closest_hit)?;
-                    let chit_idx = stage_infos.len() as u32;
-                    stage_infos.push(
-                        vk::PipelineShaderStageCreateInfo::default()
-                            .stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR)
-                            .module(chit_module.module)
-                            .name(&chit_module.entry_point),
-                    );
-                    let ahit_idx = if let Some(ah) = any_hit {
-                        let ahit_module = module_for_group_shader(*ah)?;
-                        let i = stage_infos.len() as u32;
-                        stage_infos.push(
-                            vk::PipelineShaderStageCreateInfo::default()
-                                .stage(vk::ShaderStageFlags::ANY_HIT_KHR)
-                                .module(ahit_module.module)
-                                .name(&ahit_module.entry_point),
-                        );
-                        i
-                    } else {
-                        vk::SHADER_UNUSED_KHR
-                    };
-                    groups.push(
-                        vk::RayTracingShaderGroupCreateInfoKHR::default()
-                            .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
-                            .general_shader(vk::SHADER_UNUSED_KHR)
-                            .closest_hit_shader(chit_idx)
-                            .any_hit_shader(ahit_idx)
-                            .intersection_shader(vk::SHADER_UNUSED_KHR),
-                    );
-                }
-                RayTracingShaderGroup::ProceduralHit {
-                    intersection,
-                    closest_hit,
-                    any_hit,
-                } => {
-                    let isect_module = module_for_group_shader(*intersection)?;
-                    let isect_idx = stage_infos.len() as u32;
-                    stage_infos.push(
-                        vk::PipelineShaderStageCreateInfo::default()
-                            .stage(vk::ShaderStageFlags::INTERSECTION_KHR)
-                            .module(isect_module.module)
-                            .name(&isect_module.entry_point),
-                    );
-                    let chit_idx = if let Some(ch) = closest_hit {
-                        let chit_module = module_for_group_shader(*ch)?;
-                        let i = stage_infos.len() as u32;
-                        stage_infos.push(
-                            vk::PipelineShaderStageCreateInfo::default()
-                                .stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR)
-                                .module(chit_module.module)
-                                .name(&chit_module.entry_point),
-                        );
-                        i
-                    } else {
-                        vk::SHADER_UNUSED_KHR
-                    };
-                    let ahit_idx = if let Some(ah) = any_hit {
-                        let ahit_module = module_for_group_shader(*ah)?;
-                        let i = stage_infos.len() as u32;
-                        stage_infos.push(
-                            vk::PipelineShaderStageCreateInfo::default()
-                                .stage(vk::ShaderStageFlags::ANY_HIT_KHR)
-                                .module(ahit_module.module)
-                                .name(&ahit_module.entry_point),
-                        );
-                        i
-                    } else {
-                        vk::SHADER_UNUSED_KHR
-                    };
-                    groups.push(
-                        vk::RayTracingShaderGroupCreateInfoKHR::default()
-                            .ty(vk::RayTracingShaderGroupTypeKHR::PROCEDURAL_HIT_GROUP)
-                            .general_shader(vk::SHADER_UNUSED_KHR)
-                            .closest_hit_shader(chit_idx)
-                            .any_hit_shader(ahit_idx)
-                            .intersection_shader(isect_idx),
-                    );
-                }
-                RayTracingShaderGroup::Callable { shader } => {
-                    let module = module_for_group_shader(*shader)?;
-                    let idx = stage_infos.len() as u32;
-                    stage_infos.push(
-                        vk::PipelineShaderStageCreateInfo::default()
-                            .stage(vk::ShaderStageFlags::CALLABLE_KHR)
-                            .module(module.module)
-                            .name(&module.entry_point),
-                    );
-                    groups.push(
-                        vk::RayTracingShaderGroupCreateInfoKHR::default()
-                            .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-                            .general_shader(idx)
-                            .closest_hit_shader(vk::SHADER_UNUSED_KHR)
-                            .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                            .intersection_shader(vk::SHADER_UNUSED_KHR),
-                    );
-                }
-            }
-        }
-
-        let push_range = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::ALL)
-            .offset(0)
-            .size(64); // Standard: two GpuAddress root pointers
-        let set_layouts = [self.texture_descriptor_set_layout];
-        let layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts)
-            .push_constant_ranges(std::slice::from_ref(&push_range));
-        let pipeline_layout = unsafe {
-            self.device
-                .create_pipeline_layout(&layout_info, None)
-                .map_err(|e| RhiError::PipelineCreation(e.to_string()))?
-        };
-
-        let pipeline_info = vk::RayTracingPipelineCreateInfoKHR::default()
-            .stages(&stage_infos)
-            .groups(&groups)
-            .max_pipeline_ray_recursion_depth(desc.max_recursion_depth)
-            .layout(pipeline_layout);
-
-        let pipelines = unsafe {
-            rt_loader
-                .create_ray_tracing_pipelines(
-                    vk::DeferredOperationKHR::null(),
-                    vk::PipelineCache::null(),
-                    &[pipeline_info],
-                    None,
-                )
-                .map_err(|e| RhiError::PipelineCreation(format!("{e:?}")))?
-        };
-        let pipeline = pipelines[0];
-
-        // Fetch opaque shader group handles for SBT construction.
-        let handle_size = rt_props.shader_group_handle_size;
-        let total = handle_size as usize * groups.len();
-        let group_handles = unsafe {
-            rt_loader
-                .get_ray_tracing_shader_group_handles(pipeline, 0, groups.len() as u32, total)
-                .map_err(|e| RhiError::PipelineCreation(e.to_string()))?
-        };
-
-        Ok(RayTracingPso {
-            inner: RayTracingPsoInner::Vulkan(Box::new(VulkanRayTracingPso {
-                pipeline,
-                pipeline_layout,
-                device: self.device.clone(),
-                group_handles,
-                handle_size,
-                handle_alignment: rt_props.shader_group_handle_alignment,
-            })),
-        })
-    }
-
     // -- Acceleration structures (VK_KHR_acceleration_structure) --
 
     fn build_flags_to_vk(flags: BuildAccelFlags) -> vk::BuildAccelerationStructureFlagsKHR {
@@ -2389,7 +2125,6 @@ impl VulkanDevice {
             None
         };
         let accel_loader_cmd = self.acceleration_structure.clone();
-        let rt_loader_cmd = self.ray_tracing.as_ref().map(|(l, _)| l.clone());
 
         Ok(CommandBuffer {
             inner: CommandBufferInner::Vulkan(Box::new(VulkanCommandBuffer {
@@ -2412,7 +2147,6 @@ impl VulkanDevice {
                 textures: self.textures.clone(),
                 mesh_shader,
                 acceleration_structure: accel_loader_cmd,
-                ray_tracing: rt_loader_cmd,
                 max_draw_indirect_count: self.max_draw_indirect_count,
             })),
         })
@@ -2468,7 +2202,6 @@ impl VulkanDevice {
             None
         };
         let accel_loader_cmd = self.acceleration_structure.clone();
-        let rt_loader_cmd = self.ray_tracing.as_ref().map(|(l, _)| l.clone());
 
         Ok(CommandBuffer {
             inner: CommandBufferInner::Vulkan(Box::new(VulkanCommandBuffer {
@@ -2491,7 +2224,6 @@ impl VulkanDevice {
                 textures: self.textures.clone(),
                 mesh_shader,
                 acceleration_structure: accel_loader_cmd,
-                ray_tracing: rt_loader_cmd,
                 max_draw_indirect_count: self.max_draw_indirect_count,
             })),
         })

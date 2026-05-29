@@ -351,17 +351,3 @@ pub struct TlasDesc {
     pub instance_count: u32,
     pub flags: BuildAccelFlags,
 }
-
-/// Shader binding table entry for a single shader group.
-/// Each entry is a GPU address pointing to a shader record.
-/// The record holds the shader identifier (backend-specific opaque blob)
-/// followed by user inline data.
-#[derive(Clone, Copy, Debug)]
-pub struct SbtRegion {
-    /// GPU address of the first record in this region.
-    pub device_address: GpuAddress,
-    /// Byte stride between consecutive records.
-    pub stride: u64,
-    /// Total byte size of this region.
-    pub size: u64,
-}

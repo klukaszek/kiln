@@ -6,7 +6,6 @@ use crate::memory::{
 };
 use crate::pipeline::{
     ComputePso, ComputePsoDesc, GraphicsPso, GraphicsPsoDesc, MeshletPso, MeshletPsoDesc,
-    RayTracingPso, RayTracingPsoDesc,
 };
 use crate::queue::Queue;
 use crate::sampler::{Sampler, SamplerDesc};
@@ -373,20 +372,6 @@ impl Device {
             DeviceInner::Vulkan(d) => d.create_meshlet_pso(desc),
             #[cfg(feature = "metal")]
             DeviceInner::Metal(d) => d.create_meshlet_pso(desc),
-        }
-    }
-
-    /// Create a ray tracing pipeline.
-    ///
-    /// On Vulkan, requires `VK_KHR_ray_tracing_pipeline` + `VK_KHR_acceleration_structure`.
-    /// On Metal, compiles the ray-generation compute kernel.
-    /// Returns `RhiError::Unsupported` if ray tracing is not available.
-    pub fn create_ray_tracing_pso(&self, desc: &RayTracingPsoDesc) -> RhiResult<RayTracingPso> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_ray_tracing_pso(desc),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_ray_tracing_pso(desc),
         }
     }
 

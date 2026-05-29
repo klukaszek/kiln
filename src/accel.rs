@@ -24,6 +24,6 @@ pub(crate) enum AccelInner {
 }
 
 pub use crate::types::{
-    BlasDesc, BlasMeshDesc, BuildAccelFlags, GeometryFlags, GeometryType, InstanceFlags, SbtRegion,
-    TlasDesc, TlasInstance,
+    BlasDesc, BlasMeshDesc, BuildAccelFlags, GeometryFlags, GeometryType, InstanceFlags, TlasDesc,
+    TlasInstance,
 };

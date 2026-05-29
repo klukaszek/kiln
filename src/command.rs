@@ -2,10 +2,10 @@ use crate::accel::AccelerationStructure;
 use crate::barrier::{HazardFlags, StageFlags};
 use crate::error::RhiResult;
 use crate::pipeline::{
-    BlendState, ComputePso, DepthStencilState, GraphicsPso, MeshletPso, RayTracingPso,
+    BlendState, ComputePso, DepthStencilState, GraphicsPso, MeshletPso,
 };
 use crate::types::*;
-use crate::types::{BlasDesc, SbtRegion, TlasDesc};
+use crate::types::{BlasDesc, TlasDesc};
 
 /// Color attachment for dynamic rendering.
 #[derive(Clone, Debug)]
@@ -638,31 +638,4 @@ impl CommandBuffer {
 
     // -- Ray tracing dispatch --
 
-    /// Launch ray tracing using the given SBT regions and dimension.
-    ///
-    /// Aaltonen model: SBT is GPU memory the caller manages.
-    /// On Vulkan: `vkCmdTraceRaysKHR`.
-    /// On Metal: dispatches the raygen compute kernel with caller-managed SBT regions.
-    #[allow(clippy::too_many_arguments)]
-    pub fn trace_rays(
-        &mut self,
-        pso: &RayTracingPso,
-        raygen: &SbtRegion,
-        miss: &SbtRegion,
-        hit: &SbtRegion,
-        width: u32,
-        height: u32,
-        depth: u32,
-    ) -> RhiResult<()> {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => {
-                cmd.trace_rays(pso, raygen, miss, hit, width, height, depth)
-            }
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => {
-                cmd.trace_rays(pso, raygen, miss, hit, width, height, depth)
-            }
-        }
-    }
 }

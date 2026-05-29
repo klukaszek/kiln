@@ -1,5 +1,47 @@
 use crate::types::GpuAddress;
 use crate::{Device, RhiError, RhiResult};
+use zerocopy::{FromBytes, IntoBytes};
+
+/// Types that can be copied verbatim to/from GPU-mapped memory: fixed C-like layout, no
+/// uninit padding, and valid for any bit pattern. Auto-implemented for anything deriving
+/// `zerocopy::{IntoBytes, FromBytes, Immutable}` (e.g. `GpuAddress`, `TextureId`, and any
+/// `#[repr(C)]` struct of such fields — see `gpu_struct!`).
+pub trait GpuPod: IntoBytes + FromBytes + zerocopy::Immutable {}
+impl<T> GpuPod for T where T: IntoBytes + FromBytes + zerocopy::Immutable {}
+
+/// Copy `bytes` into a CPU-mapped region, bounds-checked. Shared by the allocation upload
+/// methods so the single raw write lives in one audited place.
+fn mapped_write(ptr: Option<*mut u8>, capacity: u64, bytes: &[u8]) -> RhiResult<()> {
+    if bytes.len() as u64 > capacity {
+        return Err(RhiError::AllocationFailed(format!(
+            "upload of {} bytes exceeds mapped region ({capacity} bytes)",
+            bytes.len()
+        )));
+    }
+    let dst =
+        ptr.ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
+    // SAFETY: `dst` is a valid CPU-mapped pointer to at least `capacity` bytes (allocation
+    // invariant) and we just checked `bytes.len() <= capacity`. The GPU-mapped destination
+    // cannot overlap the Rust-owned `bytes` source.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
+    Ok(())
+}
+
+/// Read a `T` out of a CPU-mapped region, bounds-checked.
+fn mapped_read<T: GpuPod>(ptr: Option<*mut u8>, capacity: u64) -> RhiResult<T> {
+    let n = std::mem::size_of::<T>();
+    let src =
+        ptr.ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
+    if n as u64 > capacity {
+        return Err(RhiError::AllocationFailed(format!(
+            "read of {n} bytes exceeds mapped region ({capacity} bytes)"
+        )));
+    }
+    // SAFETY: `src` is valid for `capacity` >= `n` bytes; `T: FromBytes` => any bit pattern
+    // is a valid `T`.
+    let bytes = unsafe { std::slice::from_raw_parts(src as *const u8, n) };
+    T::read_from_bytes(bytes).map_err(|_| RhiError::AllocationFailed("read size mismatch".into()))
+}
 
 /// Memory residency for GPU allocations. Matches `NoGraphicsApi.md` `MEMORY_*` (line 95).
 ///
@@ -9,15 +51,16 @@ use crate::{Device, RhiError, RhiResult};
 ///   and large persistent buffers that benefit from lossless compression.
 /// - `Readback`: GPU-writable, CPU-cached on read. Slower GPU writes due to coherence.
 ///   Use for screenshots, virtual-texture feedback, GPGPU output.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum MemoryType {
+    #[default]
     Default,
     GpuOnly,
     Readback,
 }
 
 /// Description for creating a GPU buffer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct BufferDesc {
     pub size: u64,
     pub memory: MemoryType,
@@ -50,6 +93,50 @@ impl GpuAllocation {
     /// Consume the allocation and return the backing buffer.
     pub fn into_buffer(self) -> GpuBuffer {
         self.buffer
+    }
+
+    /// Upload a value into this allocation's CPU-mapped memory (bounds-checked).
+    ///
+    /// # Coherence
+    /// Requires `MemoryType::Default`/`Readback`. The caller is responsible for ordering
+    /// writes before the dependent GPU submit; this is a correctness concern, not a
+    /// memory-safety one.
+    pub fn upload<T: GpuPod>(&self, value: &T) -> RhiResult<()> {
+        mapped_write(self.mapped_ptr(), self.size, value.as_bytes())
+    }
+
+    /// Upload a slice into this allocation's CPU-mapped memory (bounds-checked).
+    pub fn upload_slice<T: GpuPod>(&self, data: &[T]) -> RhiResult<()> {
+        mapped_write(self.mapped_ptr(), self.size, data.as_bytes())
+    }
+
+    /// Read a value back from CPU-mapped memory (e.g. `Readback` after a GPU write).
+    pub fn read<T: GpuPod>(&self) -> RhiResult<T> {
+        mapped_read(self.mapped_ptr(), self.size)
+    }
+
+    /// View the mapped memory as `&[T]` (shared). Errors if not CPU-mapped or the size is
+    /// not a whole number of `T`.
+    pub fn as_slice<T: GpuPod>(&self) -> RhiResult<&[T]> {
+        let ptr = self
+            .mapped_ptr()
+            .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
+        // SAFETY: `ptr` is valid for `self.size` bytes for the lifetime of `&self`.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, self.size as usize) };
+        <[T]>::ref_from_bytes(bytes)
+            .map_err(|_| RhiError::AllocationFailed("size is not a multiple of element size".into()))
+    }
+
+    /// View the mapped memory as `&mut [T]` (exclusive). `&mut self` rules out CPU aliasing.
+    pub fn as_mut_slice<T: GpuPod>(&mut self) -> RhiResult<&mut [T]> {
+        let ptr = self
+            .mapped_ptr()
+            .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
+        // SAFETY: `ptr` is valid for `self.size` bytes; `&mut self` guarantees no other CPU
+        // reference aliases it.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, self.size as usize) };
+        <[T]>::mut_from_bytes(bytes)
+            .map_err(|_| RhiError::AllocationFailed("size is not a multiple of element size".into()))
     }
 }
 
@@ -105,47 +192,45 @@ impl GpuSubAllocation {
         self.offset
     }
 
-    /// Write a value into this suballocation.
+    /// Upload a value into this suballocation's CPU-mapped memory (bounds-checked).
     ///
-    /// # Safety
-    /// The caller must ensure the allocation is CPU mapped and not concurrently
-    /// accessed in a conflicting way by the GPU.
-    pub unsafe fn upload<T: zerocopy::IntoBytes + zerocopy::Immutable>(
-        &self,
-        data: &T,
-    ) -> RhiResult<()> {
-        let bytes = zerocopy::IntoBytes::as_bytes(data);
-        self.upload_bytes(bytes)
+    /// # Coherence
+    /// Requires CPU-mapped backing memory; ordering the write before the dependent GPU
+    /// submit is the caller's responsibility (a correctness, not memory-safety, concern).
+    pub fn upload<T: GpuPod>(&self, data: &T) -> RhiResult<()> {
+        mapped_write(self.cpu_ptr, self.size, data.as_bytes())
     }
 
-    /// Write a slice of values into this suballocation.
-    ///
-    /// # Safety
-    /// The caller must ensure the allocation is CPU mapped and not concurrently
-    /// accessed in a conflicting way by the GPU.
-    pub unsafe fn upload_slice<T: zerocopy::IntoBytes + zerocopy::Immutable>(
-        &self,
-        data: &[T],
-    ) -> RhiResult<()> {
-        let bytes = zerocopy::IntoBytes::as_bytes(data);
-        self.upload_bytes(bytes)
+    /// Upload a slice into this suballocation's CPU-mapped memory (bounds-checked).
+    pub fn upload_slice<T: GpuPod>(&self, data: &[T]) -> RhiResult<()> {
+        mapped_write(self.cpu_ptr, self.size, data.as_bytes())
     }
 
-    fn upload_bytes(&self, bytes: &[u8]) -> RhiResult<()> {
-        if bytes.len() as u64 > self.size {
-            return Err(RhiError::AllocationFailed(format!(
-                "upload size {} exceeds allocation size {}",
-                bytes.len(),
-                self.size
-            )));
-        }
-        let cpu_ptr = self
+    /// Read a value back from CPU-mapped memory.
+    pub fn read<T: GpuPod>(&self) -> RhiResult<T> {
+        mapped_read(self.cpu_ptr, self.size)
+    }
+
+    /// View the mapped memory as `&[T]` (shared).
+    pub fn as_slice<T: GpuPod>(&self) -> RhiResult<&[T]> {
+        let ptr = self
             .cpu_ptr
-            .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU mapped".into()))?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), cpu_ptr, bytes.len());
-        }
-        Ok(())
+            .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
+        // SAFETY: `ptr` is valid for `self.size` bytes for the lifetime of `&self`.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, self.size as usize) };
+        <[T]>::ref_from_bytes(bytes)
+            .map_err(|_| RhiError::AllocationFailed("size is not a multiple of element size".into()))
+    }
+
+    /// View the mapped memory as `&mut [T]` (exclusive). `&mut self` rules out CPU aliasing.
+    pub fn as_mut_slice<T: GpuPod>(&mut self) -> RhiResult<&mut [T]> {
+        let ptr = self
+            .cpu_ptr
+            .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
+        // SAFETY: `ptr` valid for `self.size` bytes; `&mut self` rules out CPU aliasing.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, self.size as usize) };
+        <[T]>::mut_from_bytes(bytes)
+            .map_err(|_| RhiError::AllocationFailed("size is not a multiple of element size".into()))
     }
 }
 
@@ -394,32 +479,17 @@ pub(crate) enum GpuBufferInner {
 impl GpuBuffer {
     /// Get the CPU-mapped pointer (only valid for Upload/Readback buffers).
     pub fn mapped_ptr(&self) -> Option<*mut u8> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            GpuBufferInner::Vulkan(b) => b.mapped_ptr(),
-            #[cfg(feature = "metal")]
-            GpuBufferInner::Metal(b) => b.mapped_ptr(),
-        }
+        backend_dispatch!(&self.inner, GpuBufferInner, b => b.mapped_ptr())
     }
 
     /// Get the GPU virtual address for shader access.
     pub fn gpu_address(&self) -> GpuAddress {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            GpuBufferInner::Vulkan(b) => b.gpu_address(),
-            #[cfg(feature = "metal")]
-            GpuBufferInner::Metal(b) => b.gpu_address(),
-        }
+        backend_dispatch!(&self.inner, GpuBufferInner, b => b.gpu_address())
     }
 
     /// Buffer size in bytes.
     pub fn size(&self) -> u64 {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            GpuBufferInner::Vulkan(b) => b.size(),
-            #[cfg(feature = "metal")]
-            GpuBufferInner::Metal(b) => b.size(),
-        }
+        backend_dispatch!(&self.inner, GpuBufferInner, b => b.size())
     }
 }
 

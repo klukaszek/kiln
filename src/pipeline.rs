@@ -104,6 +104,17 @@ pub struct ComputePsoDesc {
     pub label: Option<String>,
 }
 
+impl Default for ComputePsoDesc {
+    fn default() -> Self {
+        Self {
+            compute_shader: 0,
+            root_constant_size: std::mem::size_of::<GpuAddress>() as u32,
+            threads_per_threadgroup: [1, 1, 1],
+            label: None,
+        }
+    }
+}
+
 /// Opaque compute pipeline state object handle.
 pub struct ComputePso {
     pub(crate) inner: ComputePsoInner,

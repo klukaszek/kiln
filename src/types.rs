@@ -2,7 +2,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 /// GPU virtual address for buffer device address / Metal gpuAddress.
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, IntoBytes, FromBytes, Immutable)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, IntoBytes, FromBytes, Immutable)]
 pub struct GpuAddress(pub u64);
 
 impl GpuAddress {
@@ -287,7 +287,7 @@ bitflags::bitflags! {
 
 bitflags::bitflags! {
     /// Acceleration structure build flags.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
     pub struct BuildAccelFlags: u8 {
         const ALLOW_UPDATE      = 0x01;
         const ALLOW_COMPACTION  = 0x02;
@@ -319,7 +319,7 @@ pub struct BlasMeshDesc {
 }
 
 /// Descriptor for building a Bottom-Level Acceleration Structure.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct BlasDesc {
     pub meshes: Vec<BlasMeshDesc>,
     pub flags: BuildAccelFlags,
@@ -343,7 +343,7 @@ pub struct TlasInstance {
 }
 
 /// Descriptor for building a Top-Level Acceleration Structure.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TlasDesc {
     /// GPU address of an array of `TlasInstance`.
     pub instance_buffer: GpuAddress,

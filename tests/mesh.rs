@@ -101,14 +101,10 @@ fn mesh_fullscreen_color() {
     let root = device
         .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
-    unsafe {
-        common::write_mapped(
-            root.mapped_ptr().expect("root mapped"),
-            Root {
-                color: [0.0, 1.0, 0.0, 1.0],
-            },
-        );
-    }
+    root.upload(&Root {
+        color: [0.0, 1.0, 0.0, 1.0],
+    })
+    .expect("upload root");
     let readback = device
         .malloc((SIZE * SIZE * 4) as u64, MemoryType::Readback)
         .expect("readback");
@@ -140,21 +136,19 @@ fn mesh_fullscreen_color() {
         queue.wait_idle();
     });
 
-    let ptr = readback.mapped_ptr().expect("readback mapped");
-    unsafe {
-        for px in 0..(SIZE * SIZE) as usize {
-            let (r, g, b, a) = (
-                *ptr.add(px * 4),
-                *ptr.add(px * 4 + 1),
-                *ptr.add(px * 4 + 2),
-                *ptr.add(px * 4 + 3),
-            );
-            assert_eq!(
-                (r, g, b, a),
-                (0, 255, 0, 255),
-                "pixel {px} not green: ({r},{g},{b},{a})"
-            );
-        }
+    let pixels = readback.as_slice::<u8>().expect("read readback");
+    for px in 0..(SIZE * SIZE) as usize {
+        let (r, g, b, a) = (
+            pixels[px * 4],
+            pixels[px * 4 + 1],
+            pixels[px * 4 + 2],
+            pixels[px * 4 + 3],
+        );
+        assert_eq!(
+            (r, g, b, a),
+            (0, 255, 0, 255),
+            "pixel {px} not green: ({r},{g},{b},{a})"
+        );
     }
 
     device.free(root);

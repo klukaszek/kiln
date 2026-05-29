@@ -37,16 +37,12 @@ pub(crate) enum SwapchainInner {
 impl Swapchain {
     /// Get the swapchain color format.
     pub fn format(&self) -> Format {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            SwapchainInner::Vulkan(sc) => sc.format,
-            #[cfg(feature = "metal")]
-            SwapchainInner::Metal(sc) => sc.format,
-        }
+        backend_dispatch!(&self.inner, SwapchainInner, sc => sc.format)
     }
 
     /// Get the swapchain extent [width, height].
     pub fn extent(&self) -> [u32; 2] {
+        // Divergent per backend: Vulkan stores a `vk::Extent2D`, Metal a `[u32; 2]`.
         match &self.inner {
             #[cfg(feature = "vulkan")]
             SwapchainInner::Vulkan(sc) => [sc.extent.width, sc.extent.height],

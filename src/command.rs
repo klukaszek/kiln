@@ -164,105 +164,55 @@ impl CommandBuffer {
 
     /// Begin dynamic rendering (no VkRenderPass objects).
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.begin_render_pass(desc),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.begin_render_pass(desc),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.begin_render_pass(desc))
     }
 
     /// End dynamic rendering.
     pub fn end_render_pass(&mut self) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.end_render_pass(),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.end_render_pass(),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.end_render_pass())
     }
 
     // -- Pipeline state --
 
     /// Set the active graphics pipeline.
     pub fn set_graphics_pipeline(&mut self, pso: &GraphicsPso) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.set_graphics_pipeline(pso),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.set_graphics_pipeline(pso),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_graphics_pipeline(pso))
     }
 
     /// Set the active compute pipeline.
     pub fn set_compute_pipeline(&mut self, pso: &ComputePso) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.set_compute_pipeline(pso),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.set_compute_pipeline(pso),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_compute_pipeline(pso))
     }
 
     /// `gpuSetPipeline` for mesh pipelines — set before `draw_meshlets`/`draw_meshlets_indirect`.
     pub fn set_meshlet_pipeline(&mut self, pso: &MeshletPso) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.set_meshlet_pipeline(pso),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.set_meshlet_pipeline(pso),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_meshlet_pipeline(pso))
     }
 
     /// Set depth-stencil state.
     pub fn set_depth_stencil_state(&mut self, state: &DepthStencilState) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.set_depth_stencil_state(state),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.set_depth_stencil_state(state),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_depth_stencil_state(state))
     }
 
     /// Set blend state.
     pub fn set_blend_state(&mut self, state: &BlendState) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.set_blend_state(state),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.set_blend_state(state),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_blend_state(state))
     }
 
     // -- Root data (internal — callers never set these separately) --
 
     fn set_root_data(&mut self, vertex_root: GpuAddress, pixel_root: GpuAddress) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.set_root_data(vertex_root, pixel_root),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.set_root_data(vertex_root, pixel_root),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_root_data(vertex_root, pixel_root))
     }
 
     fn set_compute_root(&mut self, root: GpuAddress) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.set_compute_root(root),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.set_compute_root(root),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_compute_root(root))
     }
 
     /// Set the active bindless texture heap pointer for subsequent pipeline binds.
     /// Relevant for descriptor-buffer style backends.
     pub fn set_active_texture_heap_ptr(&mut self, heap_ptr: GpuAddress) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.set_active_texture_heap_ptr(heap_ptr),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.set_active_texture_heap_ptr(heap_ptr),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_active_texture_heap_ptr(heap_ptr))
     }
 
     // -- Draw / Dispatch --
@@ -316,23 +266,13 @@ impl CommandBuffer {
     /// `gpuDispatch(cb, dataGpu, gridDimensions)`
     pub fn dispatch(&mut self, root: GpuAddress, x: u32, y: u32, z: u32) {
         self.set_compute_root(root);
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.dispatch(x, y, z),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.dispatch(x, y, z),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch(x, y, z))
     }
 
     /// `gpuDispatchIndirect(cb, dataGpu, gridDimensionsGpu)`
     pub fn dispatch_indirect(&mut self, root: GpuAddress, args: GpuAddress) {
         self.set_compute_root(root);
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.dispatch_indirect(args),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.dispatch_indirect(args),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch_indirect(args))
     }
 
     /// `gpuDrawIndexedInstancedIndirect(cb, vertexDataGpu, pixelDataGpu, indicesGpu, argsGpu)`
@@ -344,12 +284,7 @@ impl CommandBuffer {
         args: GpuAddress,
     ) {
         self.set_root_data(vertex_root, pixel_root);
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.draw_indexed_indirect(indices, args),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.draw_indexed_indirect(indices, args),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indexed_indirect(indices, args))
     }
 
     /// `gpuDrawIndexedInstancedIndirectMulti(cb, vData, vStride, pData, pStride, argsGpu, drawCountGpu)`
@@ -396,12 +331,7 @@ impl CommandBuffer {
 
     /// Copy bytes between two GPU pointers.
     pub fn memcpy(&mut self, dst: GpuAddress, src: GpuAddress, size: u64) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.memcpy(dst, src, size),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.memcpy(dst, src, size),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.memcpy(dst, src, size))
     }
 
     /// `gpuCopyToTexture(cb, destGpu, srcGpu, texture)`
@@ -415,12 +345,7 @@ impl CommandBuffer {
         src: GpuAddress,
         texture: &crate::texture::Texture,
     ) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.copy_to_texture(texture_gpu, src, texture),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.copy_to_texture(texture_gpu, src, texture),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_to_texture(texture_gpu, src, texture))
     }
 
     /// `gpuCopyFromTexture(cb, destGpu, srcGpu, texture)`
@@ -433,34 +358,19 @@ impl CommandBuffer {
         texture_gpu: GpuAddress,
         texture: &crate::texture::Texture,
     ) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.copy_from_texture(dst, texture_gpu, texture),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.copy_from_texture(dst, texture_gpu, texture),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_from_texture(dst, texture_gpu, texture))
     }
 
     // -- Barriers --
 
     /// Stage-only global barrier.
     pub fn barrier(&mut self, src: StageFlags, dst: StageFlags) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.barrier(src, dst),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.barrier(src, dst),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.barrier(src, dst))
     }
 
     /// Stage barrier with hazard flags.
     pub fn barrier_with_hazard(&mut self, src: StageFlags, dst: StageFlags, hazard: HazardFlags) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.barrier_with_hazard(src, dst, hazard),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.barrier_with_hazard(src, dst, hazard),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.barrier_with_hazard(src, dst, hazard))
     }
 
     /// `gpuSignalAfter(cb, STAGE before, ptrGpu, value, SIGNAL signal)`
@@ -468,12 +378,7 @@ impl CommandBuffer {
     /// Split-barrier producer: writes `desc.value` to `desc.value_ptr` after `desc.src_stage`
     /// completes, using the specified atomic operation.
     pub fn signal_after(&mut self, desc: &SignalValueDesc) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.signal_after_value(desc),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.signal_after_value(desc),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.signal_after_value(desc))
     }
 
     /// `gpuWaitBefore(cb, STAGE after, ptrGpu, value, OP op, hazards=0, mask=~0)`
@@ -481,12 +386,7 @@ impl CommandBuffer {
     /// Split-barrier consumer: stalls `desc.dst_stage` until the value at `desc.value_ptr`
     /// satisfies `desc.wait_op` against `desc.value`, then enforces `desc.hazard` visibility.
     pub fn wait_before(&mut self, desc: &WaitValueDesc) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.wait_before_value(desc),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.wait_before_value(desc),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.wait_before_value(desc))
     }
 
     // -- Viewport / Scissor --
@@ -515,12 +415,7 @@ impl CommandBuffer {
 
     /// Set scissor rect.
     pub fn set_scissor(&mut self, x: i32, y: i32, width: u32, height: u32) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.set_scissor(x, y, width, height),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.set_scissor(x, y, width, height),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_scissor(x, y, width, height))
     }
 
     // -- Presentation --
@@ -569,12 +464,7 @@ impl CommandBuffer {
         z: u32,
     ) {
         self.set_root_data(mesh_root, pixel_root);
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.draw_meshlets(x, y, z),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.draw_meshlets(x, y, z),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets(x, y, z))
     }
 
     /// `gpuDrawMeshletsIndirect(cb, meshletDataGpu, pixelDataGpu, dimGpu)`
@@ -588,12 +478,7 @@ impl CommandBuffer {
         args: GpuAddress,
     ) {
         self.set_root_data(mesh_root, pixel_root);
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.draw_meshlets_indirect(args),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.draw_meshlets_indirect(args),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets_indirect(args))
     }
 
     // -- Acceleration structure builds --
@@ -604,12 +489,7 @@ impl CommandBuffer {
     /// parameter to the buffer slot after the root, so ray-query compute kernels bind the
     /// TLAS at slot 1. Call after the pipeline is set and before the dispatch.
     pub fn bind_acceleration_structure(&mut self, slot: u32, accel: &AccelerationStructure) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.bind_acceleration_structure(slot, accel),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.bind_acceleration_structure(slot, accel),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.bind_acceleration_structure(slot, accel))
     }
 
     /// Build a bottom-level acceleration structure.
@@ -618,22 +498,12 @@ impl CommandBuffer {
     /// `device.create_blas(desc)` using the same `desc`.  A scratch buffer is required;
     /// on Metal it is stored on the `AccelerationStructure` handle from creation time.
     pub fn build_blas(&mut self, accel: &AccelerationStructure, desc: &BlasDesc) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.build_blas(accel, desc),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.build_blas(accel, desc),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.build_blas(accel, desc))
     }
 
     /// Build a top-level acceleration structure.
     pub fn build_tlas(&mut self, accel: &AccelerationStructure, desc: &TlasDesc) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.build_tlas(accel, desc),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => cmd.build_tlas(accel, desc),
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.build_tlas(accel, desc))
     }
 
     // -- Ray tracing dispatch --

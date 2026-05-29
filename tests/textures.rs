@@ -123,16 +123,13 @@ fn texture_copy_roundtrip() {
         .expect("create_texture");
 
     let bytes = (W as usize) * (H as usize) * BPP;
-    let src = device.malloc(bytes as u64, MemoryType::Default).expect("upload");
+    let mut src = device.malloc(bytes as u64, MemoryType::Default).expect("upload");
     let dst = device
         .malloc(bytes as u64, MemoryType::Readback)
         .expect("readback");
 
-    let src_ptr = src.mapped_ptr().expect("upload is CPU-mapped");
-    unsafe {
-        for i in 0..bytes {
-            *src_ptr.add(i) = (i as u8).wrapping_mul(31).wrapping_add(5);
-        }
+    for (i, b) in src.as_mut_slice::<u8>().expect("src slice").iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(31).wrapping_add(5);
     }
 
     common::timed("upload→texture→readback · submit+wait", || {
@@ -147,12 +144,9 @@ fn texture_copy_roundtrip() {
         queue.wait_idle();
     });
 
-    let dst_ptr = dst.mapped_ptr().expect("readback is CPU-mapped");
-    unsafe {
-        for i in 0..bytes {
-            let expected = (i as u8).wrapping_mul(31).wrapping_add(5);
-            assert_eq!(*dst_ptr.add(i), expected, "texel byte {i} mismatch");
-        }
+    for (i, &b) in dst.as_slice::<u8>().expect("dst slice").iter().enumerate() {
+        let expected = (i as u8).wrapping_mul(31).wrapping_add(5);
+        assert_eq!(b, expected, "texel byte {i} mismatch");
     }
 
     device.free(src);

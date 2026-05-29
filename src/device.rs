@@ -1,6 +1,6 @@
 use crate::accel::AccelerationStructure;
 use crate::command::CommandBuffer;
-use crate::error::RhiResult;
+use crate::error::{RhiError, RhiResult};
 use crate::memory::{
     BufferDesc, GpuAllocation, GpuAllocator, GpuAllocatorDesc, GpuBuffer, MemoryType,
 };
@@ -137,12 +137,7 @@ impl Device {
 
     /// The active bindless mode selected by the backend.
     pub fn bindless_mode(&self) -> BindlessMode {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.bindless_mode(),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.bindless_mode(),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.bindless_mode())
     }
 
     /// Clip-space Y convention for this backend.
@@ -157,12 +152,7 @@ impl Device {
 
     /// Create a presentation surface from raw window handles.
     pub fn create_surface(&self, desc: &SurfaceDesc) -> RhiResult<Surface> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_surface(desc),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_surface(desc),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_surface(desc))
     }
 
     /// Create a swapchain for the given surface.
@@ -171,12 +161,7 @@ impl Device {
         surface: &Surface,
         desc: &SwapchainDesc,
     ) -> RhiResult<Swapchain> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_swapchain(surface, desc),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_swapchain(surface, desc),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_swapchain(surface, desc))
     }
 
     /// Recreate swapchain (on resize).
@@ -185,22 +170,12 @@ impl Device {
         swapchain: &mut Swapchain,
         desc: &SwapchainDesc,
     ) -> RhiResult<()> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.recreate_swapchain(swapchain, desc),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.recreate_swapchain(swapchain, desc),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.recreate_swapchain(swapchain, desc))
     }
 
     /// Create a GPU buffer.
     pub fn create_buffer(&self, desc: &BufferDesc) -> RhiResult<GpuBuffer> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_buffer(desc),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_buffer(desc),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_buffer(desc))
     }
 
     /// Allocate GPU memory and return a pointer-first allocation.
@@ -245,22 +220,12 @@ impl Device {
 
     /// Translate a CPU-mapped pointer to a GPU virtual address, if possible.
     pub fn host_to_device_pointer(&self, cpu_ptr: *const u8) -> Option<GpuAddress> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.host_to_device_pointer(cpu_ptr),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.host_to_device_pointer(cpu_ptr),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.host_to_device_pointer(cpu_ptr))
     }
 
     /// Query the size/alignment required for `create_texture`.
     pub fn texture_size_align(&self, desc: &TextureDesc) -> RhiResult<TextureSizeAlign> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.texture_size_align(desc),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.texture_size_align(desc),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.texture_size_align(desc))
     }
 
     /// Create a texture in caller-owned GPU memory.
@@ -274,12 +239,7 @@ impl Device {
         desc: &TextureDesc,
         texture_gpu: GpuAddress,
     ) -> RhiResult<Texture> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_texture(desc, texture_gpu),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_texture(desc, texture_gpu),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_texture(desc, texture_gpu))
     }
 
     /// Create a sampled (SRV) view of an existing texture and register it in the bindless heap.
@@ -293,12 +253,7 @@ impl Device {
         source: &Texture,
         view: &GpuViewDesc,
     ) -> RhiResult<crate::types::TextureId> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.texture_view_descriptor(source, view),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.texture_view_descriptor(source, view),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.texture_view_descriptor(source, view))
     }
 
     /// Create a storage (UAV) view of an existing texture and register it in the bindless heap.
@@ -311,52 +266,27 @@ impl Device {
         source: &Texture,
         view: &GpuViewDesc,
     ) -> RhiResult<crate::types::TextureId> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.rw_texture_view_descriptor(source, view),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.rw_texture_view_descriptor(source, view),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.rw_texture_view_descriptor(source, view))
     }
 
     /// Create a sampler.
     pub fn create_sampler(&self, desc: &SamplerDesc) -> RhiResult<Sampler> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_sampler(desc),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_sampler(desc),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_sampler(desc))
     }
 
     /// Create a shader module.
     pub fn create_shader_module(&self, desc: &ShaderModuleDesc) -> RhiResult<ShaderModule> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_shader_module(desc),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_shader_module(desc),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_shader_module(desc))
     }
 
     /// Create a graphics pipeline state object.
     pub fn create_graphics_pso(&self, desc: &GraphicsPsoDesc) -> RhiResult<GraphicsPso> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_graphics_pso(desc),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_graphics_pso(desc),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_graphics_pso(desc))
     }
 
     /// Create a compute pipeline state object.
     pub fn create_compute_pso(&self, desc: &ComputePsoDesc) -> RhiResult<ComputePso> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_compute_pso(desc),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_compute_pso(desc),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_compute_pso(desc))
     }
 
     /// Create a mesh-shader graphics pipeline.
@@ -367,12 +297,7 @@ impl Device {
     /// On Metal, uses the Metal 4 mesh render pipeline path.
     /// Returns `RhiError::Unsupported` if the device does not support mesh shaders.
     pub fn create_meshlet_pso(&self, desc: &MeshletPsoDesc) -> RhiResult<MeshletPso> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_meshlet_pso(desc),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_meshlet_pso(desc),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_meshlet_pso(desc))
     }
 
     /// Allocate a Bottom-Level Acceleration Structure.
@@ -380,22 +305,12 @@ impl Device {
     /// The returned `AccelerationStructure` must be built via `cmd.build_blas(as, desc)`
     /// before it can be referenced in a TLAS instance.
     pub fn create_blas(&self, desc: &BlasDesc) -> RhiResult<AccelerationStructure> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_blas(desc),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_blas(desc),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_blas(desc))
     }
 
     /// Allocate a Top-Level Acceleration Structure.
     pub fn create_tlas(&self, desc: &TlasDesc) -> RhiResult<AccelerationStructure> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_tlas(desc),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_tlas(desc),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_tlas(desc))
     }
 
     /// Return the GPU address of a built acceleration structure.
@@ -418,37 +333,39 @@ impl Device {
     /// buffer passed to `build_tlas` must use this stride; fill entries with
     /// [`write_tlas_instance`](Self::write_tlas_instance).
     pub fn tlas_instance_stride(&self) -> usize {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.tlas_instance_stride(),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.tlas_instance_stride(),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.tlas_instance_stride())
     }
 
-    /// Encode a [`TlasInstance`] into `dst` using the active backend's native instance
-    /// layout (Vulkan `VkAccelerationStructureInstanceKHR`; Metal indirect descriptor).
-    /// `dst` must have room for [`tlas_instance_stride`](Self::tlas_instance_stride) bytes.
-    ///
-    /// # Safety
-    /// `dst` must point to at least `tlas_instance_stride()` writable, mapped bytes.
-    pub unsafe fn write_tlas_instance(&self, dst: *mut u8, instance: &TlasInstance) {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.write_tlas_instance(dst, instance),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.write_tlas_instance(dst, instance),
+    /// Encode `instance` into slot `index` of a CPU-mapped instance buffer, using the active
+    /// backend's native instance layout (Vulkan `VkAccelerationStructureInstanceKHR`; Metal
+    /// indirect descriptor). Size the buffer as `instance_count * tlas_instance_stride()`.
+    pub fn write_tlas_instance(
+        &self,
+        dst: &crate::memory::GpuAllocation,
+        index: usize,
+        instance: &TlasInstance,
+    ) -> RhiResult<()> {
+        let stride = self.tlas_instance_stride();
+        let offset = index * stride;
+        let capacity = dst.size() as usize;
+        if offset + stride > capacity {
+            return Err(RhiError::AllocationFailed(format!(
+                "TLAS instance {index} (stride {stride}) exceeds instance buffer ({capacity} bytes)"
+            )));
         }
+        let base = dst.mapped_ptr().ok_or_else(|| {
+            RhiError::AllocationFailed("instance buffer is not CPU-mapped".into())
+        })?;
+        // SAFETY: `offset + stride <= capacity`, and `base` is valid for `capacity` mapped
+        // bytes, so `ptr` points to `stride` writable bytes for the backend to fill.
+        let ptr = unsafe { base.add(offset) };
+        backend_dispatch!(&self.inner, DeviceInner, d => d.write_tlas_instance(ptr, instance));
+        Ok(())
     }
 
     /// Create a transient command buffer for recording.
     pub fn create_command_buffer(&self) -> RhiResult<CommandBuffer> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_command_buffer(),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_command_buffer(),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_command_buffer())
     }
 
     /// Create a command buffer pre-configured with swapchain image views.
@@ -457,72 +374,37 @@ impl Device {
         &self,
         swapchain: &Swapchain,
     ) -> RhiResult<CommandBuffer> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_command_buffer_for_swapchain(swapchain),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_command_buffer_for_swapchain(swapchain),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_command_buffer_for_swapchain(swapchain))
     }
 
     /// Get the primary queue.
     pub fn queue(&self) -> &Queue {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.queue(),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.queue(),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.queue())
     }
 
     /// Create a timeline semaphore.
     pub fn create_timeline_semaphore(&self, initial_value: u64) -> RhiResult<TimelineSemaphore> {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.create_timeline_semaphore(initial_value),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.create_timeline_semaphore(initial_value),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_timeline_semaphore(initial_value))
     }
 
     /// Wait for the device to be idle.
     pub fn wait_idle(&self) {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.wait_idle(),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.wait_idle(),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.wait_idle())
     }
 
     /// Destroy a buffer.
     pub fn destroy_buffer(&self, buffer: GpuBuffer) {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.destroy_buffer(buffer),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.destroy_buffer(buffer),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.destroy_buffer(buffer))
     }
 
     /// Destroy a texture.
     pub fn destroy_texture(&self, texture: Texture) {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.destroy_texture(texture),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.destroy_texture(texture),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.destroy_texture(texture))
     }
 
     /// Wait for a specific frame's fence before reusing resources.
     pub fn wait_for_frame(&self, frame_index: usize) {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(d) => d.wait_for_frame(frame_index),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(d) => d.wait_for_frame(frame_index),
-        }
+        backend_dispatch!(&self.inner, DeviceInner, d => d.wait_for_frame(frame_index))
     }
 
     /// Get raw Vulkan handles for escape-hatch scenarios (e.g. ImGui).

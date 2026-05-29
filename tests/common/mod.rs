@@ -112,7 +112,7 @@ macro_rules! gpu_struct {
     ) => {
         $(#[$meta])*
         #[repr(C)]
-        #[derive(Clone, Copy)]
+        #[derive(Clone, Copy, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::Immutable)]
         $vis struct $name {
             $( pub $fname : $fty ),*
         }
@@ -127,13 +127,6 @@ macro_rules! gpu_struct {
     };
 }
 
-/// Write a `#[repr(C)]` value into a mapped GPU allocation (type-safe root upload).
-///
-/// # Safety
-/// `mapped` must point to at least `size_of::<T>()` writable, mapped bytes.
-pub unsafe fn write_mapped<T: Copy>(mapped: *mut u8, value: T) {
-    unsafe { std::ptr::write_unaligned(mapped as *mut T, value) }
-}
 
 // ---------------------------------------------------------------------------
 // Backend-agnostic shading via Slang

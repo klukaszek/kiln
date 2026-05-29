@@ -14,6 +14,9 @@ gpu_struct! {
         input: u64 as "uint*",
         output: u64 as "uint*",
         count: u32 as "uint",
+        // Explicit tail padding so the struct is padding-free (GpuPod/IntoBytes) and matches
+        // Slang's 24-byte natural layout exactly.
+        _pad: u32 as "uint",
     }
 }
 
@@ -64,21 +67,17 @@ fn compute_doubles_buffer() {
         .malloc(std::mem::size_of::<Data>() as u64, MemoryType::Default)
         .expect("root data");
 
-    unsafe {
-        let ip = input.mapped_ptr().expect("input mapped") as *mut u32;
-        for i in 0..N {
-            *ip.add(i as usize) = i;
-        }
-        // Build the root struct type-safely — no hand-computed offsets.
-        common::write_mapped(
-            data.mapped_ptr().expect("data mapped"),
-            Data {
-                input: input.gpu_address().0,
-                output: output.gpu_address().0,
-                count: N,
-            },
-        );
-    }
+    input
+        .upload_slice(&(0..N).collect::<Vec<u32>>())
+        .expect("upload input");
+    // Build the root struct type-safely — no raw pointers, no hand-computed offsets.
+    data.upload(&Data {
+        input: input.gpu_address().0,
+        output: output.gpu_address().0,
+        count: N,
+        _pad: 0,
+    })
+    .expect("upload root");
 
     common::timed("dispatch 1024 · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
@@ -91,11 +90,9 @@ fn compute_doubles_buffer() {
         queue.wait_idle();
     });
 
-    unsafe {
-        let op = output.mapped_ptr().expect("output mapped") as *const u32;
-        for i in 0..N {
-            assert_eq!(*op.add(i as usize), i * 2, "element {i} not doubled");
-        }
+    let result = output.as_slice::<u32>().expect("read output");
+    for i in 0..N as usize {
+        assert_eq!(result[i], i as u32 * 2, "element {i} not doubled");
     }
 
     device.free(input);

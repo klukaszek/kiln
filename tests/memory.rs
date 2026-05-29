@@ -16,21 +16,28 @@ fn default_memory_is_cpu_mapped_roundtrip() {
     };
 
     const N: usize = 4096;
-    let allocation = common::timed("malloc 4 KiB (Default)", || {
+    let mut allocation = common::timed("malloc 4 KiB (Default)", || {
         device
             .malloc(N as u64, MemoryType::Default)
             .expect("malloc(Default) should succeed")
     });
-    let ptr = allocation
-        .mapped_ptr()
-        .expect("Default memory must expose a CPU-mapped pointer");
 
-    common::timed("CPU write+read 4 KiB roundtrip", || unsafe {
-        for i in 0..N {
-            *ptr.add(i) = (i as u8).wrapping_mul(7);
+    common::timed("CPU write+read 4 KiB roundtrip", || {
+        for (i, b) in allocation
+            .as_mut_slice::<u8>()
+            .expect("mapped slice")
+            .iter_mut()
+            .enumerate()
+        {
+            *b = (i as u8).wrapping_mul(7);
         }
-        for i in 0..N {
-            assert_eq!(*ptr.add(i), (i as u8).wrapping_mul(7), "byte {i} mismatch");
+        for (i, &b) in allocation
+            .as_slice::<u8>()
+            .expect("mapped slice")
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(b, (i as u8).wrapping_mul(7), "byte {i} mismatch");
         }
     });
 
@@ -59,6 +66,9 @@ fn host_to_device_pointer_translates_with_offset() {
     });
     assert_eq!(base, allocation.gpu_address());
 
+    // `host_to_device_pointer` is intentionally a raw-pointer bridge, so exercising an
+    // offset translation requires raw pointer arithmetic — the one place `unsafe` is
+    // inherent to what's under test.
     let offset = device
         .host_to_device_pointer(unsafe { cpu.add(64) })
         .expect("offset CPU pointer should translate to a GPU address");

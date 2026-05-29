@@ -74,9 +74,7 @@ fn ray_query_triangle_hit() {
     let vbuf = device
         .malloc(std::mem::size_of_val(&verts) as u64, MemoryType::Default)
         .expect("vertex buffer");
-    unsafe {
-        common::write_mapped(vbuf.mapped_ptr().expect("vbuf mapped"), verts);
-    }
+    vbuf.upload(&verts).expect("upload vertices");
 
     let blas_desc = BlasDesc {
         meshes: vec![BlasMeshDesc {
@@ -124,9 +122,9 @@ fn ray_query_triangle_hit() {
         instance_sbt_offset_and_flags: 0,
         acceleration_structure_reference: device.accel_gpu_address(&blas),
     };
-    unsafe {
-        device.write_tlas_instance(instbuf.mapped_ptr().expect("inst mapped"), &instance);
-    }
+    device
+        .write_tlas_instance(&instbuf, 0, &instance)
+        .expect("write instance");
 
     let tlas_desc = TlasDesc {
         instance_buffer: instbuf.gpu_address(),
@@ -149,14 +147,10 @@ fn ray_query_triangle_hit() {
     let root = device
         .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
-    unsafe {
-        common::write_mapped(
-            root.mapped_ptr().expect("root mapped"),
-            Root {
-                output: output.gpu_address().0,
-            },
-        );
-    }
+    root.upload(&Root {
+        output: output.gpu_address().0,
+    })
+    .expect("upload root");
 
     common::timed("ray query dispatch · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
@@ -170,7 +164,7 @@ fn ray_query_triangle_hit() {
         q.wait_idle();
     });
 
-    let hit = unsafe { *(output.mapped_ptr().expect("output mapped") as *const u32) };
+    let hit = output.read::<u32>().expect("read hit result");
     assert_eq!(hit, 1, "ray query should report a triangle hit");
 
     device.free(vbuf);

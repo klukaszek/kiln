@@ -14,6 +14,9 @@
 //! - Mesh shader pipelines (gpuCreateGraphicsMeshletPipeline / gpuDrawMeshlets)
 //! - Ray tracing (BLAS/TLAS + inline ray query in compute)
 
+#[macro_use]
+mod macros;
+
 pub mod accel;
 pub mod backend;
 pub mod barrier;
@@ -42,7 +45,7 @@ pub use command::{
 pub use device::{Backend, BindlessMode, Device, DeviceDesc};
 pub use error::{RhiError, RhiResult};
 pub use memory::{
-    BufferDesc, BumpAllocator, GpuAllocation, GpuAllocator, GpuAllocatorDesc, GpuBuffer,
+    BufferDesc, BumpAllocator, GpuAllocation, GpuAllocator, GpuAllocatorDesc, GpuBuffer, GpuPod,
     GpuSubAllocation, MemoryType, TransientAllocation,
 };
 pub use pipeline::*;

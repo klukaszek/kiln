@@ -14,14 +14,11 @@ fn gpu_memcpy_roundtrip() {
 
     const SIZE: u64 = 1 << 16; // 64 KiB
 
-    let src = device.malloc(SIZE, MemoryType::Default).expect("src");
+    let mut src = device.malloc(SIZE, MemoryType::Default).expect("src");
     let dst = device.malloc(SIZE, MemoryType::Readback).expect("dst");
 
-    let src_ptr = src.mapped_ptr().expect("Default is CPU-mapped");
-    unsafe {
-        for i in 0..SIZE as usize {
-            *src_ptr.add(i) = (i as u8).wrapping_mul(13).wrapping_add(1);
-        }
+    for (i, b) in src.as_mut_slice::<u8>().expect("src slice").iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(13).wrapping_add(1);
     }
 
     common::timed("memcpy 64 KiB · record+submit+wait", || {
@@ -34,12 +31,9 @@ fn gpu_memcpy_roundtrip() {
         queue.wait_idle();
     });
 
-    let dst_ptr = dst.mapped_ptr().expect("Readback is CPU-mapped");
-    unsafe {
-        for i in 0..SIZE as usize {
-            let expected = (i as u8).wrapping_mul(13).wrapping_add(1);
-            assert_eq!(*dst_ptr.add(i), expected, "byte {i} mismatch");
-        }
+    for (i, &b) in dst.as_slice::<u8>().expect("dst slice").iter().enumerate() {
+        let expected = (i as u8).wrapping_mul(13).wrapping_add(1);
+        assert_eq!(b, expected, "byte {i} mismatch");
     }
 
     device.free(src);

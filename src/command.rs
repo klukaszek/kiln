@@ -598,6 +598,20 @@ impl CommandBuffer {
 
     // -- Acceleration structure builds --
 
+    /// Bind a (TLAS) acceleration structure as a shader resource at `slot` for ray queries.
+    ///
+    /// Slang lowers a `RaytracingAccelerationStructure` declared as a trailing entry-point
+    /// parameter to the buffer slot after the root, so ray-query compute kernels bind the
+    /// TLAS at slot 1. Call after the pipeline is set and before the dispatch.
+    pub fn bind_acceleration_structure(&mut self, slot: u32, accel: &AccelerationStructure) {
+        match &mut self.inner {
+            #[cfg(feature = "vulkan")]
+            CommandBufferInner::Vulkan(cmd) => cmd.bind_acceleration_structure(slot, accel),
+            #[cfg(feature = "metal")]
+            CommandBufferInner::Metal(cmd) => cmd.bind_acceleration_structure(slot, accel),
+        }
+    }
+
     /// Build a bottom-level acceleration structure.
     ///
     /// This encodes the GPU build command. The `accel` object must have been created by

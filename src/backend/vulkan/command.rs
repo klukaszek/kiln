@@ -958,6 +958,19 @@ impl VulkanCommandBuffer {
 
     // -- Acceleration structure builds --
 
+    pub fn bind_acceleration_structure(
+        &mut self,
+        _slot: u32,
+        _accel: &crate::accel::AccelerationStructure,
+    ) {
+        // Vulkan binds the TLAS as an acceleration-structure descriptor (set 0, binding 0),
+        // not via the argument table — needs a descriptor write through the descriptor
+        // buffer. Not yet wired up (RT path is Metal-validated for now).
+        log::warn!(
+            "bind_acceleration_structure: ray-query TLAS binding not yet implemented on Vulkan"
+        );
+    }
+
     pub fn build_blas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &BlasDesc) {
         let Some((accel_loader, vk_as)) = self.resolve_accel(accel, "build_blas") else {
             return;

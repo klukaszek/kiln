@@ -21,7 +21,8 @@ gpu_struct! {
 
 // Full-screen triangle in the vertex shader (covers all of NDC regardless of clip-space Y),
 // constant colour from the root in the pixel shader.
-const GFX_BODY: &str = r#"
+const GFX_BODY: &str = /*slang*/
+    r#"
 struct VOut { float4 pos : SV_Position; };
 
 [shader("vertex")]

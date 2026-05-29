@@ -1651,9 +1651,11 @@ impl MetalDevice {
         unsafe {
             instance_desc.setInstanceDescriptorBuffer(objc2_metal::MTL4BufferRange {
                 bufferAddress: desc.instance_buffer.0,
-                // stride = size of TlasInstance (64 bytes, matches MTLAccelerationStructureInstanceDescriptor)
-                length: (desc.instance_count as u64)
-                    * std::mem::size_of::<crate::types::TlasInstance>() as u64,
+                // MTL4InstanceAccelerationStructureDescriptor defaults to the *indirect*
+                // instance-descriptor type, whose native layout is
+                // MTLIndirectAccelerationStructureInstanceDescriptor (NOT the Vulkan-shaped
+                // TlasInstance). Callers fill the buffer via device.write_tlas_instance.
+                length: (desc.instance_count as u64) * self.tlas_instance_stride() as u64,
             });
             instance_desc.setInstanceCount(desc.instance_count as usize);
         }
@@ -1665,6 +1667,52 @@ impl MetalDevice {
             )
         };
         self.finalize_accel_structure(sizes, "TLAS")
+    }
+
+    /// Native size of one TLAS instance descriptor. Metal's instance acceleration structure
+    /// uses the *indirect* descriptor layout (references the BLAS by `gpuResourceID`).
+    pub fn tlas_instance_stride(&self) -> usize {
+        std::mem::size_of::<objc2_metal::MTLIndirectAccelerationStructureInstanceDescriptor>()
+    }
+
+    /// Encode `inst` into `dst` in Metal's native indirect instance-descriptor layout.
+    /// `dst` must have room for `tlas_instance_stride()` bytes.
+    ///
+    /// `inst.acceleration_structure_reference` must be the BLAS `gpuResourceID` (i.e. the
+    /// value returned by `device.accel_gpu_address(blas)` on Metal).
+    pub fn write_tlas_instance(&self, dst: *mut u8, inst: &crate::types::TlasInstance) {
+        use objc2_metal::{
+            MTLAccelerationStructureInstanceOptions, MTLIndirectAccelerationStructureInstanceDescriptor,
+            MTLPackedFloat3, MTLPackedFloat4x3, MTLResourceID,
+        };
+
+        // TlasInstance.transform is row-major 3x4 (transform[row][col]); Metal's packed 4x3
+        // is column-major (columns[c] = (m[0][c], m[1][c], m[2][c])).
+        let t = &inst.transform;
+        let col = |c: usize| MTLPackedFloat3 {
+            x: t[0][c],
+            y: t[1][c],
+            z: t[2][c],
+        };
+        let resource_id: MTLResourceID =
+            unsafe { std::mem::transmute(inst.acceleration_structure_reference) };
+
+        let desc = MTLIndirectAccelerationStructureInstanceDescriptor {
+            transformationMatrix: MTLPackedFloat4x3 {
+                columns: [col(0), col(1), col(2), col(3)],
+            },
+            options: MTLAccelerationStructureInstanceOptions::empty(),
+            mask: (inst.instance_custom_index_and_mask >> 24) & 0xFF,
+            intersectionFunctionTableOffset: inst.instance_sbt_offset_and_flags & 0x00FF_FFFF,
+            userID: inst.instance_custom_index_and_mask & 0x00FF_FFFF,
+            accelerationStructureID: resource_id,
+        };
+        unsafe {
+            std::ptr::write_unaligned(
+                dst as *mut MTLIndirectAccelerationStructureInstanceDescriptor,
+                desc,
+            );
+        }
     }
 
     /// Allocate the acceleration structure + scratch buffer for `sizes`, register both

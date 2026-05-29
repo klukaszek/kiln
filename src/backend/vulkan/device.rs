@@ -2201,6 +2201,18 @@ impl VulkanDevice {
         )
     }
 
+    /// Vulkan's TLAS instance layout is `VkAccelerationStructureInstanceKHR`, which is
+    /// exactly the RHI's `TlasInstance` layout (BLAS referenced by device address).
+    pub fn tlas_instance_stride(&self) -> usize {
+        std::mem::size_of::<crate::types::TlasInstance>()
+    }
+
+    pub fn write_tlas_instance(&self, dst: *mut u8, inst: &crate::types::TlasInstance) {
+        unsafe {
+            std::ptr::write_unaligned(dst as *mut crate::types::TlasInstance, *inst);
+        }
+    }
+
     pub fn create_tlas(&self, desc: &TlasDesc) -> RhiResult<AccelerationStructure> {
         let accel_loader = self.require_accel_loader()?;
 

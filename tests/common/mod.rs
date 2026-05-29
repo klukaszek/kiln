@@ -169,6 +169,18 @@ pub fn compile_shader_or_skip(
     entry: &str,
     stage: ShaderStage,
 ) -> Option<ShaderModule> {
+    compile_shader_caps_or_skip(device, slang_src, entry, stage, &[])
+}
+
+/// Like [`compile_shader_or_skip`] but enables extra Slang capabilities (e.g.
+/// `spvRayQueryKHR` for inline ray tracing).
+pub fn compile_shader_caps_or_skip(
+    device: &Device,
+    slang_src: &str,
+    entry: &str,
+    stage: ShaderStage,
+    capabilities: &[&str],
+) -> Option<ShaderModule> {
     if !slangc_available() {
         eprintln!("skipping: slangc not found on PATH");
         return None;
@@ -192,7 +204,7 @@ pub fn compile_shader_or_skip(
     let out_path = dir.join(format!("rhi_test_{}_{seq}.{ext}", std::process::id()));
     std::fs::write(&src_path, slang_src).expect("write slang source");
 
-    let output = common_timed_slangc(&src_path, &out_path, target, entry, slang_stage);
+    let output = common_timed_slangc(&src_path, &out_path, target, entry, slang_stage, capabilities);
     if !output.status.success() {
         let _ = std::fs::remove_file(&src_path);
         panic!(
@@ -223,11 +235,17 @@ fn common_timed_slangc(
     target: &str,
     entry: &str,
     stage: &str,
+    capabilities: &[&str],
 ) -> std::process::Output {
     let start = Instant::now();
-    let output = Command::new("slangc")
-        .arg(src)
-        .args(["-target", target, "-entry", entry, "-stage", stage, "-o"])
+    let mut cmd = Command::new("slangc");
+    cmd.arg(src)
+        .args(["-target", target, "-entry", entry, "-stage", stage]);
+    for cap in capabilities {
+        cmd.args(["-capability", cap]);
+    }
+    let output = cmd
+        .arg("-o")
         .arg(out)
         .output()
         .expect("failed to run slangc");

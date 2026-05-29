@@ -15,7 +15,7 @@ use crate::surface::{Surface, SurfaceDesc};
 use crate::swapchain::{Swapchain, SwapchainDesc};
 use crate::sync::TimelineSemaphore;
 use crate::texture::{GpuViewDesc, Texture, TextureDesc, TextureSizeAlign};
-use crate::types::{BlasDesc, ClipSpaceY, GpuAddress, TlasDesc};
+use crate::types::{BlasDesc, ClipSpaceY, GpuAddress, TlasDesc, TlasInstance};
 
 /// Which GPU backend to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -426,6 +426,33 @@ impl Device {
             crate::accel::AccelInner::Vulkan(a) => a.device_address,
             #[cfg(feature = "metal")]
             crate::accel::AccelInner::Metal(a) => a.gpu_resource_id,
+        }
+    }
+
+    /// Size in bytes of one native TLAS instance descriptor for this backend. The instance
+    /// buffer passed to `build_tlas` must use this stride; fill entries with
+    /// [`write_tlas_instance`](Self::write_tlas_instance).
+    pub fn tlas_instance_stride(&self) -> usize {
+        match &self.inner {
+            #[cfg(feature = "vulkan")]
+            DeviceInner::Vulkan(d) => d.tlas_instance_stride(),
+            #[cfg(feature = "metal")]
+            DeviceInner::Metal(d) => d.tlas_instance_stride(),
+        }
+    }
+
+    /// Encode a [`TlasInstance`] into `dst` using the active backend's native instance
+    /// layout (Vulkan `VkAccelerationStructureInstanceKHR`; Metal indirect descriptor).
+    /// `dst` must have room for [`tlas_instance_stride`](Self::tlas_instance_stride) bytes.
+    ///
+    /// # Safety
+    /// `dst` must point to at least `tlas_instance_stride()` writable, mapped bytes.
+    pub unsafe fn write_tlas_instance(&self, dst: *mut u8, instance: &TlasInstance) {
+        match &self.inner {
+            #[cfg(feature = "vulkan")]
+            DeviceInner::Vulkan(d) => d.write_tlas_instance(dst, instance),
+            #[cfg(feature = "metal")]
+            DeviceInner::Metal(d) => d.write_tlas_instance(dst, instance),
         }
     }
 

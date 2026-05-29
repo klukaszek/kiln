@@ -956,6 +956,28 @@ impl MetalCommandBuffer {
         }
     }
 
+    /// Bind a (TLAS) acceleration structure as a shader resource at argument-table slot
+    /// `slot`. Slang lowers a `RaytracingAccelerationStructure` (trailing entry param) to a
+    /// resource at the next buffer slot after the root, so ray-query compute kernels use
+    /// slot 1. Call after `set_compute_pipeline` and before `dispatch`. The structure is
+    /// already resident (registered at create time).
+    pub fn bind_acceleration_structure(
+        &mut self,
+        slot: u32,
+        accel: &crate::accel::AccelerationStructure,
+    ) {
+        let rid = match &accel.inner {
+            crate::accel::AccelInner::Metal(a) => a.gpu_resource_id,
+            #[allow(unreachable_patterns)]
+            _ => return,
+        };
+        let resource_id: objc2_metal::MTLResourceID = unsafe { std::mem::transmute(rid) };
+        unsafe {
+            self.argument_table
+                .setResource_atBufferIndex(resource_id, slot as usize);
+        }
+    }
+
     pub fn set_active_texture_heap_ptr(&mut self, heap_ptr: GpuAddress) {
         self.active_texture_heap_ptr_override = if heap_ptr.0 == 0 {
             None
@@ -1691,8 +1713,12 @@ impl MetalCommandBuffer {
         unsafe {
             instance_desc.setInstanceDescriptorBuffer(objc2_metal::MTL4BufferRange {
                 bufferAddress: desc.instance_buffer.0,
+                // Indirect instance-descriptor layout (see device.write_tlas_instance), not
+                // the Vulkan-shaped TlasInstance.
                 length: (desc.instance_count as u64)
-                    * std::mem::size_of::<crate::types::TlasInstance>() as u64,
+                    * std::mem::size_of::<
+                        objc2_metal::MTLIndirectAccelerationStructureInstanceDescriptor,
+                    >() as u64,
             });
             instance_desc.setInstanceCount(desc.instance_count as usize);
         }

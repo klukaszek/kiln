@@ -12,6 +12,7 @@ use objc2_metal::{
     MTLLibrary, MTLPrimitiveType, MTLRenderPipelineState, MTLWinding,
 };
 
+use crate::error::{RhiError, RhiResult};
 use crate::pipeline::{BlendAttachment, BlendState};
 use crate::types::{BlendFactor, BlendOp, ColorWriteMask};
 
@@ -47,6 +48,9 @@ pub struct MetalComputePso {
 }
 
 impl MetalGraphicsPso {
+    /// Get (compiling+caching on first use) the pipeline variant for `blend`. Called at draw
+    /// time, where the RHI command API has no `Result` channel — a compile failure here is a
+    /// programmer error (an unsupported blend combo) and panics, like other draw-time guards.
     pub(crate) fn pipeline_for_blend(
         &self,
         blend: &BlendState,
@@ -54,7 +58,9 @@ impl MetalGraphicsPso {
         if let Some(pso) = self.blend_pipelines.borrow().get(blend) {
             return pso.clone();
         }
-        let pso = self.create_pipeline(blend);
+        let pso = self
+            .create_pipeline(blend)
+            .expect("Metal 4 graphics PSO creation failed for dynamic blend variant");
         self.blend_pipelines
             .borrow_mut()
             .insert(blend.clone(), pso.clone());
@@ -64,7 +70,7 @@ impl MetalGraphicsPso {
     fn create_pipeline(
         &self,
         blend: &BlendState,
-    ) -> Retained<ProtocolObject<dyn MTLRenderPipelineState>> {
+    ) -> RhiResult<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
         Self::compile_pipeline_state(
             self.compiler.as_ref(),
             self.vertex_library.as_ref(),
@@ -89,7 +95,7 @@ impl MetalGraphicsPso {
         sample_count: usize,
         alpha_to_coverage: bool,
         blend: &BlendState,
-    ) -> Retained<ProtocolObject<dyn MTLRenderPipelineState>> {
+    ) -> RhiResult<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
         let vertex_name = NSString::from_str(vertex_entry_point);
         let fragment_name = NSString::from_str(fragment_entry_point);
 
@@ -136,7 +142,9 @@ impl MetalGraphicsPso {
         let base_desc: &MTL4PipelineDescriptor = pso_desc.as_ref();
         compiler
             .newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(base_desc, None)
-            .expect("Metal 4 graphics PSO creation failed")
+            .map_err(|e| {
+                RhiError::PipelineCreation(format!("Metal 4 graphics PSO creation failed: {e}"))
+            })
     }
 }
 

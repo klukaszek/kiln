@@ -1081,7 +1081,7 @@ impl MetalDevice {
             sample_count,
             desc.alpha_to_coverage,
             &BlendState::default(),
-        );
+        )?;
 
         let graphics_argument_buffer_slots = pipeline_state
             .reflection()

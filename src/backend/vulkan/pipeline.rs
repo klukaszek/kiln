@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use ash::vk;
 
 use super::device::format_to_vk;
+use crate::error::{RhiError, RhiResult};
 use crate::pipeline::{BlendAttachment, BlendState, ColorTarget};
 use crate::types::{BlendFactor, BlendOp, ColorWriteMask, Cull, SampleCount, Topology};
 
@@ -41,18 +42,22 @@ pub struct VulkanGraphicsPsoDesc {
 }
 
 impl VulkanGraphicsPso {
+    /// Draw-time variant fetch: no `Result` channel here, so a compile failure (an
+    /// unsupported blend combo) is a programmer error and panics, like other draw-time guards.
     pub(crate) fn pipeline_for_blend(&self, blend: &BlendState) -> vk::Pipeline {
         if let Some(p) = self.blend_pipelines.borrow().get(blend) {
             return *p;
         }
-        let pipeline = self.create_pipeline(blend);
+        let pipeline = self
+            .create_pipeline(blend)
+            .expect("Vulkan graphics PSO creation failed for dynamic blend variant");
         self.blend_pipelines
             .borrow_mut()
             .insert(blend.clone(), pipeline);
         pipeline
     }
 
-    fn create_pipeline(&self, blend: &BlendState) -> vk::Pipeline {
+    pub(crate) fn create_pipeline(&self, blend: &BlendState) -> RhiResult<vk::Pipeline> {
         let shader_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -165,10 +170,12 @@ impl VulkanGraphicsPso {
         let pipelines = unsafe {
             self.device
                 .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-                .expect("Failed to create Vulkan pipeline variant")
+                .map_err(|(_, e)| {
+                    RhiError::PipelineCreation(format!("Vulkan graphics pipeline creation: {e:?}"))
+                })?
         };
 
-        pipelines[0]
+        Ok(pipelines[0])
     }
 }
 
@@ -291,18 +298,22 @@ pub struct VulkanMeshletPsoDesc {
 }
 
 impl VulkanMeshletPso {
+    /// Draw-time variant fetch — panics on compile failure (no `Result` channel), see the
+    /// graphics PSO equivalent.
     pub(crate) fn pipeline_for_blend(&self, blend: &BlendState) -> vk::Pipeline {
         if let Some(p) = self.blend_pipelines.borrow().get(blend) {
             return *p;
         }
-        let pipeline = self.create_pipeline(blend);
+        let pipeline = self
+            .create_pipeline(blend)
+            .expect("Vulkan meshlet PSO creation failed for dynamic blend variant");
         self.blend_pipelines
             .borrow_mut()
             .insert(blend.clone(), pipeline);
         pipeline
     }
 
-    fn create_pipeline(&self, blend: &BlendState) -> vk::Pipeline {
+    pub(crate) fn create_pipeline(&self, blend: &BlendState) -> RhiResult<vk::Pipeline> {
         let mesh_stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::MESH_EXT)
             .module(self.desc.mesh_module)
@@ -407,9 +418,11 @@ impl VulkanMeshletPso {
         let pipelines = unsafe {
             self.device
                 .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-                .expect("Failed to create Vulkan meshlet pipeline variant")
+                .map_err(|(_, e)| {
+                    RhiError::PipelineCreation(format!("Vulkan meshlet pipeline creation: {e:?}"))
+                })?
         };
-        pipelines[0]
+        Ok(pipelines[0])
     }
 }
 

@@ -1693,10 +1693,15 @@ impl VulkanDevice {
             desc: pso_desc,
             blend_pipelines: RefCell::new(std::collections::HashMap::new()),
         };
-        // Pre-bake the embedded blend state if provided, otherwise bake the default.
+        // Pre-bake the embedded blend state if provided, otherwise bake the default. Unlike the
+        // draw-time `pipeline_for_blend`, creation has a `Result` channel, so propagate failures.
         let initial_blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
-        let pipeline = vk_pso.pipeline_for_blend(&initial_blend);
+        let pipeline = vk_pso.create_pipeline(&initial_blend)?;
         vk_pso.pipeline = pipeline;
+        vk_pso
+            .blend_pipelines
+            .borrow_mut()
+            .insert(initial_blend, pipeline);
 
         Ok(GraphicsPso {
             inner: GraphicsPsoInner::Vulkan(Box::new(vk_pso)),
@@ -1805,8 +1810,12 @@ impl VulkanDevice {
             blend_pipelines: RefCell::new(std::collections::HashMap::new()),
         };
         let initial_blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
-        let pipeline = vk_pso.pipeline_for_blend(&initial_blend);
+        let pipeline = vk_pso.create_pipeline(&initial_blend)?;
         vk_pso.pipeline = pipeline;
+        vk_pso
+            .blend_pipelines
+            .borrow_mut()
+            .insert(initial_blend, pipeline);
 
         Ok(MeshletPso {
             inner: MeshletPsoInner::Vulkan(Box::new(vk_pso)),

@@ -84,7 +84,6 @@ pub struct MetalDevice {
     textures: SharedTextures,
     samplers: SharedSamplers,
     allocations: SharedAllocations,
-    shader_modules: RefCell<Vec<MetalShaderModule>>,
     /// Per-frame fence values for swapchain acquisition.
     frame_fence_values: FrameFenceValues,
     /// Shared event for per-frame synchronization.
@@ -606,7 +605,6 @@ impl MetalDevice {
             textures: Rc::new(RefCell::new(Vec::new())),
             samplers: Rc::new(RefCell::new(Vec::new())),
             allocations: Rc::new(RefCell::new(BTreeMap::new())),
-            shader_modules: RefCell::new(Vec::new()),
             frame_fence_values,
             frame_event,
             bindless_mode,
@@ -1026,35 +1024,21 @@ impl MetalDevice {
                 RhiError::ShaderCompilation(format!("Metal library creation failed: {e}"))
             })?;
 
-        let module = MetalShaderModule {
-            library,
-            entry_point: desc.entry_point.to_string(),
-        };
-
-        let mut modules = self.shader_modules.borrow_mut();
-        let idx = modules.len();
-        modules.push(module);
-
-        let stage = desc.stage;
         Ok(ShaderModule {
             inner: crate::shader::ShaderModuleInner::Metal(MetalShaderModule {
-                library: modules[idx].library.clone(),
-                entry_point: modules[idx].entry_point.clone(),
+                library,
+                entry_point: desc.entry_point.to_string(),
             }),
-            stage,
+            stage: desc.stage,
         })
     }
 
-    pub fn create_graphics_pso(&self, desc: &GraphicsPsoDesc) -> RhiResult<GraphicsPso> {
-        let modules = self.shader_modules.borrow();
-
-        let vert_module = modules
-            .get(desc.vertex_shader)
-            .ok_or_else(|| RhiError::PipelineCreation("Invalid vertex shader index".into()))?;
-        let frag_module = modules
-            .get(desc.pixel_shader)
-            .ok_or_else(|| RhiError::PipelineCreation("Invalid fragment shader index".into()))?;
-
+    pub fn create_graphics_pso(
+        &self,
+        desc: &GraphicsPsoDesc,
+        vert_module: &MetalShaderModule,
+        frag_module: &MetalShaderModule,
+    ) -> RhiResult<GraphicsPso> {
         let compiler_desc = MTL4CompilerDescriptor::new();
         let compiler = self
             .device
@@ -1161,12 +1145,11 @@ impl MetalDevice {
         })
     }
 
-    pub fn create_compute_pso(&self, desc: &ComputePsoDesc) -> RhiResult<ComputePso> {
-        let modules = self.shader_modules.borrow();
-        let compute_module = modules
-            .get(desc.compute_shader)
-            .ok_or_else(|| RhiError::PipelineCreation("Invalid compute shader index".into()))?;
-
+    pub fn create_compute_pso(
+        &self,
+        desc: &ComputePsoDesc,
+        compute_module: &MetalShaderModule,
+    ) -> RhiResult<ComputePso> {
         let fn_name = NSString::from_str(&compute_module.entry_point);
         let compiler_desc = MTL4CompilerDescriptor::new();
         let compiler = self
@@ -1233,18 +1216,14 @@ impl MetalDevice {
 
     // -- Meshlet (mesh shader) pipeline --
 
-    pub fn create_meshlet_pso(&self, desc: &MeshletPsoDesc) -> RhiResult<MeshletPso> {
+    pub fn create_meshlet_pso(
+        &self,
+        desc: &MeshletPsoDesc,
+        mesh_module: &MetalShaderModule,
+        frag_module: &MetalShaderModule,
+    ) -> RhiResult<MeshletPso> {
         use super::pipeline::MetalMeshletPso;
         use objc2_metal::MTL4MeshRenderPipelineDescriptor;
-
-        let modules = self.shader_modules.borrow();
-
-        let mesh_module = modules
-            .get(desc.mesh_shader)
-            .ok_or_else(|| RhiError::PipelineCreation("Invalid mesh shader index".into()))?;
-        let frag_module = modules
-            .get(desc.pixel_shader)
-            .ok_or_else(|| RhiError::PipelineCreation("Invalid pixel shader index".into()))?;
 
         let compiler_desc = MTL4CompilerDescriptor::new();
         let compiler = self

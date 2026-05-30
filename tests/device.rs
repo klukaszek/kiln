@@ -2,7 +2,7 @@
 
 mod common;
 
-use spectradio_rhi::{Device, DeviceDesc};
+use kiln_rhi::{Device, DeviceDesc};
 
 /// Time device creation and report the backend's reported properties.
 #[test]

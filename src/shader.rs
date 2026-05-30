@@ -9,13 +9,15 @@ pub enum ShaderStage {
 }
 
 /// A compiled shader module.
+///
+/// Owns its backend resource and is passed by reference to `create_*_pso`
+/// (matching `gpuCreateGraphicsPipeline(vertexIR, pixelIR, desc)` in the spec — shaders
+/// are arguments to pipeline creation, not fields of the raster desc).
 pub struct ShaderModule {
-    #[allow(dead_code)]
     pub(crate) inner: ShaderModuleInner,
     pub(crate) stage: ShaderStage,
 }
 
-#[allow(dead_code)]
 pub(crate) enum ShaderModuleInner {
     #[cfg(feature = "vulkan")]
     Vulkan(crate::backend::vulkan::shader::VulkanShaderModule),

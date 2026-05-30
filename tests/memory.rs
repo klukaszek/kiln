@@ -5,7 +5,7 @@
 
 mod common;
 
-use spectradio_rhi::{GpuAllocatorDesc, MemoryType};
+use kiln_rhi::{GpuAllocatorDesc, MemoryType};
 
 /// `Default` memory is CPU-mapped GPU memory: a write through the mapped pointer must read
 /// straight back (the dual-pointer model the whole RHI is built on).
@@ -85,7 +85,9 @@ fn malloc_free_throughput() {
     };
 
     common::bench("malloc(64 KiB) + free", 256, || {
-        let a = device.malloc(64 * 1024, MemoryType::Default).expect("malloc");
+        let a = device
+            .malloc(64 * 1024, MemoryType::Default)
+            .expect("malloc");
         device.free(a);
     });
 }
@@ -138,7 +140,11 @@ fn freed_ranges_coalesce_for_reuse() {
         let a = allocator.alloc(64, 16).expect("a fits");
         let b = allocator.alloc(64, 16).expect("b fits");
         let c = allocator.alloc(64, 16).expect("c fits");
-        assert_eq!(allocator.block_count(), 1, "three 64B allocs fit in one block");
+        assert_eq!(
+            allocator.block_count(),
+            1,
+            "three 64B allocs fit in one block"
+        );
 
         allocator.free(a);
         allocator.free(b);

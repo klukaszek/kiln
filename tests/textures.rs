@@ -2,9 +2,9 @@
 
 mod common;
 
-use spectradio_rhi::{
-    ALL_LAYERS, ALL_MIPS, AddressMode, FilterMode, Format, GpuViewDesc, MemoryType, SampleCount,
-    SamplerDesc, StageFlags, TextureDesc, TextureDimension, TextureUsage,
+use kiln_rhi::{
+    AddressMode, FilterMode, Format, GpuViewDesc, MemoryType, SampleCount, SamplerDesc, StageFlags,
+    TextureDesc, TextureDimension, TextureUsage, ALL_LAYERS, ALL_MIPS,
 };
 
 const W: u32 = 64;
@@ -123,12 +123,19 @@ fn texture_copy_roundtrip() {
         .expect("create_texture");
 
     let bytes = (W as usize) * (H as usize) * BPP;
-    let mut src = device.malloc(bytes as u64, MemoryType::Default).expect("upload");
+    let mut src = device
+        .malloc(bytes as u64, MemoryType::Default)
+        .expect("upload");
     let dst = device
         .malloc(bytes as u64, MemoryType::Readback)
         .expect("readback");
 
-    for (i, b) in src.as_mut_slice::<u8>().expect("src slice").iter_mut().enumerate() {
+    for (i, b) in src
+        .as_mut_slice::<u8>()
+        .expect("src slice")
+        .iter_mut()
+        .enumerate()
+    {
         *b = (i as u8).wrapping_mul(31).wrapping_add(5);
     }
 

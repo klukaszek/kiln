@@ -28,12 +28,11 @@ impl ColorTarget {
 /// `set_blend_state`) to minimise PSO permutations.
 ///
 /// Matches Aaltonen's `GpuRasterDesc`.
+///
+/// Shaders are not part of this desc — they are passed as `&ShaderModule` arguments to
+/// `create_graphics_pso`, matching the spec's `gpuCreateGraphicsPipeline(vertexIR, pixelIR, desc)`.
 #[derive(Clone, Debug)]
 pub struct GraphicsPsoDesc {
-    /// Vertex shader module index (from device.create_shader_module).
-    pub vertex_shader: usize,
-    /// Pixel shader module index.
-    pub pixel_shader: usize,
     /// Primitive topology.
     pub topology: Topology,
     /// Color render targets. Each entry bakes the format and static write mask.
@@ -62,8 +61,6 @@ pub struct GraphicsPsoDesc {
 impl Default for GraphicsPsoDesc {
     fn default() -> Self {
         Self {
-            vertex_shader: 0,
-            pixel_shader: 0,
             topology: Topology::TriangleList,
             color_targets: vec![ColorTarget::new(Format::B8G8R8A8Srgb)],
             depth_format: Some(Format::D32Float),
@@ -92,10 +89,11 @@ pub(crate) enum GraphicsPsoInner {
 }
 
 /// Description for creating a compute pipeline.
+///
+/// The compute shader is passed as a `&ShaderModule` argument to `create_compute_pso`,
+/// matching the spec's `gpuCreateComputePipeline(computeIR)`.
 #[derive(Clone, Debug)]
 pub struct ComputePsoDesc {
-    /// Compute shader module index.
-    pub compute_shader: usize,
     /// Size of root constants in bytes.
     pub root_constant_size: u32,
     /// Threads per threadgroup (Metal dispatch requires this).
@@ -107,7 +105,6 @@ pub struct ComputePsoDesc {
 impl Default for ComputePsoDesc {
     fn default() -> Self {
         Self {
-            compute_shader: 0,
             root_constant_size: std::mem::size_of::<GpuAddress>() as u32,
             threads_per_threadgroup: [1, 1, 1],
             label: None,
@@ -259,12 +256,11 @@ impl Default for BlendState {
 ///
 /// On Vulkan, requires `VK_EXT_mesh_shader`.
 /// On Metal, this backend targets the Metal 4 mesh render pipeline path.
+///
+/// Mesh and pixel shaders are passed as `&ShaderModule` arguments to `create_meshlet_pso`,
+/// matching the spec's `gpuCreateGraphicsMeshletPipeline(meshletIR, pixelIR, desc)`.
 #[derive(Clone, Debug)]
 pub struct MeshletPsoDesc {
-    /// Mesh shader module index.
-    pub mesh_shader: usize,
-    /// Pixel shader module index.
-    pub pixel_shader: usize,
     /// Rasterizer state — same fields as `GraphicsPsoDesc`.
     pub topology: Topology,
     pub color_targets: Vec<ColorTarget>,
@@ -284,8 +280,6 @@ pub struct MeshletPsoDesc {
 impl Default for MeshletPsoDesc {
     fn default() -> Self {
         Self {
-            mesh_shader: 0,
-            pixel_shader: 0,
             topology: Topology::TriangleList,
             color_targets: vec![ColorTarget::new(Format::B8G8R8A8Srgb)],
             depth_format: Some(Format::D32Float),

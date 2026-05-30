@@ -1,5 +1,5 @@
 [package]
-name = "spectradio-rhi"
+name = "kiln-rhi"
 version = "0.1.0"
 edition = "2024"
 

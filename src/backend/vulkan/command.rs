@@ -783,18 +783,24 @@ impl VulkanCommandBuffer {
 
         let mut src_stage = to_vk_stage_flags(src);
         let mut dst_stage = to_vk_stage_flags(dst);
-        let mut src_access = to_vk_access_flags(hazard_for_access, true);
-        let mut dst_access = to_vk_access_flags(hazard_for_access, false);
+        // A hazard barrier is additive: it is a normal stage barrier (broad write→read
+        // visibility, matching `barrier()`) PLUS the hazard-specific access. Starting only
+        // from the hazard flags would make this *narrower* than the plain barrier and could
+        // drop general UAV write→read visibility.
+        let src_access = vk::AccessFlags2::MEMORY_WRITE | to_vk_access_flags(hazard_for_access, true);
+        let mut dst_access = vk::AccessFlags2::MEMORY_READ
+            | vk::AccessFlags2::MEMORY_WRITE
+            | to_vk_access_flags(hazard_for_access, false);
 
         if use_descriptor_buffer_hazard {
             // Descriptor buffer reads happen in shader stages; include them to satisfy access masks.
+            // `DESCRIPTOR_BUFFER_READ_EXT` is an extension access not subsumed by `MEMORY_READ`.
             src_stage |= vk::PipelineStageFlags2::VERTEX_SHADER
                 | vk::PipelineStageFlags2::FRAGMENT_SHADER
                 | vk::PipelineStageFlags2::COMPUTE_SHADER;
             dst_stage |= vk::PipelineStageFlags2::VERTEX_SHADER
                 | vk::PipelineStageFlags2::FRAGMENT_SHADER
                 | vk::PipelineStageFlags2::COMPUTE_SHADER;
-            src_access |= vk::AccessFlags2::MEMORY_WRITE;
             dst_access |= vk::AccessFlags2::DESCRIPTOR_BUFFER_READ_EXT;
         }
 

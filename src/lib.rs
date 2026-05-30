@@ -1,4 +1,4 @@
-//! Spectradio RHI - Render Hardware Interface
+//! Kiln RHI - Render Hardware Interface
 //!
 //! An Aaltonen "No Graphics API"-inspired abstraction over Vulkan and Metal.
 //!
@@ -44,7 +44,7 @@ pub use accel::AccelerationStructure;
 pub use barrier::{HazardFlags, StageFlags};
 pub use command::{
     ColorAttachment, CommandBuffer, DepthAttachment, DispatchIndirectArgs, DrawIndexedIndirectArgs,
-    DrawIndirectMultiArgs, DrawIndirectArgs, LoadOp, RenderPassDesc, RenderTarget, SignalOp,
+    DrawIndirectArgs, DrawIndirectMultiArgs, LoadOp, RenderPassDesc, RenderTarget, SignalOp,
     SignalValueDesc, StoreOp, WaitOp, WaitValueDesc,
 };
 pub use device::{Backend, BindlessMode, Device, DeviceDesc};
@@ -60,7 +60,7 @@ pub use shader::{ShaderModule, ShaderModuleDesc, ShaderStage};
 pub use surface::{Surface, SurfaceDesc};
 pub use swapchain::{AcquiredImage, Swapchain, SwapchainDesc};
 pub use sync::TimelineSemaphore;
-pub use texture::{ALL_LAYERS, ALL_MIPS, GpuViewDesc, Texture, TextureDesc, TextureUsage};
+pub use texture::{GpuViewDesc, Texture, TextureDesc, TextureUsage, ALL_LAYERS, ALL_MIPS};
 pub use types::*;
 pub use types::{
     AccelerationStructureId, BlasDesc, BlasMeshDesc, BuildAccelFlags, GeometryFlags, GeometryType,

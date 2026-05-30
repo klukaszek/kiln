@@ -2,7 +2,7 @@
 
 mod common;
 
-use spectradio_rhi::{MemoryType, StageFlags};
+use kiln_rhi::{MemoryType, StageFlags};
 
 /// Write a pattern into a CPU-mapped `Default` buffer, GPU-copy it into a `Readback`
 /// buffer, and verify the bytes came through. Reports the full submit→wait latency.
@@ -17,7 +17,12 @@ fn gpu_memcpy_roundtrip() {
     let mut src = device.malloc(SIZE, MemoryType::Default).expect("src");
     let dst = device.malloc(SIZE, MemoryType::Readback).expect("dst");
 
-    for (i, b) in src.as_mut_slice::<u8>().expect("src slice").iter_mut().enumerate() {
+    for (i, b) in src
+        .as_mut_slice::<u8>()
+        .expect("src slice")
+        .iter_mut()
+        .enumerate()
+    {
         *b = (i as u8).wrapping_mul(13).wrapping_add(1);
     }
 

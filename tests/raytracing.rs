@@ -6,8 +6,8 @@
 
 mod common;
 
-use spectradio_rhi::gpu_struct;
-use spectradio_rhi::{
+use kiln_rhi::gpu_struct;
+use kiln_rhi::{
     BlasDesc, BlasMeshDesc, BuildAccelFlags, ComputePsoDesc, GeometryFlags, GeometryType,
     GpuAddress, MemoryType, ShaderStage, StageFlags, TlasDesc, TlasInstance,
 };
@@ -48,7 +48,7 @@ fn ray_query_triangle_hit() {
     };
 
     let src = format!("{}{}", Root::SLANG, RQ_BODY);
-    let Some(_module) = common::compile_shader_caps_or_skip(
+    let Some(module) = common::compile_shader_caps_or_skip(
         &device,
         &src,
         "rqMain",
@@ -58,12 +58,14 @@ fn ray_query_triangle_hit() {
         return;
     };
 
-    let pso = match device.create_compute_pso(&ComputePsoDesc {
-        compute_shader: 0,
-        root_constant_size: 8,
-        threads_per_threadgroup: [1, 1, 1],
-        label: Some("ray-query".into()),
-    }) {
+    let pso = match device.create_compute_pso(
+        &ComputePsoDesc {
+            root_constant_size: 8,
+            threads_per_threadgroup: [1, 1, 1],
+            label: Some("ray-query".into()),
+        },
+        &module,
+    ) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("skipping: compute PSO creation failed ({e})");
@@ -122,7 +124,7 @@ fn ray_query_triangle_hit() {
         ],
         instance_custom_index_and_mask: 0xFF << 24, // mask = 0xFF
         instance_sbt_offset_and_flags: 0,
-        acceleration_structure_reference: device.accel_gpu_address(&blas),
+        acceleration_structure_reference: device.accel_gpu_address(&blas).0,
     };
     device
         .write_tlas_instance(&instbuf, 0, &instance)

@@ -6,8 +6,8 @@
 
 mod common;
 
-use spectradio_rhi::gpu_struct;
-use spectradio_rhi::{
+use kiln_rhi::gpu_struct;
+use kiln_rhi::{
     ColorAttachment, ColorTarget, Cull, Format, GraphicsPsoDesc, LoadOp, MemoryType,
     RenderPassDesc, RenderTarget, SampleCount, ShaderStage, StageFlags, StoreOp, TextureDesc,
     TextureDimension, TextureUsage, Topology,
@@ -51,28 +51,30 @@ fn graphics_fullscreen_color() {
     };
 
     let src = format!("{}{}", Root::SLANG, GFX_BODY);
-    let Some(_vs) = common::compile_shader_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
+    let Some(vs) = common::compile_shader_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
     else {
         return;
     };
-    let Some(_fs) = common::compile_shader_or_skip(&device, &src, "fsMain", ShaderStage::Pixel)
+    let Some(fs) = common::compile_shader_or_skip(&device, &src, "fsMain", ShaderStage::Pixel)
     else {
         return;
     };
 
     let pso = common::timed("create_graphics_pso", || {
         device
-            .create_graphics_pso(&GraphicsPsoDesc {
-                vertex_shader: 0,
-                pixel_shader: 1,
-                topology: Topology::TriangleList,
-                color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
-                depth_format: None,
-                sample_count: SampleCount::S1,
-                root_constant_size: 16,
-                cull: Cull::None,
-                ..Default::default()
-            })
+            .create_graphics_pso(
+                &GraphicsPsoDesc {
+                    topology: Topology::TriangleList,
+                    color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
+                    depth_format: None,
+                    sample_count: SampleCount::S1,
+                    root_constant_size: 16,
+                    cull: Cull::None,
+                    ..Default::default()
+                },
+                &vs,
+                &fs,
+            )
             .expect("create_graphics_pso")
     });
 

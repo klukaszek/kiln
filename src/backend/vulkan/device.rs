@@ -133,9 +133,6 @@ pub struct VulkanDevice {
     pub(crate) samplers: RefCell<Vec<vk::Sampler>>,
     pub(crate) next_sampler_id: RefCell<u32>,
 
-    // Shader module storage
-    pub(crate) shader_modules: RefCell<Vec<VulkanShaderModule>>,
-
     // Setup command buffer
     pub(crate) setup_command_buffer: vk::CommandBuffer,
 
@@ -514,7 +511,6 @@ pub fn format_to_vk(format: Format) -> vk::Format {
         Format::R16G16B16A16Float => vk::Format::R16G16B16A16_SFLOAT,
         Format::R32Float => vk::Format::R32_SFLOAT,
         Format::R32G32Float => vk::Format::R32G32_SFLOAT,
-        Format::R32G32B32Float => vk::Format::R32G32B32_SFLOAT,
         Format::R32G32B32A32Float => vk::Format::R32G32B32A32_SFLOAT,
         Format::R10G10B10A2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
         Format::R11G11B10Float => vk::Format::B10G11R11_UFLOAT_PACK32,
@@ -548,7 +544,7 @@ impl VulkanDevice {
         let entry = unsafe { Entry::load() }
             .map_err(|e| RhiError::DeviceCreation(format!("Failed to load Vulkan: {e}")))?;
 
-        let app_name = CString::new("Spectradio").unwrap();
+        let app_name = c"kiln-rhi";
 
         // Validation layers
         let mut layer_names_raw: Vec<*const c_char> = Vec::new();
@@ -592,9 +588,9 @@ impl VulkanDevice {
         }
 
         let app_info = vk::ApplicationInfo::default()
-            .application_name(&app_name)
+            .application_name(app_name)
             .application_version(vk::make_api_version(0, 1, 0, 0))
-            .engine_name(&app_name)
+            .engine_name(app_name)
             .engine_version(vk::make_api_version(0, 1, 0, 0))
             .api_version(vk::make_api_version(0, 1, 3, 0));
 
@@ -886,7 +882,6 @@ impl VulkanDevice {
             allocations: Arc::new(Mutex::new(BTreeMap::new())),
             samplers: RefCell::new(Vec::new()),
             next_sampler_id: RefCell::new(0),
-            shader_modules: RefCell::new(Vec::new()),
             setup_command_buffer,
             mesh_shader_supported: supports_mesh_shader,
             acceleration_structure: acceleration_structure_opt,
@@ -1638,30 +1633,24 @@ impl VulkanDevice {
         let entry_point = CString::new(desc.entry_point)
             .map_err(|e| RhiError::ShaderCompilation(e.to_string()))?;
 
-        let vk_module = VulkanShaderModule {
-            module,
-            entry_point,
-        };
-
-        self.shader_modules.borrow_mut().push(vk_module);
-
         Ok(ShaderModule {
-            inner: ShaderModuleInner::Vulkan(VulkanShaderModule {
+            inner: ShaderModuleInner::Vulkan(VulkanShaderModule::new(
+                self.device.clone(),
                 module,
-                entry_point: CString::new(desc.entry_point).unwrap(),
-            }),
+                entry_point,
+            )),
             stage: desc.stage,
         })
     }
 
     // -- Pipeline --
 
-    pub fn create_graphics_pso(&self, desc: &GraphicsPsoDesc) -> RhiResult<GraphicsPso> {
-        // Get shader modules
-        let modules = self.shader_modules.borrow();
-        let vert_module = &modules[desc.vertex_shader];
-        let frag_module = &modules[desc.pixel_shader];
-
+    pub fn create_graphics_pso(
+        &self,
+        desc: &GraphicsPsoDesc,
+        vert_module: &VulkanShaderModule,
+        frag_module: &VulkanShaderModule,
+    ) -> RhiResult<GraphicsPso> {
         let pso_desc = VulkanGraphicsPsoDesc {
             vert_module: vert_module.module,
             frag_module: frag_module.module,
@@ -1714,10 +1703,11 @@ impl VulkanDevice {
         })
     }
 
-    pub fn create_compute_pso(&self, desc: &ComputePsoDesc) -> RhiResult<ComputePso> {
-        let modules = self.shader_modules.borrow();
-        let shader = &modules[desc.compute_shader];
-
+    pub fn create_compute_pso(
+        &self,
+        desc: &ComputePsoDesc,
+        shader: &VulkanShaderModule,
+    ) -> RhiResult<ComputePso> {
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader.module)
@@ -1761,17 +1751,18 @@ impl VulkanDevice {
 
     // -- Mesh-shader pipeline (VK_EXT_mesh_shader) --
 
-    pub fn create_meshlet_pso(&self, desc: &MeshletPsoDesc) -> RhiResult<MeshletPso> {
+    pub fn create_meshlet_pso(
+        &self,
+        desc: &MeshletPsoDesc,
+        mesh_module: &VulkanShaderModule,
+        frag_module: &VulkanShaderModule,
+    ) -> RhiResult<MeshletPso> {
         // Require mesh-shader extension support.
         if !self.mesh_shader_supported {
             return Err(RhiError::Unsupported(
                 "VK_EXT_mesh_shader not available on this device".into(),
             ));
         }
-
-        let modules = self.shader_modules.borrow();
-        let mesh_module = &modules[desc.mesh_shader];
-        let frag_module = &modules[desc.pixel_shader];
 
         let pso_desc = VulkanMeshletPsoDesc {
             mesh_module: mesh_module.module,
@@ -2738,10 +2729,7 @@ impl Drop for VulkanDevice {
                 self.device.destroy_sampler(sampler, None);
             }
 
-            // Destroy shader modules
-            for shader in self.shader_modules.borrow_mut().drain(..) {
-                self.device.destroy_shader_module(shader.module, None);
-            }
+            // Shader modules are owned by the frontend `ShaderModule` (RAII) and freed there.
 
             if let Some(heap) = self.descriptor_buffer_heap.as_ref() {
                 self.device.unmap_memory(heap.memory);

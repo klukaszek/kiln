@@ -9,7 +9,7 @@ use crate::pipeline::{
 };
 use crate::queue::Queue;
 use crate::sampler::{Sampler, SamplerDesc};
-use crate::shader::{ShaderModule, ShaderModuleDesc};
+use crate::shader::{ShaderModule, ShaderModuleDesc, ShaderModuleInner};
 use crate::surface::{Surface, SurfaceDesc};
 use crate::swapchain::{Swapchain, SwapchainDesc};
 use crate::sync::TimelineSemaphore;
@@ -280,13 +280,47 @@ impl Device {
     }
 
     /// Create a graphics pipeline state object.
-    pub fn create_graphics_pso(&self, desc: &GraphicsPsoDesc) -> RhiResult<GraphicsPso> {
-        backend_dispatch!(&self.inner, DeviceInner, d => d.create_graphics_pso(desc))
+    ///
+    /// Matches the spec's `gpuCreateGraphicsPipeline(vertexIR, pixelIR, desc)` — shaders are
+    /// arguments, not part of `desc`. `vertex`/`pixel` must outlive only this call.
+    pub fn create_graphics_pso(
+        &self,
+        desc: &GraphicsPsoDesc,
+        vertex: &ShaderModule,
+        pixel: &ShaderModule,
+    ) -> RhiResult<GraphicsPso> {
+        match (&self.inner, &vertex.inner, &pixel.inner) {
+            #[cfg(feature = "vulkan")]
+            (
+                DeviceInner::Vulkan(d),
+                ShaderModuleInner::Vulkan(v),
+                ShaderModuleInner::Vulkan(p),
+            ) => d.create_graphics_pso(desc, v, p),
+            #[cfg(feature = "metal")]
+            (DeviceInner::Metal(d), ShaderModuleInner::Metal(v), ShaderModuleInner::Metal(p)) => {
+                d.create_graphics_pso(desc, v, p)
+            }
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("shader module backend does not match device backend"),
+        }
     }
 
     /// Create a compute pipeline state object.
-    pub fn create_compute_pso(&self, desc: &ComputePsoDesc) -> RhiResult<ComputePso> {
-        backend_dispatch!(&self.inner, DeviceInner, d => d.create_compute_pso(desc))
+    ///
+    /// Matches the spec's `gpuCreateComputePipeline(computeIR)`.
+    pub fn create_compute_pso(
+        &self,
+        desc: &ComputePsoDesc,
+        compute: &ShaderModule,
+    ) -> RhiResult<ComputePso> {
+        match (&self.inner, &compute.inner) {
+            #[cfg(feature = "vulkan")]
+            (DeviceInner::Vulkan(d), ShaderModuleInner::Vulkan(c)) => d.create_compute_pso(desc, c),
+            #[cfg(feature = "metal")]
+            (DeviceInner::Metal(d), ShaderModuleInner::Metal(c)) => d.create_compute_pso(desc, c),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("shader module backend does not match device backend"),
+        }
     }
 
     /// Create a mesh-shader graphics pipeline.
@@ -296,8 +330,28 @@ impl Device {
     /// On Vulkan, requires `VK_EXT_mesh_shader` (enabled automatically when supported).
     /// On Metal, uses the Metal 4 mesh render pipeline path.
     /// Returns `RhiError::Unsupported` if the device does not support mesh shaders.
-    pub fn create_meshlet_pso(&self, desc: &MeshletPsoDesc) -> RhiResult<MeshletPso> {
-        backend_dispatch!(&self.inner, DeviceInner, d => d.create_meshlet_pso(desc))
+    ///
+    /// Matches the spec's `gpuCreateGraphicsMeshletPipeline(meshletIR, pixelIR, desc)`.
+    pub fn create_meshlet_pso(
+        &self,
+        desc: &MeshletPsoDesc,
+        mesh: &ShaderModule,
+        pixel: &ShaderModule,
+    ) -> RhiResult<MeshletPso> {
+        match (&self.inner, &mesh.inner, &pixel.inner) {
+            #[cfg(feature = "vulkan")]
+            (
+                DeviceInner::Vulkan(d),
+                ShaderModuleInner::Vulkan(m),
+                ShaderModuleInner::Vulkan(p),
+            ) => d.create_meshlet_pso(desc, m, p),
+            #[cfg(feature = "metal")]
+            (DeviceInner::Metal(d), ShaderModuleInner::Metal(m), ShaderModuleInner::Metal(p)) => {
+                d.create_meshlet_pso(desc, m, p)
+            }
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("shader module backend does not match device backend"),
+        }
     }
 
     /// Allocate a Bottom-Level Acceleration Structure.
@@ -318,14 +372,15 @@ impl Device {
     /// On Vulkan: `vkGetAccelerationStructureDeviceAddressKHR`.
     /// On Metal: the opaque 64-bit `MTLResourceID` (cached at build time).
     ///
-    /// Store this in a root struct field typed `u64` and pass it to the
-    /// intersection shader / ray generation kernel.
-    pub fn accel_gpu_address(&self, accel: &AccelerationStructure) -> u64 {
+    /// Store this in a root struct field typed `u64` (via `.0`) and pass it to the
+    /// intersection shader / ray generation kernel — same convention as
+    /// [`GpuBuffer::gpu_address`](crate::GpuBuffer::gpu_address).
+    pub fn accel_gpu_address(&self, accel: &AccelerationStructure) -> GpuAddress {
         match &accel.inner {
             #[cfg(feature = "vulkan")]
-            crate::accel::AccelInner::Vulkan(a) => a.device_address,
+            crate::accel::AccelInner::Vulkan(a) => GpuAddress(a.device_address),
             #[cfg(feature = "metal")]
-            crate::accel::AccelInner::Metal(a) => a.gpu_resource_id,
+            crate::accel::AccelInner::Metal(a) => GpuAddress(a.gpu_resource_id),
         }
     }
 

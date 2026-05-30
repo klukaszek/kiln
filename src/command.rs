@@ -228,16 +228,8 @@ impl CommandBuffer {
         first_instance: u32,
     ) {
         self.set_root_data(vertex_root, pixel_root);
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => {
-                cmd.draw(vertex_count, instance_count, first_vertex, first_instance)
-            }
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => {
-                cmd.draw(vertex_count, instance_count, first_vertex, first_instance)
-            }
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd =>
+            cmd.draw(vertex_count, instance_count, first_vertex, first_instance))
     }
 
     /// `gpuDrawIndexedInstanced(cb, vertexDataGpu, pixelDataGpu, indicesGpu, indexCount, instanceCount)`
@@ -250,16 +242,8 @@ impl CommandBuffer {
         instance_count: u32,
     ) {
         self.set_root_data(vertex_root, pixel_root);
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => {
-                cmd.draw_indexed(indices, index_count, instance_count)
-            }
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => {
-                cmd.draw_indexed(indices, index_count, instance_count)
-            }
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd =>
+            cmd.draw_indexed(indices, index_count, instance_count))
     }
 
     /// `gpuDispatch(cb, dataGpu, gridDimensions)`
@@ -388,16 +372,8 @@ impl CommandBuffer {
         min_depth: f32,
         max_depth: f32,
     ) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => {
-                cmd.set_viewport(x, y, width, height, min_depth, max_depth)
-            }
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => {
-                cmd.set_viewport(x, y, width, height, min_depth, max_depth)
-            }
-        }
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd =>
+            cmd.set_viewport(x, y, width, height, min_depth, max_depth))
     }
 
     /// Set scissor rect.

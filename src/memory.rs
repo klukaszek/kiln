@@ -502,28 +502,18 @@ pub struct TransientAllocation {
 }
 
 impl TransientAllocation {
-    /// Write a value into this allocation.
+    /// Write a value into this allocation's CPU-mapped memory (bounds-checked).
     ///
-    /// # Safety
-    /// The caller must ensure T fits within `self.size` and the pointer is valid.
-    pub unsafe fn upload<T: zerocopy::IntoBytes + zerocopy::Immutable>(&self, data: &T) {
-        let bytes = zerocopy::IntoBytes::as_bytes(data);
-        debug_assert!(bytes.len() as u64 <= self.size);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.cpu_ptr, bytes.len());
-        }
+    /// # Coherence
+    /// Ordering the write before the dependent GPU submit is the caller's responsibility
+    /// (a correctness, not memory-safety, concern) — same as [`GpuAllocation::upload`].
+    pub fn upload<T: GpuPod>(&self, data: &T) -> RhiResult<()> {
+        mapped_write(Some(self.cpu_ptr), self.size, data.as_bytes())
     }
 
-    /// Write a slice of values into this allocation.
-    ///
-    /// # Safety
-    /// The caller must ensure the slice fits within `self.size`.
-    pub unsafe fn upload_slice<T: zerocopy::IntoBytes + zerocopy::Immutable>(&self, data: &[T]) {
-        let bytes = zerocopy::IntoBytes::as_bytes(data);
-        debug_assert!(bytes.len() as u64 <= self.size);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.cpu_ptr, bytes.len());
-        }
+    /// Write a slice of values into this allocation's CPU-mapped memory (bounds-checked).
+    pub fn upload_slice<T: GpuPod>(&self, data: &[T]) -> RhiResult<()> {
+        mapped_write(Some(self.cpu_ptr), self.size, data.as_bytes())
     }
 }
 

@@ -10,7 +10,7 @@
 //! should *skip* rather than fail — use [`device_or_skip`] and bail out with
 //! `let Some(device) = common::device_or_skip() else { return; };`.
 
-use spectradio_rhi::{Device, DeviceDesc, ShaderModule, ShaderModuleDesc, ShaderStage};
+use kiln_rhi::{Device, DeviceDesc, ShaderModule, ShaderModuleDesc, ShaderStage};
 
 /// Create a headless device for testing, or `None` if no usable backend is available.
 ///
@@ -118,8 +118,7 @@ pub fn slangc_available() -> bool {
 /// module. Returns `None` (skip) if `slangc` is unavailable; panics on a compile error
 /// (that's a test bug, not an environment issue).
 ///
-/// Modules are registered in creation order, so the first module compiled is index 0 —
-/// the value to put in `ComputePsoDesc::compute_shader` etc.
+/// Pass the returned [`ShaderModule`] by reference to `create_*_pso`.
 pub fn compile_shader_or_skip(
     device: &Device,
     slang_src: &str,
@@ -161,7 +160,14 @@ pub fn compile_shader_caps_or_skip(
     let out_path = dir.join(format!("rhi_test_{}_{seq}.{ext}", std::process::id()));
     std::fs::write(&src_path, slang_src).expect("write slang source");
 
-    let output = common_timed_slangc(&src_path, &out_path, target, entry, slang_stage, capabilities);
+    let output = common_timed_slangc(
+        &src_path,
+        &out_path,
+        target,
+        entry,
+        slang_stage,
+        capabilities,
+    );
     if !output.status.success() {
         let _ = std::fs::remove_file(&src_path);
         panic!(

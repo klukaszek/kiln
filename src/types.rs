@@ -59,7 +59,6 @@ pub enum Format {
     R16G16B16A16Float,
     R32Float,
     R32G32Float,
-    R32G32B32Float,
     R32G32B32A32Float,
     R10G10B10A2Unorm,
     R11G11B10Float,

@@ -6,11 +6,11 @@
 
 mod common;
 
-use spectradio_rhi::gpu_struct;
-use spectradio_rhi::{
-    ColorAttachment, ColorTarget, Cull, Format, LoadOp, MemoryType, MeshletPsoDesc,
-    RenderPassDesc, RenderTarget, SampleCount, ShaderStage, StageFlags, StoreOp, TextureDesc,
-    TextureDimension, TextureUsage, Topology,
+use kiln_rhi::gpu_struct;
+use kiln_rhi::{
+    ColorAttachment, ColorTarget, Cull, Format, LoadOp, MemoryType, MeshletPsoDesc, RenderPassDesc,
+    RenderTarget, SampleCount, ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension,
+    TextureUsage, Topology,
 };
 
 gpu_struct! {
@@ -19,7 +19,8 @@ gpu_struct! {
     }
 }
 
-const MESH_BODY: &str = r#"
+const MESH_BODY: &str = /*slang*/
+    r#"
 struct VOut { float4 pos : SV_Position; };
 
 [shader("mesh")]
@@ -48,30 +49,32 @@ fn mesh_fullscreen_color() {
     };
 
     let src = format!("{}{}", Root::SLANG, MESH_BODY);
-    let Some(_ms) = common::compile_shader_or_skip(&device, &src, "msMain", ShaderStage::Mesh)
+    let Some(ms) = common::compile_shader_or_skip(&device, &src, "msMain", ShaderStage::Mesh)
     else {
         return;
     };
-    let Some(_fs) = common::compile_shader_or_skip(&device, &src, "fsMain", ShaderStage::Pixel)
+    let Some(fs) = common::compile_shader_or_skip(&device, &src, "fsMain", ShaderStage::Pixel)
     else {
         return;
     };
 
-    let pso = match device.create_meshlet_pso(&MeshletPsoDesc {
-        mesh_shader: 0,
-        pixel_shader: 1,
-        topology: Topology::TriangleList,
-        color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
-        depth_format: None,
-        stencil_format: None,
-        sample_count: SampleCount::S1,
-        alpha_to_coverage: false,
-        cull: Cull::None,
-        support_dual_source_blending: false,
-        blendstate: None,
-        root_constant_size: 16,
-        label: Some("mesh".into()),
-    }) {
+    let pso = match device.create_meshlet_pso(
+        &MeshletPsoDesc {
+            topology: Topology::TriangleList,
+            color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
+            depth_format: None,
+            stencil_format: None,
+            sample_count: SampleCount::S1,
+            alpha_to_coverage: false,
+            cull: Cull::None,
+            support_dual_source_blending: false,
+            blendstate: None,
+            root_constant_size: 16,
+            label: Some("mesh".into()),
+        },
+        &ms,
+        &fs,
+    ) {
         Ok(pso) => pso,
         Err(e) => {
             eprintln!("skipping: mesh shaders unsupported on this device ({e})");

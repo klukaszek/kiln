@@ -128,7 +128,6 @@ pub fn bytes_per_pixel(format: Format) -> Option<usize> {
         Format::R16G16B16A16Float => Some(8),
         Format::R32Float => Some(4),
         Format::R32G32Float => Some(8),
-        Format::R32G32B32Float => Some(12),
         Format::R32G32B32A32Float => Some(16),
         Format::R10G10B10A2Unorm => Some(4),
         Format::R11G11B10Float => Some(4),

@@ -6,7 +6,7 @@
 
 mod common;
 
-use spectradio_rhi::{gpu_struct, ComputePsoDesc, MemoryType, ShaderStage, StageFlags};
+use kiln_rhi::{gpu_struct, ComputePsoDesc, MemoryType, ShaderStage, StageFlags};
 
 // Shared host/device data contract. `Data::SLANG` is the matching Slang declaration.
 gpu_struct! {
@@ -38,21 +38,22 @@ fn compute_doubles_buffer() {
     };
 
     let src = format!("{}{}", Data::SLANG, COMPUTE_BODY);
-    let Some(_module) =
+    let Some(module) =
         common::compile_shader_or_skip(&device, &src, "computeMain", ShaderStage::Compute)
     else {
         return;
     };
 
-    // First (and only) module compiled → index 0.
     let pso = common::timed("create_compute_pso", || {
         device
-            .create_compute_pso(&ComputePsoDesc {
-                compute_shader: 0,
-                root_constant_size: 16,
-                threads_per_threadgroup: [64, 1, 1],
-                label: Some("double".into()),
-            })
+            .create_compute_pso(
+                &ComputePsoDesc {
+                    root_constant_size: 16,
+                    threads_per_threadgroup: [64, 1, 1],
+                    label: Some("double".into()),
+                },
+                &module,
+            )
             .expect("create_compute_pso")
     });
 

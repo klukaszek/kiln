@@ -71,8 +71,8 @@ impl Texture {
         self.id
     }
 
-    /// Get the raw GPU allocation address used to create this texture.
-    pub fn gpu_address(&self) -> GpuAddress {
+    /// The backing GPU allocation address this texture was created at.
+    pub fn gpu(&self) -> GpuAddress {
         self.gpu_address
     }
 
@@ -82,14 +82,9 @@ impl Texture {
     }
 }
 
-/// View descriptor for creating a non-default view of an existing texture.
-///
-/// Matches Aaltonen's `GpuViewDesc`. Used with `device.texture_view_descriptor()`
-/// (sampled/SRV) and `device.rw_texture_view_descriptor()` (storage/UAV).
-///
-/// `mip_count = ALL_MIPS` → all mips from `base_mip` to the end.
-/// `layer_count = ALL_LAYERS` → all layers from `base_layer` to the end.
-/// `format = None` → same format as the source texture.
+/// A non-default view of a texture, for `texture_view_descriptor` (SRV) /
+/// `rw_texture_view_descriptor` (UAV). `ALL_MIPS`/`ALL_LAYERS` cover the rest of the range;
+/// `format = None` keeps the source format.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GpuViewDesc {
     /// Format override. `None` = same as source texture.

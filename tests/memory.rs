@@ -56,7 +56,7 @@ fn host_to_device_pointer_translates_with_offset() {
         .malloc(256, MemoryType::Default)
         .expect("malloc(Default) should succeed");
     let cpu = allocation
-        .mapped_ptr()
+        .cpu()
         .expect("Default memory must expose a CPU-mapped pointer");
 
     let base = common::timed("host_to_device_pointer", || {
@@ -64,7 +64,7 @@ fn host_to_device_pointer_translates_with_offset() {
             .host_to_device_pointer(cpu)
             .expect("base CPU pointer should translate to a GPU address")
     });
-    assert_eq!(base, allocation.gpu_address());
+    assert_eq!(base, allocation.gpu());
 
     // `host_to_device_pointer` is intentionally a raw-pointer bridge, so exercising an
     // offset translation requires raw pointer arithmetic — the one place `unsafe` is
@@ -72,7 +72,7 @@ fn host_to_device_pointer_translates_with_offset() {
     let offset = device
         .host_to_device_pointer(unsafe { cpu.add(64) })
         .expect("offset CPU pointer should translate to a GPU address");
-    assert_eq!(offset.0, allocation.gpu_address().0 + 64);
+    assert_eq!(offset, allocation.gpu().offset(64));
 
     device.free(allocation);
 }
@@ -109,11 +109,10 @@ fn suballocation_address_is_aligned() {
         let sub = allocator
             .alloc(16, align)
             .expect("allocation within a fresh block should fit");
-        assert_eq!(
-            sub.gpu_address().0 % align,
-            0,
+        assert!(
+            sub.gpu().is_aligned_to(align),
             "address {:#x} not aligned to {align}",
-            sub.gpu_address().0
+            sub.gpu()
         );
     }
 

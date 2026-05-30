@@ -1,6 +1,14 @@
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 /// GPU virtual address for buffer device address / Metal gpuAddress.
+///
+/// Use this type directly as the field type for GPU-pointer fields in [`gpu_struct!`] (the
+/// Slang side stays `"T*"`). It is `#[repr(transparent)]` over `u64` and a [`GpuPod`], so a
+/// pointer field reads as a pointer and you can assign `alloc.gpu()` straight in — no `.0`
+/// unwrap. Reserve raw `u64` fields for genuine integers.
+///
+/// [`gpu_struct!`]: crate::gpu_struct
+/// [`GpuPod`]: crate::GpuPod
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, IntoBytes, FromBytes, Immutable)]
 pub struct GpuAddress(pub u64);
@@ -18,6 +26,19 @@ impl GpuAddress {
     #[inline]
     pub fn is_null(self) -> bool {
         self.0 == 0
+    }
+
+    /// True if this address is a multiple of `align` (a power of two). Useful for asserting
+    /// placement/binding alignment without reaching for `.0`.
+    #[inline]
+    pub fn is_aligned_to(self, align: u64) -> bool {
+        align != 0 && self.0 & (align - 1) == 0
+    }
+}
+
+impl std::fmt::LowerHex for GpuAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::LowerHex::fmt(&self.0, f)
     }
 }
 
@@ -134,13 +155,8 @@ pub enum BlendOp {
 
 /// Texture dimension.
 ///
-/// Matches Aaltonen's `TEXTURE { TEXTURE_1D, TEXTURE_2D, TEXTURE_3D, TEXTURE_CUBE,
-/// TEXTURE_2D_ARRAY, TEXTURE_CUBE_ARRAY }`.
-///
-/// For `D2Array`, `TextureDesc::array_layers` is the number of slices.
-/// For `CubeArray`, `TextureDesc::array_layers` is the total number of faces (n × 6).
-/// For `Cube`, `array_layers` is the number of cubes (1 for a single cubemap);
-/// both backends automatically multiply by 6 when allocating storage.
+/// `TextureDesc::array_layers` means: slices for `D2Array`; total faces (n×6) for `CubeArray`;
+/// cube count for `Cube` (backends multiply by 6 for storage).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TextureDimension {
     D1,
@@ -180,11 +196,7 @@ bitflags::bitflags! {
 }
 
 bitflags::bitflags! {
-    /// Depth mode flags. Matches Aaltonen's `DEPTH_FLAGS { DEPTH_READ = 0x1, DEPTH_WRITE = 0x2 }`.
-    ///
-    /// - `0` = depth fully disabled
-    /// - `READ` = depth test only (no writes; useful for transparent surfaces)
-    /// - `READ | WRITE` = full depth test and write
+    /// Depth mode: empty = disabled, `READ` = test only, `READ | WRITE` = test and write.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
     pub struct DepthFlags: u8 {
         const READ  = 0x1;
@@ -193,8 +205,6 @@ bitflags::bitflags! {
 }
 
 /// Stencil operation applied when a stencil test passes or fails.
-///
-/// Corresponds to Aaltonen's `OP_KEEP`, `OP_ZERO`, etc. in the stencil context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StencilOp {
     Keep,
@@ -207,15 +217,9 @@ pub enum StencilOp {
     DecrementWrap,
 }
 
-/// Cull mode for rasterization.
+/// Cull mode. Front face is always CCW; the variant names the winding culled.
 ///
-/// Encodes both culling direction and implied front-face winding in a single value,
-/// matching Aaltonen's `CULL { CULL_CCW, CULL_CW, CULL_ALL, CULL_NONE }`.
-///
-/// - `Cw`  — cull clockwise-winding triangles (standard back-face culling; front = CCW)
-/// - `Ccw` — cull counter-clockwise-winding triangles (front-face culling; front = CCW)
-/// - `All` — cull both faces
-/// - `None` — no culling
+/// - `Cw` — back-face culling (the common case) · `Ccw` — front-face · `All` · `None`
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cull {
     None,
@@ -240,12 +244,8 @@ pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
 // Ray tracing types
 // ---------------------------------------------------------------------------
 
-/// Opaque acceleration structure handle (BLAS or TLAS).
-///
-/// In Aaltonen's model everything is GPU memory. An acceleration structure is
-/// a GPU allocation whose GPU address is placed directly in a root struct —
-/// exactly the same as any other buffer pointer. The CPU-side handle exists
-/// only so the backend can issue `build` commands against the right object.
+/// Opaque acceleration-structure handle (BLAS or TLAS). Exists so the backend can issue
+/// `build` against the right object; shaders use its GPU address (`accel.gpu()`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AccelerationStructureId(pub u32);
 
@@ -256,8 +256,7 @@ impl AccelerationStructureId {
 /// Geometry type inside a BLAS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GeometryType {
-    /// Triangle geometry. Backend reads positions from `vertex_buffer` using
-    /// `vertex_format` and `vertex_stride`.
+    /// Triangle geometry, read from `vertex_buffer` at `vertex_stride`.
     Triangles,
     /// Axis-aligned bounding boxes for procedural geometry.
     Aabbs,
@@ -338,8 +337,8 @@ pub struct TlasInstance {
     /// Low 24 bits: shader binding table hit group offset.
     /// High 8 bits: `InstanceFlags`.
     pub instance_sbt_offset_and_flags: u32,
-    /// GPU address of the BLAS for this instance.
-    pub acceleration_structure_reference: u64,
+    /// GPU address of the BLAS for this instance — assign `blas.gpu()`.
+    pub acceleration_structure_reference: GpuAddress,
 }
 
 /// Descriptor for building a Top-Level Acceleration Structure.

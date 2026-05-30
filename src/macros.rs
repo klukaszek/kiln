@@ -1,16 +1,7 @@
 //! Internal helper macros.
 
-/// Dispatch to whichever backend an enum-dispatch wrapper currently holds.
-///
-/// Collapses the repetitive backend-passthrough match:
-/// ```ignore
-/// match &self.inner {
-///     #[cfg(feature = "vulkan")] DeviceInner::Vulkan(d) => d.foo(x),
-///     #[cfg(feature = "metal")]  DeviceInner::Metal(d)  => d.foo(x),
-/// }
-/// ```
-/// into `backend_dispatch!(&self.inner, DeviceInner, d => d.foo(x))`. Works with `&` or
-/// `&mut` receivers; the body is duplicated into each backend arm under its `cfg`.
+/// Collapse a backend-passthrough match into `backend_dispatch!(&self.inner, DeviceInner, d
+/// => d.foo(x))`. The body is duplicated into each backend arm under its `cfg`.
 macro_rules! backend_dispatch {
     ($value:expr, $variant:ident, $bind:ident => $body:expr $(,)?) => {
         match $value {
@@ -22,21 +13,17 @@ macro_rules! backend_dispatch {
     };
 }
 
-/// Define a GPU-facing struct once, generating both the `#[repr(C)]` Rust type (a
-/// [`GpuPod`](crate::GpuPod) via zerocopy derives) and a matching Slang declaration string
-/// `Name::SLANG` to prepend to a shader. Keeps the host/device data contract in lockstep so
-/// roots are built type-safely instead of poking bytes at hand-computed offsets.
-///
-/// Each field gives its Rust type and the equivalent Slang type. The struct must be
-/// padding-free (zerocopy `IntoBytes` requires it) — add explicit tail-padding fields where
-/// alignment would otherwise insert padding.
+/// Define a GPU-facing struct once, generating the `#[repr(C)]` [`GpuPod`](crate::GpuPod) Rust
+/// type and a matching Slang declaration string `Name::SLANG` to prepend to a shader — keeping
+/// the host/device layout in lockstep. Each field gives its Rust and Slang type. Must be
+/// padding-free (add explicit tail padding where alignment would insert it).
 ///
 /// ```ignore
 /// gpu_struct! {
 ///     pub struct Material {
-///         albedo: u32 as "uint",   // bindless texture id
+///         albedo: u32 as "uint",            // bindless texture id
 ///         tint:   [f32; 4] as "float4",
-///         data:   u64 as "Surface*", // 64-bit GPU pointer
+///         data:   GpuAddress as "Surface*", // 64-bit GPU pointer
 ///     }
 /// }
 /// ```

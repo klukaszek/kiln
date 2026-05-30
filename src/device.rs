@@ -205,7 +205,7 @@ impl Device {
         })?;
 
         debug_assert_eq!(
-            buffer.gpu_address().0 & (align - 1),
+            buffer.gpu().0 & (align - 1),
             0,
             "backend returned a misaligned GPU address for malloc_aligned",
         );
@@ -228,12 +228,8 @@ impl Device {
         backend_dispatch!(&self.inner, DeviceInner, d => d.texture_size_align(desc))
     }
 
-    /// Create a texture in caller-owned GPU memory.
-    ///
-    /// `texture_gpu` must point to an allocation of at least
-    /// `texture_size_align(desc).size` bytes and satisfy that alignment.
-    /// The caller owns the allocation lifetime and must keep it alive while the
-    /// returned texture is live.
+    /// Create a texture in caller-owned GPU memory. `texture_gpu` must point to an allocation
+    /// meeting `texture_size_align(desc)` and be kept alive while the texture is live.
     pub fn create_texture(
         &self,
         desc: &TextureDesc,
@@ -242,12 +238,8 @@ impl Device {
         backend_dispatch!(&self.inner, DeviceInner, d => d.create_texture(desc, texture_gpu))
     }
 
-    /// Create a sampled (SRV) view of an existing texture and register it in the bindless heap.
-    ///
-    /// Returns a new `TextureId` that can be used in shaders like any other texture.
-    /// The view shares storage with the source texture — destroying the source while
-    /// the view `TextureId` is in use is undefined behavior.
-    /// Matches Aaltonen's `gpuTextureViewDescriptor(texture, viewDesc)`.
+    /// Register a sampled (SRV) view of `source` in the bindless heap, returning its `TextureId`.
+    /// The view shares `source`'s storage; using the id after `source` is destroyed is UB.
     pub fn texture_view_descriptor(
         &self,
         source: &Texture,
@@ -256,11 +248,7 @@ impl Device {
         backend_dispatch!(&self.inner, DeviceInner, d => d.texture_view_descriptor(source, view))
     }
 
-    /// Create a storage (UAV) view of an existing texture and register it in the bindless heap.
-    ///
-    /// Returns a new `TextureId`. On Metal, storage views share the same representation as
-    /// sampled views — access mode is controlled by the shader binding type.
-    /// Matches Aaltonen's `gpuRWTextureViewDescriptor(texture, viewDesc)`.
+    /// Register a storage (UAV) view of `source` in the bindless heap, returning its `TextureId`.
     pub fn rw_texture_view_descriptor(
         &self,
         source: &Texture,
@@ -323,15 +311,9 @@ impl Device {
         }
     }
 
-    /// Create a mesh-shader graphics pipeline.
-    ///
-    /// Matches Aaltonen's `gpuCreateGraphicsMeshletPipeline(meshletIR, pixelIR, desc)`.
-    ///
-    /// On Vulkan, requires `VK_EXT_mesh_shader` (enabled automatically when supported).
-    /// On Metal, uses the Metal 4 mesh render pipeline path.
-    /// Returns `RhiError::Unsupported` if the device does not support mesh shaders.
-    ///
-    /// Matches the spec's `gpuCreateGraphicsMeshletPipeline(meshletIR, pixelIR, desc)`.
+    /// Create a mesh-shader graphics pipeline (spec: `gpuCreateGraphicsMeshletPipeline`).
+    /// Requires `VK_EXT_mesh_shader` on Vulkan; returns `RhiError::Unsupported` if mesh
+    /// shaders are unavailable.
     pub fn create_meshlet_pso(
         &self,
         desc: &MeshletPsoDesc,
@@ -367,23 +349,6 @@ impl Device {
         backend_dispatch!(&self.inner, DeviceInner, d => d.create_tlas(desc))
     }
 
-    /// Return the GPU address of a built acceleration structure.
-    ///
-    /// On Vulkan: `vkGetAccelerationStructureDeviceAddressKHR`.
-    /// On Metal: the opaque 64-bit `MTLResourceID` (cached at build time).
-    ///
-    /// Store this in a root struct field typed `u64` (via `.0`) and pass it to the
-    /// intersection shader / ray generation kernel — same convention as
-    /// [`GpuBuffer::gpu_address`](crate::GpuBuffer::gpu_address).
-    pub fn accel_gpu_address(&self, accel: &AccelerationStructure) -> GpuAddress {
-        match &accel.inner {
-            #[cfg(feature = "vulkan")]
-            crate::accel::AccelInner::Vulkan(a) => GpuAddress(a.device_address),
-            #[cfg(feature = "metal")]
-            crate::accel::AccelInner::Metal(a) => GpuAddress(a.gpu_resource_id),
-        }
-    }
-
     /// Size in bytes of one native TLAS instance descriptor for this backend. The instance
     /// buffer passed to `build_tlas` must use this stride; fill entries with
     /// [`write_tlas_instance`](Self::write_tlas_instance).
@@ -408,7 +373,7 @@ impl Device {
                 "TLAS instance {index} (stride {stride}) exceeds instance buffer ({capacity} bytes)"
             )));
         }
-        let base = dst.mapped_ptr().ok_or_else(|| {
+        let base = dst.cpu().ok_or_else(|| {
             RhiError::AllocationFailed("instance buffer is not CPU-mapped".into())
         })?;
         // SAFETY: `offset + stride <= capacity`, and `base` is valid for `capacity` mapped

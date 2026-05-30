@@ -99,7 +99,7 @@ fn mesh_fullscreen_color() {
         .malloc_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let texture = device
-        .create_texture(&tex_desc, tex_mem.gpu_address())
+        .create_texture(&tex_desc, tex_mem.gpu())
         .expect("create_texture");
 
     let root = device
@@ -128,11 +128,11 @@ fn mesh_fullscreen_color() {
         cmd.set_meshlet_pipeline(&pso);
         cmd.set_viewport(0.0, 0.0, SIZE as f32, SIZE as f32, 0.0, 1.0);
         cmd.set_scissor(0, 0, SIZE, SIZE);
-        cmd.draw_meshlets(root.gpu_address(), root.gpu_address(), 1, 1, 1);
+        cmd.draw_meshlets(root.gpu(), root.gpu(), 1, 1, 1);
         cmd.end_render_pass();
 
         cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
-        cmd.copy_from_texture(readback.gpu_address(), tex_mem.gpu_address(), &texture);
+        cmd.copy_from_texture(readback.gpu(), tex_mem.gpu(), &texture);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
         cmd.end();
         let queue = device.queue();

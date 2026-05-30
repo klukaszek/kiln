@@ -2,15 +2,12 @@ use crate::types::GpuAddress;
 use crate::{Device, RhiError, RhiResult};
 use zerocopy::{FromBytes, IntoBytes};
 
-/// Types that can be copied verbatim to/from GPU-mapped memory: fixed C-like layout, no
-/// uninit padding, and valid for any bit pattern. Auto-implemented for anything deriving
-/// `zerocopy::{IntoBytes, FromBytes, Immutable}` (e.g. `GpuAddress`, `TextureId`, and any
-/// `#[repr(C)]` struct of such fields — see `gpu_struct!`).
+/// Types copyable verbatim to/from GPU memory: `#[repr(C)]`, no padding, valid for any bit
+/// pattern. Auto-implemented via the `zerocopy` derives (see `gpu_struct!`).
 pub trait GpuPod: IntoBytes + FromBytes + zerocopy::Immutable {}
 impl<T> GpuPod for T where T: IntoBytes + FromBytes + zerocopy::Immutable {}
 
-/// Copy `bytes` into a CPU-mapped region, bounds-checked. Shared by the allocation upload
-/// methods so the single raw write lives in one audited place.
+/// Copy `bytes` into a CPU-mapped region, bounds-checked.
 fn mapped_write(ptr: Option<*mut u8>, capacity: u64, bytes: &[u8]) -> RhiResult<()> {
     if bytes.len() as u64 > capacity {
         return Err(RhiError::AllocationFailed(format!(
@@ -20,9 +17,7 @@ fn mapped_write(ptr: Option<*mut u8>, capacity: u64, bytes: &[u8]) -> RhiResult<
     }
     let dst =
         ptr.ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
-    // SAFETY: `dst` is a valid CPU-mapped pointer to at least `capacity` bytes (allocation
-    // invariant) and we just checked `bytes.len() <= capacity`. The GPU-mapped destination
-    // cannot overlap the Rust-owned `bytes` source.
+    // SAFETY: `dst` is valid for `capacity` bytes and `bytes.len() <= capacity`.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
     Ok(())
 }
@@ -37,20 +32,16 @@ fn mapped_read<T: GpuPod>(ptr: Option<*mut u8>, capacity: u64) -> RhiResult<T> {
             "read of {n} bytes exceeds mapped region ({capacity} bytes)"
         )));
     }
-    // SAFETY: `src` is valid for `capacity` >= `n` bytes; `T: FromBytes` => any bit pattern
-    // is a valid `T`.
+    // SAFETY: `src` is valid for `capacity` >= `n` bytes; `T: FromBytes`.
     let bytes = unsafe { std::slice::from_raw_parts(src as *const u8, n) };
     T::read_from_bytes(bytes).map_err(|_| RhiError::AllocationFailed("read size mismatch".into()))
 }
 
-/// Memory residency for GPU allocations. Matches `NoGraphicsApi.md` `MEMORY_*` (line 95).
+/// Memory residency for GPU allocations.
 ///
-/// - `Default`: CPU-mapped GPU memory (write-combined). Fast for GPU read, CPU can write
-///   directly. Use for uniforms, staging, transient draw arguments, descriptors.
-/// - `GpuOnly`: device-local, not CPU-mapped. Required for textures (Morton swizzle, DCC)
-///   and large persistent buffers that benefit from lossless compression.
-/// - `Readback`: GPU-writable, CPU-cached on read. Slower GPU writes due to coherence.
-///   Use for screenshots, virtual-texture feedback, GPGPU output.
+/// - `Default`: CPU-mapped, write-combined. Uniforms, staging, draw args, descriptors.
+/// - `GpuOnly`: device-local, not CPU-mapped. Textures and large persistent buffers.
+/// - `Readback`: GPU-writable, CPU-cached on read. Screenshots, feedback, GPGPU output.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum MemoryType {
     #[default]
@@ -67,22 +58,21 @@ pub struct BufferDesc {
     pub label: Option<String>,
 }
 
-/// Pointer-first GPU allocation. Each one wraps an exclusive `GpuBuffer`
-/// returned by `Device::malloc` / `malloc_aligned`.
+/// A GPU allocation: a CPU-mapped pointer + GPU address over a backing buffer.
 pub struct GpuAllocation {
     pub(crate) buffer: GpuBuffer,
     pub(crate) size: u64,
 }
 
 impl GpuAllocation {
-    /// CPU-mapped pointer (only valid for `MemoryType::Default` / `Readback`).
-    pub fn mapped_ptr(&self) -> Option<*mut u8> {
-        self.buffer.mapped_ptr()
+    /// CPU-mapped pointer (`None` for `GpuOnly`). The `.cpu` of the dual-pointer pair.
+    pub fn cpu(&self) -> Option<*mut u8> {
+        self.buffer.cpu()
     }
 
-    /// GPU virtual address.
-    pub fn gpu_address(&self) -> GpuAddress {
-        self.buffer.gpu_address()
+    /// GPU virtual address — the `.gpu` of the dual-pointer pair.
+    pub fn gpu(&self) -> GpuAddress {
+        self.buffer.gpu()
     }
 
     /// Allocation size in bytes.
@@ -95,31 +85,27 @@ impl GpuAllocation {
         self.buffer
     }
 
-    /// Upload a value into this allocation's CPU-mapped memory (bounds-checked).
-    ///
-    /// # Coherence
-    /// Requires `MemoryType::Default`/`Readback`. The caller is responsible for ordering
-    /// writes before the dependent GPU submit; this is a correctness concern, not a
-    /// memory-safety one.
+    /// Upload a value into CPU-mapped memory (bounds-checked). Caller orders the write before
+    /// the dependent submit.
     pub fn upload<T: GpuPod>(&self, value: &T) -> RhiResult<()> {
-        mapped_write(self.mapped_ptr(), self.size, value.as_bytes())
+        mapped_write(self.cpu(), self.size, value.as_bytes())
     }
 
     /// Upload a slice into this allocation's CPU-mapped memory (bounds-checked).
     pub fn upload_slice<T: GpuPod>(&self, data: &[T]) -> RhiResult<()> {
-        mapped_write(self.mapped_ptr(), self.size, data.as_bytes())
+        mapped_write(self.cpu(), self.size, data.as_bytes())
     }
 
     /// Read a value back from CPU-mapped memory (e.g. `Readback` after a GPU write).
     pub fn read<T: GpuPod>(&self) -> RhiResult<T> {
-        mapped_read(self.mapped_ptr(), self.size)
+        mapped_read(self.cpu(), self.size)
     }
 
     /// View the mapped memory as `&[T]` (shared). Errors if not CPU-mapped or the size is
     /// not a whole number of `T`.
     pub fn as_slice<T: GpuPod>(&self) -> RhiResult<&[T]> {
         let ptr = self
-            .mapped_ptr()
+            .cpu()
             .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
         // SAFETY: `ptr` is valid for `self.size` bytes for the lifetime of `&self`.
         let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, self.size as usize) };
@@ -130,7 +116,7 @@ impl GpuAllocation {
     /// View the mapped memory as `&mut [T]` (exclusive). `&mut self` rules out CPU aliasing.
     pub fn as_mut_slice<T: GpuPod>(&mut self) -> RhiResult<&mut [T]> {
         let ptr = self
-            .mapped_ptr()
+            .cpu()
             .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
         // SAFETY: `ptr` is valid for `self.size` bytes; `&mut self` guarantees no other CPU
         // reference aliases it.
@@ -172,13 +158,13 @@ pub struct GpuSubAllocation {
 }
 
 impl GpuSubAllocation {
-    /// CPU-mapped pointer for this suballocation, if the backing memory is CPU visible.
-    pub fn mapped_ptr(&self) -> Option<*mut u8> {
+    /// CPU-mapped pointer, if the backing memory is CPU visible.
+    pub fn cpu(&self) -> Option<*mut u8> {
         self.cpu_ptr
     }
 
-    /// GPU virtual address for this suballocation.
-    pub fn gpu_address(&self) -> GpuAddress {
+    /// GPU virtual address.
+    pub fn gpu(&self) -> GpuAddress {
         self.gpu_address
     }
 
@@ -192,11 +178,7 @@ impl GpuSubAllocation {
         self.offset
     }
 
-    /// Upload a value into this suballocation's CPU-mapped memory (bounds-checked).
-    ///
-    /// # Coherence
-    /// Requires CPU-mapped backing memory; ordering the write before the dependent GPU
-    /// submit is the caller's responsibility (a correctness, not memory-safety, concern).
+    /// Upload a value into CPU-mapped memory (bounds-checked).
     pub fn upload<T: GpuPod>(&self, data: &T) -> RhiResult<()> {
         mapped_write(self.cpu_ptr, self.size, data.as_bytes())
     }
@@ -248,10 +230,7 @@ struct GpuAllocatorBlock {
     free: Vec<FreeRange>,
 }
 
-/// User-land GPU allocator over large `gpuMalloc` blocks.
-///
-/// This matches the `NoGraphicsApi.md` philosophy: callers work with CPU/GPU
-/// pointer pairs, while buffer objects remain backend implementation detail.
+/// User-land suballocator over large GPU memory blocks.
 pub struct GpuAllocator<'a> {
     device: &'a Device,
     desc: GpuAllocatorDesc,
@@ -352,8 +331,8 @@ impl<'a> GpuAllocator<'a> {
         let allocation = self
             .device
             .malloc_aligned(block_size, 16, self.desc.memory)?;
-        let cpu_base = allocation.mapped_ptr();
-        let gpu_base = allocation.gpu_address();
+        let cpu_base = allocation.cpu();
+        let gpu_base = allocation.gpu();
 
         Ok(GpuAllocatorBlock {
             allocation: Some(allocation),
@@ -477,13 +456,13 @@ pub(crate) enum GpuBufferInner {
 }
 
 impl GpuBuffer {
-    /// Get the CPU-mapped pointer (only valid for Upload/Readback buffers).
-    pub fn mapped_ptr(&self) -> Option<*mut u8> {
+    /// CPU-mapped pointer (`None` for `GpuOnly`).
+    pub fn cpu(&self) -> Option<*mut u8> {
         backend_dispatch!(&self.inner, GpuBufferInner, b => b.mapped_ptr())
     }
 
-    /// Get the GPU virtual address for shader access.
-    pub fn gpu_address(&self) -> GpuAddress {
+    /// GPU virtual address for shader access.
+    pub fn gpu(&self) -> GpuAddress {
         backend_dispatch!(&self.inner, GpuBufferInner, b => b.gpu_address())
     }
 
@@ -493,27 +472,23 @@ impl GpuBuffer {
     }
 }
 
-/// Dual-pointer transient allocation from the bump allocator.
+/// Dual-pointer transient allocation from the bump allocator (the doc's `{ cpu, gpu }`).
 #[derive(Clone, Copy, Debug)]
 pub struct TransientAllocation {
-    pub cpu_ptr: *mut u8,
-    pub gpu_address: GpuAddress,
+    pub cpu: *mut u8,
+    pub gpu: GpuAddress,
     pub size: u64,
 }
 
 impl TransientAllocation {
-    /// Write a value into this allocation's CPU-mapped memory (bounds-checked).
-    ///
-    /// # Coherence
-    /// Ordering the write before the dependent GPU submit is the caller's responsibility
-    /// (a correctness, not memory-safety, concern) — same as [`GpuAllocation::upload`].
+    /// Write a value into CPU-mapped memory (bounds-checked).
     pub fn upload<T: GpuPod>(&self, data: &T) -> RhiResult<()> {
-        mapped_write(Some(self.cpu_ptr), self.size, data.as_bytes())
+        mapped_write(Some(self.cpu), self.size, data.as_bytes())
     }
 
-    /// Write a slice of values into this allocation's CPU-mapped memory (bounds-checked).
+    /// Write a slice into CPU-mapped memory (bounds-checked).
     pub fn upload_slice<T: GpuPod>(&self, data: &[T]) -> RhiResult<()> {
-        mapped_write(Some(self.cpu_ptr), self.size, data.as_bytes())
+        mapped_write(Some(self.cpu), self.size, data.as_bytes())
     }
 }
 
@@ -549,17 +524,13 @@ impl BumpAllocator {
             return None;
         }
 
-        let cpu_ptr = self.buffer.mapped_ptr()?;
-        let gpu_address = self.buffer.gpu_address().offset(aligned_offset);
-        let cpu_ptr = unsafe { cpu_ptr.add(aligned_offset as usize) };
+        let cpu = self.buffer.cpu()?;
+        let gpu = self.buffer.gpu().offset(aligned_offset);
+        let cpu = unsafe { cpu.add(aligned_offset as usize) };
 
         self.offset = end;
 
-        Some(TransientAllocation {
-            cpu_ptr,
-            gpu_address,
-            size,
-        })
+        Some(TransientAllocation { cpu, gpu, size })
     }
 
     /// Reset the allocator for a new frame.
@@ -567,9 +538,9 @@ impl BumpAllocator {
         self.offset = 0;
     }
 
-    /// Get the underlying buffer's GPU address.
-    pub fn gpu_address(&self) -> GpuAddress {
-        self.buffer.gpu_address()
+    /// The underlying buffer's base GPU address.
+    pub fn gpu(&self) -> GpuAddress {
+        self.buffer.gpu()
     }
 
     /// How many bytes have been allocated so far.

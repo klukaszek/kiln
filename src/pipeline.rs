@@ -1,14 +1,10 @@
 use crate::types::*;
 
 /// Per-color-attachment entry in a graphics PSO.
-///
-/// Matches Aaltonen's `ColorTarget { FORMAT format; uint8 writeMask; }`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ColorTarget {
     pub format: Format,
-    /// Static write mask baked into the PSO for dead-code elimination.
-    /// Disable unused outputs (e.g. set to empty) to allow the compiler to
-    /// eliminate dead pixel shader outputs, reducing PSO permutations.
+    /// Static write mask baked into the PSO; set empty to dead-code-eliminate unused outputs.
     pub write_mask: ColorWriteMask,
 }
 
@@ -23,14 +19,9 @@ impl ColorTarget {
 
 /// Description for creating a graphics pipeline state object.
 ///
-/// Minimal PSO — only topology, color/depth formats, MSAA, cull, and write masks baked.
-/// DepthStencil and Blend are separate flyweight objects (`set_depth_stencil_state` /
-/// `set_blend_state`) to minimise PSO permutations.
-///
-/// Matches Aaltonen's `GpuRasterDesc`.
-///
-/// Shaders are not part of this desc — they are passed as `&ShaderModule` arguments to
-/// `create_graphics_pso`, matching the spec's `gpuCreateGraphicsPipeline(vertexIR, pixelIR, desc)`.
+/// Minimal PSO — only topology, formats, MSAA, cull, and write masks baked. DepthStencil and
+/// Blend are separate flyweights (`set_depth_stencil_state` / `set_blend_state`) to minimise
+/// permutations. Shaders are passed as `&ShaderModule` args to `create_graphics_pso`, not here.
 #[derive(Clone, Debug)]
 pub struct GraphicsPsoDesc {
     /// Primitive topology.
@@ -51,9 +42,7 @@ pub struct GraphicsPsoDesc {
     pub stencil_format: Option<Format>,
     /// Enable dual-source blending (requires `blendstate` with two outputs).
     pub support_dual_source_blending: bool,
-    /// Optional pre-baked blend state. When `Some`, this variant is compiled into the PSO
-    /// at creation time and used as the default — matching Aaltonen's `GpuRasterDesc.blendstate`.
-    /// When `None`, blend state is supplied per-draw via `cmd.set_blend_state(...)`.
+    /// Pre-baked default blend state. `None` = supply per-draw via `cmd.set_blend_state(...)`.
     pub blendstate: Option<BlendState>,
     pub label: Option<String>,
 }
@@ -125,8 +114,6 @@ pub(crate) enum ComputePsoInner {
 }
 
 /// Per-face stencil operation descriptor.
-///
-/// Matches Aaltonen's `Stencil` struct.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StencilDesc {
     /// Comparison function applied against the stencil buffer.
@@ -153,9 +140,7 @@ impl Default for StencilDesc {
     }
 }
 
-/// Separate depth-stencil state (flyweight object).
-///
-/// Matches Aaltonen's `GpuDepthStencilDesc`. Set dynamically via `set_depth_stencil_state`.
+/// Separate depth-stencil state (flyweight). Set via `set_depth_stencil_state`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DepthStencilState {
     /// Depth read/write mode. `0` = disabled; `READ` = test only; `READ|WRITE` = full.
@@ -247,18 +232,9 @@ impl Default for BlendState {
 // Meshlet (mesh shader) pipeline — gpuCreateGraphicsMeshletPipeline
 // ---------------------------------------------------------------------------
 
-/// Description for creating a mesh-shader graphics pipeline.
-///
-/// Matches Aaltonen's `gpuCreateGraphicsMeshletPipeline(meshletIR, pixelIR, desc)`.
-/// The mesh shader replaces the vertex shader entirely; amplification shaders
-/// are not exposed (use a compute prepass or a root-pointer-addressed amplification
-/// in the mesh shader itself).
-///
-/// On Vulkan, requires `VK_EXT_mesh_shader`.
-/// On Metal, this backend targets the Metal 4 mesh render pipeline path.
-///
-/// Mesh and pixel shaders are passed as `&ShaderModule` arguments to `create_meshlet_pso`,
-/// matching the spec's `gpuCreateGraphicsMeshletPipeline(meshletIR, pixelIR, desc)`.
+/// Description for a mesh-shader graphics pipeline. The mesh shader replaces the vertex shader;
+/// amplification shaders aren't exposed. Mesh and pixel shaders are passed as `&ShaderModule`
+/// args to `create_meshlet_pso`. Requires `VK_EXT_mesh_shader` on Vulkan.
 #[derive(Clone, Debug)]
 pub struct MeshletPsoDesc {
     /// Rasterizer state — same fields as `GraphicsPsoDesc`.

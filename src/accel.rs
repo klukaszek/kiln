@@ -1,19 +1,25 @@
-//! Acceleration structure types (BLAS + TLAS) for ray tracing.
-//!
-//! Following Aaltonen's model: the AS is just another piece of GPU memory.
-//! The GPU address is placed into root structs as a `u64` and the shader
-//! dereferences it with a `TraceRayInline` / `intersect(ray, as, ...)` intrinsic.
+//! Acceleration structure types (BLAS + TLAS) for ray tracing. An AS is just GPU memory: its
+//! address goes into a root struct and the shader dereferences it via `TraceRayInline`.
 
-use crate::types::AccelerationStructureId;
+use crate::types::{AccelerationStructureId, GpuAddress};
 
-/// A built acceleration structure (BLAS or TLAS).
-///
-/// Created by `device.create_blas(desc)` or `device.create_tlas(desc)`.
-/// The `id` is opaque — pass it to `cmd.build_blas()` / `cmd.build_tlas()`.
-/// The GPU address is obtained via `device.accel_gpu_address(id)`.
+/// A built acceleration structure (BLAS or TLAS). Build it with `cmd.build_blas`/`build_tlas`,
+/// then store [`gpu()`](Self::gpu) in a root `GpuAddress` field for the shader.
 pub struct AccelerationStructure {
     pub id: AccelerationStructureId,
     pub(crate) inner: AccelInner,
+}
+
+impl AccelerationStructure {
+    /// GPU address of this structure, for a root `GpuAddress` field (`TraceRayInline`).
+    pub fn gpu(&self) -> GpuAddress {
+        match &self.inner {
+            #[cfg(feature = "vulkan")]
+            AccelInner::Vulkan(a) => GpuAddress(a.device_address),
+            #[cfg(feature = "metal")]
+            AccelInner::Metal(a) => GpuAddress(a.gpu_resource_id),
+        }
+    }
 }
 
 pub(crate) enum AccelInner {

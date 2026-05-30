@@ -685,7 +685,7 @@ impl VulkanCommandBuffer {
     ) -> (vk::Image, vk::ImageAspectFlags, u32, u32, vk::Buffer, u64) {
         assert_eq!(
             texture_gpu,
-            texture.gpu_address(),
+            texture.gpu(),
             "{op} texture_gpu must match the address used to create the texture"
         );
         let (image, _view) = self.resolve_texture(texture.id());

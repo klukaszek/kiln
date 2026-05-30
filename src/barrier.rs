@@ -1,8 +1,5 @@
 bitflags::bitflags! {
-    /// Pipeline stage flags for barrier synchronization.
-    ///
-    /// Matches the Aaltonen "No Graphics API" stage model.
-    /// Stage-only barriers — no per-resource state tracking.
+    /// Producer/consumer stages for a barrier. Stage-only — no per-resource state tracking.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct StageFlags: u32 {
         const VERTEX_SHADER     = 0x01;
@@ -17,17 +14,11 @@ bitflags::bitflags! {
 }
 
 bitflags::bitflags! {
-    /// Hazard flags for barrier special-case cache invalidation.
+    /// Special-case cache-invalidation hints added to a barrier; most barriers need none.
     ///
-    /// Modern GPUs flush the majority of non-coherent caches automatically on
-    /// every barrier. Only these three cases require explicit hints:
-    ///
-    /// - `DRAW_ARGUMENTS`: GPU-written indirect args — stalls the command
-    ///   processor prefetcher so it sees the updated draw/dispatch parameters.
-    /// - `DESCRIPTORS`: Texture descriptor heap was written — invalidates the
-    ///   sampler's internal descriptor cache.
-    /// - `DEPTH_STENCIL`: Depth buffer written by compute — invalidates HiZ
-    ///   and depth caches that are not automatically flushed.
+    /// - `DRAW_ARGUMENTS`: GPU-written indirect args — stall the command-processor prefetcher.
+    /// - `DESCRIPTORS`: descriptor heap written — invalidate the sampler descriptor cache.
+    /// - `DEPTH_STENCIL`: depth written by compute — invalidate HiZ/depth caches.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct HazardFlags: u32 {
         const DRAW_ARGUMENTS    = 0x0001;

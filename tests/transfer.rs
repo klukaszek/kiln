@@ -28,7 +28,7 @@ fn gpu_memcpy_roundtrip() {
 
     common::timed("memcpy 64 KiB · record+submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
-        cmd.memcpy(dst.gpu_address(), src.gpu_address(), SIZE);
+        cmd.memcpy(dst.gpu(), src.gpu(), SIZE);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
         cmd.end();
         let queue = device.queue();
@@ -59,7 +59,7 @@ fn gpu_memcpy_size_sweep() {
 
         common::timed(&format!("memcpy {kib} KiB → GpuOnly"), || {
             let mut cmd = device.create_command_buffer().expect("cmd");
-            cmd.memcpy(dst.gpu_address(), src.gpu_address(), size);
+            cmd.memcpy(dst.gpu(), src.gpu(), size);
             cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
             cmd.end();
             let queue = device.queue();

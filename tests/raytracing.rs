@@ -14,7 +14,7 @@ use kiln_rhi::{
 
 gpu_struct! {
     pub struct Root {
-        output: u64 as "uint*",
+        output: GpuAddress as "uint*",
     }
 }
 
@@ -84,7 +84,7 @@ fn ray_query_triangle_hit() {
         meshes: vec![BlasMeshDesc {
             geometry_type: GeometryType::Triangles,
             flags: GeometryFlags::OPAQUE,
-            vertex_buffer: vbuf.gpu_address(),
+            vertex_buffer: vbuf.gpu(),
             vertex_stride: 12,
             vertex_count: 3,
             index_buffer: GpuAddress(0),
@@ -124,14 +124,14 @@ fn ray_query_triangle_hit() {
         ],
         instance_custom_index_and_mask: 0xFF << 24, // mask = 0xFF
         instance_sbt_offset_and_flags: 0,
-        acceleration_structure_reference: device.accel_gpu_address(&blas).0,
+        acceleration_structure_reference: blas.gpu(),
     };
     device
         .write_tlas_instance(&instbuf, 0, &instance)
         .expect("write instance");
 
     let tlas_desc = TlasDesc {
-        instance_buffer: instbuf.gpu_address(),
+        instance_buffer: instbuf.gpu(),
         instance_count: 1,
         flags: BuildAccelFlags::PREFER_FAST_TRACE,
     };
@@ -152,7 +152,7 @@ fn ray_query_triangle_hit() {
         .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
     root.upload(&Root {
-        output: output.gpu_address().0,
+        output: output.gpu(),
     })
     .expect("upload root");
 
@@ -160,7 +160,7 @@ fn ray_query_triangle_hit() {
         let mut cmd = device.create_command_buffer().expect("cmd");
         cmd.set_compute_pipeline(&pso);
         cmd.bind_acceleration_structure(1, &tlas);
-        cmd.dispatch(root.gpu_address(), 1, 1, 1);
+        cmd.dispatch(root.gpu(), 1, 1, 1);
         cmd.barrier(StageFlags::COMPUTE, StageFlags::ALL_COMMANDS);
         cmd.end();
         let q = device.queue();

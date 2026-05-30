@@ -79,14 +79,10 @@ pub struct DrawIndexedIndirectArgs {
     pub first_instance: u32,
 }
 
-/// Arguments for multi-draw indirect.
+/// Arguments for multi-draw indirect (layout matches `VkDrawIndirectCommand`).
 ///
-/// `NoGraphicsApi.md` gives MDI no CPU-side `indicesGpu` parameter (line 1124).
-/// The architecture relies on programmable vertex fetch (lines 59, 1152): the
-/// vertex shader reads `[[draw_id]]` / `gl_DrawID`, computes its per-draw root
-/// pointer (`dataVx + draw_id * vxStride`), and loads its own index buffer from
-/// a pointer field inside that root struct. The hardware draw is non-indexed.
-/// Layout matches `VkDrawIndirectCommand`.
+/// The hardware draw is non-indexed: the vertex shader reads `draw_id`, finds its per-draw
+/// root, and does programmable index fetch from a pointer in that root.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::Immutable)]
 pub struct DrawIndirectMultiArgs {
@@ -106,8 +102,6 @@ pub struct DispatchIndirectArgs {
 }
 
 /// Atomic signal operation for split synchronization.
-///
-/// Matches Aaltonen's `SIGNAL { SIGNAL_ATOMIC_SET, SIGNAL_ATOMIC_MAX, SIGNAL_ATOMIC_OR }`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignalOp {
     /// Write the value unconditionally.
@@ -270,15 +264,9 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indexed_indirect(indices, args))
     }
 
-    /// `gpuDrawIndexedInstancedIndirectMulti(cb, vData, vStride, pData, pStride, argsGpu, drawCountGpu)`
-    ///
-    /// `args` points to an array of `DrawIndirectMultiArgs`. Root data is selected
-    /// by draw ID from `vertex_root + draw_id * vertex_stride` and
-    /// `pixel_root + draw_id * pixel_stride`; a zero stride broadcasts one root block.
-    ///
-    /// Drawing is non-indexed at the hardware level — per the spec the vertex shader
-    /// performs programmable index fetch from a pointer carried in its per-draw root
-    /// struct. No index buffer parameter exists.
+    /// Multi-draw indirect. `args` is an array of `DrawIndirectMultiArgs`; per-draw root data
+    /// is `root + draw_id * stride` (stride 0 broadcasts one block). Non-indexed — the vertex
+    /// shader does its own index fetch (see [`DrawIndirectMultiArgs`]).
     pub fn draw_indirect_multi(
         &mut self,
         vertex_root: GpuAddress,
@@ -305,11 +293,8 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.memcpy(dst, src, size))
     }
 
-    /// `gpuCopyToTexture(cb, destGpu, srcGpu, texture)`
-    ///
-    /// `texture_gpu` is the raw GPU memory address of the destination texture allocation
-    /// (the pointer returned by `gpuMalloc` when the texture was created).
-    /// `src` is the source staging buffer GPU address.
+    /// Copy a staging buffer into a texture. `texture_gpu` is the texture's backing
+    /// allocation address; `src` is the source buffer address.
     pub fn copy_to_texture(
         &mut self,
         texture_gpu: GpuAddress,
@@ -319,10 +304,8 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_to_texture(texture_gpu, src, texture))
     }
 
-    /// `gpuCopyFromTexture(cb, destGpu, srcGpu, texture)`
-    ///
-    /// `dst` is the destination buffer GPU address.
-    /// `texture_gpu` is the raw GPU memory address of the source texture allocation.
+    /// Copy a texture into a buffer. `dst` is the destination buffer address; `texture_gpu`
+    /// is the texture's backing allocation address.
     pub fn copy_from_texture(
         &mut self,
         dst: GpuAddress,
@@ -448,29 +431,19 @@ impl CommandBuffer {
 
     // -- Acceleration structure builds --
 
-    /// Bind a (TLAS) acceleration structure as a shader resource at `slot` for ray queries.
-    ///
-    /// Slang lowers a `RaytracingAccelerationStructure` declared as a trailing entry-point
-    /// parameter to the buffer slot after the root, so ray-query compute kernels bind the
-    /// TLAS at slot 1. Call after the pipeline is set and before the dispatch.
+    /// Bind a TLAS at `slot` for ray queries (kernels use slot 1: Slang places the trailing
+    /// `RaytracingAccelerationStructure` after the root). Call after the pipeline, before dispatch.
     pub fn bind_acceleration_structure(&mut self, slot: u32, accel: &AccelerationStructure) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.bind_acceleration_structure(slot, accel))
     }
 
-    /// Build a bottom-level acceleration structure.
-    ///
-    /// This encodes the GPU build command. The `accel` object must have been created by
-    /// `device.create_blas(desc)` using the same `desc`.  A scratch buffer is required;
-    /// on Metal it is stored on the `AccelerationStructure` handle from creation time.
+    /// Build a BLAS. `accel` must come from `device.create_blas(desc)` with the same `desc`.
     pub fn build_blas(&mut self, accel: &AccelerationStructure, desc: &BlasDesc) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.build_blas(accel, desc))
     }
 
-    /// Build a top-level acceleration structure.
+    /// Build a TLAS.
     pub fn build_tlas(&mut self, accel: &AccelerationStructure, desc: &TlasDesc) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.build_tlas(accel, desc))
     }
-
-    // -- Ray tracing dispatch --
-
 }

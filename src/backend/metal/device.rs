@@ -456,13 +456,9 @@ static inline primitive_type rhi_primitive_type(uint id) {
     }
 }
 
-// Encodes non-indexed multi-draw indirect into an MTLIndirectCommandBuffer.
-// Per NoGraphicsApi.md (lines 904-907, 1124, 59, 1152) the architecture's MDI
-// is fully GPU-driven and non-indexed at the hardware level: vertex shaders
-// perform programmable index fetch from a pointer inside per-draw root data,
-// selected by [[draw_id]] + stride.
-//
-// The ICB is bound directly via Metal 4's setResource_atBufferIndex (no argument buffer).
+// Encodes non-indexed MDI into an MTLIndirectCommandBuffer (bound directly via
+// setResource_atBufferIndex). The draw is non-indexed; the vertex shader does its own index
+// fetch from per-draw root data selected by [[draw_id]] + stride.
 kernel void rhi_encode_mdi_icb(
     device const RhiDrawIndirectMultiArgs* draws [[buffer(0)]],
     device atomic_uint* drawCount [[buffer(1)]],
@@ -1389,8 +1385,7 @@ impl MetalDevice {
     /// Encode `inst` into `dst` in Metal's native indirect instance-descriptor layout.
     /// `dst` must have room for `tlas_instance_stride()` bytes.
     ///
-    /// `inst.acceleration_structure_reference` must be the BLAS `gpuResourceID` (i.e. the
-    /// value returned by `device.accel_gpu_address(blas)` on Metal).
+    /// `inst.acceleration_structure_reference` must be the BLAS `gpuResourceID` (`blas.gpu()`).
     pub fn write_tlas_instance(&self, dst: *mut u8, inst: &crate::types::TlasInstance) {
         use objc2_metal::{
             MTLAccelerationStructureInstanceOptions, MTLIndirectAccelerationStructureInstanceDescriptor,
@@ -1406,7 +1401,7 @@ impl MetalDevice {
             z: t[2][c],
         };
         let resource_id: MTLResourceID =
-            unsafe { std::mem::transmute(inst.acceleration_structure_reference) };
+            unsafe { std::mem::transmute(inst.acceleration_structure_reference.0) };
 
         let desc = MTLIndirectAccelerationStructureInstanceDescriptor {
             transformationMatrix: MTLPackedFloat4x3 {

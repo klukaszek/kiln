@@ -6,13 +6,13 @@
 
 mod common;
 
-use kiln_rhi::{gpu_struct, ComputePsoDesc, MemoryType, ShaderStage, StageFlags};
+use kiln_rhi::{gpu_struct, ComputePsoDesc, GpuAddress, MemoryType, ShaderStage, StageFlags};
 
 // Shared host/device data contract. `Data::SLANG` is the matching Slang declaration.
 gpu_struct! {
     pub struct Data {
-        input: u64 as "uint*",
-        output: u64 as "uint*",
+        input: GpuAddress as "uint*",
+        output: GpuAddress as "uint*",
         count: u32 as "uint",
         // Explicit tail padding so the struct is padding-free (GpuPod/IntoBytes) and matches
         // Slang's 24-byte natural layout exactly.
@@ -20,7 +20,8 @@ gpu_struct! {
     }
 }
 
-const COMPUTE_BODY: &str = r#"
+const COMPUTE_BODY: &str = /*slang*/
+    r#"
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void computeMain(uint3 tid : SV_DispatchThreadID, uniform Data* data)
@@ -73,8 +74,8 @@ fn compute_doubles_buffer() {
         .expect("upload input");
     // Build the root struct type-safely — no raw pointers, no hand-computed offsets.
     data.upload(&Data {
-        input: input.gpu_address().0,
-        output: output.gpu_address().0,
+        input: input.gpu(),
+        output: output.gpu(),
         count: N,
         _pad: 0,
     })
@@ -83,7 +84,7 @@ fn compute_doubles_buffer() {
     common::timed("dispatch 1024 · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
         cmd.set_compute_pipeline(&pso);
-        cmd.dispatch(data.gpu_address(), N.div_ceil(64), 1, 1);
+        cmd.dispatch(data.gpu(), N.div_ceil(64), 1, 1);
         cmd.barrier(StageFlags::COMPUTE, StageFlags::ALL_COMMANDS);
         cmd.end();
         let queue = device.queue();

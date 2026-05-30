@@ -40,8 +40,6 @@ pub fn to_vk_stage_flags(flags: StageFlags) -> vk::PipelineStageFlags2 {
 }
 
 /// Convert RHI hazard flags to Vulkan access flags (for global memory barriers).
-///
-/// Aaltonen's three hazard cases map cleanly onto Vulkan's access flag model.
 pub fn to_vk_access_flags(hazard: HazardFlags, is_src: bool) -> vk::AccessFlags2 {
     let mut result = vk::AccessFlags2::NONE;
 

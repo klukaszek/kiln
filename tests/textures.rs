@@ -50,7 +50,7 @@ fn texture_create_and_view_descriptors() {
         .expect("texture backing memory");
     let texture = common::timed("create_texture (placement)", || {
         device
-            .create_texture(&desc, mem.gpu_address())
+            .create_texture(&desc, mem.gpu())
             .expect("create_texture")
     });
 
@@ -119,7 +119,7 @@ fn texture_copy_roundtrip() {
         .malloc_aligned(size_align.size, size_align.align, MemoryType::GpuOnly)
         .expect("texture backing");
     let texture = device
-        .create_texture(&desc, mem.gpu_address())
+        .create_texture(&desc, mem.gpu())
         .expect("create_texture");
 
     let bytes = (W as usize) * (H as usize) * BPP;
@@ -141,9 +141,9 @@ fn texture_copy_roundtrip() {
 
     common::timed("upload→texture→readback · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
-        cmd.copy_to_texture(mem.gpu_address(), src.gpu_address(), &texture);
+        cmd.copy_to_texture(mem.gpu(), src.gpu(), &texture);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::TRANSFER);
-        cmd.copy_from_texture(dst.gpu_address(), mem.gpu_address(), &texture);
+        cmd.copy_from_texture(dst.gpu(), mem.gpu(), &texture);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
         cmd.end();
         let queue = device.queue();

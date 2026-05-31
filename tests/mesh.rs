@@ -210,10 +210,11 @@ fn make_meshlet_pso(
 fn render_meshlets(
     device: &Device,
     pso: &MeshletPso,
-    root: GpuAddress,
+    root: impl Into<Option<GpuAddress>>,
     size: u32,
     groups: [u32; 3],
 ) -> Vec<u8> {
+    let root = root.into();
     let tex_desc = TextureDesc {
         width: size,
         height: size,
@@ -333,12 +334,10 @@ fn mesh_clip_space_is_y_up() {
     };
 
     const SIZE: u32 = 128;
-    // Shader ignores the root, but `draw_meshlets` still needs a valid pointer — hand
-    // it a transient bump allocation rather than a dedicated malloc.
-    let mut bump = test_bump(&device);
-    let root = bump.alloc(16, 16).expect("bump root");
+    // This shader reads no root data, so the draw's root pointer is NULL — a draw
+    // that carries nothing needs no allocation.
     let pixels = common::timed("mesh clip-space orientation · submit+wait", || {
-        render_meshlets(&device, &pso, root.gpu, SIZE, [1, 1, 1])
+        render_meshlets(&device, &pso, None, SIZE, [1, 1, 1])
     });
     common::save_rgba_png("mesh_clip_space_is_y_up", SIZE, SIZE, &pixels);
 
@@ -364,8 +363,6 @@ fn mesh_clip_space_is_y_up() {
             }
         }
     }
-
-    device.destroy_buffer(bump.into_buffer());
 }
 
 // ---------------------------------------------------------------------------
@@ -528,12 +525,10 @@ fn mesh_interpolated_triangle() {
     };
 
     const SIZE: u32 = 128;
-    // Per-vertex colours come from the shader; the root is unused but still required,
-    // so source it transiently from the bump allocator.
-    let mut bump = test_bump(&device);
-    let root = bump.alloc(16, 16).expect("bump root");
+    // Per-vertex colours come from the shader; the draw reads no root data, so its
+    // root pointer is NULL.
     let pixels = common::timed("interpolated triangle · submit+wait", || {
-        render_meshlets(&device, &pso, root.gpu, SIZE, [1, 1, 1])
+        render_meshlets(&device, &pso, None, SIZE, [1, 1, 1])
     });
     common::save_rgba_png("mesh_interpolated_triangle", SIZE, SIZE, &pixels);
 
@@ -582,6 +577,4 @@ fn mesh_interpolated_triangle() {
         max_b.2 > 200 && max_b.0 < 80 && max_b.1 < 80,
         "no blue-dominant pixel: {max_b:?}"
     );
-
-    device.destroy_buffer(bump.into_buffer());
 }

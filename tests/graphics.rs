@@ -201,11 +201,12 @@ fn make_graphics_pso(
 fn render_draw(
     device: &Device,
     pso: &GraphicsPso,
-    root: GpuAddress,
+    root: impl Into<Option<GpuAddress>>,
     size: u32,
     vertex_count: u32,
     instance_count: u32,
 ) -> Vec<u8> {
+    let root = root.into();
     let tex_desc = TextureDesc {
         width: size,
         height: size,
@@ -319,12 +320,10 @@ fn graphics_clip_space_is_y_up() {
     let pso = make_graphics_pso(&device, &vs, &fs, 16, "orient");
 
     const SIZE: u32 = 128;
-    // Shader ignores the root, but `draw` still needs a valid pointer — hand it a
-    // transient bump allocation rather than a dedicated malloc.
-    let mut bump = test_bump(&device);
-    let root = bump.alloc(16, 16).expect("bump root");
+    // This shader reads no root data, so the draw's root pointer is NULL — a draw
+    // that carries nothing needs no allocation.
     let pixels = common::timed("graphics clip-space orientation · submit+wait", || {
-        render_draw(&device, &pso, root.gpu, SIZE, 6, 1)
+        render_draw(&device, &pso, None, SIZE, 6, 1)
     });
     common::save_rgba_png("graphics_clip_space_is_y_up", SIZE, SIZE, &pixels);
 
@@ -346,8 +345,6 @@ fn graphics_clip_space_is_y_up() {
             }
         }
     }
-
-    device.destroy_buffer(bump.into_buffer());
 }
 
 // ---------------------------------------------------------------------------
@@ -391,12 +388,10 @@ fn graphics_interpolated_triangle() {
     let pso = make_graphics_pso(&device, &vs, &fs, 16, "tri");
 
     const SIZE: u32 = 128;
-    // Per-vertex colours come from the shader; the root is unused but still required,
-    // so source it transiently from the bump allocator.
-    let mut bump = test_bump(&device);
-    let root = bump.alloc(16, 16).expect("bump root");
+    // Per-vertex colours come from the shader; the draw reads no root data, so its
+    // root pointer is NULL.
     let pixels = common::timed("graphics interpolated triangle · submit+wait", || {
-        render_draw(&device, &pso, root.gpu, SIZE, 3, 1)
+        render_draw(&device, &pso, None, SIZE, 3, 1)
     });
     common::save_rgba_png("graphics_interpolated_triangle", SIZE, SIZE, &pixels);
 
@@ -450,8 +445,6 @@ fn graphics_interpolated_triangle() {
         max_b.2 > 200 && max_b.0 < 80 && max_b.1 < 80,
         "no blue-dominant pixel: {max_b:?}"
     );
-
-    device.destroy_buffer(bump.into_buffer());
 }
 
 // ---------------------------------------------------------------------------

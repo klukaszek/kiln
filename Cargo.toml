@@ -59,3 +59,8 @@ objc2-quartz-core = { version = "0.3", optional = true, features = [
 ] }
 objc2-core-foundation = { version = "0.3", optional = true }
 dispatch2 = { version = "0.3", optional = true }
+
+[dev-dependencies]
+# Windowing for the `examples/` (surface + swapchain demos). winit 0.30 speaks
+# raw-window-handle 0.6, matching the RHI's surface API.
+winit = "0.30"

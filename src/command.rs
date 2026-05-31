@@ -145,6 +145,13 @@ pub struct CommandBuffer {
     pub(crate) inner: CommandBufferInner,
 }
 
+/// Resolve an optional root pointer: `None` (a draw that carries no root data) maps to
+/// the null GPU address, which the backends bind as a never-dereferenced `buffer(0)`.
+#[inline]
+fn root_or_null(root: impl Into<Option<GpuAddress>>) -> GpuAddress {
+    root.into().unwrap_or(GpuAddress::NULL)
+}
+
 pub(crate) enum CommandBufferInner {
     #[cfg(feature = "vulkan")]
     Vulkan(Box<crate::backend::vulkan::command::VulkanCommandBuffer>),
@@ -212,16 +219,19 @@ impl CommandBuffer {
     // Every call includes its root data pointer(s) — no pre-call dance, no separate set_root_data.
 
     /// Non-indexed draw. 🔵 Extension (spec only has indexed draws).
+    ///
+    /// Pass `None` for a root the shader doesn't read; otherwise a `GpuAddress` (bare,
+    /// no `Some`). Vertex and pixel share one root table, so pass the same pointer for both.
     pub fn draw(
         &mut self,
-        vertex_root: GpuAddress,
-        pixel_root: GpuAddress,
+        vertex_root: impl Into<Option<GpuAddress>>,
+        pixel_root: impl Into<Option<GpuAddress>>,
         vertex_count: u32,
         instance_count: u32,
         first_vertex: u32,
         first_instance: u32,
     ) {
-        self.set_root_data(vertex_root, pixel_root);
+        self.set_root_data(root_or_null(vertex_root), root_or_null(pixel_root));
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd =>
             cmd.draw(vertex_count, instance_count, first_vertex, first_instance))
     }
@@ -229,38 +239,38 @@ impl CommandBuffer {
     /// `gpuDrawIndexedInstanced(cb, vertexDataGpu, pixelDataGpu, indicesGpu, indexCount, instanceCount)`
     pub fn draw_indexed(
         &mut self,
-        vertex_root: GpuAddress,
-        pixel_root: GpuAddress,
+        vertex_root: impl Into<Option<GpuAddress>>,
+        pixel_root: impl Into<Option<GpuAddress>>,
         indices: GpuAddress,
         index_count: u32,
         instance_count: u32,
     ) {
-        self.set_root_data(vertex_root, pixel_root);
+        self.set_root_data(root_or_null(vertex_root), root_or_null(pixel_root));
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd =>
             cmd.draw_indexed(indices, index_count, instance_count))
     }
 
     /// `gpuDispatch(cb, dataGpu, gridDimensions)`
-    pub fn dispatch(&mut self, root: GpuAddress, x: u32, y: u32, z: u32) {
-        self.set_compute_root(root);
+    pub fn dispatch(&mut self, root: impl Into<Option<GpuAddress>>, x: u32, y: u32, z: u32) {
+        self.set_compute_root(root_or_null(root));
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch(x, y, z))
     }
 
     /// `gpuDispatchIndirect(cb, dataGpu, gridDimensionsGpu)`
-    pub fn dispatch_indirect(&mut self, root: GpuAddress, args: GpuAddress) {
-        self.set_compute_root(root);
+    pub fn dispatch_indirect(&mut self, root: impl Into<Option<GpuAddress>>, args: GpuAddress) {
+        self.set_compute_root(root_or_null(root));
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch_indirect(args))
     }
 
     /// `gpuDrawIndexedInstancedIndirect(cb, vertexDataGpu, pixelDataGpu, indicesGpu, argsGpu)`
     pub fn draw_indexed_indirect(
         &mut self,
-        vertex_root: GpuAddress,
-        pixel_root: GpuAddress,
+        vertex_root: impl Into<Option<GpuAddress>>,
+        pixel_root: impl Into<Option<GpuAddress>>,
         indices: GpuAddress,
         args: GpuAddress,
     ) {
-        self.set_root_data(vertex_root, pixel_root);
+        self.set_root_data(root_or_null(vertex_root), root_or_null(pixel_root));
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indexed_indirect(indices, args))
     }
 
@@ -269,13 +279,14 @@ impl CommandBuffer {
     /// shader does its own index fetch (see [`DrawIndirectMultiArgs`]).
     pub fn draw_indirect_multi(
         &mut self,
-        vertex_root: GpuAddress,
+        vertex_root: impl Into<Option<GpuAddress>>,
         vertex_stride: u32,
-        pixel_root: GpuAddress,
+        pixel_root: impl Into<Option<GpuAddress>>,
         pixel_stride: u32,
         args: GpuAddress,
         draw_count: GpuAddress,
     ) {
+        let (vertex_root, pixel_root) = (root_or_null(vertex_root), root_or_null(pixel_root));
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indirect_multi(
             vertex_root,
             vertex_stride,
@@ -405,13 +416,13 @@ impl CommandBuffer {
     /// Pipeline must be set first via `set_meshlet_pipeline`.
     pub fn draw_meshlets(
         &mut self,
-        mesh_root: GpuAddress,
-        pixel_root: GpuAddress,
+        mesh_root: impl Into<Option<GpuAddress>>,
+        pixel_root: impl Into<Option<GpuAddress>>,
         x: u32,
         y: u32,
         z: u32,
     ) {
-        self.set_root_data(mesh_root, pixel_root);
+        self.set_root_data(root_or_null(mesh_root), root_or_null(pixel_root));
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets(x, y, z))
     }
 
@@ -421,11 +432,11 @@ impl CommandBuffer {
     /// `args` is a GPU address pointing to one `VkDrawMeshTasksIndirectCommandEXT` (12 bytes: x,y,z).
     pub fn draw_meshlets_indirect(
         &mut self,
-        mesh_root: GpuAddress,
-        pixel_root: GpuAddress,
+        mesh_root: impl Into<Option<GpuAddress>>,
+        pixel_root: impl Into<Option<GpuAddress>>,
         args: GpuAddress,
     ) {
-        self.set_root_data(mesh_root, pixel_root);
+        self.set_root_data(root_or_null(mesh_root), root_or_null(pixel_root));
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets_indirect(args))
     }
 

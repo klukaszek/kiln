@@ -705,15 +705,11 @@ impl MetalDevice {
 
         let format = mtl_to_format(layer.pixelFormat());
 
-        // Create depth texture
-        let depth_texture = self.create_depth_texture(desc.width, desc.height)?;
-
         Ok(Swapchain {
             inner: SwapchainInner::Metal(MetalSwapchain {
                 layer: layer.clone(),
                 format,
                 extent: [desc.width, desc.height],
-                depth_texture,
                 current_drawable: RefCell::new(None),
                 current_drawable_texture: RefCell::new(None),
             }),
@@ -732,7 +728,6 @@ impl MetalDevice {
                     height: desc.height as f64,
                 });
                 sc.extent = [desc.width, desc.height];
-                sc.depth_texture = self.create_depth_texture(desc.width, desc.height)?;
                 Ok(())
             }
             #[allow(unreachable_patterns)]
@@ -1515,7 +1510,6 @@ impl MetalDevice {
         match (&mut cmd_buf.inner, &swapchain.inner) {
             (crate::command::CommandBufferInner::Metal(mtl_cmd), SwapchainInner::Metal(sc)) => {
                 mtl_cmd.drawable_texture = sc.current_drawable_texture.borrow().clone();
-                mtl_cmd.depth_texture = Some(sc.depth_texture.clone());
             }
             #[allow(unreachable_patterns)]
             _ => unreachable!("wrong backend"),
@@ -1675,34 +1669,6 @@ impl MetalDevice {
         Ok(id)
     }
 
-    fn create_depth_texture(
-        &self,
-        width: u32,
-        height: u32,
-    ) -> RhiResult<Retained<ProtocolObject<dyn MTLTexture>>> {
-        let desc = MTLTextureDescriptor::new();
-        unsafe {
-            desc.setPixelFormat(MTLPixelFormat::Depth32Float);
-            desc.setWidth(width as usize);
-            desc.setHeight(height as usize);
-            desc.setStorageMode(MTLStorageMode::Private);
-            desc.setUsage(MtlTextureUsage::RenderTarget);
-        }
-
-        let texture = self
-            .device
-            .newTextureWithDescriptor(&desc)
-            .ok_or_else(|| RhiError::TextureCreation("Depth texture creation failed".into()))?;
-
-        let allocation = unsafe {
-            &*(texture.as_ref() as *const ProtocolObject<dyn MTLTexture>
-                as *const ProtocolObject<dyn MTLAllocation>)
-        };
-        self.residency_set.addAllocation(allocation);
-        self.residency_dirty.set(true);
-
-        Ok(texture)
-    }
 }
 
 fn filter_to_mtl(f: crate::types::FilterMode) -> objc2_metal::MTLSamplerMinMagFilter {

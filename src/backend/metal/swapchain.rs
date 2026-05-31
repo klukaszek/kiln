@@ -11,7 +11,6 @@ pub struct MetalSwapchain {
     pub(crate) layer: Retained<CAMetalLayer>,
     pub(crate) format: Format,
     pub(crate) extent: [u32; 2],
-    pub(crate) depth_texture: Retained<ProtocolObject<dyn MTLTexture>>,
     /// Current drawable acquired for this frame (set by acquire_image, consumed by present).
     pub(crate) current_drawable: RefCell<Option<Retained<ProtocolObject<dyn MTLDrawable>>>>,
     /// Texture from the current drawable for rendering.

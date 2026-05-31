@@ -228,12 +228,19 @@ pub enum Cull {
     All,
 }
 
-/// Clip-space Y direction. Vulkan is Y-down; Metal/OpenGL is Y-up.
+/// Clip-space Y direction.
+///
+/// Kiln normalizes every backend to [`ClipSpaceY::Up`] (see [`Device::clip_space_y`]),
+/// so [`Down`] never arises in practice; it exists only to name the convention. Native
+/// Vulkan is Y-down, but the backend flips its viewport to present Y-up like Metal.
+///
+/// [`Down`]: ClipSpaceY::Down
+/// [`Device::clip_space_y`]: crate::Device::clip_space_y
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ClipSpaceY {
-    /// NDC Y points down (Vulkan). Projection must negate Y.
+    /// NDC Y points down (native Vulkan). Projection must negate Y.
     Down,
-    /// NDC Y points up (Metal, OpenGL). Standard projection.
+    /// NDC Y points up (Metal, OpenGL, and Kiln's normalized convention). Standard projection.
     Up,
 }
 

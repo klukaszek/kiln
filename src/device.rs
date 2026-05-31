@@ -1,9 +1,7 @@
 use crate::accel::AccelerationStructure;
 use crate::command::CommandBuffer;
 use crate::error::{RhiError, RhiResult};
-use crate::memory::{
-    BufferDesc, GpuAllocation, GpuAllocator, GpuAllocatorDesc, GpuBuffer, MemoryType,
-};
+use crate::memory::{BufferDesc, GpuAllocation, GpuBuffer, MemoryType};
 use crate::pipeline::{
     ComputePso, ComputePsoDesc, GraphicsPso, GraphicsPsoDesc, MeshletPso, MeshletPsoDesc,
 };
@@ -140,14 +138,14 @@ impl Device {
         backend_dispatch!(&self.inner, DeviceInner, d => d.bindless_mode())
     }
 
-    /// Clip-space Y convention for this backend.
+    /// Clip-space Y convention — always [`ClipSpaceY::Up`].
+    ///
+    /// Kiln normalizes clip space to Y-up (Metal/D3D convention) on every backend, so
+    /// the same NDC renders identically everywhere and a single Y-up projection works
+    /// without per-backend branches. The Vulkan backend achieves this with a
+    /// negative-height viewport (see `set_viewport`); Metal is Y-up natively.
     pub fn clip_space_y(&self) -> ClipSpaceY {
-        match &self.inner {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(_) => ClipSpaceY::Down,
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(_) => ClipSpaceY::Up,
-        }
+        ClipSpaceY::Up
     }
 
     /// Create a presentation surface from raw window handles.
@@ -181,11 +179,6 @@ impl Device {
     /// Allocate GPU memory and return a pointer-first allocation.
     pub fn malloc(&self, size: u64, memory: MemoryType) -> RhiResult<GpuAllocation> {
         self.malloc_aligned(size, 16, memory)
-    }
-
-    /// Create a user-land GPU allocator over large pointer-first backing blocks.
-    pub fn create_gpu_allocator(&self, desc: GpuAllocatorDesc) -> GpuAllocator<'_> {
-        GpuAllocator::new(self, desc)
     }
 
     /// Allocate GPU memory with explicit alignment.

@@ -50,8 +50,7 @@ pub use command::{
 pub use device::{Backend, BindlessMode, Device, DeviceDesc};
 pub use error::{RhiError, RhiResult};
 pub use memory::{
-    BufferDesc, BumpAllocator, GpuAllocation, GpuAllocator, GpuAllocatorDesc, GpuBuffer, GpuPod,
-    GpuSubAllocation, MemoryType, TransientAllocation,
+    BufferDesc, BumpAllocator, GpuAllocation, GpuBuffer, GpuPod, MemoryType, TransientAllocation,
 };
 pub use pipeline::*;
 pub use queue::Queue;

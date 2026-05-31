@@ -4,7 +4,6 @@ pub enum ShaderStage {
     Vertex,
     Pixel,
     Compute,
-    /// Mesh shader stage (used with `create_meshlet_pso` / `draw_meshlets`).
     Mesh,
 }
 

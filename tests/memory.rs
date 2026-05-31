@@ -5,7 +5,7 @@
 
 mod common;
 
-use kiln_rhi::{GpuAllocatorDesc, MemoryType};
+use kiln_rhi::{BufferDesc, BumpAllocator, MemoryType};
 
 /// `Default` memory is CPU-mapped GPU memory: a write through the mapped pointer must read
 /// straight back (the dual-pointer model the whole RHI is built on).
@@ -92,72 +92,145 @@ fn malloc_free_throughput() {
     });
 }
 
-/// A sub-allocation honours the requested alignment in its absolute GPU address.
-#[test]
-fn suballocation_address_is_aligned() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+// ---------------------------------------------------------------------------
+// BumpAllocator — the per-frame transient allocator the doc reaches for in nearly
+// every example (see NoGraphicsApi.md appendix). It wraps one CPU-mapped GpuBuffer,
+// caches the GPU base once, and hands out dual `{ cpu, gpu }` pointers by bumping an
+// offset. These tests pin the contract: alignment, accounting, full-handling, reset
+// reuse, and that the cpu/gpu pair actually refer to the same memory.
+// ---------------------------------------------------------------------------
 
-    let mut allocator = device.create_gpu_allocator(GpuAllocatorDesc {
-        block_size: 1 << 20,
-        memory: MemoryType::Default,
-        label: None,
-    });
-
-    for align in [16u64, 64, 256, 4096] {
-        let sub = allocator
-            .alloc(16, align)
-            .expect("allocation within a fresh block should fit");
-        assert!(
-            sub.gpu().is_aligned_to(align),
-            "address {:#x} not aligned to {align}",
-            sub.gpu()
-        );
-    }
-
-    common::bench("GpuAllocator.alloc(256, 16)", 4096, || {
-        let _ = allocator.alloc(256, 16).expect("suballoc");
-    });
+/// Make a CPU-mapped `BumpAllocator` of `size` bytes, or `None` to skip.
+fn bump_or_skip(device: &kiln_rhi::Device, size: u64) -> Option<BumpAllocator> {
+    let buffer = device
+        .create_buffer(&BufferDesc {
+            size,
+            memory: MemoryType::Default,
+            label: Some("bump".into()),
+        })
+        .expect("create_buffer(Default)");
+    Some(BumpAllocator::new(buffer))
 }
 
-/// Freed ranges coalesce: after freeing every sub-allocation in a block, a single allocation
-/// spanning (almost) the whole block fits *without* pulling in a second backing block.
+/// Allocations honour alignment and accounting advances exactly: each chunk lands at
+/// a distinct, aligned, non-overlapping address and `used()` tracks the bumped offset.
 #[test]
-fn freed_ranges_coalesce_for_reuse() {
+fn bump_alloc_aligns_and_accounts() {
     let Some((device, _gpu)) = common::device_or_skip() else {
         return;
     };
+    let Some(mut bump) = bump_or_skip(&device, 64 * 1024) else {
+        return;
+    };
 
-    let mut allocator = device.create_gpu_allocator(GpuAllocatorDesc {
-        block_size: 256,
-        memory: MemoryType::Default,
-        label: None,
-    });
+    assert_eq!(bump.capacity(), 64 * 1024, "capacity is the backing size");
+    assert_eq!(bump.used(), 0, "fresh allocator has used nothing");
 
-    common::timed("alloc x3 · free x3 · coalesced realloc", || {
-        let a = allocator.alloc(64, 16).expect("a fits");
-        let b = allocator.alloc(64, 16).expect("b fits");
-        let c = allocator.alloc(64, 16).expect("c fits");
-        assert_eq!(
-            allocator.block_count(),
-            1,
-            "three 64B allocs fit in one block"
+    let mut prev_end = bump.gpu().0;
+    for align in [16u64, 64, 256, 4096] {
+        let used_before = bump.used();
+        let a = bump.alloc(100, align).expect("fits in a 64 KiB block");
+        assert!(
+            a.gpu.is_aligned_to(align),
+            "gpu address {:#x} not aligned to {align}",
+            a.gpu.0
         );
+        assert!(!a.cpu.is_null(), "Default memory must be CPU-mapped");
+        assert!(a.gpu.0 >= prev_end, "allocations must not overlap");
+        // used() == bumped offset == (aligned start - base) + size.
+        let start = a.gpu.0 - bump.gpu().0;
+        assert_eq!(bump.used(), start + 100, "used() tracks the bump offset");
+        assert!(bump.used() > used_before);
+        prev_end = a.gpu.0 + 100;
+    }
 
-        allocator.free(a);
-        allocator.free(b);
-        allocator.free(c);
-        assert_eq!(allocator.used(), 0, "freeing everything frees all bytes");
+    device.destroy_buffer(bump.into_buffer());
+}
 
-        let big = allocator
-            .alloc(192, 16)
-            .expect("coalesced free space should fit 192 bytes");
-        assert_eq!(
-            allocator.block_count(),
-            1,
-            "coalesced reuse must not allocate a second block"
-        );
-        allocator.free(big);
-    });
+/// The dual-pointer invariant: `cpu` and `gpu` from one allocation name the *same*
+/// memory. `host_to_device_pointer(cpu)` must return exactly `gpu`, and a CPU write
+/// through `cpu` must read straight back.
+#[test]
+fn bump_alloc_cpu_gpu_correspond() {
+    let Some((device, _gpu)) = common::device_or_skip() else {
+        return;
+    };
+    let Some(mut bump) = bump_or_skip(&device, 4096) else {
+        return;
+    };
+
+    // Bump past offset 0 so the correspondence is exercised at a non-base address.
+    let _pad = bump.alloc(48, 16).expect("pad");
+    let a = bump.alloc(256, 16).expect("alloc");
+
+    let translated = device
+        .host_to_device_pointer(a.cpu)
+        .expect("mapped cpu pointer should translate to a gpu address");
+    assert_eq!(translated, a.gpu, "cpu and gpu must name the same memory");
+    assert_eq!(
+        a.gpu,
+        bump.gpu().offset(a.gpu.0 - bump.gpu().0),
+        "gpu address is the base plus the bumped offset"
+    );
+
+    // CPU write/read roundtrip through the mapped pointer.
+    a.upload(&0xDEAD_BEEFu32).expect("upload");
+    let read_back = unsafe { std::ptr::read_unaligned(a.cpu as *const u32) };
+    assert_eq!(read_back, 0xDEAD_BEEF, "write through cpu pointer must persist");
+
+    device.destroy_buffer(bump.into_buffer());
+}
+
+/// A full allocator returns `None` rather than panicking or overrunning: both an
+/// oversized request and exhausting the capacity fail gracefully.
+#[test]
+fn bump_full_returns_none() {
+    let Some((device, _gpu)) = common::device_or_skip() else {
+        return;
+    };
+    let Some(mut bump) = bump_or_skip(&device, 256) else {
+        return;
+    };
+
+    assert!(
+        bump.alloc(512, 16).is_none(),
+        "a request larger than capacity must return None"
+    );
+
+    // Drain the allocator; once it can't fit another chunk it keeps returning None.
+    let mut count = 0;
+    while bump.alloc(64, 16).is_some() {
+        count += 1;
+        assert!(count <= 4, "256 bytes can't yield more than four 64B chunks");
+    }
+    assert_eq!(count, 4, "exactly four 64B chunks fit in 256 bytes");
+    assert!(bump.alloc(1, 1).is_none(), "exhausted allocator stays full");
+
+    device.destroy_buffer(bump.into_buffer());
+}
+
+/// `reset()` rewinds to the start: post-reset allocations reuse the same addresses,
+/// which is the whole point of a per-frame bump allocator.
+#[test]
+fn bump_reset_reuses_space() {
+    let Some((device, _gpu)) = common::device_or_skip() else {
+        return;
+    };
+    let Some(mut bump) = bump_or_skip(&device, 4096) else {
+        return;
+    };
+
+    let first = bump.alloc(128, 16).expect("first");
+    let (first_cpu, first_gpu) = (first.cpu, first.gpu);
+    let _second = bump.alloc(128, 16).expect("second");
+    assert_eq!(bump.used(), 256, "two 128B allocs used 256 bytes");
+
+    bump.reset();
+    assert_eq!(bump.used(), 0, "reset rewinds the offset");
+
+    let reused = bump.alloc(128, 16).expect("post-reset alloc");
+    assert_eq!(reused.cpu, first_cpu, "reset reuses the same cpu pointer");
+    assert_eq!(reused.gpu, first_gpu, "reset reuses the same gpu address");
+
+    device.destroy_buffer(bump.into_buffer());
 }

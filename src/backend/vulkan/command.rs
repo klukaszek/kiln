@@ -855,11 +855,17 @@ impl VulkanCommandBuffer {
         min_depth: f32,
         max_depth: f32,
     ) {
+        // Normalize to a Y-up clip space (Metal/D3D convention) so the same NDC
+        // produces the same image on every backend. Vulkan's NDC is natively
+        // Y-down; a negative-height viewport (core since Vulkan 1.1) flips it,
+        // mapping NDC y=+1 to the top of the framebuffer like Metal. This nets to
+        // the same window-space transform as negating Y in the projection, so the
+        // front-face winding is unchanged (still CCW). See `Device::clip_space_y`.
         let viewport = vk::Viewport {
             x,
-            y,
+            y: y + height,
             width,
-            height,
+            height: -height,
             min_depth,
             max_depth,
         };

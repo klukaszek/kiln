@@ -7,6 +7,7 @@
 //!
 //! Run with: `cargo run --example triangle_mesh` (needs `slangc` on PATH).
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::Example;

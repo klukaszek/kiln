@@ -12,9 +12,10 @@
 use std::process::Command;
 
 use kiln_rhi::{
-    ColorAttachment, CommandBuffer, Device, DeviceDesc, Format, LoadOp, RenderPassDesc,
-    RenderTarget, ShaderModule, ShaderModuleDesc, ShaderStage, StoreOp, Surface, SurfaceDesc,
-    Swapchain, SwapchainDesc, MAX_FRAMES_IN_FLIGHT,
+    ColorAttachment, CommandBuffer, DepthAttachment, Device, DeviceDesc, Format, GpuAllocation,
+    LoadOp, MemoryType, RenderPassDesc, RenderTarget, SampleCount, ShaderModule, ShaderModuleDesc,
+    ShaderStage, StoreOp, Surface, SurfaceDesc, Swapchain, SwapchainDesc, Texture, TextureDesc,
+    TextureDimension, TextureUsage, MAX_FRAMES_IN_FLIGHT,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
@@ -33,9 +34,45 @@ pub trait Example {
     where
         Self: Sized;
 
+    /// Opt into a depth buffer. When `Some(format)`, the harness creates a
+    /// swapchain-sized depth texture (recreated on resize) and binds it cleared to 1.0
+    /// for every render pass. Default `None` keeps the simple no-depth path.
+    fn depth_format() -> Option<Format>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     /// Record draws for one frame. The render pass is already begun on the acquired
-    /// swapchain image (cleared) with viewport + scissor set to the full `extent`.
+    /// swapchain image (cleared) with viewport + scissor set to the full `extent`. When
+    /// [`Self::depth_format`] is `Some`, a cleared depth attachment is bound too.
     fn render(&mut self, cmd: &mut CommandBuffer, extent: [u32; 2]);
+}
+
+/// Create a swapchain-sized depth texture in its own GPU-only allocation. The caller
+/// keeps both alive together; the texture borrows the allocation's storage.
+fn make_depth(device: &Device, format: Format, w: u32, h: u32) -> (Texture, GpuAllocation) {
+    let desc = TextureDesc {
+        width: w,
+        height: h,
+        depth: 1,
+        mip_levels: 1,
+        array_layers: 1,
+        format,
+        dimension: TextureDimension::D2,
+        sample_count: SampleCount::S1,
+        usage: TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+        label: Some("depth".into()),
+    };
+    let sa = device.texture_size_align(&desc).expect("depth size_align");
+    let mem = device
+        .malloc_aligned(sa.size, sa.align, MemoryType::GpuOnly)
+        .expect("depth mem");
+    let texture = device
+        .create_texture(&desc, mem.gpu())
+        .expect("create depth texture");
+    (texture, mem)
 }
 
 /// Run `E` in an 800×600 window titled `title`, clearing each frame to `clear`.
@@ -61,6 +98,7 @@ pub fn run<E: Example + 'static>(
         window: None,
         surface: None,
         swapchain: None,
+        depth: None,
         example: None,
         frame_index: 0,
     };
@@ -78,6 +116,9 @@ struct App<E: Example> {
     window: Option<Window>,
     surface: Option<Surface>,
     swapchain: Option<Swapchain>,
+    // Harness-owned depth buffer (texture + its backing allocation), present only when
+    // the example opts in via `E::depth_format()`. Recreated on resize.
+    depth: Option<(Texture, GpuAllocation)>,
     example: Option<E>,
     frame_index: usize,
 }
@@ -115,7 +156,13 @@ impl<E: Example> App<E> {
                 store_op: StoreOp::Store,
                 clear_color: self.clear,
             }],
-            depth_attachment: None,
+            depth_attachment: self.depth.as_ref().map(|(tex, _)| DepthAttachment {
+                target: RenderTarget::Texture(tex.id()),
+                load_op: LoadOp::Clear,
+                store_op: StoreOp::DontCare, // depth is transient; never read back
+                clear_depth: 1.0,
+                clear_stencil: 0,
+            }),
             render_area: [0, 0, extent[0], extent[1]],
         });
         cmd.set_viewport(0.0, 0.0, extent[0] as f32, extent[1] as f32, 0.0, 1.0);
@@ -179,10 +226,12 @@ impl<E: Example> ApplicationHandler for App<E> {
             )
             .expect("create_swapchain");
         let example = E::new(&self.device, swapchain.format());
+        let depth = E::depth_format().map(|fmt| make_depth(&self.device, fmt, w, h));
 
         self.window = Some(window);
         self.surface = Some(surface);
         self.swapchain = Some(swapchain);
+        self.depth = depth;
         self.example = Some(example);
     }
 
@@ -199,6 +248,11 @@ impl<E: Example> ApplicationHandler for App<E> {
                 ..
             } => {
                 self.device.wait_idle();
+                // Release the depth allocation explicitly (the texture only borrows it).
+                if let Some((tex, mem)) = self.depth.take() {
+                    drop(tex);
+                    self.device.free(mem);
+                }
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -216,6 +270,13 @@ impl<E: Example> ApplicationHandler for App<E> {
                             },
                         )
                         .expect("recreate_swapchain");
+                    // Depth buffer must track the swapchain size: drop the old one and
+                    // build a fresh match (the example opted in, so the slot stays Some).
+                    if let Some((tex, mem)) = self.depth.take() {
+                        drop(tex);
+                        self.device.free(mem);
+                        self.depth = Some(make_depth(&self.device, E::depth_format().unwrap(), w, h));
+                    }
                 }
             }
             WindowEvent::RedrawRequested => self.render_frame(),

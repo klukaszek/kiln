@@ -64,3 +64,9 @@ dispatch2 = { version = "0.3", optional = true }
 # Windowing for the `examples/` (surface + swapchain demos). winit 0.30 speaks
 # raw-window-handle 0.6, matching the RHI's surface API.
 winit = "0.30"
+# Pure-Rust USD reader for the asset-driven examples (e.g. the Cornell box). The
+# `geom` feature pulls in the UsdGeom mesh/camera/xform schema readers; only the
+# scene-loading examples link it.
+openusd = { version = "0.4", default-features = false, features = ["geom"] }
+# openusd surfaces `anyhow::Result` at its API boundary; the scene loader propagates it.
+anyhow = "1"

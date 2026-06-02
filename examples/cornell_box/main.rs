@@ -14,14 +14,15 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+mod png;
 mod ray_scene;
 mod scene;
 
 use common::Example;
 use kiln_rhi::{
     BufferDesc, BumpAllocator, ColorTarget, CommandBuffer, CompareOp, Cull, DepthFlags,
-    DepthStencilState, Device, Format, GpuAddress, GpuAllocation, MemoryType, MeshletPso,
-    MeshletPsoDesc, SampleCount, ShaderStage, Topology, gpu_struct,
+    DepthStencilState, Device, DeviceDesc, Format, GpuAddress, GpuAllocation, MemoryType,
+    MeshletPso, MeshletPsoDesc, SampleCount, ShaderStage, Topology, gpu_struct,
 };
 
 const ASSET: &str = concat!(
@@ -254,12 +255,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = parse_config();
     ray_scene::set_target_spp(config.target_spp);
     ray_scene::set_samples_per_frame(config.samples_per_frame);
+    if let Some(resolution) = config.headless {
+        run_headless(resolution)?;
+        return Ok(());
+    }
+
     common::run::<CornellBox>("Kiln · Cornell box", [0.02, 0.02, 0.03, 1.0])
 }
 
 struct Config {
     target_spp: u32,
     samples_per_frame: u32,
+    headless: Option<[u32; 2]>,
 }
 
 fn parse_config() -> Config {
@@ -269,6 +276,7 @@ fn parse_config() -> Config {
     let mut config = Config {
         target_spp: default_target_spp,
         samples_per_frame: default_samples_per_frame,
+        headless: None,
     };
 
     while let Some(arg) = args.next() {
@@ -305,6 +313,20 @@ fn parse_config() -> Config {
             continue;
         }
 
+        if arg == "--headless" {
+            let Some(value) = args.next() else {
+                eprintln!("--headless requires a resolution in AxB form, for example 1024x768");
+                std::process::exit(2);
+            };
+            config.headless = Some(parse_resolution("--headless", &value));
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--headless=") {
+            config.headless = Some(parse_resolution("--headless", value));
+            continue;
+        }
+
         if arg == "-h" || arg == "--help" {
             print_help(default_target_spp, default_samples_per_frame);
             std::process::exit(0);
@@ -328,10 +350,78 @@ fn parse_positive_u32(flag: &str, value: &str) -> u32 {
     }
 }
 
+fn parse_resolution(flag: &str, value: &str) -> [u32; 2] {
+    let Some((w, h)) = value.split_once('x').or_else(|| value.split_once('X')) else {
+        eprintln!("{flag} expects a resolution in AxB form, got {value:?}");
+        std::process::exit(2);
+    };
+    [
+        parse_positive_u32("width", w),
+        parse_positive_u32("height", h),
+    ]
+}
+
 fn print_help(default_spp: u32, default_samples_per_frame: u32) {
-    eprintln!("Usage: cargo run --example cornell_box -- [--spp N] [--samples-per-frame N]");
+    eprintln!(
+        "Usage: cargo run --example cornell_box -- [--spp N] [--samples-per-frame N] [--headless AxB]"
+    );
     eprintln!("  --spp N    progressive render target samples per pixel (default: {default_spp})");
     eprintln!(
         "  --samples-per-frame N, --spf N    path samples accumulated per frame (default: {default_samples_per_frame})"
     );
+    eprintln!("  --headless AxB    render offscreen and write target/test-images");
+}
+
+fn run_headless(resolution: [u32; 2]) -> anyhow::Result<()> {
+    let device = Device::new(&DeviceDesc {
+        validation: false,
+        label: Some("cornell-box-headless".into()),
+        ..Default::default()
+    })?;
+
+    let scene = scene::load(ASSET)?;
+    let vbuf = device
+        .malloc(
+            (scene.vertices.len() * std::mem::size_of::<Vertex>()) as u64,
+            MemoryType::Default,
+        )
+        .expect("alloc vertex buffer");
+    vbuf.upload_slice(&scene.vertices).expect("upload vertices");
+
+    let mut ray_scene = ray_scene::RayScene::build(&device, Format::B8G8R8A8Srgb, &scene, &vbuf)?;
+    eprintln!(
+        "cornell headless: {}x{}, target spp={}, samples/frame={}",
+        resolution[0],
+        resolution[1],
+        ray_scene.target_spp(),
+        ray_scene.samples_per_frame()
+    );
+
+    while !ray_scene.is_complete() {
+        let before = ray_scene.sample_count();
+        let mut cmd = device.create_command_buffer()?;
+        ray_scene.pre_render(&device, &mut cmd, &scene, &vbuf, resolution);
+        cmd.end();
+        let queue = device.queue();
+        queue.submit(cmd)?;
+        queue.wait_idle();
+
+        anyhow::ensure!(
+            ray_scene.sample_count() > before,
+            "path tracer made no progress; lights={}",
+            ray_scene.light_count()
+        );
+    }
+
+    let rgba = ray_scene.tonemapped_rgba8()?;
+    let [width, height] = ray_scene.extent();
+    let name = format!(
+        "cornell_box_{}x{}_{}spp",
+        width,
+        height,
+        ray_scene.sample_count()
+    );
+    let path = png::save_rgba_png(&name, width, height, &rgba)?;
+    eprintln!("cornell headless wrote {}", path.display());
+    Ok(())
 }

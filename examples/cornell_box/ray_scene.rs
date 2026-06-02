@@ -72,7 +72,7 @@ gpu_struct! {
 
 gpu_struct! {
     struct DisplayRoot {
-        dims: [u32; 4] as "uint4", // width, height, sample_count, unused
+        dims: [u32; 4] as "uint4", // width, height, sample_count, target_is_srgb
         accum: GpuAddress as "float4*",
     }
 }
@@ -92,6 +92,7 @@ pub struct RayScene {
     extent: [u32; 2],
     target_spp: u32,
     samples_per_frame: u32,
+    display_target_is_srgb: bool,
     sample_count: u32,
     triangle_count: u32,
     light_count: u32,
@@ -111,6 +112,7 @@ impl RayScene {
         }
         let target_spp = configured_target_spp();
         let samples_per_frame = configured_samples_per_frame();
+        let display_target_is_srgb = format_is_srgb(color_format);
 
         let trace_src = format!(
             "{}{}{}",
@@ -272,6 +274,7 @@ impl RayScene {
             extent: [0, 0],
             target_spp,
             samples_per_frame,
+            display_target_is_srgb,
             sample_count: 0,
             triangle_count,
             light_count: light_triangles.len() as u32,
@@ -342,7 +345,12 @@ impl RayScene {
             .alloc(std::mem::size_of::<DisplayRoot>() as u64, 16)
             .expect("display root bump");
         root.upload(&DisplayRoot {
-            dims: [extent[0], extent[1], self.sample_count.max(1), 0],
+            dims: [
+                extent[0],
+                extent[1],
+                self.sample_count.max(1),
+                self.display_target_is_srgb as u32,
+            ],
             accum: accum.gpu(),
         })
         .expect("upload display root");
@@ -356,6 +364,51 @@ impl RayScene {
             ..Default::default()
         });
         cmd.draw(None, root.gpu, 3, 1, 0, 0);
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.sample_count >= self.target_spp
+    }
+
+    pub fn sample_count(&self) -> u32 {
+        self.sample_count
+    }
+
+    pub fn target_spp(&self) -> u32 {
+        self.target_spp
+    }
+
+    pub fn samples_per_frame(&self) -> u32 {
+        self.samples_per_frame
+    }
+
+    pub fn light_count(&self) -> u32 {
+        self.light_count
+    }
+
+    pub fn extent(&self) -> [u32; 2] {
+        self.extent
+    }
+
+    pub fn tonemapped_rgba8(&self) -> anyhow::Result<Vec<u8>> {
+        let accum = self
+            .accum
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("path tracer has no accumulation buffer"))?;
+        let pixels = accum.as_slice::<[f32; 4]>()?;
+        let sample_count = self.sample_count.max(1) as f32;
+        let mut rgba = Vec::with_capacity(pixels.len() * 4);
+
+        for pixel in pixels {
+            let mapped = [
+                tonemap_channel(pixel[0], sample_count),
+                tonemap_channel(pixel[1], sample_count),
+                tonemap_channel(pixel[2], sample_count),
+            ];
+            rgba.extend_from_slice(&[mapped[0], mapped[1], mapped[2], 255]);
+        }
+
+        Ok(rgba)
     }
 
     fn ensure_extent(&mut self, device: &Device, extent: [u32; 2]) {
@@ -461,6 +514,17 @@ fn material_to_gpu(material: Material) -> GpuMaterial {
         ],
         flags: [material.use_specular_workflow as u32, 0, 0, 0],
     }
+}
+
+fn tonemap_channel(value: f32, sample_count: f32) -> u8 {
+    let linear = (value / sample_count) * 0.25;
+    let reinhard = linear / (linear + 1.0);
+    let srgb = reinhard.max(0.0).powf(1.0 / 2.2);
+    (srgb.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn format_is_srgb(format: Format) -> bool {
+    matches!(format, Format::R8G8B8A8Srgb | Format::B8G8R8A8Srgb)
 }
 
 fn normalize4(v: [f32; 4]) -> [f32; 4] {

@@ -19,13 +19,16 @@ float4 displayFs(VOut i, uniform DisplayRoot* r) : SV_Target
     uint width = r.dims.x;
     uint height = r.dims.y;
     uint sampleCount = r.dims.z;
+    bool targetIsSrgb = r.dims.w != 0u;
     uint x = min((uint)i.pos.x, width - 1u);
     uint y = min((uint)i.pos.y, height - 1u);
     uint pixel = y * width + x;
     float invSamples = 1.0 / max((float)sampleCount, 1.0);
     float3 c = r.accum[pixel].xyz * invSamples * 0.25;
     c = c / (c + float3(1.0));
-    c = pow(max(c, float3(0.0)), float3(1.0 / 2.2));
+    if (!targetIsSrgb) {
+        c = pow(max(c, float3(0.0)), float3(1.0 / 2.2));
+    }
     return float4(c, 1.0);
 }
 "#;

@@ -3,8 +3,8 @@
 mod common;
 
 use kiln_rhi::{
-    AddressMode, FilterMode, Format, GpuViewDesc, MemoryType, SampleCount, SamplerDesc, StageFlags,
-    TextureDesc, TextureDimension, TextureUsage, ALL_LAYERS, ALL_MIPS,
+    ALL_LAYERS, ALL_MIPS, AddressMode, FilterMode, Format, GpuViewDesc, MemoryType, SampleCount,
+    SamplerDesc, StageFlags, TextureDesc, TextureDimension, TextureUsage,
 };
 
 const W: u32 = 64;

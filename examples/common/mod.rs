@@ -13,9 +13,9 @@ use std::process::Command;
 
 use kiln_rhi::{
     ColorAttachment, CommandBuffer, DepthAttachment, Device, DeviceDesc, Format, GpuAllocation,
-    LoadOp, MemoryType, RenderPassDesc, RenderTarget, SampleCount, ShaderModule, ShaderModuleDesc,
-    ShaderStage, StoreOp, Surface, SurfaceDesc, Swapchain, SwapchainDesc, Texture, TextureDesc,
-    TextureDimension, TextureUsage, MAX_FRAMES_IN_FLIGHT,
+    LoadOp, MAX_FRAMES_IN_FLIGHT, MemoryType, RenderPassDesc, RenderTarget, SampleCount,
+    ShaderModule, ShaderModuleDesc, ShaderStage, StoreOp, Surface, SurfaceDesc, Swapchain,
+    SwapchainDesc, Texture, TextureDesc, TextureDimension, TextureUsage,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
@@ -43,6 +43,10 @@ pub trait Example {
     {
         None
     }
+
+    /// Record work that must happen before the swapchain render pass, such as compute
+    /// accumulation for progressive renderers. Default examples do nothing here.
+    fn pre_render(&mut self, _device: &Device, _cmd: &mut CommandBuffer, _extent: [u32; 2]) {}
 
     /// Record draws for one frame. The render pass is already begun on the acquired
     /// swapchain image (cleared) with viewport + scissor set to the full `extent`. When
@@ -88,7 +92,7 @@ pub fn run<E: Example + 'static>(
     })?;
 
     let event_loop = EventLoop::new()?;
-    // Poll + request_redraw drives a continuous present loop; vsync throttles it.
+    // Poll + request_redraw drives a continuous present loop.
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App::<E> {
@@ -149,6 +153,7 @@ impl<E: Example> App<E> {
             .device
             .create_command_buffer_for_swapchain(swapchain)
             .expect("create_command_buffer_for_swapchain");
+        example.pre_render(&self.device, &mut cmd, extent);
         cmd.begin_render_pass(&RenderPassDesc {
             color_attachments: vec![ColorAttachment {
                 target: RenderTarget::SwapchainImage(image.index),
@@ -197,14 +202,8 @@ impl<E: Example> ApplicationHandler for App<E> {
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
 
-        let window_handle = window
-            .window_handle()
-            .expect("window handle")
-            .as_raw();
-        let display_handle = window
-            .display_handle()
-            .expect("display handle")
-            .as_raw();
+        let window_handle = window.window_handle().expect("window handle").as_raw();
+        let display_handle = window.display_handle().expect("display handle").as_raw();
 
         let surface = self
             .device
@@ -220,7 +219,6 @@ impl<E: Example> ApplicationHandler for App<E> {
                 &SwapchainDesc {
                     width: w,
                     height: h,
-                    vsync: true,
                     ..Default::default()
                 },
             )
@@ -265,7 +263,6 @@ impl<E: Example> ApplicationHandler for App<E> {
                             &SwapchainDesc {
                                 width: w,
                                 height: h,
-                                vsync: true,
                                 ..Default::default()
                             },
                         )
@@ -275,7 +272,8 @@ impl<E: Example> ApplicationHandler for App<E> {
                     if let Some((tex, mem)) = self.depth.take() {
                         drop(tex);
                         self.device.free(mem);
-                        self.depth = Some(make_depth(&self.device, E::depth_format().unwrap(), w, h));
+                        self.depth =
+                            Some(make_depth(&self.device, E::depth_format().unwrap(), w, h));
                     }
                 }
             }
@@ -300,11 +298,17 @@ impl<E: Example> ApplicationHandler for App<E> {
 
 /// Compile a Slang entry point to the active backend's shader format and register it.
 /// Panics with a clear message if `slangc` is missing or compilation fails.
-pub fn compile(
+pub fn compile(device: &Device, slang_src: &str, entry: &str, stage: ShaderStage) -> ShaderModule {
+    compile_with_caps(device, slang_src, entry, stage, &[])
+}
+
+/// Compile a Slang entry point with explicit Slang capabilities.
+pub fn compile_with_caps(
     device: &Device,
     slang_src: &str,
     entry: &str,
     stage: ShaderStage,
+    capabilities: &[&str],
 ) -> ShaderModule {
     let (target, ext) = match device.backend_name() {
         "Vulkan" => ("spirv", "spv"),
@@ -324,9 +328,13 @@ pub fn compile(
     let out_path = dir.join(format!("kiln_example_{pid}_{entry}.{ext}"));
     std::fs::write(&src_path, slang_src).expect("write slang source");
 
-    let output = Command::new("slangc")
-        .arg(&src_path)
-        .args(["-target", target, "-entry", entry, "-stage", slang_stage])
+    let mut cmd = Command::new("slangc");
+    cmd.arg(&src_path)
+        .args(["-target", target, "-entry", entry, "-stage", slang_stage]);
+    for cap in capabilities {
+        cmd.args(["-capability", cap]);
+    }
+    let output = cmd
         .arg("-o")
         .arg(&out_path)
         .output()

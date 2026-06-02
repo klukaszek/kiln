@@ -9,17 +9,19 @@
 //! The first step toward spectrally path tracing this scene — for now it just rasterizes the
 //! geometry. Exits cleanly if the device doesn't support mesh shaders.
 //!
-//! Run with: `cargo run --example cornell_box` (needs `slangc` on PATH).
+//! Run with: `cargo run --example cornell_box -- --spp 1024 --samples-per-frame 16`
+//! (needs `slangc` on PATH).
 
 #[path = "../common/mod.rs"]
 mod common;
+mod ray_scene;
 mod scene;
 
 use common::Example;
 use kiln_rhi::{
-    gpu_struct, BufferDesc, BumpAllocator, ColorTarget, CommandBuffer, Cull, Device, Format,
-    GpuAddress, GpuAllocation, MemoryType, MeshletPso, MeshletPsoDesc, SampleCount, ShaderStage,
-    Topology,
+    BufferDesc, BumpAllocator, ColorTarget, CommandBuffer, CompareOp, Cull, DepthFlags,
+    DepthStencilState, Device, Format, GpuAddress, GpuAllocation, MemoryType, MeshletPso,
+    MeshletPsoDesc, SampleCount, ShaderStage, Topology, gpu_struct,
 };
 
 const ASSET: &str = concat!(
@@ -112,6 +114,7 @@ struct CornellBox {
     vbuf: GpuAllocation,
     bump: BumpAllocator,
     scene: scene::Scene,
+    _ray_scene: Option<ray_scene::RayScene>,
     tri_count: u32,
     num_meshlets: u32,
 }
@@ -135,9 +138,9 @@ impl Example for CornellBox {
                     stencil_format: None,
                     sample_count: SampleCount::S1,
                     alpha_to_coverage: false,
-                    // No culling for the first render — the box is viewed from inside, and
-                    // this keeps every wall visible regardless of authored winding.
-                    cull: Cull::Cw,
+                    // No culling for the first render: the box is viewed from inside, and
+                    // this keeps every wall/light visible regardless of authored winding.
+                    cull: Cull::None,
                     support_dual_source_blending: false,
                     blendstate: None,
                     root_constant_size: 16,
@@ -172,6 +175,14 @@ impl Example for CornellBox {
             .expect("alloc vertex buffer");
         vbuf.upload_slice(&scene.vertices).expect("upload vertices");
 
+        let ray_scene = match ray_scene::RayScene::build(device, color_format, &scene, &vbuf) {
+            Ok(ray_scene) => Some(ray_scene),
+            Err(e) => {
+                eprintln!("cornell ray scene disabled: {e}");
+                None
+            }
+        };
+
         // Per-frame bump allocator for the transient draw root.
         let bump = BumpAllocator::new(
             device
@@ -188,12 +199,24 @@ impl Example for CornellBox {
             vbuf,
             bump,
             scene,
+            _ray_scene: ray_scene,
             tri_count,
             num_meshlets,
         }
     }
 
+    fn pre_render(&mut self, device: &Device, cmd: &mut CommandBuffer, extent: [u32; 2]) {
+        if let Some(ray_scene) = &mut self._ray_scene {
+            ray_scene.pre_render(device, cmd, &self.scene, &self.vbuf, extent);
+        }
+    }
+
     fn render(&mut self, cmd: &mut CommandBuffer, extent: [u32; 2]) {
+        if let Some(ray_scene) = &mut self._ray_scene {
+            ray_scene.render(cmd, extent);
+            return;
+        }
+
         self.bump.reset();
         let aspect = extent[0] as f32 / extent[1].max(1) as f32;
         let vp = self.scene.view_proj_rows(aspect);
@@ -216,10 +239,99 @@ impl Example for CornellBox {
         .expect("upload root");
 
         cmd.set_meshlet_pipeline(&self.pso);
+        cmd.set_depth_stencil_state(&DepthStencilState {
+            depth_mode: DepthFlags::READ | DepthFlags::WRITE,
+            depth_test: CompareOp::Less,
+            stencil_read_mask: 0,
+            stencil_write_mask: 0,
+            ..Default::default()
+        });
         cmd.draw_meshlets(root.gpu, root.gpu, self.num_meshlets, 1, 1);
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = parse_config();
+    ray_scene::set_target_spp(config.target_spp);
+    ray_scene::set_samples_per_frame(config.samples_per_frame);
     common::run::<CornellBox>("Kiln · Cornell box", [0.02, 0.02, 0.03, 1.0])
+}
+
+struct Config {
+    target_spp: u32,
+    samples_per_frame: u32,
+}
+
+fn parse_config() -> Config {
+    let mut args = std::env::args().skip(1);
+    let default_target_spp = ray_scene::default_target_spp();
+    let default_samples_per_frame = ray_scene::default_samples_per_frame();
+    let mut config = Config {
+        target_spp: default_target_spp,
+        samples_per_frame: default_samples_per_frame,
+    };
+
+    while let Some(arg) = args.next() {
+        if arg == "--spp" {
+            let Some(value) = args.next() else {
+                eprintln!("--spp requires a positive integer value");
+                std::process::exit(2);
+            };
+            config.target_spp = parse_positive_u32("--spp", &value);
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--spp=") {
+            config.target_spp = parse_positive_u32("--spp", value);
+            continue;
+        }
+
+        if arg == "--samples-per-frame" || arg == "--spf" {
+            let Some(value) = args.next() else {
+                eprintln!("{arg} requires a positive integer value");
+                std::process::exit(2);
+            };
+            config.samples_per_frame = parse_positive_u32(&arg, &value);
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--samples-per-frame=") {
+            config.samples_per_frame = parse_positive_u32("--samples-per-frame", value);
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--spf=") {
+            config.samples_per_frame = parse_positive_u32("--spf", value);
+            continue;
+        }
+
+        if arg == "-h" || arg == "--help" {
+            print_help(default_target_spp, default_samples_per_frame);
+            std::process::exit(0);
+        }
+
+        eprintln!("unknown argument: {arg}");
+        print_help(default_target_spp, default_samples_per_frame);
+        std::process::exit(2);
+    }
+
+    config
+}
+
+fn parse_positive_u32(flag: &str, value: &str) -> u32 {
+    match value.parse::<u32>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            eprintln!("{flag} must be a positive integer, got {value:?}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn print_help(default_spp: u32, default_samples_per_frame: u32) {
+    eprintln!("Usage: cargo run --example cornell_box -- [--spp N] [--samples-per-frame N]");
+    eprintln!("  --spp N    progressive render target samples per pixel (default: {default_spp})");
+    eprintln!(
+        "  --samples-per-frame N, --spf N    path samples accumulated per frame (default: {default_samples_per_frame})"
+    );
 }

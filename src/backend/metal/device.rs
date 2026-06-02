@@ -12,11 +12,11 @@ use objc2_metal::{
     MTL4ComputePipelineDescriptor, MTL4LibraryFunctionDescriptor, MTL4PipelineDescriptor,
     MTL4PipelineOptions, MTL4ShaderReflection, MTLAllocation, MTLBinding, MTLBindingType,
     MTLBuffer, MTLCompileOptions, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
-    MTLCullMode, MTLDevice, MTLDrawable, MTLEvent, MTLHeap, MTLHeapDescriptor,
-    MTLHeapType, MTLLanguageVersion, MTLLibrary, MTLPixelFormat, MTLRenderPipelineState,
-    MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions, MTLSamplerDescriptor,
-    MTLSamplerState, MTLSharedEvent, MTLStorageMode, MTLTexture, MTLTextureDescriptor,
-    MTLTextureType, MTLTextureUsage as MtlTextureUsage, MTLWinding,
+    MTLCullMode, MTLDevice, MTLDrawable, MTLEvent, MTLHeap, MTLHeapDescriptor, MTLHeapType,
+    MTLLanguageVersion, MTLLibrary, MTLPixelFormat, MTLRenderPipelineState, MTLResidencySet,
+    MTLResidencySetDescriptor, MTLResourceOptions, MTLSamplerDescriptor, MTLSamplerState,
+    MTLSharedEvent, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
+    MTLTextureUsage as MtlTextureUsage, MTLWinding,
 };
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use raw_window_handle::RawWindowHandle;
@@ -25,7 +25,7 @@ use crate::accel::{AccelInner, AccelerationStructure};
 use crate::command::{CommandBuffer, SignalOp, SignalValueDesc, WaitOp, WaitValueDesc};
 use crate::device::{BindlessMode, DeviceDesc};
 use crate::error::{RhiError, RhiResult};
-use crate::memory::{BufferDesc, MemoryType, GpuBuffer, GpuBufferInner};
+use crate::memory::{BufferDesc, GpuBuffer, GpuBufferInner, MemoryType};
 use crate::pipeline::*;
 use crate::queue::{Queue, QueueInner, SubmitDesc};
 use crate::sampler::{Sampler, SamplerDesc};
@@ -515,13 +515,9 @@ fn create_mdi_icb_pipeline(
             ))
         })?;
     let function_name = NSString::from_str("rhi_encode_mdi_icb");
-    let function = library
-        .newFunctionWithName(&function_name)
-        .ok_or_else(|| {
-            RhiError::PipelineCreation(
-                "Metal MDI ICB encoder function was not found".into(),
-            )
-        })?;
+    let function = library.newFunctionWithName(&function_name).ok_or_else(|| {
+        RhiError::PipelineCreation("Metal MDI ICB encoder function was not found".into())
+    })?;
     device
         .newComputePipelineStateWithFunction_error(&function)
         .map_err(|e| {
@@ -1383,8 +1379,9 @@ impl MetalDevice {
     /// `inst.acceleration_structure_reference` must be the BLAS `gpuResourceID` (`blas.gpu()`).
     pub fn write_tlas_instance(&self, dst: *mut u8, inst: &crate::types::TlasInstance) {
         use objc2_metal::{
-            MTLAccelerationStructureInstanceOptions, MTLIndirectAccelerationStructureInstanceDescriptor,
-            MTLPackedFloat3, MTLPackedFloat4x3, MTLResourceID,
+            MTLAccelerationStructureInstanceOptions,
+            MTLIndirectAccelerationStructureInstanceDescriptor, MTLPackedFloat3, MTLPackedFloat4x3,
+            MTLResourceID,
         };
 
         // TlasInstance.transform is row-major 3x4 (transform[row][col]); Metal's packed 4x3
@@ -1668,7 +1665,6 @@ impl MetalDevice {
 
         Ok(id)
     }
-
 }
 
 fn filter_to_mtl(f: crate::types::FilterMode) -> objc2_metal::MTLSamplerMinMagFilter {

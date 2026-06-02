@@ -1,8 +1,6 @@
 use crate::accel::AccelerationStructure;
 use crate::barrier::{HazardFlags, StageFlags};
-use crate::pipeline::{
-    BlendState, ComputePso, DepthStencilState, GraphicsPso, MeshletPso,
-};
+use crate::pipeline::{BlendState, ComputePso, DepthStencilState, GraphicsPso, MeshletPso};
 use crate::types::*;
 use crate::types::{BlasDesc, TlasDesc};
 

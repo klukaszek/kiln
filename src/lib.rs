@@ -59,7 +59,7 @@ pub use shader::{ShaderModule, ShaderModuleDesc, ShaderStage};
 pub use surface::{Surface, SurfaceDesc};
 pub use swapchain::{AcquiredImage, Swapchain, SwapchainDesc};
 pub use sync::TimelineSemaphore;
-pub use texture::{GpuViewDesc, Texture, TextureDesc, TextureUsage, ALL_LAYERS, ALL_MIPS};
+pub use texture::{ALL_LAYERS, ALL_MIPS, GpuViewDesc, Texture, TextureDesc, TextureUsage};
 pub use types::*;
 pub use types::{
     AccelerationStructureId, BlasDesc, BlasMeshDesc, BuildAccelFlags, GeometryFlags, GeometryType,

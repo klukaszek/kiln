@@ -5,21 +5,19 @@ use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
     MTL4CommandEncoder, MTL4ComputeCommandEncoder, MTL4RenderCommandEncoder,
     MTL4RenderPassDescriptor, MTL4VisibilityOptions, MTLAllocation, MTLBuffer,
-    MTLComputePipelineState, MTLDepthStencilState, MTLDevice, MTLGPUAddress,
-    MTLIndexType, MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor,
-    MTLIndirectCommandType, MTLLoadAction, MTLOrigin, MTLPrimitiveType, MTLRenderPipelineState,
-    MTLRenderStages, MTLResidencySet, MTLResourceOptions, MTLSamplerState, MTLScissorRect, MTLSize,
-    MTLStages, MTLStencilOperation, MTLStoreAction, MTLTexture, MTLViewport,
+    MTLComputePipelineState, MTLDepthStencilState, MTLDevice, MTLGPUAddress, MTLIndexType,
+    MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType,
+    MTLLoadAction, MTLOrigin, MTLPrimitiveType, MTLRenderPipelineState, MTLRenderStages,
+    MTLResidencySet, MTLResourceOptions, MTLSamplerState, MTLScissorRect, MTLSize, MTLStages,
+    MTLStencilOperation, MTLStoreAction, MTLTexture, MTLViewport,
 };
 
 use crate::barrier::{HazardFlags, StageFlags};
 use crate::command::{
-    DrawIndirectMultiArgs, LoadOp, RenderPassDesc, RenderTarget,
-    SignalValueDesc, StoreOp, WaitValueDesc,
+    DrawIndirectMultiArgs, LoadOp, RenderPassDesc, RenderTarget, SignalValueDesc, StoreOp,
+    WaitValueDesc,
 };
-use crate::pipeline::{
-    BlendState, ComputePso, DepthStencilState, GraphicsPso, MeshletPso,
-};
+use crate::pipeline::{BlendState, ComputePso, DepthStencilState, GraphicsPso, MeshletPso};
 use crate::texture::{Texture, bytes_per_pixel};
 use crate::types::*;
 
@@ -323,10 +321,7 @@ impl MetalCommandBuffer {
         }
 
         unsafe {
-            encoder.resetCommandsInBuffer_withRange(
-                &icb,
-                NSRange::new(0, max_draw_count as usize),
-            );
+            encoder.resetCommandsInBuffer_withRange(&icb, NSRange::new(0, max_draw_count as usize));
             self.argument_table.setAddress_atIndex(args_addr, 0);
             self.argument_table.setAddress_atIndex(draw_count_addr, 1);
             self.argument_table
@@ -780,7 +775,10 @@ impl MetalCommandBuffer {
             stages: MTLRenderStages::Vertex | MTLRenderStages::Fragment,
         };
         self.current_pipeline = Some(binding.clone());
-        let encoder = self.render_encoder.as_ref().expect("No active render encoder");
+        let encoder = self
+            .render_encoder
+            .as_ref()
+            .expect("No active render encoder");
         encoder.setRenderPipelineState(&pipeline);
         encoder.setCullMode(cull_mode);
         encoder.setFrontFacingWinding(winding);
@@ -882,7 +880,11 @@ impl MetalCommandBuffer {
             self.render_encoder.is_some(),
             "set_root_data called outside a render pass"
         );
-        let root = if vertex_root.0 != 0 { vertex_root } else { pixel_root };
+        let root = if vertex_root.0 != 0 {
+            vertex_root
+        } else {
+            pixel_root
+        };
         let (slot_addr, slot_ptr) = self.alloc_root_bytes(std::mem::size_of::<u64>());
         unsafe {
             std::ptr::write_unaligned(slot_ptr as *mut u64, root.0);
@@ -1720,7 +1722,6 @@ impl MetalCommandBuffer {
         }
         encoder.endEncoding();
     }
-
 }
 
 impl Drop for MetalCommandBuffer {

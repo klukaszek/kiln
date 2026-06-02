@@ -176,7 +176,10 @@ fn bump_alloc_cpu_gpu_correspond() {
     // CPU write/read roundtrip through the mapped pointer.
     a.upload(&0xDEAD_BEEFu32).expect("upload");
     let read_back = unsafe { std::ptr::read_unaligned(a.cpu as *const u32) };
-    assert_eq!(read_back, 0xDEAD_BEEF, "write through cpu pointer must persist");
+    assert_eq!(
+        read_back, 0xDEAD_BEEF,
+        "write through cpu pointer must persist"
+    );
 
     device.destroy_buffer(bump.into_buffer());
 }
@@ -201,7 +204,10 @@ fn bump_full_returns_none() {
     let mut count = 0;
     while bump.alloc(64, 16).is_some() {
         count += 1;
-        assert!(count <= 4, "256 bytes can't yield more than four 64B chunks");
+        assert!(
+            count <= 4,
+            "256 bytes can't yield more than four 64B chunks"
+        );
     }
     assert_eq!(count, 4, "exactly four 64B chunks fit in 256 bytes");
     assert!(bump.alloc(1, 1).is_none(), "exhausted allocator stays full");

@@ -975,7 +975,12 @@ impl VulkanDevice {
             rendering_complete_semaphores,
             in_flight_fences,
             in_flight_cmd_buffers,
-        } = self.build_swapchain_contents(vk_surface, surface_format, desc, vk::SwapchainKHR::null())?;
+        } = self.build_swapchain_contents(
+            vk_surface,
+            surface_format,
+            desc,
+            vk::SwapchainKHR::null(),
+        )?;
 
         Ok(Swapchain {
             inner: SwapchainInner::Vulkan(VulkanSwapchain {
@@ -1332,10 +1337,7 @@ impl VulkanDevice {
 
     /// Build the `vk::ImageCreateInfo` for `desc` and create the image.
     /// Returns the image plus the effective `array_layers` (cube → ×6) and the format.
-    fn create_image_for_desc(
-        &self,
-        desc: &TextureDesc,
-    ) -> RhiResult<(vk::Image, u32, vk::Format)> {
+    fn create_image_for_desc(&self, desc: &TextureDesc) -> RhiResult<(vk::Image, u32, vk::Format)> {
         let vk_format = format_to_vk(desc.format);
 
         let mut usage = vk::ImageUsageFlags::empty();
@@ -1351,8 +1353,14 @@ impl VulkanDevice {
                 TextureUsage::DEPTH_STENCIL_ATTACHMENT,
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             ),
-            (TextureUsage::TRANSFER_SRC, vk::ImageUsageFlags::TRANSFER_SRC),
-            (TextureUsage::TRANSFER_DST, vk::ImageUsageFlags::TRANSFER_DST),
+            (
+                TextureUsage::TRANSFER_SRC,
+                vk::ImageUsageFlags::TRANSFER_SRC,
+            ),
+            (
+                TextureUsage::TRANSFER_DST,
+                vk::ImageUsageFlags::TRANSFER_DST,
+            ),
         ];
         for (flag, vk_flag) in pairs {
             if desc.usage.contains(flag) {

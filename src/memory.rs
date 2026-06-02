@@ -109,8 +109,9 @@ impl GpuAllocation {
             .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
         // SAFETY: `ptr` is valid for `self.size` bytes for the lifetime of `&self`.
         let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, self.size as usize) };
-        <[T]>::ref_from_bytes(bytes)
-            .map_err(|_| RhiError::AllocationFailed("size is not a multiple of element size".into()))
+        <[T]>::ref_from_bytes(bytes).map_err(|_| {
+            RhiError::AllocationFailed("size is not a multiple of element size".into())
+        })
     }
 
     /// View the mapped memory as `&mut [T]` (exclusive). `&mut self` rules out CPU aliasing.
@@ -121,8 +122,9 @@ impl GpuAllocation {
         // SAFETY: `ptr` is valid for `self.size` bytes; `&mut self` guarantees no other CPU
         // reference aliases it.
         let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, self.size as usize) };
-        <[T]>::mut_from_bytes(bytes)
-            .map_err(|_| RhiError::AllocationFailed("size is not a multiple of element size".into()))
+        <[T]>::mut_from_bytes(bytes).map_err(|_| {
+            RhiError::AllocationFailed("size is not a multiple of element size".into())
+        })
     }
 }
 

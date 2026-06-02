@@ -2,8 +2,8 @@ use super::barrier::{to_vk_access_flags, to_vk_stage_flags};
 use super::device::{SharedAllocations, SharedTextures};
 use crate::barrier::{HazardFlags, StageFlags};
 use crate::command::{
-    DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectMultiArgs, LoadOp,
-    RenderPassDesc, RenderTarget, SignalValueDesc, StoreOp, WaitValueDesc,
+    DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectMultiArgs, LoadOp, RenderPassDesc,
+    RenderTarget, SignalValueDesc, StoreOp, WaitValueDesc,
 };
 use crate::pipeline::{
     BlendState, ComputePso, ComputePsoInner, DepthStencilState, GraphicsPso, GraphicsPsoInner,
@@ -787,7 +787,8 @@ impl VulkanCommandBuffer {
         // visibility, matching `barrier()`) PLUS the hazard-specific access. Starting only
         // from the hazard flags would make this *narrower* than the plain barrier and could
         // drop general UAV write→read visibility.
-        let src_access = vk::AccessFlags2::MEMORY_WRITE | to_vk_access_flags(hazard_for_access, true);
+        let src_access =
+            vk::AccessFlags2::MEMORY_WRITE | to_vk_access_flags(hazard_for_access, true);
         let mut dst_access = vk::AccessFlags2::MEMORY_READ
             | vk::AccessFlags2::MEMORY_WRITE
             | to_vk_access_flags(hazard_for_access, false);
@@ -1142,7 +1143,6 @@ impl VulkanCommandBuffer {
             _ => None,
         }
     }
-
 }
 
 fn build_buffer_image_region(

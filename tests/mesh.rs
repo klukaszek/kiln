@@ -540,7 +540,10 @@ fn mesh_interpolated_triangle() {
     // 1) All four image corners are outside the inset triangle → clear (black).
     for (x, y) in [(0, 0), (SIZE - 1, 0), (0, SIZE - 1), (SIZE - 1, SIZE - 1)] {
         let (r, g, b) = at(x, y);
-        assert!(r < 5 && g < 5 && b < 5, "corner ({x},{y}) not clear: ({r},{g},{b})");
+        assert!(
+            r < 5 && g < 5 && b < 5,
+            "corner ({x},{y}) not clear: ({r},{g},{b})"
+        );
     }
 
     // 2) Image centre (NDC origin) is inside the triangle; by symmetry its colour
@@ -560,9 +563,15 @@ fn mesh_interpolated_triangle() {
     for y in 0..SIZE {
         for x in 0..SIZE {
             let p = at(x, y);
-            if p.0 > max_r.0 { max_r = p; }
-            if p.1 > max_g.1 { max_g = p; }
-            if p.2 > max_b.2 { max_b = p; }
+            if p.0 > max_r.0 {
+                max_r = p;
+            }
+            if p.1 > max_g.1 {
+                max_g = p;
+            }
+            if p.2 > max_b.2 {
+                max_b = p;
+            }
         }
     }
     assert!(

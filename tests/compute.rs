@@ -6,7 +6,7 @@
 
 mod common;
 
-use kiln_rhi::{gpu_struct, ComputePsoDesc, GpuAddress, MemoryType, ShaderStage, StageFlags};
+use kiln_rhi::{ComputePsoDesc, GpuAddress, MemoryType, ShaderStage, StageFlags, gpu_struct};
 
 // Shared host/device data contract. `Data::SLANG` is the matching Slang declaration.
 gpu_struct! {

@@ -10,6 +10,11 @@ The crate targets Vulkan 1.3+ (with buffer device address and descriptor buffers
 argument tables). The same application code runs on both. Shaders are authored once in Slang and
 compiled per backend.
 
+![Path-traced Cornell box](public/cornell_box.png)
+
+*Cornell box path-traced headless at 1024x1024, 1024 spp, through the ray-tracing path. Reproduce
+with `cargo run --release --example cornell_box -- --headless 1024x1024`.*
+
 ## Philosophy
 
 Modern GPU APIs spend a large fraction of their surface area on resource binding: descriptor set

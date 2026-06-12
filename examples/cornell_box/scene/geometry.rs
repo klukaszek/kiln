@@ -1,12 +1,10 @@
-use openusd::math::{mat4_transform_point, mat4_transform_vec};
+use glam::{DVec3, Vec3};
 use openusd::schemas::geom::{Orientation, read_mesh};
 use openusd::sdf;
 use openusd::usd::Stage;
 
-use crate::Vertex;
-
+use super::Vertex;
 use super::material::{Material, MaterialCache};
-use super::math::{face_normal, norm3};
 use super::transform::world_xform;
 
 pub struct Geometry {
@@ -42,7 +40,8 @@ pub fn load_geometry(stage: &Stage, mesh_paths: &[String]) -> anyhow::Result<Geo
 
                 for k in 0..n {
                     let vi = mesh.face_vertex_indices[corner + k] as usize;
-                    face_points.push(mat4_transform_point(&world, mesh.points[vi]));
+                    face_points
+                        .push(world.transform_point3(Vec3::from_array(mesh.points[vi]).as_dvec3()));
                     face_normals.push(
                         mesh.normals
                             .as_ref()
@@ -62,13 +61,16 @@ pub fn load_geometry(stage: &Stage, mesh_paths: &[String]) -> anyhow::Result<Geo
                     triangle_materials.push(material_index);
                     for &k in &tri {
                         let world_normal = match face_normals[k] {
-                            Some(local_normal) => norm3(mat4_transform_vec(&world, local_normal)),
+                            Some(local_normal) => world
+                                .transform_vector3(Vec3::from_array(local_normal).as_dvec3())
+                                .normalize_or(DVec3::Y)
+                                .as_vec3(),
                             None => geo_normal,
                         };
                         vertices.push(Vertex {
-                            pos: [face_points[k][0], face_points[k][1], face_points[k][2], 1.0],
-                            normal: [world_normal[0], world_normal[1], world_normal[2], 0.0],
-                            color: [color[0], color[1], color[2], 1.0],
+                            pos: face_points[k].as_vec3().extend(1.0),
+                            normal: world_normal.extend(0.0),
+                            color: color.extend(1.0),
                         });
                     }
                 }
@@ -82,4 +84,14 @@ pub fn load_geometry(stage: &Stage, mesh_paths: &[String]) -> anyhow::Result<Geo
         triangle_materials,
         materials: material_cache.into_materials(),
     })
+}
+
+fn face_normal(points: &[DVec3]) -> Vec3 {
+    if points.len() < 3 {
+        return Vec3::Y;
+    }
+    (points[1] - points[0])
+        .cross(points[2] - points[0])
+        .normalize_or(DVec3::Y)
+        .as_vec3()
 }

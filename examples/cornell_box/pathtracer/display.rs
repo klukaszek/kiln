@@ -1,3 +1,8 @@
+//! Presentation of the accumulation buffer: the fullscreen blit shader for the
+//! swapchain, and the matching CPU tonemap used for PNG readback.
+
+use kiln_rhi::Format;
+
 pub const SOURCE: &str = /*slang*/
     r#"
 struct VOut {
@@ -32,3 +37,15 @@ float4 displayFs(VOut i, uniform DisplayRoot* r) : SV_Target
     return float4(c, 1.0);
 }
 "#;
+
+/// CPU twin of `displayFs` for headless readback: exposure, Reinhard, gamma.
+pub fn tonemap_channel(value: f32, sample_count: f32) -> u8 {
+    let linear = (value / sample_count) * 0.25;
+    let reinhard = linear / (linear + 1.0);
+    let srgb = reinhard.max(0.0).powf(1.0 / 2.2);
+    (srgb.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+pub fn format_is_srgb(format: Format) -> bool {
+    matches!(format, Format::R8G8B8A8Srgb | Format::B8G8R8A8Srgb)
+}

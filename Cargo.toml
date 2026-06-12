@@ -70,3 +70,5 @@ winit = "0.30"
 openusd = { version = "0.4", default-features = false, features = ["geom"] }
 # openusd surfaces `anyhow::Result` at its API boundary; the scene loader propagates it.
 anyhow = "1"
+clap = { version = "4.6.1", features = ["derive"] }
+glam = { version = "0.33.1", features = ["zerocopy"] }

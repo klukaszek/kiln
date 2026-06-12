@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
+use glam::Vec3;
 use openusd::sdf::{self, Value};
 use openusd::usd::Stage;
 
-const DEFAULT_BASE_COLOR: [f32; 3] = [0.8, 0.8, 0.8];
-const DEFAULT_SPECULAR_COLOR: [f32; 3] = [0.0, 0.0, 0.0];
-const DEFAULT_EMISSION: [f32; 3] = [0.0, 0.0, 0.0];
+const DEFAULT_BASE_COLOR: Vec3 = Vec3::splat(0.8);
+const DEFAULT_SPECULAR_COLOR: Vec3 = Vec3::ZERO;
+const DEFAULT_EMISSION: Vec3 = Vec3::ZERO;
 const DEFAULT_OPACITY: f32 = 1.0;
 const DEFAULT_ROUGHNESS: f32 = 0.5;
 const DEFAULT_METALLIC: f32 = 0.0;
@@ -21,9 +22,9 @@ const DEFAULT_OPACITY_THRESHOLD: f32 = 0.0;
 /// build a real BSDF/emitter representation without reparsing USD.
 #[derive(Clone, Copy, Debug)]
 pub struct Material {
-    pub base_color: [f32; 3],
-    pub specular_color: [f32; 3],
-    pub emission: [f32; 3],
+    pub base_color: Vec3,
+    pub specular_color: Vec3,
+    pub emission: Vec3,
     pub opacity: f32,
     pub roughness: f32,
     pub metallic: f32,
@@ -53,7 +54,7 @@ impl Default for Material {
 }
 
 impl Material {
-    pub fn raster_color(&self) -> [f32; 3] {
+    pub fn raster_color(&self) -> Vec3 {
         if self.is_emissive() {
             self.emission
         } else {
@@ -62,7 +63,7 @@ impl Material {
     }
 
     pub fn is_emissive(&self) -> bool {
-        self.emission.iter().any(|&v| v > 0.0)
+        self.emission.max_element() > 0.0
     }
 }
 
@@ -193,11 +194,11 @@ fn apply_shader_inputs(
     Ok(())
 }
 
-fn read_vec3(stage: &Stage, shader: &sdf::Path, attr: &str) -> anyhow::Result<Option<[f32; 3]>> {
+fn read_vec3(stage: &Stage, shader: &sdf::Path, attr: &str) -> anyhow::Result<Option<Vec3>> {
     let prop = shader.append_property(attr)?;
     Ok(match stage.field::<Value>(prop, "default")? {
-        Some(Value::Vec3f(c)) => Some(c),
-        Some(Value::Vec3d(c)) => Some([c[0] as f32, c[1] as f32, c[2] as f32]),
+        Some(Value::Vec3f(c)) => Some(Vec3::from_array(c)),
+        Some(Value::Vec3d(c)) => Some(glam::DVec3::from_array(c).as_vec3()),
         _ => None,
     })
 }

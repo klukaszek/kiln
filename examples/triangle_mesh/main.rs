@@ -75,7 +75,7 @@ impl Example for TriangleMesh {
         Self { pso }
     }
 
-    fn render(&mut self, cmd: &mut CommandBuffer, _extent: [u32; 2]) {
+    fn render(&mut self, _ctx: &common::FrameCtx, cmd: &mut CommandBuffer) {
         cmd.set_meshlet_pipeline(&self.pso);
         cmd.draw_meshlets(None, None, 1, 1, 1);
     }

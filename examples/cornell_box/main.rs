@@ -1,378 +1,176 @@
-//! Windowed Cornell box, rendered through the mesh-shader path.
+//! Cornell box, progressively path traced on the GPU through the RHI — with
+//! spectral transport.
 //!
-//! Loads `examples/assets/cornell-box.usda` with the pure-Rust `openusd` crate, bakes its
-//! 16 quad meshes into a world-space triangle soup tagged with each surface's material
-//! colour, and draws them with a mesh shader. The scene's authored `Camera` prim drives the
-//! view/projection; a simple camera-headlight shades the boxes so depth reads correctly. A
-//! harness-owned depth buffer (opted into via [`Example::depth_format`]) resolves occlusion.
+//! Loads `examples/assets/cornell-box.usda` with the pure-Rust `openusd` crate
+//! and renders it with a compute path tracer: Owen-scrambled Sobol' sampling,
+//! NEE + MIS, one importance-sampled wavelength per path from a physically based
+//! light spectrum, and moment-based reflectance spectra fitted to the USD
+//! albedos (Peters 2019). Devices without ray-query support fall back to a
+//! mesh-shader raster preview of the same triangle soup.
 //!
-//! The first step toward spectrally path tracing this scene — for now it just rasterizes the
-//! geometry. Exits cleanly if the device doesn't support mesh shaders.
+//! This file is the application: CLI, the windowed harness glue, and the
+//! headless render-to-PNG path. The domain code lives in [`scene`] (USD loading,
+//! spectra, GPU upload), [`pathtracer`], and [`raster`].
 //!
-//! Run with: `cargo run --example cornell_box -- --spp 1024 --samples-per-frame 16`
+//! Run with: `cargo run --example cornell_box -- --spp 1024 --light-spectrum A`
 //! (needs `slangc` on PATH).
 
 #[path = "../common/mod.rs"]
 mod common;
+
+mod pathtracer;
 mod png;
-mod ray_scene;
+mod raster;
 mod scene;
 
-use common::Example;
-use kiln_rhi::{
-    BufferDesc, BumpAllocator, ColorTarget, CommandBuffer, CompareOp, Cull, DepthFlags,
-    DepthStencilState, Device, DeviceDesc, Format, GpuAddress, GpuAllocation, MemoryType,
-    MeshletPso, MeshletPsoDesc, SampleCount, ShaderStage, Topology, gpu_struct,
-};
+use std::sync::OnceLock;
+
+use clap::Parser;
+use glam::UVec2;
+use kiln_rhi::{CommandBuffer, Device, DeviceDesc, Format};
+
+use common::{Example, FrameCtx};
+use pathtracer::PathTracer;
+use raster::RasterPreview;
+use scene::gpu::GpuScene;
+use scene::{Scene, spectral};
 
 const ASSET: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/examples/assets/cornell-box.usda"
 );
 
-/// Triangles per meshlet workgroup. 64 × 3 = 192 mesh-output vertices, within the 256 cap.
-const TRIS_PER_MESHLET: u32 = 64;
-
-gpu_struct! {
-    /// Per-vertex render data. Declared first so the `Vertex*` in `Root` resolves.
-    pub struct Vertex {
-        pos: [f32; 4] as "float4",    // world position, w = 1
-        normal: [f32; 4] as "float4", // world normal,   w = 0
-        color: [f32; 4] as "float4",  // linear RGB,      w = 1
-    }
+/// Progressive spectral path tracer for the Cornell box USD stage.
+#[derive(Parser, Clone)]
+struct Config {
+    /// Target samples per pixel for the progressive render
+    #[arg(long, default_value_t = pathtracer::DEFAULT_TARGET_SPP)]
+    spp: u32,
+    /// Path samples accumulated per frame
+    #[arg(long, visible_alias = "spf", default_value_t = pathtracer::DEFAULT_SAMPLES_PER_FRAME)]
+    samples_per_frame: u32,
+    /// Render offscreen at WxH and write a PNG under target/test-images
+    #[arg(long, value_name = "WxH", value_parser = parse_resolution)]
+    headless: Option<UVec2>,
+    /// Light emission spectrum: A, D50, D65, E, FL2, FL7, FL11, <T>K
+    /// (blackbody), <λ>nm (monochromatic), or a path to an LSPDD CSV
+    #[arg(long, default_value = "A")]
+    light_spectrum: String,
 }
 
-gpu_struct! {
-    /// Pointer-first draw root. `view_proj` is carried as four `float4` rows of a row-vector
-    /// matrix so the shader never depends on Slang's matrix storage layout.
-    pub struct Root {
-        vp0: [f32; 4] as "float4",
-        vp1: [f32; 4] as "float4",
-        vp2: [f32; 4] as "float4",
-        vp3: [f32; 4] as "float4",
-        cam_pos: [f32; 4] as "float4",
-        verts: GpuAddress as "Vertex*",
-        tri_count: u32 as "uint",
-        _pad: u32 as "uint",
-    }
-}
-
-// One Slang source for both stages. `Vertex` then `Root` declarations are prepended so the
-// `gpu_struct!` host layouts and the shader stay in lockstep. Digit-free varying semantics
-// (`COLOR`, `NORMAL`, `WORLD`) — Slang lowers indexed forms to mismatched Metal attributes.
-const BODY: &str = /*slang*/
-    r#"
-struct VOut {
-    float4 pos    : SV_Position;
-    float3 world  : WORLD;
-    float3 nrm    : NORMAL;
-    float3 color  : COLOR;
-};
-
-[shader("mesh")]
-[numthreads(1, 1, 1)]
-[outputtopology("triangle")]
-void msMain(uint3 gid : SV_GroupID,
-            out vertices VOut verts[192],
-            out indices uint3 tris[64],
-            uniform Root* r)
-{
-    uint base = gid.x * 64u;
-    uint remaining = r.tri_count - base;
-    uint count = remaining < 64u ? remaining : 64u;
-    SetMeshOutputCounts(count * 3u, count);
-
-    for (uint t = 0u; t < count; t++) {
-        for (uint k = 0u; k < 3u; k++) {
-            uint vi = (base + t) * 3u + k;
-            Vertex v = r.verts[vi];
-            float4 p = v.pos;
-            VOut o;
-            // Row-vector transform: clip = p · view_proj, view_proj split into rows.
-            o.pos   = p.x * r.vp0 + p.y * r.vp1 + p.z * r.vp2 + p.w * r.vp3;
-            o.world = v.pos.xyz;
-            o.nrm   = v.normal.xyz;
-            o.color = v.color.xyz;
-            verts[t * 3u + k] = o;
+impl Config {
+    /// Resolve `--light-spectrum` to an SPD: built-in names first, then an
+    /// LSPDD CSV path.
+    fn light_spectrum(&self) -> anyhow::Result<spectral::Spd> {
+        if let Some(spd) = spectral::named(&self.light_spectrum) {
+            return Ok(spd);
         }
-        tris[t] = uint3(t * 3u, t * 3u + 1u, t * 3u + 2u);
+        spectral::from_lspdd_csv(std::path::Path::new(&self.light_spectrum))
     }
 }
 
-[shader("fragment")]
-float4 fsMain(VOut i, uniform Root* r) : SV_Target
-{
-    float3 N = normalize(i.nrm);
-    float3 L = normalize(r.cam_pos.xyz - i.world);   // camera headlight
-    float lambert = abs(dot(N, L));                  // two-sided so no wall goes black
-    float3 lit = i.color * (0.2 + 0.8 * lambert);
-    return float4(lit, 1.0);
-}
-"#;
-
-struct CornellBox {
-    pso: MeshletPso,
-    vbuf: GpuAllocation,
-    bump: BumpAllocator,
-    scene: scene::Scene,
-    _ray_scene: Option<ray_scene::RayScene>,
-    tri_count: u32,
-    num_meshlets: u32,
+fn parse_resolution(value: &str) -> Result<UVec2, String> {
+    let (w, h) = value
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("expected a resolution in WxH form, got {value:?}"))?;
+    let parse = |s: &str| {
+        s.parse::<u32>()
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or_else(|| format!("expected a positive integer, got {s:?}"))
+    };
+    Ok(UVec2::new(parse(w)?, parse(h)?))
 }
 
-impl Example for CornellBox {
+/// The windowed harness constructs the example through the no-argument
+/// [`Example::new`], so `main` stashes the parsed config here.
+static CONFIG: OnceLock<Config> = OnceLock::new();
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::parse();
+    if let Some(resolution) = config.headless {
+        run_headless(&config, resolution)?;
+        return Ok(());
+    }
+
+    let _ = CONFIG.set(config);
+    common::run::<App>("Kiln · Cornell box", [0.02, 0.02, 0.03, 1.0])
+}
+
+// ---------------------------------------------------------------------------
+// Windowed application: glue between the harness, the scene, and the two
+// renderers. Prefers the path tracer; raster preview when the device can't
+// trace.
+// ---------------------------------------------------------------------------
+
+struct App {
+    scene: Scene,
+    gpu_scene: GpuScene,
+    raster: RasterPreview,
+    tracer: Option<PathTracer>,
+}
+
+impl Example for App {
     fn depth_format() -> Option<Format> {
         Some(Format::D32Float)
     }
 
     fn new(device: &Device, color_format: Format) -> Self {
-        let src = format!("{}{}{}", Vertex::SLANG, Root::SLANG, BODY);
-        let ms = common::compile(device, &src, "msMain", ShaderStage::Mesh);
-        let fs = common::compile(device, &src, "fsMain", ShaderStage::Pixel);
-
-        let pso = device
-            .create_meshlet_pso(
-                &MeshletPsoDesc {
-                    topology: Topology::TriangleList,
-                    color_targets: vec![ColorTarget::new(color_format)],
-                    depth_format: Some(Format::D32Float),
-                    stencil_format: None,
-                    sample_count: SampleCount::S1,
-                    alpha_to_coverage: false,
-                    // No culling for the first render: the box is viewed from inside, and
-                    // this keeps every wall/light visible regardless of authored winding.
-                    cull: Cull::None,
-                    support_dual_source_blending: false,
-                    blendstate: None,
-                    root_constant_size: 16,
-                    label: Some("cornell-box".into()),
-                },
-                &ms,
-                &fs,
-            )
-            .unwrap_or_else(|e| {
-                eprintln!("mesh shaders unsupported on this device: {e}");
-                std::process::exit(0);
-            });
-
-        let scene = scene::load(ASSET).unwrap_or_else(|e| {
-            eprintln!("failed to load {ASSET}: {e}");
+        let config = CONFIG.get().cloned().unwrap_or_else(|| Config::parse_from(["cornell_box"]));
+        let fail = |message: String| -> ! {
+            eprintln!("{message}");
             std::process::exit(1);
-        });
-        let tri_count = scene.triangle_count();
-        let num_meshlets = tri_count.div_ceil(TRIS_PER_MESHLET);
-        eprintln!(
-            "cornell box: {} vertices, {tri_count} triangles, {num_meshlets} meshlets",
-            scene.vertices.len()
-        );
-
-        // Persistent vertex buffer (the geometry is static). A plain CPU-visible allocation
-        // the mesh shader reads through its `Vertex*` root pointer.
-        let vbuf = device
-            .malloc(
-                (scene.vertices.len() * std::mem::size_of::<Vertex>()) as u64,
-                MemoryType::Default,
-            )
-            .expect("alloc vertex buffer");
-        vbuf.upload_slice(&scene.vertices).expect("upload vertices");
-
-        let ray_scene = match ray_scene::RayScene::build(device, color_format, &scene, &vbuf) {
-            Ok(ray_scene) => Some(ray_scene),
-            Err(e) => {
-                eprintln!("cornell ray scene disabled: {e}");
-                None
-            }
         };
 
-        // Per-frame bump allocator for the transient draw root.
-        let bump = BumpAllocator::new(
-            device
-                .create_buffer(&BufferDesc {
-                    size: 64 * 1024,
-                    memory: MemoryType::Default,
-                    label: Some("cornell-bump".into()),
-                })
-                .expect("create bump buffer"),
-        );
+        let scene = scene::load(ASSET)
+            .unwrap_or_else(|e| fail(format!("failed to load {ASSET}: {e}")));
+        let light_spectrum = config
+            .light_spectrum()
+            .unwrap_or_else(|e| fail(format!("invalid --light-spectrum: {e}")));
+        let gpu_scene = GpuScene::build(device, &scene, &light_spectrum)
+            .unwrap_or_else(|e| fail(format!("failed to upload scene: {e}")));
+        let raster = RasterPreview::build(device, color_format, &scene);
+
+        let tracer = if gpu_scene.accel.is_some() {
+            match PathTracer::new(device, color_format, config.spp, config.samples_per_frame) {
+                Ok(tracer) => Some(tracer),
+                Err(e) => {
+                    eprintln!("cornell path tracer disabled: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Self {
-            pso,
-            vbuf,
-            bump,
             scene,
-            _ray_scene: ray_scene,
-            tri_count,
-            num_meshlets,
+            gpu_scene,
+            raster,
+            tracer,
         }
     }
 
-    fn pre_render(&mut self, device: &Device, cmd: &mut CommandBuffer, extent: [u32; 2]) {
-        if let Some(ray_scene) = &mut self._ray_scene {
-            ray_scene.pre_render(device, cmd, &self.scene, &self.vbuf, extent);
+    fn pre_render(&mut self, ctx: &FrameCtx, cmd: &mut CommandBuffer) {
+        if let Some(tracer) = &mut self.tracer {
+            tracer.pre_render(ctx, cmd, &self.scene, &self.gpu_scene);
         }
     }
 
-    fn render(&mut self, cmd: &mut CommandBuffer, extent: [u32; 2]) {
-        if let Some(ray_scene) = &mut self._ray_scene {
-            ray_scene.render(cmd, extent);
+    fn render(&mut self, ctx: &FrameCtx, cmd: &mut CommandBuffer) {
+        if let Some(tracer) = &mut self.tracer {
+            tracer.render(ctx, cmd);
             return;
         }
-
-        self.bump.reset();
-        let aspect = extent[0] as f32 / extent[1].max(1) as f32;
-        let vp = self.scene.view_proj_rows(aspect);
-        let cam = self.scene.camera_pos();
-
-        let root = self
-            .bump
-            .alloc(std::mem::size_of::<Root>() as u64, 16)
-            .expect("bump root");
-        root.upload(&Root {
-            vp0: vp[0],
-            vp1: vp[1],
-            vp2: vp[2],
-            vp3: vp[3],
-            cam_pos: [cam[0], cam[1], cam[2], 1.0],
-            verts: self.vbuf.gpu(),
-            tri_count: self.tri_count,
-            _pad: 0,
-        })
-        .expect("upload root");
-
-        cmd.set_meshlet_pipeline(&self.pso);
-        cmd.set_depth_stencil_state(&DepthStencilState {
-            depth_mode: DepthFlags::READ | DepthFlags::WRITE,
-            depth_test: CompareOp::Less,
-            stencil_read_mask: 0,
-            stencil_write_mask: 0,
-            ..Default::default()
-        });
-        cmd.draw_meshlets(root.gpu, root.gpu, self.num_meshlets, 1, 1);
+        self.raster.render(ctx, cmd, &self.scene, &self.gpu_scene);
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = parse_config();
-    ray_scene::set_target_spp(config.target_spp);
-    ray_scene::set_samples_per_frame(config.samples_per_frame);
-    if let Some(resolution) = config.headless {
-        run_headless(resolution)?;
-        return Ok(());
-    }
+// ---------------------------------------------------------------------------
+// Headless: trace to the target sample count and write a PNG.
+// ---------------------------------------------------------------------------
 
-    common::run::<CornellBox>("Kiln · Cornell box", [0.02, 0.02, 0.03, 1.0])
-}
-
-struct Config {
-    target_spp: u32,
-    samples_per_frame: u32,
-    headless: Option<[u32; 2]>,
-}
-
-fn parse_config() -> Config {
-    let mut args = std::env::args().skip(1);
-    let default_target_spp = ray_scene::default_target_spp();
-    let default_samples_per_frame = ray_scene::default_samples_per_frame();
-    let mut config = Config {
-        target_spp: default_target_spp,
-        samples_per_frame: default_samples_per_frame,
-        headless: None,
-    };
-
-    while let Some(arg) = args.next() {
-        if arg == "--spp" {
-            let Some(value) = args.next() else {
-                eprintln!("--spp requires a positive integer value");
-                std::process::exit(2);
-            };
-            config.target_spp = parse_positive_u32("--spp", &value);
-            continue;
-        }
-
-        if let Some(value) = arg.strip_prefix("--spp=") {
-            config.target_spp = parse_positive_u32("--spp", value);
-            continue;
-        }
-
-        if arg == "--samples-per-frame" || arg == "--spf" {
-            let Some(value) = args.next() else {
-                eprintln!("{arg} requires a positive integer value");
-                std::process::exit(2);
-            };
-            config.samples_per_frame = parse_positive_u32(&arg, &value);
-            continue;
-        }
-
-        if let Some(value) = arg.strip_prefix("--samples-per-frame=") {
-            config.samples_per_frame = parse_positive_u32("--samples-per-frame", value);
-            continue;
-        }
-
-        if let Some(value) = arg.strip_prefix("--spf=") {
-            config.samples_per_frame = parse_positive_u32("--spf", value);
-            continue;
-        }
-
-        if arg == "--headless" {
-            let Some(value) = args.next() else {
-                eprintln!("--headless requires a resolution in AxB form, for example 1024x768");
-                std::process::exit(2);
-            };
-            config.headless = Some(parse_resolution("--headless", &value));
-            continue;
-        }
-
-        if let Some(value) = arg.strip_prefix("--headless=") {
-            config.headless = Some(parse_resolution("--headless", value));
-            continue;
-        }
-
-        if arg == "-h" || arg == "--help" {
-            print_help(default_target_spp, default_samples_per_frame);
-            std::process::exit(0);
-        }
-
-        eprintln!("unknown argument: {arg}");
-        print_help(default_target_spp, default_samples_per_frame);
-        std::process::exit(2);
-    }
-
-    config
-}
-
-fn parse_positive_u32(flag: &str, value: &str) -> u32 {
-    match value.parse::<u32>() {
-        Ok(value) if value > 0 => value,
-        _ => {
-            eprintln!("{flag} must be a positive integer, got {value:?}");
-            std::process::exit(2);
-        }
-    }
-}
-
-fn parse_resolution(flag: &str, value: &str) -> [u32; 2] {
-    let Some((w, h)) = value.split_once('x').or_else(|| value.split_once('X')) else {
-        eprintln!("{flag} expects a resolution in AxB form, got {value:?}");
-        std::process::exit(2);
-    };
-    [
-        parse_positive_u32("width", w),
-        parse_positive_u32("height", h),
-    ]
-}
-
-fn print_help(default_spp: u32, default_samples_per_frame: u32) {
-    eprintln!(
-        "Usage: cargo run --example cornell_box -- [--spp N] [--samples-per-frame N] [--headless AxB]"
-    );
-    eprintln!("  --spp N    progressive render target samples per pixel (default: {default_spp})");
-    eprintln!(
-        "  --samples-per-frame N, --spf N    path samples accumulated per frame (default: {default_samples_per_frame})"
-    );
-    eprintln!("  --headless AxB    render offscreen and write target/test-images");
-}
-
-fn run_headless(resolution: [u32; 2]) -> anyhow::Result<()> {
+fn run_headless(config: &Config, resolution: UVec2) -> anyhow::Result<()> {
     let device = Device::new(&DeviceDesc {
         validation: false,
         label: Some("cornell-box-headless".into()),
@@ -380,48 +178,53 @@ fn run_headless(resolution: [u32; 2]) -> anyhow::Result<()> {
     })?;
 
     let scene = scene::load(ASSET)?;
-    let vbuf = device
-        .malloc(
-            (scene.vertices.len() * std::mem::size_of::<Vertex>()) as u64,
-            MemoryType::Default,
-        )
-        .expect("alloc vertex buffer");
-    vbuf.upload_slice(&scene.vertices).expect("upload vertices");
-
-    let mut ray_scene = ray_scene::RayScene::build(&device, Format::B8G8R8A8Srgb, &scene, &vbuf)?;
+    let light_spectrum = config.light_spectrum()?;
+    let gpu_scene = GpuScene::build(&device, &scene, &light_spectrum)?;
+    anyhow::ensure!(
+        gpu_scene.accel.is_some(),
+        "headless render needs ray tracing support"
+    );
+    let mut tracer = PathTracer::new(
+        &device,
+        Format::B8G8R8A8Srgb,
+        config.spp,
+        config.samples_per_frame,
+    )?;
     eprintln!(
-        "cornell headless: {}x{}, target spp={}, samples/frame={}",
-        resolution[0],
-        resolution[1],
-        ray_scene.target_spp(),
-        ray_scene.samples_per_frame()
+        "cornell headless: {}x{}, target spp={}, samples/frame={}, light spectrum {}",
+        resolution.x,
+        resolution.y,
+        tracer.target_spp(),
+        tracer.samples_per_frame(),
+        light_spectrum.name,
     );
 
-    while !ray_scene.is_complete() {
-        let before = ray_scene.sample_count();
+    // Each iteration submits and drains, so reusing frame slot 0 is safe here.
+    let ctx = FrameCtx {
+        device: &device,
+        extent: resolution,
+        slot: 0,
+    };
+    while !tracer.is_complete() {
+        let before = tracer.sample_count();
         let mut cmd = device.create_command_buffer()?;
-        ray_scene.pre_render(&device, &mut cmd, &scene, &vbuf, resolution);
+        tracer.pre_render(&ctx, &mut cmd, &scene, &gpu_scene);
         cmd.end();
         let queue = device.queue();
         queue.submit(cmd)?;
         queue.wait_idle();
 
         anyhow::ensure!(
-            ray_scene.sample_count() > before,
+            tracer.sample_count() > before,
             "path tracer made no progress; lights={}",
-            ray_scene.light_count()
+            gpu_scene.light_count
         );
     }
 
-    let rgba = ray_scene.tonemapped_rgba8()?;
-    let [width, height] = ray_scene.extent();
-    let name = format!(
-        "cornell_box_{}x{}_{}spp",
-        width,
-        height,
-        ray_scene.sample_count()
-    );
-    let path = png::save_rgba_png(&name, width, height, &rgba)?;
+    let rgba = tracer.tonemapped_rgba8()?;
+    let extent = tracer.extent();
+    let name = format!("cornell_box_{}x{}_{}spp", extent.x, extent.y, tracer.sample_count());
+    let path = png::save_rgba_png(&name, extent.x, extent.y, &rgba)?;
     eprintln!("cornell headless wrote {}", path.display());
     Ok(())
 }

@@ -1,39 +1,40 @@
-use openusd::math::{IDENTITY_MAT4, mat4_inverse, mat4_mul};
+use glam::{DMat4, Vec3, Vec4};
 use openusd::schemas::geom::{ReadCamera, read_camera};
 use openusd::sdf;
 use openusd::usd::Stage;
 
-use super::math::perspective_rh_zo;
 use super::transform::world_xform;
 
-/// Authored camera data plus its local-to-world transform.
+/// Authored camera data plus its local-to-world transform (glam column-vector
+/// convention — see [`world_xform`] for how openusd's data transposes in).
 pub struct Camera {
-    pub world: [f64; 16],
+    pub world: DMat4,
     pub usd: ReadCamera,
 }
 
 impl Camera {
-    pub fn position(&self) -> [f32; 3] {
-        let m = &self.world;
-        [m[12] as f32, m[13] as f32, m[14] as f32]
+    pub fn position(&self) -> Vec3 {
+        self.world.w_axis.truncate().as_vec3()
     }
 
-    /// Right-handed (camera looks down -Z), Y-up, depth range [0, 1] - matching Kiln's
-    /// normalized clip space. Returned as four `float4` rows for layout-free shader use.
-    pub fn view_proj_rows(&self, aspect: f32) -> [[f32; 4]; 4] {
-        let view = mat4_inverse(&self.world).unwrap_or(IDENTITY_MAT4);
-        let proj = perspective_rh_zo(
-            self.usd.vertical_fov_rad(),
-            aspect,
-            self.usd.clipping_range[0].max(1e-3),
-            self.usd.clipping_range[1],
+    /// Right-handed (camera looks down -Z), Y-up, depth range [0, 1] — matching
+    /// Kiln's normalized clip space. Returned as the four rows of the row-vector
+    /// `view·proj` (= the columns of the column-vector matrix) for layout-free
+    /// shader use.
+    pub fn view_proj_rows(&self, aspect: f32) -> [Vec4; 4] {
+        let view = self.world.inverse();
+        let proj = DMat4::perspective_rh(
+            self.usd.vertical_fov_rad() as f64,
+            aspect as f64,
+            self.usd.clipping_range[0].max(1e-3) as f64,
+            self.usd.clipping_range[1] as f64,
         );
-        let vp = mat4_mul(&view, &proj);
+        let vp = proj * view;
         [
-            [vp[0] as f32, vp[1] as f32, vp[2] as f32, vp[3] as f32],
-            [vp[4] as f32, vp[5] as f32, vp[6] as f32, vp[7] as f32],
-            [vp[8] as f32, vp[9] as f32, vp[10] as f32, vp[11] as f32],
-            [vp[12] as f32, vp[13] as f32, vp[14] as f32, vp[15] as f32],
+            vp.x_axis.as_vec4(),
+            vp.y_axis.as_vec4(),
+            vp.z_axis.as_vec4(),
+            vp.w_axis.as_vec4(),
         ]
     }
 }

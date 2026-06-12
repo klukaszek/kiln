@@ -11,6 +11,8 @@
 
 use std::process::Command;
 
+use glam::UVec2;
+
 use kiln_rhi::{
     ColorAttachment, CommandBuffer, DepthAttachment, Device, DeviceDesc, Format, GpuAllocation,
     LoadOp, MAX_FRAMES_IN_FLIGHT, MemoryType, RenderPassDesc, RenderTarget, SampleCount,
@@ -24,6 +26,19 @@ use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
+
+/// Per-frame recording context: the device, the target extent, and which of the
+/// [`MAX_FRAMES_IN_FLIGHT`] slots this frame occupies.
+///
+/// `slot` is the realtime invariant: when this frame records, up to
+/// `MAX_FRAMES_IN_FLIGHT - 1` earlier frames may still execute on the GPU, so any
+/// CPU-written transient (root structs, bump arenas) must be keyed by `slot` —
+/// the harness only guarantees that *this slot's* previous frame has retired.
+pub struct FrameCtx<'a> {
+    pub device: &'a Device,
+    pub extent: UVec2,
+    pub slot: usize,
+}
 
 /// What each windowed example implements: build its pipelines once, then record
 /// draw commands into the per-frame render pass.
@@ -46,12 +61,12 @@ pub trait Example {
 
     /// Record work that must happen before the swapchain render pass, such as compute
     /// accumulation for progressive renderers. Default examples do nothing here.
-    fn pre_render(&mut self, _device: &Device, _cmd: &mut CommandBuffer, _extent: [u32; 2]) {}
+    fn pre_render(&mut self, _ctx: &FrameCtx, _cmd: &mut CommandBuffer) {}
 
     /// Record draws for one frame. The render pass is already begun on the acquired
-    /// swapchain image (cleared) with viewport + scissor set to the full `extent`. When
+    /// swapchain image (cleared) with viewport + scissor set to the full extent. When
     /// [`Self::depth_format`] is `Some`, a cleared depth attachment is bound too.
-    fn render(&mut self, cmd: &mut CommandBuffer, extent: [u32; 2]);
+    fn render(&mut self, ctx: &FrameCtx, cmd: &mut CommandBuffer);
 }
 
 /// Create a swapchain-sized depth texture in its own GPU-only allocation. The caller
@@ -147,13 +162,18 @@ impl<E: Example> App<E> {
                 return;
             }
         };
-        let extent = [image.width, image.height];
+        let extent = UVec2::new(image.width, image.height);
+        let ctx = FrameCtx {
+            device: &self.device,
+            extent,
+            slot: frame_index,
+        };
 
         let mut cmd = self
             .device
             .create_command_buffer_for_swapchain(swapchain)
             .expect("create_command_buffer_for_swapchain");
-        example.pre_render(&self.device, &mut cmd, extent);
+        example.pre_render(&ctx, &mut cmd);
         cmd.begin_render_pass(&RenderPassDesc {
             color_attachments: vec![ColorAttachment {
                 target: RenderTarget::SwapchainImage(image.index),
@@ -168,12 +188,12 @@ impl<E: Example> App<E> {
                 clear_depth: 1.0,
                 clear_stencil: 0,
             }),
-            render_area: [0, 0, extent[0], extent[1]],
+            render_area: [0, 0, extent.x, extent.y],
         });
-        cmd.set_viewport(0.0, 0.0, extent[0] as f32, extent[1] as f32, 0.0, 1.0);
-        cmd.set_scissor(0, 0, extent[0], extent[1]);
+        cmd.set_viewport(0.0, 0.0, extent.x as f32, extent.y as f32, 0.0, 1.0);
+        cmd.set_scissor(0, 0, extent.x, extent.y);
 
-        example.render(&mut cmd, extent);
+        example.render(&ctx, &mut cmd);
 
         cmd.end_render_pass();
         cmd.transition_to_present(image.index);

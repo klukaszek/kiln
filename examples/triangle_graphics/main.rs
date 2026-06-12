@@ -65,7 +65,7 @@ impl Example for TriangleGraphics {
         Self { pso }
     }
 
-    fn render(&mut self, cmd: &mut CommandBuffer, _extent: [u32; 2]) {
+    fn render(&mut self, _ctx: &common::FrameCtx, cmd: &mut CommandBuffer) {
         cmd.set_graphics_pipeline(&self.pso);
         cmd.draw(None, None, 3, 1, 0, 0);
     }

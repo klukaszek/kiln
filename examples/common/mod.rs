@@ -59,6 +59,11 @@ pub trait Example {
         None
     }
 
+    /// Observe window events (keyboard, mouse) ahead of the harness's own handling.
+    /// The harness still owns close/Esc/resize; examples use this for interaction
+    /// such as camera controls. Default examples ignore input.
+    fn window_event(&mut self, _event: &WindowEvent) {}
+
     /// Record work that must happen before the swapchain render pass, such as compute
     /// accumulation for progressive renderers. Default examples do nothing here.
     fn pre_render(&mut self, _ctx: &FrameCtx, _cmd: &mut CommandBuffer) {}
@@ -120,6 +125,7 @@ pub fn run<E: Example + 'static>(
         depth: None,
         example: None,
         frame_index: 0,
+        surface_size: (0, 0),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -140,9 +146,41 @@ struct App<E: Example> {
     depth: Option<(Texture, GpuAllocation)>,
     example: Option<E>,
     frame_index: usize,
+    // The swapchain's current physical size, to skip the duplicate Resized
+    // events macOS streams during a live resize — every redundant
+    // recreate_swapchain invalidates the layer's drawable pool for nothing.
+    surface_size: (u32, u32),
 }
 
 impl<E: Example> App<E> {
+    /// Rebuild the swapchain (and depth buffer) at `w`×`h` after draining the GPU.
+    fn recreate_surface_sized(&mut self, w: u32, h: u32) {
+        let Some(swapchain) = self.swapchain.as_mut() else {
+            return;
+        };
+        self.device.wait_idle();
+        self.device
+            .recreate_swapchain(
+                swapchain,
+                &SwapchainDesc {
+                    width: w,
+                    height: h,
+                    ..Default::default()
+                },
+            )
+            .expect("recreate_swapchain");
+        self.surface_size = (w, h);
+        // Depth buffer must track the swapchain size: destroy the old one and
+        // build a fresh match (the example opted in, so the slot stays Some).
+        // Destruction is explicit — dropping a Texture leaves it registered
+        // (and resident) on the device, leaking a window-sized texture per resize.
+        if let Some((tex, mem)) = self.depth.take() {
+            self.device.destroy_texture(tex);
+            self.device.free(mem);
+            self.depth = Some(make_depth(&self.device, E::depth_format().unwrap(), w, h));
+        }
+    }
+
     /// Acquire → record → present one frame for the current `frame_index` slot.
     fn render_frame(&mut self) {
         let frame_index = self.frame_index;
@@ -158,7 +196,13 @@ impl<E: Example> App<E> {
         let image = match queue.acquire_image(swapchain, frame_index) {
             Ok(image) => image,
             Err(e) => {
-                eprintln!("acquire_image failed: {e}");
+                // Transient during live resize, but a wedged drawable pool
+                // never recovers on its own: drain the GPU and rebuild the
+                // swapchain so the next frame starts from a clean pool instead
+                // of the window staying black forever.
+                eprintln!("acquire_image failed: {e}; rebuilding swapchain");
+                let (w, h) = self.surface_size;
+                self.recreate_surface_sized(w.max(1), h.max(1));
                 return;
             }
         };
@@ -251,9 +295,13 @@ impl<E: Example> ApplicationHandler for App<E> {
         self.swapchain = Some(swapchain);
         self.depth = depth;
         self.example = Some(example);
+        self.surface_size = (w, h);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let Some(example) = self.example.as_mut() {
+            example.window_event(&event);
+        }
         match event {
             WindowEvent::CloseRequested
             | WindowEvent::KeyboardInput {
@@ -266,35 +314,17 @@ impl<E: Example> ApplicationHandler for App<E> {
                 ..
             } => {
                 self.device.wait_idle();
-                // Release the depth allocation explicitly (the texture only borrows it).
+                // Release the depth texture + allocation explicitly (drops are no-ops).
                 if let Some((tex, mem)) = self.depth.take() {
-                    drop(tex);
+                    self.device.destroy_texture(tex);
                     self.device.free(mem);
                 }
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                if let Some(swapchain) = self.swapchain.as_mut() {
-                    let (w, h) = (size.width.max(1), size.height.max(1));
-                    self.device.wait_idle();
-                    self.device
-                        .recreate_swapchain(
-                            swapchain,
-                            &SwapchainDesc {
-                                width: w,
-                                height: h,
-                                ..Default::default()
-                            },
-                        )
-                        .expect("recreate_swapchain");
-                    // Depth buffer must track the swapchain size: drop the old one and
-                    // build a fresh match (the example opted in, so the slot stays Some).
-                    if let Some((tex, mem)) = self.depth.take() {
-                        drop(tex);
-                        self.device.free(mem);
-                        self.depth =
-                            Some(make_depth(&self.device, E::depth_format().unwrap(), w, h));
-                    }
+                let (w, h) = (size.width.max(1), size.height.max(1));
+                if (w, h) != self.surface_size {
+                    self.recreate_surface_sized(w, h);
                 }
             }
             WindowEvent::RedrawRequested => self.render_frame(),

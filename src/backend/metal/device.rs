@@ -362,6 +362,13 @@ impl MetalQueue {
         // CAMetalDrawable conforms to MTLDrawable, so we need to upcast
         let drawable_proto: Retained<ProtocolObject<dyn MTLDrawable>> =
             ProtocolObject::from_retained(drawable);
+        // Metal 4 decouples drawable availability from display readiness:
+        // nextDrawable can return a drawable the presentation system is still
+        // reading. Apple requires this queue wait "before committing any
+        // command buffers containing commands that target this drawable" —
+        // without it, rendering scribbles over the on-glass image (ghost
+        // frames) and races the pool invalidation during live resize.
+        self.queue.waitForDrawable(&drawable_proto);
         *sc.current_drawable.borrow_mut() = Some(drawable_proto);
 
         Ok(AcquiredImage {

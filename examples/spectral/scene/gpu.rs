@@ -100,7 +100,7 @@ impl GpuScene {
         };
 
         eprintln!(
-            "cornell gpu scene: {triangle_count} triangles, {} materials, {} emissive triangles, light spectrum {} ({} texels), accel={}",
+            "spectral gpu scene: {triangle_count} triangles, {} materials, {} emissive triangles, light spectrum {} ({} texels), accel={}",
             gpu_materials.len(),
             light_triangles.len(),
             baked.name,

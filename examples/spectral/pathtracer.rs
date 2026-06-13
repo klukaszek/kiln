@@ -105,7 +105,7 @@ impl PathTracer {
             &ComputePsoDesc {
                 root_constant_size: std::mem::size_of::<GpuAddress>() as u32,
                 threads_per_threadgroup: [integrator::THREADS_X, integrator::THREADS_Y, 1],
-                label: Some("cornell-trace".into()),
+                label: Some("spectral-trace".into()),
             },
             &trace_shader,
         )?;
@@ -116,7 +116,7 @@ impl PathTracer {
             &ComputePsoDesc {
                 root_constant_size: std::mem::size_of::<GpuAddress>() as u32,
                 threads_per_threadgroup: [CLEAR_THREADS, 1, 1],
-                label: Some("cornell-film-clear".into()),
+                label: Some("spectral-film-clear".into()),
             },
             &clear_shader,
         )?;
@@ -133,7 +133,7 @@ impl PathTracer {
                 root_constant_size: 16,
                 cull: kiln_rhi::Cull::None,
                 blendstate: Some(BlendState::default()),
-                label: Some("cornell-display".into()),
+                label: Some("spectral-display".into()),
                 ..Default::default()
             },
             &display_vs,
@@ -146,7 +146,7 @@ impl PathTracer {
                     .create_buffer(&BufferDesc {
                         size: FRAME_ARENA_SIZE,
                         memory: MemoryType::Default,
-                        label: Some(format!("cornell-frame-arena-{slot}")),
+                        label: Some(format!("spectral-frame-arena-{slot}")),
                     })
                     .expect("create frame arena"),
             )
@@ -180,19 +180,42 @@ impl PathTracer {
 
         let camera = CameraGpu::from_scene(scene, ctx.extent);
         let film_key = camera.film_key(self.target_spp as u64);
-        if self.film.prepare(ctx.device, ctx.extent, film_key) {
-            self.record_film_clear(ctx, cmd);
-            eprintln!(
-                "cornell path tracer reset: {}x{}, target spp={}, samples/frame={}, materials={}, lights={}",
-                ctx.extent.x,
-                ctx.extent.y,
-                self.target_spp,
-                self.samples_per_frame,
-                gpu_scene.material_count,
-                gpu_scene.light_count
-            );
+        // Camera motion resets the film every frame it changes; only the
+        // startup/resize resets are worth a log line.
+        let resized = self.film.extent() != ctx.extent;
+        let needs_clear = self.film.prepare(ctx.device, ctx.extent, film_key);
+        let will_trace =
+            self.film.sample_count() < self.target_spp && gpu_scene.light_count > 0;
+        if !needs_clear && !will_trace {
+            return;
         }
-        if self.film.sample_count() >= self.target_spp || gpu_scene.light_count == 0 {
+
+        // Order this frame's film writes after the previous in-flight frame's
+        // trace writes and display reads. The barrier is recorded outside any
+        // encoder, so it lands queue-scoped at the head of the next compute
+        // encoder — which is why it must only be emitted when compute work
+        // follows. Without it, the film clear recorded on every camera move
+        // races the prior frame's display pass still reading the buffer.
+        cmd.barrier(
+            StageFlags::COMPUTE | StageFlags::PIXEL_SHADER,
+            StageFlags::COMPUTE,
+        );
+
+        if needs_clear {
+            self.record_film_clear(ctx, cmd);
+            if resized {
+                eprintln!(
+                    "spectral path tracer reset: {}x{}, target spp={}, samples/frame={}, materials={}, lights={}",
+                    ctx.extent.x,
+                    ctx.extent.y,
+                    self.target_spp,
+                    self.samples_per_frame,
+                    gpu_scene.material_count,
+                    gpu_scene.light_count
+                );
+            }
+        }
+        if !will_trace {
             return;
         }
 
@@ -317,7 +340,16 @@ impl PathTracer {
 
         cmd.set_compute_pipeline(&self.clear_pso);
         cmd.dispatch(root.gpu, pixel_count.div_ceil(CLEAR_THREADS), 1, 1);
-        cmd.barrier(StageFlags::COMPUTE, StageFlags::COMPUTE);
+        // The trace dispatch lands in a *different* compute encoder (every
+        // set_compute_pipeline opens a fresh one), and a COMPUTE→COMPUTE
+        // barrier inside this encoder is encoder-scoped — it would not order
+        // the trace after the clear at all. Including PIXEL_SHADER in the
+        // destination forces the queue-scoped form, ordering everything that
+        // follows (trace and display) after the clear.
+        cmd.barrier(
+            StageFlags::COMPUTE,
+            StageFlags::COMPUTE | StageFlags::PIXEL_SHADER,
+        );
     }
 
     fn log_progress(&self) {
@@ -326,7 +358,7 @@ impl PathTracer {
             || (sample_count >= 64 && sample_count.is_power_of_two())
         {
             eprintln!(
-                "cornell path tracer progress: {}/{} spp",
+                "spectral path tracer progress: {}/{} spp",
                 sample_count, self.target_spp
             );
         }
@@ -370,12 +402,21 @@ impl Film {
         let pixels = (extent.x as u64) * (extent.y as u64);
         let accum = match self.accum.take() {
             Some(existing) if self.extent == extent => existing,
-            _ => device
-                .malloc(
-                    pixels * std::mem::size_of::<[f32; 4]>() as u64,
-                    MemoryType::Default,
-                )
-                .expect("alloc accumulation buffer"),
+            stale => {
+                // Freeing must be explicit (dropping a GpuAllocation leaks it,
+                // residency included). Safe here: extent changes only follow
+                // the harness's wait_idle on resize, so no frame in flight
+                // still reads the old buffer.
+                if let Some(stale) = stale {
+                    device.free(stale);
+                }
+                device
+                    .malloc(
+                        pixels * std::mem::size_of::<[f32; 4]>() as u64,
+                        MemoryType::Default,
+                    )
+                    .expect("alloc accumulation buffer")
+            }
         };
 
         self.accum = Some(accum);

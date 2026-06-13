@@ -18,9 +18,10 @@ pub mod spectral;
 pub use camera::Camera;
 pub use material::Material;
 
-use glam::{Vec3, Vec4};
+use glam::{DVec3, Vec3, Vec4};
 use kiln_rhi::gpu_struct;
 use openusd::schemas::geom::find_geom_prims;
+use openusd::sdf::{self, Value};
 use openusd::usd::Stage;
 
 gpu_struct! {
@@ -39,6 +40,10 @@ pub struct Scene {
     pub triangle_materials: Vec<u32>,
     pub materials: Vec<Material>,
     pub camera: Camera,
+    /// World up axis from the stage's `upAxis` metadata (Y when unauthored).
+    /// Geometry and cameras arrive in world space, so a Z-up stage stays Z-up;
+    /// interactive camera controls must level against this axis, not Y.
+    pub up: DVec3,
 }
 
 impl Scene {
@@ -59,7 +64,10 @@ impl Scene {
 }
 
 /// Load `path` (a `.usda`/`.usdc`/`.usdz`) into a [`Scene`].
-pub fn load(path: &str) -> anyhow::Result<Scene> {
+pub fn load(path: &std::path::Path) -> anyhow::Result<Scene> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 scene path {}", path.display()))?;
     let stage = Stage::open(path)?;
     let prims = find_geom_prims(&stage)?;
     let geometry = geometry::load_geometry(&stage, &prims.meshes)?;
@@ -69,5 +77,17 @@ pub fn load(path: &str) -> anyhow::Result<Scene> {
         triangle_materials: geometry.triangle_materials,
         materials: geometry.materials,
         camera: camera::load_first(&stage, &prims.cameras)?,
+        up: stage_up_axis(&stage),
     })
+}
+
+/// The stage's `upAxis` layer metadata, read off the pseudo-root.
+fn stage_up_axis(stage: &Stage) -> DVec3 {
+    let axis = sdf::path("/")
+        .ok()
+        .and_then(|root| stage.field::<Value>(root, "upAxis").ok().flatten());
+    match axis {
+        Some(Value::Token(axis) | Value::String(axis)) if axis == "Z" => DVec3::Z,
+        _ => DVec3::Y,
+    }
 }

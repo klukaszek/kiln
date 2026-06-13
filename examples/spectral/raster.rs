@@ -115,7 +115,7 @@ impl RasterPreview {
                     support_dual_source_blending: false,
                     blendstate: None,
                     root_constant_size: 16,
-                    label: Some("cornell-box".into()),
+                    label: Some("spectral-raster".into()),
                 },
                 &ms,
                 &fs,
@@ -128,7 +128,7 @@ impl RasterPreview {
         let tri_count = scene.triangle_count();
         let num_meshlets = tri_count.div_ceil(TRIS_PER_MESHLET);
         eprintln!(
-            "cornell box: {} vertices, {tri_count} triangles, {num_meshlets} meshlets",
+            "raster preview: {} vertices, {tri_count} triangles, {num_meshlets} meshlets",
             scene.vertices.len()
         );
 
@@ -140,7 +140,7 @@ impl RasterPreview {
                     .create_buffer(&BufferDesc {
                         size: 4096,
                         memory: MemoryType::Default,
-                        label: Some(format!("cornell-raster-arena-{slot}")),
+                        label: Some(format!("spectral-raster-arena-{slot}")),
                     })
                     .expect("create raster arena"),
             )

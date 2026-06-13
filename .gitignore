@@ -1,2 +1,4 @@
 target/
 Cargo.lock
+# Reference papers kept alongside the spectral example, not vendored
+examples/spectral/*.pdf

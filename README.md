@@ -13,7 +13,7 @@ compiled per backend.
 ![Path-traced Cornell box](public/cornell_box.png)
 
 *Cornell box path-traced headless at 1024x1024, 64 spp, through the ray-tracing path. Reproduce
-with `cargo run --release --example cornell_box -- --spp 64 --headless 1024x1024`.*
+with `cargo run --release --example spectral -- --spp 64 --headless 1024x1024`.*
 
 ## Philosophy
 
@@ -270,7 +270,7 @@ Slang shaders.
 ```bash
 cargo run --example triangle_graphics   # windowed raster triangle
 cargo run --example triangle_mesh       # mesh-shader pipeline
-cargo run --example cornell_box         # USD scene + ray tracing
+cargo run --example spectral         # USD scene + ray tracing
 ```
 
 ### Tests

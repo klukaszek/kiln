@@ -334,7 +334,8 @@ pub fn named(name: &str) -> Option<Spd> {
 /// Load a measured lamp spectrum in the LSPDD CSV format (metadata lines such as
 /// `Category: …`, then `wavelength,flux` rows). The data set is CC BY-NC-ND
 /// (Roby & Aubé, <https://lspdd.org>) — download it yourself, keep it out of the
-/// repository.
+/// repository. `examples/assets/lspdd/` is the version-control-ignored drop
+/// folder the CLI resolves bare spectrum names against.
 pub fn from_lspdd_csv(path: &std::path::Path) -> anyhow::Result<Spd> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading LSPDD spectrum {}", path.display()))?;

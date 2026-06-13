@@ -19,15 +19,15 @@ use super::{Material, Scene, Vertex};
 
 gpu_struct! {
     pub struct GpuMaterial {
-        base_roughness: Vec4 as "float4",
-        emission_metallic: Vec4 as "float4",
-        specular_ior: Vec4 as "float4",
-        coat_opacity: Vec4 as "float4",
-        flags: UVec4 as "uint4",
+        base_roughness: Vec4,
+        emission_metallic: Vec4,
+        specular_ior: Vec4,
+        coat_opacity: Vec4,
+        flags: UVec4,
         // xyz: Lagrange multipliers of the moment-based reflectance spectrum
         // (prep done on the CPU; the shader only evaluates). w: the emitter
         // scalar for spectral transport (0 for non-emissive materials).
-        lagrange_emission: Vec4 as "float4",
+        lagrange_emission: Vec4,
     }
 }
 
@@ -44,10 +44,12 @@ pub struct GpuScene {
     pub triangle_material_buffer: GpuAllocation,
     pub material_buffer: GpuAllocation,
     pub light_triangle_buffer: GpuAllocation,
-    /// The light's baked wavelength-sampling table ([`spectral::EmissionSpectrum`]
-    /// texels: rgb = sensor weight, w = phase). One spectrum per scene for now;
-    /// per-light spectra need per-light tables plus flux data for MIS.
+    /// The light's baked wavelength tables ([`spectral::EmissionSpectrum`],
+    /// texel `(phase, λ, flux_shape, p_light)`): `spectrum_buffer` is the
+    /// inverse-CDF (light-importance) table, `lambda_buffer` the uniform-λ MIS
+    /// partner. Both share `spectrum_len`. One spectrum per scene for now.
     pub spectrum_buffer: GpuAllocation,
+    pub lambda_buffer: GpuAllocation,
     pub spectrum_len: u32,
     pub accel: Option<SceneAccel>,
     pub triangle_count: u32,
@@ -69,6 +71,7 @@ impl GpuScene {
 
         let baked = light_spectrum.bake(spectral::DEFAULT_RESOLUTION);
         let spectrum_buffer = upload_slice(device, &baked.texels, "light spectrum table");
+        let lambda_buffer = upload_slice(device, &baked.lambda_texels, "uniform wavelength table");
 
         let gpu_materials: Vec<GpuMaterial> = scene
             .materials
@@ -114,6 +117,7 @@ impl GpuScene {
             material_buffer,
             light_triangle_buffer,
             spectrum_buffer,
+            lambda_buffer,
             spectrum_len: baked.texels.len() as u32,
             accel,
             triangle_count,

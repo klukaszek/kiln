@@ -28,9 +28,9 @@ gpu_struct! {
     /// Per-vertex render data. Declared ahead of any root struct whose Slang source
     /// dereferences a `Vertex*`.
     pub struct Vertex {
-        pos: Vec4 as "float4",    // world position, w = 1
-        normal: Vec4 as "float4", // world normal,   w = 0
-        color: Vec4 as "float4",  // linear RGB,      w = 1
+        pos: Vec4,    // world position, w = 1
+        normal: Vec4, // world normal,   w = 0
+        color: Vec4,  // linear RGB,      w = 1
     }
 }
 

@@ -16,7 +16,7 @@ use kiln_rhi::{
 
 gpu_struct! {
     pub struct Root {
-        color: [f32; 4] as "float4",
+        color: [f32; 4],
     }
 }
 
@@ -378,7 +378,7 @@ const GRID_SIZE: u32 = 256;
 
 gpu_struct! {
     pub struct GridCfg {
-        dim: u32 as "uint", // grid is dim × dim meshlets
+        dim: u32, // grid is dim × dim meshlets
     }
 }
 

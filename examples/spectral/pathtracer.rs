@@ -5,6 +5,17 @@
 //! scenes never rebuilds a PSO. Per frame it records one compute accumulation
 //! pass into the [`Film`] and a fullscreen blit of the running average.
 //!
+//! This is a *realtime* path tracer in the sense of Peters' reference
+//! renderer: every frame traces `samples_per_frame` (default 1) paths for
+//! every film pixel and presents the running average — the per-present GPU
+//! cost is one low-spp pass by construction, with no scheduling layer. While
+//! the camera is still the film accumulates at the display rate; any change
+//! restarts it, so motion shows the live 1-spp image. `render_scale` divides
+//! the film resolution (the blit upscales) when full-resolution paths exceed
+//! the frame budget the display imposes — per-pass overhead is negligible
+//! (measured: 64×1 spp ≈ 4×16 spp wall time), so a lower `samples_per_frame`
+//! costs no convergence throughput.
+//!
 //! Realtime invariants:
 //! - All per-frame GPU arguments (trace + display roots) come from a bump arena
 //!   owned by the frame's slot, so a recording frame never touches memory an
@@ -19,51 +30,43 @@
 
 mod display;
 mod integrator;
+mod roots;
 mod sampler;
 
-use glam::{DVec3, UVec2, UVec4, Vec4};
+use glam::{UVec2, UVec4, Vec3, Vec4};
 use kiln_rhi::{
     BlendState, BufferDesc, BumpAllocator, ColorTarget, CommandBuffer, CompareOp, ComputePso,
     ComputePsoDesc, DepthFlags, DepthStencilState, Device, Format, GpuAddress, GpuAllocation,
     GraphicsPso, GraphicsPsoDesc, MAX_FRAMES_IN_FLIGHT, MemoryType, SampleCount, ShaderStage,
-    StageFlags, Topology, gpu_struct,
+    StageFlags, Topology,
 };
 
 use crate::common::{self, FrameCtx};
 use crate::scene::Scene;
 use crate::scene::gpu::{GpuMaterial, GpuScene};
-use crate::scene::Vertex;
+use crate::scene::{Vertex, spectral};
+use roots::{CLEAR_SOURCE, CLEAR_THREADS, CameraGpu, ClearRoot, DisplayRoot, TraceRoot};
 
 pub const DEFAULT_TARGET_SPP: u32 = 1024;
-pub const DEFAULT_SAMPLES_PER_FRAME: u32 = 16;
+/// One pass per present — the realtime loop. Raising this trades present rate
+/// for nothing: per-pass overhead is noise next to per-sample cost.
+pub const DEFAULT_SAMPLES_PER_FRAME: u32 = 1;
+
+/// Number of f32 per film pixel: one band-radiance accumulator per spectral
+/// bin, plus a trailing per-pixel sample count.
+const FILM_STRIDE: u32 = spectral::SPECTRAL_BINS as u32 + 1;
+
+/// Hero wavelengths per path, split between the two MIS sampling strategies:
+/// `N_LIGHT_LANES` drawn from the light-importance CDF (good for the display
+/// image and spiky illuminants), `N_UNIFORM_LANES` drawn uniformly in
+/// wavelength (so the deep spectral tails get bounded-variance coverage). Their
+/// sum is the float4 wavelength width the kernel carries — keep it at 4.
+const N_LIGHT_LANES: u32 = 2;
+const N_UNIFORM_LANES: u32 = 2;
 
 /// Bytes of transient root data each frame slot may allocate.
 const FRAME_ARENA_SIZE: u64 = 4096;
 
-/// Zero the accumulation buffer on the GPU. Recorded ahead of the trace pass
-/// whenever the film resets, so history invalidation needs no CPU writes and
-/// stays ordered against in-flight frames by queue submission order.
-const CLEAR_SOURCE: &str = /*slang*/
-    r#"
-[shader("compute")]
-[numthreads(256, 1, 1)]
-void clearMain(uint3 tid : SV_DispatchThreadID, uniform ClearRoot* r)
-{
-    if (tid.x < r.count) {
-        r.accum[tid.x] = float4(0.0);
-    }
-}
-"#;
-
-const CLEAR_THREADS: u32 = 256;
-
-gpu_struct! {
-    struct ClearRoot {
-        accum: GpuAddress as "float4*",
-        count: u32 as "uint",
-        _pad: u32 as "uint",
-    }
-}
 
 pub struct PathTracer {
     trace_pso: ComputePso,
@@ -74,6 +77,13 @@ pub struct PathTracer {
     film: Film,
     target_spp: u32,
     samples_per_frame: u32,
+    /// Film resolution divisor: trace at `display_extent / render_scale`, blit
+    /// upscales. 1 = native.
+    render_scale: u32,
+    /// Per-bin linear-sRGB colour-matching response (the sensor), resident for
+    /// the display blit. The CPU copy backs PNG/probe readback.
+    cmf_bins: GpuAllocation,
+    cmf_bins_cpu: Vec<Vec3>,
     display_target_is_srgb: bool,
 }
 
@@ -85,6 +95,7 @@ impl PathTracer {
         color_format: Format,
         target_spp: u32,
         samples_per_frame: u32,
+        render_scale: u32,
     ) -> anyhow::Result<Self> {
         let trace_src = format!(
             "{}{}{}{}{}",
@@ -152,6 +163,17 @@ impl PathTracer {
             )
         });
 
+        // The sensor: per-bin linear-sRGB colour-matching response. Uploaded
+        // once (padded to float4) for the display blit; kept on the CPU for
+        // PNG/probe readback. Light-independent, so it never changes.
+        let cmf_bins_cpu = spectral::cmf_bins_linear_srgb();
+        let cmf_padded: Vec<Vec4> = cmf_bins_cpu.iter().map(|c| c.extend(0.0)).collect();
+        let cmf_bins = device.malloc(
+            std::mem::size_of_val(cmf_padded.as_slice()) as u64,
+            MemoryType::Default,
+        )?;
+        cmf_bins.upload_slice(&cmf_padded)?;
+
         Ok(Self {
             trace_pso,
             clear_pso,
@@ -160,8 +182,19 @@ impl PathTracer {
             film: Film::new(),
             target_spp,
             samples_per_frame,
+            render_scale: render_scale.max(1),
+            cmf_bins,
+            cmf_bins_cpu,
             display_target_is_srgb: display::format_is_srgb(color_format),
         })
+    }
+
+    /// The film resolution for a given display extent.
+    fn film_extent(&self, display: UVec2) -> UVec2 {
+        UVec2::new(
+            display.x.div_ceil(self.render_scale).max(1),
+            display.y.div_ceil(self.render_scale).max(1),
+        )
     }
 
     /// Record this frame's accumulation pass. Must run before [`Self::render`]
@@ -178,12 +211,13 @@ impl PathTracer {
         };
         self.frame_arenas[ctx.slot].reset();
 
-        let camera = CameraGpu::from_scene(scene, ctx.extent);
+        let film_extent = self.film_extent(ctx.extent);
+        let camera = CameraGpu::from_scene(scene, film_extent);
         let film_key = camera.film_key(self.target_spp as u64);
         // Camera motion resets the film every frame it changes; only the
         // startup/resize resets are worth a log line.
-        let resized = self.film.extent() != ctx.extent;
-        let needs_clear = self.film.prepare(ctx.device, ctx.extent, film_key);
+        let resized = self.film.extent() != film_extent;
+        let needs_clear = self.film.prepare(ctx.device, film_extent, film_key);
         let will_trace =
             self.film.sample_count() < self.target_spp && gpu_scene.light_count > 0;
         if !needs_clear && !will_trace {
@@ -205,7 +239,9 @@ impl PathTracer {
             self.record_film_clear(ctx, cmd);
             if resized {
                 eprintln!(
-                    "spectral path tracer reset: {}x{}, target spp={}, samples/frame={}, materials={}, lights={}",
+                    "spectral path tracer reset: {}x{} film ({}x{} display), target spp={}, samples/frame={}, materials={}, lights={}",
+                    film_extent.x,
+                    film_extent.y,
                     ctx.extent.x,
                     ctx.extent.y,
                     self.target_spp,
@@ -232,15 +268,18 @@ impl PathTracer {
             cam_up: camera.up,
             cam_forward: camera.forward,
             lens: camera.lens,
-            accum: accum.gpu(),
+            film: accum.gpu(),
             verts: gpu_scene.vertex_buffer.gpu(),
             triangle_materials: gpu_scene.triangle_material_buffer.gpu(),
             materials: gpu_scene.material_buffer.gpu(),
             light_triangles: gpu_scene.light_triangle_buffer.gpu(),
             spectrum: gpu_scene.spectrum_buffer.gpu(),
+            lambda: gpu_scene.lambda_buffer.gpu(),
+            _pad0: 0,
+            _pad1: 0,
             dims0: UVec4::new(
-                ctx.extent.x,
-                ctx.extent.y,
+                film_extent.x,
+                film_extent.y,
                 self.film.sample_count(),
                 self.target_spp,
             ),
@@ -250,6 +289,12 @@ impl PathTracer {
                 samples,
                 gpu_scene.spectrum_len,
             ),
+            dims2: UVec4::new(
+                spectral::SPECTRAL_BINS as u32,
+                N_LIGHT_LANES,
+                N_UNIFORM_LANES,
+                0,
+            ),
         })
         .expect("upload trace root");
 
@@ -257,8 +302,8 @@ impl PathTracer {
         cmd.bind_acceleration_structure(1, &accel.tlas);
         cmd.dispatch(
             root.gpu,
-            ctx.extent.x.div_ceil(integrator::THREADS_X),
-            ctx.extent.y.div_ceil(integrator::THREADS_Y),
+            film_extent.x.div_ceil(integrator::THREADS_X),
+            film_extent.y.div_ceil(integrator::THREADS_Y),
             1,
         );
         self.film.add_samples(samples);
@@ -266,26 +311,30 @@ impl PathTracer {
         cmd.barrier(StageFlags::COMPUTE, StageFlags::PIXEL_SHADER);
     }
 
-    /// Blit the running average to the bound render target.
+    /// Blit the running average to the bound render target, upscaling when the
+    /// film renders below display resolution.
     pub fn render(&mut self, ctx: &FrameCtx, cmd: &mut CommandBuffer) {
         let Some(accum) = self.film.accum() else {
             return;
         };
-        if self.film.extent() != ctx.extent {
+        if self.film.extent() != self.film_extent(ctx.extent) {
             return;
         }
 
         let root = self.frame_arenas[ctx.slot]
             .alloc(std::mem::size_of::<DisplayRoot>() as u64, 16)
             .expect("display root from frame arena");
+        let film = self.film.extent();
         root.upload(&DisplayRoot {
             dims: UVec4::new(
                 ctx.extent.x,
                 ctx.extent.y,
-                self.film.sample_count().max(1),
+                spectral::SPECTRAL_BINS as u32,
                 self.display_target_is_srgb as u32,
             ),
-            accum: accum.gpu(),
+            film_dims: UVec4::new(film.x, film.y, FILM_STRIDE, 0),
+            film: accum.gpu(),
+            cmf: self.cmf_bins.gpu(),
         })
         .expect("upload display root");
 
@@ -321,25 +370,43 @@ impl PathTracer {
     }
 
     pub fn tonemapped_rgba8(&self) -> anyhow::Result<Vec<u8>> {
-        self.film.tonemapped_rgba8(display::tonemap_channel)
+        Ok(display::film_to_rgba8(
+            self.film.rows()?,
+            FILM_STRIDE as usize,
+            &self.cmf_bins_cpu,
+        ))
     }
 
-    /// Record the GPU zero of the film's accumulation buffer.
+    /// Per-pixel band-integrated spectral radiance, row-major
+    /// `[height][width][SPECTRAL_BINS]` — the raw spectral capture.
+    pub fn spectral_bands(&self) -> anyhow::Result<Vec<f32>> {
+        Ok(display::film_to_bands(self.film.rows()?, FILM_STRIDE as usize))
+    }
+
+    /// Centre wavelength (nm) of each spectral bin, for labelling exports.
+    pub fn spectral_bin_centers() -> Vec<f32> {
+        (0..spectral::SPECTRAL_BINS)
+            .map(spectral::spectral_bin_center)
+            .collect()
+    }
+
+    /// Record the GPU zero of the spectral film (every bin and count).
     fn record_film_clear(&mut self, ctx: &FrameCtx, cmd: &mut CommandBuffer) {
         let accum = self.film.accum().expect("film prepared");
-        let pixel_count = ctx.extent.x * ctx.extent.y;
+        let film = self.film.extent();
+        let float_count = film.x * film.y * FILM_STRIDE;
         let root = self.frame_arenas[ctx.slot]
             .alloc(std::mem::size_of::<ClearRoot>() as u64, 16)
             .expect("clear root from frame arena");
         root.upload(&ClearRoot {
-            accum: accum.gpu(),
-            count: pixel_count,
+            film: accum.gpu(),
+            count: float_count,
             _pad: 0,
         })
         .expect("upload clear root");
 
         cmd.set_compute_pipeline(&self.clear_pso);
-        cmd.dispatch(root.gpu, pixel_count.div_ceil(CLEAR_THREADS), 1, 1);
+        cmd.dispatch(root.gpu, float_count.div_ceil(CLEAR_THREADS), 1, 1);
         // The trace dispatch lands in a *different* compute encoder (every
         // set_compute_pipeline opens a fresh one), and a COMPUTE→COMPUTE
         // barrier inside this encoder is encoder-scoped — it would not order
@@ -400,6 +467,7 @@ impl Film {
         }
 
         let pixels = (extent.x as u64) * (extent.y as u64);
+        let film_bytes = pixels * FILM_STRIDE as u64 * std::mem::size_of::<f32>() as u64;
         let accum = match self.accum.take() {
             Some(existing) if self.extent == extent => existing,
             stale => {
@@ -411,11 +479,8 @@ impl Film {
                     device.free(stale);
                 }
                 device
-                    .malloc(
-                        pixels * std::mem::size_of::<[f32; 4]>() as u64,
-                        MemoryType::Default,
-                    )
-                    .expect("alloc accumulation buffer")
+                    .malloc(film_bytes, MemoryType::Default)
+                    .expect("alloc spectral film")
             }
         };
 
@@ -442,97 +507,14 @@ impl Film {
         self.sample_count += samples;
     }
 
-    /// Read back the accumulated image as tonemapped RGBA8 (headless PNG path).
-    fn tonemapped_rgba8(&self, tonemap: impl Fn(f32, f32) -> u8) -> anyhow::Result<Vec<u8>> {
+    /// The film as `[bins.., count]` rows, one per pixel (row-major). Resolving
+    /// these to RGB or per-band radiance is [`display`]'s job.
+    fn rows(&self) -> anyhow::Result<&[f32]> {
         let accum = self
             .accum
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("film has no accumulation buffer"))?;
-        let pixels = accum.as_slice::<[f32; 4]>()?;
-        let sample_count = self.sample_count.max(1) as f32;
-        let mut rgba = Vec::with_capacity(pixels.len() * 4);
-
-        for pixel in pixels {
-            rgba.extend_from_slice(&[
-                tonemap(pixel[0], sample_count),
-                tonemap(pixel[1], sample_count),
-                tonemap(pixel[2], sample_count),
-                255,
-            ]);
-        }
-
-        Ok(rgba)
+        Ok(accum.as_slice::<f32>()?)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Per-pass root layouts and the camera basis the trace kernel consumes. Roots
-// are transient: bump-allocated per frame slot, never persistent.
-// ---------------------------------------------------------------------------
-
-gpu_struct! {
-    struct TraceRoot {
-        cam_pos: Vec4 as "float4",
-        cam_right: Vec4 as "float4",
-        cam_up: Vec4 as "float4",
-        cam_forward: Vec4 as "float4",
-        lens: Vec4 as "float4",
-        accum: GpuAddress as "float4*",
-        verts: GpuAddress as "Vertex*",
-        triangle_materials: GpuAddress as "uint*",
-        materials: GpuAddress as "GpuMaterial*",
-        light_triangles: GpuAddress as "uint*",
-        spectrum: GpuAddress as "float4*", // baked light spectrum table
-        dims0: UVec4 as "uint4", // width, height, sample_index, max_spp
-        dims1: UVec4 as "uint4", // tri_count, light_count, samples_per_frame, spectrum_len
-    }
-}
-
-gpu_struct! {
-    struct DisplayRoot {
-        dims: UVec4 as "uint4", // width, height, sample_count, target_is_srgb
-        accum: GpuAddress as "float4*",
-    }
-}
-
-/// Camera basis in the shape the trace kernel consumes.
-struct CameraGpu {
-    pos: Vec4,
-    right: Vec4,
-    up: Vec4,
-    forward: Vec4,
-    lens: Vec4,
-}
-
-impl CameraGpu {
-    fn from_scene(scene: &Scene, extent: UVec2) -> Self {
-        // The world matrix is column-vector glam; its x/y/z columns are the
-        // camera's right/up/back axes, w its position.
-        let world = &scene.camera.world;
-        let aspect = extent.x as f32 / extent.y.max(1) as f32;
-        let tan_half_fovy = (scene.camera.usd.vertical_fov_rad() * 0.5).tan();
-        let basis = |axis: glam::DVec4| axis.truncate().normalize_or(DVec3::Z).as_vec3().extend(0.0);
-
-        Self {
-            pos: world.w_axis.as_vec4(),
-            right: basis(world.x_axis),
-            up: basis(world.y_axis),
-            forward: basis(-world.z_axis),
-            lens: Vec4::new(aspect, tan_half_fovy, 0.0, 0.0),
-        }
-    }
-
-    /// Fold every accumulated-sample-invalidating camera input into a film key.
-    fn film_key(&self, seed: u64) -> u64 {
-        let mut key = seed;
-        for vec in [self.pos, self.right, self.up, self.forward, self.lens] {
-            for component in vec.to_array() {
-            // FNV-1a over the raw bits: cheap, stable, and exact-equality
-            // semantics (any camera change at all restarts accumulation).
-                key ^= component.to_bits() as u64;
-                key = key.wrapping_mul(0x100000001b3);
-            }
-        }
-        key
-    }
-}

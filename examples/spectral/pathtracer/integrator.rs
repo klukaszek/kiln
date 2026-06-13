@@ -93,33 +93,64 @@ float4 eval_reflectance(float4 phases, float3 lagranges)
     return atan(series) * INV_PI + 0.5;
 }
 
-// Four stratified wavelength samples from the light's baked inverse-CDF table:
-// one uniform draw, rotated by k/4 (Cranley-Patterson over the CDF). Each texel
-// is (linear-sRGB sensor weight, phase).
-struct WavePacket {
-    float4 phases;
-    float3 weights[4];
-};
+// Four hero wavelengths drawn by two MIS strategies: `n_light` lanes from the
+// light-importance CDF table (rotated by 1/n_light over the CDF), `n_uniform`
+// lanes uniform in wavelength (rotated by 1/n_uniform over [λ_min, λ_max]). Both
+// tables are indexed by a stratum u in [0,1) and share the texel layout
+// (phase, λ, flux_shape, p_light), so a lane is one fetch regardless of
+// strategy. The path carries only the two strata `xi`, `xiU` and refetches per
+// lane, keeping wavelength data out of the bounce loop's live set.
+static const float SPECTRAL_LAMBDA_MIN = 360.0;
+static const float SPECTRAL_LAMBDA_MAX = 830.0;
 
-WavePacket sample_wavelengths(TraceRoot* r, float xi)
+float4 fetch_lane(TraceRoot* r, uint k, float xi, float xiU)
 {
     uint len = max(r.dims1.w, 1u);
-    WavePacket wave;
-    [ForceUnroll]
-    for (uint k = 0u; k < 4u; k++) {
-        float u = frac(xi + 0.25 * (float)k);
-        float4 texel = r.spectrum[min((uint)(u * (float)len), len - 1u)];
-        wave.weights[k] = texel.xyz;
-        wave.phases[k] = texel.w;
+    uint nLight = r.dims2.y;
+    if (k < nLight) {
+        float u = frac(xi + (float)k / (float)nLight);
+        return r.spectrum[min((uint)(u * (float)len), len - 1u)];
     }
-    return wave;
+    uint nUniform = max(r.dims2.z, 1u);
+    float u = frac(xiU + (float)(k - nLight) / (float)nUniform);
+    return r.lambda[min((uint)(u * (float)len), len - 1u)];
 }
 
-// Average the per-wavelength radiance into the sensor's linear-sRGB response.
-float3 resolve_to_srgb(WavePacket wave, float4 radiance)
+float4 sample_phases(TraceRoot* r, float xi, float xiU)
 {
-    return 0.25 * (wave.weights[0] * radiance.x + wave.weights[1] * radiance.y +
-                   wave.weights[2] * radiance.z + wave.weights[3] * radiance.w);
+    float4 phases;
+    [ForceUnroll]
+    for (uint k = 0u; k < 4u; k++) {
+        phases[k] = fetch_lane(r, k, xi, xiU).x;
+    }
+    return phases;
+}
+
+// Splat one path's hero-wavelength radiances into the pixel's spectral film bins
+// with the balance-heuristic MIS weight: each lane contributes the true band
+// radiance L(λ) = flux_shape·radiance, divided by `n_light·p_light + n_uniform·
+// p_uniform`. The uniform term keeps the denominator bounded below in the deep
+// tails (where p_light → 0), so the edge-bin blow-up is gone. Single thread owns
+// the pixel this frame and frames are barrier-serialised, so the += is atomic-free.
+void splat_spectral(TraceRoot* r, uint pixel, float xi, float xiU, float4 radiance)
+{
+    uint bins = r.dims2.x;
+    uint stride = bins + 1u;
+    float nLight = (float)r.dims2.y;
+    float nUniform = (float)r.dims2.z;
+    float binWidth = (SPECTRAL_LAMBDA_MAX - SPECTRAL_LAMBDA_MIN) / (float)bins;
+    float pUniform = 1.0 / (SPECTRAL_LAMBDA_MAX - SPECTRAL_LAMBDA_MIN);
+    [ForceUnroll]
+    for (uint k = 0u; k < 4u; k++) {
+        float4 texel = fetch_lane(r, k, xi, xiU);
+        float lambda = texel.y;
+        float fluxShape = texel.z;
+        float pLight = texel.w;
+        float radianceL = fluxShape * radiance[k];
+        float denom = max(nLight * pLight + nUniform * pUniform, 1e-20);
+        uint bin = min((uint)((lambda - SPECTRAL_LAMBDA_MIN) / binWidth), bins - 1u);
+        r.film[pixel * stride + bin] += radianceL / denom;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -308,8 +339,9 @@ float4 sample_direct_light(TraceRoot* r,
     shadow.Direction = wi;
     shadow.TMin = 0.001;
     shadow.TMax = max(dist - 0.004, 0.001);
-    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> sq;
-    sq.TraceRayInline(tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, shadow);
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE> sq;
+    sq.TraceRayInline(
+        tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE, 0xFF, shadow);
     while (sq.Proceed()) {}
     if (sq.CommittedStatus() != COMMITTED_NOTHING) {
         return float4(0.0);
@@ -341,7 +373,6 @@ void traceMain(uint3 tid : SV_DispatchThreadID,
     }
 
     uint pixel = tid.y * width + tid.x;
-    float3 sampleRadiance = float3(0.0);
     uint samplesTaken = 0u;
 
     for (uint sampleOffset = 0u; sampleOffset < sampleBatch; sampleOffset++) {
@@ -362,9 +393,12 @@ void traceMain(uint3 tid : SV_DispatchThreadID,
             r.cam_right.xyz * (ndc.x * r.lens.y * r.lens.x) +
             r.cam_up.xyz * (ndc.y * r.lens.y));
 
-        // Four stratified wavelengths per path, importance sampled from the
-        // light's baked table.
-        WavePacket wave = sample_wavelengths(r, camU.z);
+        // Four hero wavelengths per path via MIS: `xi` strata the light-CDF
+        // lanes, `xiU` the uniform-λ lanes. Only the phases ride along the path;
+        // wavelength/flux/pdf are refetched from the two strata at splat time.
+        float xi = camU.z;
+        float xiU = camU.w;
+        float4 phases = sample_phases(r, xi, xiU);
 
         RayDesc ray;
         ray.Origin = r.cam_pos.xyz;
@@ -377,8 +411,11 @@ void traceMain(uint3 tid : SV_DispatchThreadID,
         float prevBsdfPdf = 0.0;
 
         for (uint bounce = 0u; bounce < 4u; bounce++) {
-            RayQuery<RAY_FLAG_NONE> q;
-            q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+            // Geometry is all OPAQUE in the BLAS, so force-opaque lets the
+            // hardware commit hits during traversal instead of returning each
+            // candidate to this Proceed() loop.
+            RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+            q.TraceRayInline(tlas, RAY_FLAG_FORCE_OPAQUE, 0xFF, ray);
             while (q.Proceed()) {}
 
             if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
@@ -413,7 +450,7 @@ void traceMain(uint3 tid : SV_DispatchThreadID,
 
             float3 wo = -ray.Direction;
             Surface surf = make_surface(mat);
-            float4 rho = eval_reflectance(wave.phases, surf.lagranges);
+            float4 rho = eval_reflectance(phases, surf.lagranges);
 
             float4 lightU = sample_4d(pixel, sampleIndex, 1u + bounce * 2u);
             radiance += throughput * sample_direct_light(r, tlas, p, n, wo, surf, rho, lightU);
@@ -442,11 +479,12 @@ void traceMain(uint3 tid : SV_DispatchThreadID,
             }
         }
 
-        sampleRadiance += resolve_to_srgb(wave, radiance);
+        splat_spectral(r, pixel, xi, xiU, radiance);
     }
 
     if (samplesTaken > 0u) {
-        r.accum[pixel] += float4(sampleRadiance, (float)samplesTaken);
+        uint stride = r.dims2.x + 1u;
+        r.film[pixel * stride + r.dims2.x] += (float)samplesTaken;
     }
 }
 "#;

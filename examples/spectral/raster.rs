@@ -21,14 +21,14 @@ gpu_struct! {
     /// Pointer-first draw root. `view_proj` is carried as four `float4` rows of a row-vector
     /// matrix so the shader never depends on Slang's matrix storage layout.
     pub struct Root {
-        vp0: Vec4 as "float4",
-        vp1: Vec4 as "float4",
-        vp2: Vec4 as "float4",
-        vp3: Vec4 as "float4",
-        cam_pos: Vec4 as "float4",
+        vp0: Vec4,
+        vp1: Vec4,
+        vp2: Vec4,
+        vp3: Vec4,
+        cam_pos: Vec4,
         verts: GpuAddress as "Vertex*",
-        tri_count: u32 as "uint",
-        _pad: u32 as "uint",
+        tri_count: u32,
+        _pad: u32,
     }
 }
 

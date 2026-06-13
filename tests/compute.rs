@@ -13,10 +13,10 @@ gpu_struct! {
     pub struct Data {
         input: GpuAddress as "uint*",
         output: GpuAddress as "uint*",
-        count: u32 as "uint",
+        count: u32,
         // Explicit tail padding so the struct is padding-free (GpuPod/IntoBytes) and matches
         // Slang's 24-byte natural layout exactly.
-        _pad: u32 as "uint",
+        _pad: u32,
     }
 }
 

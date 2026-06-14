@@ -18,7 +18,7 @@ use kiln_rhi::{
 
 // Same shader as the headless test: positions and per-vertex colours are static in
 // the vertex shader; the fragment shader just passes the interpolated colour through.
-const TRI_BODY: &str = /*slang*/
+const TRI_BODY: &str = /* slang */
     r#"
 struct VOut { float4 pos : SV_Position; float4 color : COLOR; };
 

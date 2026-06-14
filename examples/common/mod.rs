@@ -134,13 +134,14 @@ pub fn run<E: Example + 'static>(
 struct App<E: Example> {
     title: String,
     clear: [f32; 4],
-    device: Device,
-    // `window` must outlive `surface`: on Metal the surface is a CAMetalLayer hung off
-    // the window's view. Declared first only for readability — drop order is by the
-    // explicit teardown in `wait_idle` on exit.
-    window: Option<Window>,
-    surface: Option<Surface>,
+    // Field order is drop order, and it matters: every Vulkan device child (swapchain, surface,
+    // and the example's pipelines) holds a clone of the device/loaders and must be destroyed
+    // while the `VkDevice`/`VkInstance` are still alive — so `device` is declared LAST and drops
+    // last. Within the children, the surface must drop before the `window` (on Metal the surface
+    // is a `CAMetalLayer` hung off the window's view), and the swapchain before the surface.
     swapchain: Option<Swapchain>,
+    surface: Option<Surface>,
+    window: Option<Window>,
     // Harness-owned depth buffer (texture + its backing allocation), present only when
     // the example opts in via `E::depth_format()`. Recreated on resize.
     depth: Option<(Texture, GpuAllocation)>,
@@ -150,6 +151,7 @@ struct App<E: Example> {
     // events macOS streams during a live resize — every redundant
     // recreate_swapchain invalidates the layer's drawable pool for nothing.
     surface_size: (u32, u32),
+    device: Device,
 }
 
 impl<E: Example> App<E> {
@@ -381,6 +383,13 @@ pub fn compile_with_caps(
     let mut cmd = Command::new("slangc");
     cmd.arg(&src_path)
         .args(["-target", target, "-entry", entry, "-stage", slang_stage]);
+    // Slang renames every SPIR-V entry point to "main" by default; keep the real name so the
+    // RHI's `entry_point` matches the module's `OpEntryPoint`. Without this the Vulkan pipeline
+    // references a non-existent entry point and NVIDIA fails creation with VK_ERROR_UNKNOWN.
+    // (metallib preserves the name, so the flag is SPIR-V only.)
+    if target == "spirv" {
+        cmd.arg("-fvk-use-entrypoint-name");
+    }
     for cap in capabilities {
         cmd.args(["-capability", cap]);
     }

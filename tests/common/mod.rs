@@ -21,14 +21,43 @@ use kiln_rhi::{Device, DeviceDesc, ShaderModule, ShaderModuleDesc, ShaderStage};
 /// duration of each test so independent devices/queues don't submit concurrently.
 pub type GpuGuard = std::sync::MutexGuard<'static, ()>;
 
+/// Route `log` records (including the Vulkan validation callback) to stderr, once per process.
+/// Only used when `KILN_VALIDATION` is set; run with `-- --nocapture` to see the output.
+fn install_stderr_logger() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    struct StderrLogger;
+    impl log::Log for StderrLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+        fn flush(&self) {}
+    }
+    static LOGGER: StderrLogger = StderrLogger;
+    INIT.call_once(|| {
+        let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Trace));
+    });
+}
+
 pub fn device_or_skip() -> Option<(Device, GpuGuard)> {
     use std::sync::Mutex;
     static GPU_LOCK: Mutex<()> = Mutex::new(());
     // Recover from poisoning: a panicking test holds no GPU invariant we care about.
     let guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
+    // Opt in to backend validation (Vulkan validation layers / Metal validation) and routed
+    // log output with `KILN_VALIDATION=1 cargo test -- --nocapture`. Off by default so the tests
+    // don't depend on the validation layers being installed.
+    let validation = std::env::var_os("KILN_VALIDATION").is_some();
+    if validation {
+        install_stderr_logger();
+    }
+
     let desc = DeviceDesc {
-        validation: false,
+        validation,
         label: Some("rhi-headless-tests".into()),
         ..Default::default()
     };
@@ -302,6 +331,13 @@ fn common_timed_slangc(
     let mut cmd = Command::new("slangc");
     cmd.arg(src)
         .args(["-target", target, "-entry", entry, "-stage", stage]);
+    // Slang renames every SPIR-V entry point to "main" by default; keep the real name so the
+    // RHI's `entry_point` matches the module's `OpEntryPoint`. Without this the Vulkan pipeline
+    // references a non-existent entry point and NVIDIA fails creation with VK_ERROR_UNKNOWN.
+    // (metallib preserves the name, so the flag is SPIR-V only.)
+    if target == "spirv" {
+        cmd.arg("-fvk-use-entrypoint-name");
+    }
     for cap in capabilities {
         cmd.args(["-capability", cap]);
     }

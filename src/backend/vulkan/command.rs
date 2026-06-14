@@ -1,5 +1,5 @@
 use super::barrier::{to_vk_access_flags, to_vk_stage_flags};
-use super::device::{SharedAllocations, SharedTextures};
+use super::device::{SharedAllocations, SharedTextures, build_accel_flags_to_vk};
 use crate::barrier::{HazardFlags, StageFlags};
 use crate::command::{
     DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectMultiArgs, LoadOp, RenderPassDesc,
@@ -264,6 +264,19 @@ impl VulkanCommandBuffer {
 
         unsafe {
             self.device.cmd_begin_rendering(cmd, &rendering_info);
+
+            // The graphics pipelines declare depth/stencil/bias as dynamic state, so a draw is
+            // only valid once these have been set on the command buffer. Establish safe defaults
+            // here (depth/stencil off, no depth bias) so a draw needs no explicit configuration;
+            // `set_depth_stencil_state` overrides the depth/stencil ones when the caller cares.
+            // `DEPTH_BIAS_ENABLE` in particular is set nowhere else, so without this every draw
+            // trips a validation error.
+            self.device.cmd_set_depth_test_enable(cmd, false);
+            self.device.cmd_set_depth_write_enable(cmd, false);
+            self.device
+                .cmd_set_depth_compare_op(cmd, vk::CompareOp::ALWAYS);
+            self.device.cmd_set_stencil_test_enable(cmd, false);
+            self.device.cmd_set_depth_bias_enable(cmd, false);
         }
     }
 
@@ -416,7 +429,38 @@ impl VulkanCommandBuffer {
     }
 
     pub fn set_root_data(&mut self, vertex_root: GpuAddress, pixel_root: GpuAddress) {
-        self.set_root_table(vertex_root, 0, pixel_root, 0);
+        // Slang lowers a graphics/mesh stage's `uniform T*` to a single push-constant pointer at
+        // offset 0, and the vertex(/mesh) and fragment stages alias that one slot — independent
+        // per-stage roots aren't supported, so callers pass the same pointer for both. Mirror the
+        // Metal backend: push just the 8-byte shared root pointer, not the 32-byte MDI root table
+        // (which is only meaningful to `draw_indirect_multi`). Pushing the full table here both
+        // wrote the pixel root to the wrong offset (16, where no shader reads it) and demanded a
+        // 32-byte push-constant range, which NVIDIA rejected for the 16-byte layouts these draws use.
+        let root = if vertex_root.0 != 0 {
+            vertex_root
+        } else {
+            pixel_root
+        };
+        let bytes = root.0.to_ne_bytes();
+        if bytes.len() > self.root_constant_size as usize {
+            panic!(
+                "Root pointer ({} bytes) exceeds pipeline limit ({} bytes)",
+                bytes.len(),
+                self.root_constant_size
+            );
+        }
+        if self.push_constant_stages.is_empty() {
+            panic!("No pipeline bound before set_root_data");
+        }
+        unsafe {
+            self.device.cmd_push_constants(
+                self.command_buffer,
+                self.pipeline_layout,
+                self.push_constant_stages,
+                0,
+                &bytes,
+            );
+        }
     }
 
     pub fn set_compute_root(&mut self, root: GpuAddress) {
@@ -966,21 +1010,13 @@ impl VulkanCommandBuffer {
 
     // -- Acceleration structure builds --
 
-    pub fn bind_acceleration_structure(
-        &mut self,
-        _slot: u32,
-        _accel: &crate::accel::AccelerationStructure,
-    ) {
-        // Vulkan binds the TLAS as an acceleration-structure descriptor (set 0, binding 0),
-        // not via the argument table — needs a descriptor write through the descriptor
-        // buffer. Not yet wired up (RT path is Metal-validated for now).
-        log::warn!(
-            "bind_acceleration_structure: ray-query TLAS binding not yet implemented on Vulkan"
-        );
-    }
+    // No `bind_acceleration_structure`: the TLAS is referenced bindlessly by its device address
+    // (`accel.gpu()`), carried in the root as a `DescriptorHandle<RaytracingAccelerationStructure>`
+    // and resolved in-shader via `OpConvertUToAccelerationStructureKHR`. See the design doc.
 
     pub fn build_blas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &BlasDesc) {
-        let Some((accel_loader, vk_as)) = self.resolve_accel(accel, "build_blas") else {
+        let Some((accel_loader, vk_as, scratch_address)) = self.resolve_accel(accel, "build_blas")
+        else {
             return;
         };
 
@@ -1005,9 +1041,19 @@ impl VulkanCommandBuffer {
                         .index_data(vk::DeviceOrHostAddressConstKHR {
                             device_address: m.index_buffer.0,
                         });
+                    // Carry the geometry flags through: an OPAQUE triangle is auto-committed by
+                    // `RayQuery::Proceed`, whereas a non-opaque one is only ever a *candidate* that
+                    // the shader must explicitly commit — so dropping OPAQUE here turns every hit
+                    // into a miss for the inline-ray-query path.
+                    let flags = if m.flags.contains(GeometryFlags::OPAQUE) {
+                        vk::GeometryFlagsKHR::OPAQUE
+                    } else {
+                        vk::GeometryFlagsKHR::empty()
+                    };
                     vk::AccelerationStructureGeometryKHR::default()
                         .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
                         .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
+                        .flags(flags)
                 }
                 GeometryType::Aabbs => {
                     let aabbs = vk::AccelerationStructureGeometryAabbsDataKHR::default()
@@ -1043,24 +1089,18 @@ impl VulkanCommandBuffer {
             })
             .collect();
 
+        // Flags must match `create_blas` (which sized the pre-allocated scratch from them) and the
+        // scratch address comes from the structure itself — see `VulkanAccelerationStructure`.
         let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+            .flags(build_accel_flags_to_vk(desc.flags))
             .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
             .dst_acceleration_structure(vk_as)
-            .geometries(&geometries);
+            .geometries(&geometries)
+            .scratch_data(vk::DeviceOrHostAddressKHR {
+                device_address: scratch_address,
+            });
 
-        let mut size_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
-        unsafe {
-            accel_loader.get_acceleration_structure_build_sizes(
-                vk::AccelerationStructureBuildTypeKHR::DEVICE,
-                &build_info,
-                &primitive_counts,
-                &mut size_info,
-            );
-        }
-
-        // Allocate scratch buffer and encode the build.
-        // In production, scratch allocation should be pooled. Here we allocate device-local.
         let range_infos: Vec<vk::AccelerationStructureBuildRangeInfoKHR> = primitive_counts
             .iter()
             .map(|&pc| vk::AccelerationStructureBuildRangeInfoKHR {
@@ -1085,7 +1125,8 @@ impl VulkanCommandBuffer {
     }
 
     pub fn build_tlas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &TlasDesc) {
-        let Some((accel_loader, vk_as)) = self.resolve_accel(accel, "build_tlas") else {
+        let Some((accel_loader, vk_as, scratch_address)) = self.resolve_accel(accel, "build_tlas")
+        else {
             return;
         };
 
@@ -1101,11 +1142,16 @@ impl VulkanCommandBuffer {
             });
         let geometries = [geometry];
 
+        // Flags must match `create_tlas` (scratch was sized from them); scratch comes from the AS.
         let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+            .flags(build_accel_flags_to_vk(desc.flags))
             .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
             .dst_acceleration_structure(vk_as)
-            .geometries(&geometries);
+            .geometries(&geometries)
+            .scratch_data(vk::DeviceOrHostAddressKHR {
+                device_address: scratch_address,
+            });
 
         let range_info = [vk::AccelerationStructureBuildRangeInfoKHR {
             primitive_count: desc.instance_count,
@@ -1131,14 +1177,16 @@ impl VulkanCommandBuffer {
         &self,
         accel: &crate::accel::AccelerationStructure,
         op: &'static str,
-    ) -> Option<(vk_accel_structure::Device, vk::AccelerationStructureKHR)> {
+    ) -> Option<(vk_accel_structure::Device, vk::AccelerationStructureKHR, u64)> {
         let Some(loader) = self.acceleration_structure.as_ref() else {
             log::warn!("{op}: VK_KHR_acceleration_structure not available");
             return None;
         };
         match &accel.inner {
             #[cfg(feature = "vulkan")]
-            crate::accel::AccelInner::Vulkan(a) => Some((loader.clone(), a.acceleration_structure)),
+            crate::accel::AccelInner::Vulkan(a) => {
+                Some((loader.clone(), a.acceleration_structure, a.scratch_address))
+            }
             #[allow(unreachable_patterns)]
             _ => None,
         }

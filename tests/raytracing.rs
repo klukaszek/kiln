@@ -15,18 +15,21 @@ use kiln_rhi::{
 gpu_struct! {
     pub struct Root {
         output: GpuAddress as "uint*",
+        // The TLAS is a bindless handle carried in the root, not a bound descriptor.
+        // Slang lowers `DescriptorHandle<RaytracingAccelerationStructure>` to the AS device
+        // address (Vulkan, via OpConvertUToAccelerationStructureKHR) / `gpuResourceID` (Metal),
+        // both of which `accel.gpu()` already returns. See docs/design/vulkan-binding-convention.md.
+        tlas: GpuAddress as "DescriptorHandle<RaytracingAccelerationStructure>",
     }
 }
 
-// The TLAS is a trailing entry-point parameter so the root stays at the RHI's normal slot
-// and the acceleration structure binds to the next slot (Metal buffer(1) / Vulkan descriptor).
+// The TLAS rides the root struct as a bindless handle — no descriptor binding, no argument-table
+// slot. The same source lowers cleanly for both SPIR-V and Metal (prototype-verified).
 const RQ_BODY: &str = /*slang*/
     r#"
 [shader("compute")]
 [numthreads(1, 1, 1)]
-void rqMain(uint3 tid : SV_DispatchThreadID,
-            uniform Root* data,
-            uniform RaytracingAccelerationStructure tlas)
+void rqMain(uint3 tid : SV_DispatchThreadID, uniform Root* data)
 {
     RayDesc ray;
     ray.Origin = float3(0.0, 0.0, -1.0);
@@ -34,6 +37,7 @@ void rqMain(uint3 tid : SV_DispatchThreadID,
     ray.TMin = 0.0;
     ray.TMax = 1000.0;
 
+    RaytracingAccelerationStructure tlas = data.tlas;
     RayQuery<RAY_FLAG_NONE> q;
     q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
     q.Proceed();
@@ -153,13 +157,13 @@ fn ray_query_triangle_hit() {
         .expect("root");
     root.upload(&Root {
         output: output.gpu(),
+        tlas: tlas.gpu(),
     })
     .expect("upload root");
 
     common::timed("ray query dispatch · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
         cmd.set_compute_pipeline(&pso);
-        cmd.bind_acceleration_structure(1, &tlas);
         cmd.dispatch(root.gpu(), 1, 1, 1);
         cmd.barrier(StageFlags::COMPUTE, StageFlags::ALL_COMMANDS);
         cmd.end();

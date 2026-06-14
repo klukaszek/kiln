@@ -14,6 +14,13 @@ pub struct VulkanAccelerationStructure {
     /// Use this value in `TlasInstance::acceleration_structure_reference`
     /// and in root structs where the shader accesses it via `TraceRayInline`.
     pub(crate) device_address: u64,
+    /// Build scratch storage, owned by the structure so it outlives the GPU build:
+    /// `build_blas`/`build_tlas` only *record* the build into a command buffer that
+    /// executes later, so the scratch must stay alive until then. `scratch_address`
+    /// is aligned to the device's `minAccelerationStructureScratchOffsetAlignment`.
+    pub(crate) scratch_buffer: vk::Buffer,
+    pub(crate) scratch_memory: vk::DeviceMemory,
+    pub(crate) scratch_address: u64,
     pub(crate) device: ash::Device,
     /// Extension loader for `VK_KHR_acceleration_structure`.
     pub(crate) accel_loader: ash::khr::acceleration_structure::Device,
@@ -26,6 +33,8 @@ impl Drop for VulkanAccelerationStructure {
                 .destroy_acceleration_structure(self.acceleration_structure, None);
             self.device.free_memory(self.buffer_memory, None);
             self.device.destroy_buffer(self.buffer, None);
+            self.device.free_memory(self.scratch_memory, None);
+            self.device.destroy_buffer(self.scratch_buffer, None);
         }
     }
 }

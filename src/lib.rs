@@ -18,6 +18,7 @@
 mod macros;
 
 pub mod accel;
+pub mod compiler;
 pub mod backend;
 pub mod barrier;
 pub mod command;

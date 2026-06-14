@@ -9,16 +9,15 @@
 //! per-binary "unused helper" warnings here rather than at every call site.
 #![allow(dead_code)]
 
-use std::process::Command;
-
 use glam::UVec2;
 
 use kiln_rhi::{
     ColorAttachment, CommandBuffer, DepthAttachment, Device, DeviceDesc, Format, GpuAllocation,
     LoadOp, MAX_FRAMES_IN_FLIGHT, MemoryType, RenderPassDesc, RenderTarget, SampleCount,
-    ShaderModule, ShaderModuleDesc, ShaderStage, StoreOp, Surface, SurfaceDesc, Swapchain,
+    ShaderModule, ShaderStage, StoreOp, Surface, SurfaceDesc, Swapchain,
     SwapchainDesc, Texture, TextureDesc, TextureDimension, TextureUsage,
 };
+use kiln_rhi::compiler::SlangCompiler;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -342,10 +341,10 @@ impl<E: Example> ApplicationHandler for App<E> {
 }
 
 // ---------------------------------------------------------------------------
-// Slang compilation (mirrors tests/common): one Slang source per example, lowered
-// to the active backend's format and registered as a module. Examples are run
-// interactively, so a missing `slangc` or a compile error is a hard error here
-// (the headless tests *skip* instead).
+// Slang compilation: one Slang source per example, lowered to the active
+// backend's format and registered as a module. Examples are run interactively,
+// so a missing `slangc` or a compile error is a hard panic here (the headless
+// tests *skip* instead). Compilation is cached — see `kiln_rhi::compiler`.
 // ---------------------------------------------------------------------------
 
 /// Compile a Slang entry point to the active backend's shader format and register it.
@@ -362,60 +361,5 @@ pub fn compile_with_caps(
     stage: ShaderStage,
     capabilities: &[&str],
 ) -> ShaderModule {
-    let (target, ext) = match device.backend_name() {
-        "Vulkan" => ("spirv", "spv"),
-        "Metal" => ("metallib", "metallib"),
-        other => panic!("compile: unsupported backend {other}"),
-    };
-    let slang_stage = match stage {
-        ShaderStage::Compute => "compute",
-        ShaderStage::Vertex => "vertex",
-        ShaderStage::Pixel => "fragment",
-        ShaderStage::Mesh => "mesh",
-    };
-
-    let dir = std::env::temp_dir();
-    let pid = std::process::id();
-    let src_path = dir.join(format!("kiln_example_{pid}_{entry}.slang"));
-    let out_path = dir.join(format!("kiln_example_{pid}_{entry}.{ext}"));
-    std::fs::write(&src_path, slang_src).expect("write slang source");
-
-    let mut cmd = Command::new("slangc");
-    cmd.arg(&src_path)
-        .args(["-target", target, "-entry", entry, "-stage", slang_stage]);
-    // Slang renames every SPIR-V entry point to "main" by default; keep the real name so the
-    // RHI's `entry_point` matches the module's `OpEntryPoint`. Without this the Vulkan pipeline
-    // references a non-existent entry point and NVIDIA fails creation with VK_ERROR_UNKNOWN.
-    // (metallib preserves the name, so the flag is SPIR-V only.)
-    if target == "spirv" {
-        cmd.arg("-fvk-use-entrypoint-name");
-    }
-    for cap in capabilities {
-        cmd.args(["-capability", cap]);
-    }
-    let output = cmd
-        .arg("-o")
-        .arg(&out_path)
-        .output()
-        .expect("failed to run slangc — is it on your PATH?");
-    if !output.status.success() {
-        let _ = std::fs::remove_file(&src_path);
-        panic!(
-            "slangc failed compiling entry `{entry}` for {target}:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let code = std::fs::read(&out_path).expect("read compiled shader");
-    let _ = std::fs::remove_file(&src_path);
-    let _ = std::fs::remove_file(&out_path);
-
-    device
-        .create_shader_module(&ShaderModuleDesc {
-            code: &code,
-            entry_point: entry,
-            stage,
-            label: Some("slang"),
-        })
-        .expect("create_shader_module")
+    SlangCompiler::new().compile(device, slang_src, entry, stage, capabilities)
 }

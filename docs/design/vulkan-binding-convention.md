@@ -1,6 +1,6 @@
 # Binding Convention — bindless acceleration structures & non-BDA globals (Vulkan / Metal parity)
 
-**Status:** proposal (rev. 3 — prototype-verified), for review before implementation
+**Status:** implemented (rev. 3) — verified on Vulkan (RTX 2070 SUPER, validation-clean) and Metal (M4, slangc 2026.10.2)
 **Scope:** how acceleration structures and other opaque/non-BDA resources are bound across
 the RHI, and the shader-authoring rules that keep one shader source compiling cleanly for
 both the Vulkan (SPIR-V) and Metal (metal source) backends.
@@ -226,44 +226,32 @@ surfaced each one (the original feature chaining was silently broken — see bel
 1. Remove `bind_acceleration_structure` from the device/command API.
 2. `gpu_struct!` Slang spelling for `DescriptorHandle<RaytracingAccelerationStructure>` fields.
 
-### Open questions for the reviewer
+### Open questions — resolved
 
-- **A. Confirm on-device (RTX 2070).** ✅ Resolved — `raytracing.rs` flipped to form B traces
-  correctly and runs validation-clean (after the feature/bug fixes in §4).
-- **B. Residency strategy on Metal** (per §3.4): explicit `use_acceleration_structure` vs.
-  auto-residency of all live acceleration structures. Recommend explicit, mirroring how other
-  resources opt into residency.
-- **C. `gpu_struct!` ergonomics.** Add a dedicated helper/type alias for AS handle fields, or
-  just document the `as "DescriptorHandle<…>"` override? Recommend a small type alias for
-  readability.
+- **A. Confirm on-device (RTX 2070).** ✅ `raytracing.rs` traces correctly, validation-clean.
+- **B. Residency strategy on Metal.** ✅ Explicit: `add_accel_to_residency()` called at BLAS/TLAS
+  build time in `metal/command.rs`. Mirrors how other resources opt into residency.
+- **C. `gpu_struct!` ergonomics.** ✅ `as "DescriptorHandle<RaytracingAccelerationStructure>"`
+  string override on a `GpuAddress` field. No dedicated type alias needed — the override is
+  self-documenting at the field site and the comment convention in roots.rs is sufficient.
 
 ---
 
 ## 5. What changes, concretely
 
-> **Status update.** ✅ Vulkan ray-query slice landed (`raytracing.rs`, validation-clean). ✅
-> `instanced_grid` landed: `cfg` moved to an entry-point param; this also surfaced and fixed
-> graphics-wide Vulkan bugs (`shaderDrawParameters` for `SV_InstanceID`; default
-> depth/stencil/depth-bias dynamic state at render-pass begin — `DEPTH_BIAS_ENABLE` was set
-> nowhere, so every draw was invalid) plus test-helper render-target cleanup leaks. Tests now run
-> validation-clean via `KILN_VALIDATION=1`. ⏳ Remaining: cross-backend pass (spectral RT shaders
-> to handle form, remove `bind_acceleration_structure`, Metal residency) + `mesh.rs`/`textures.rs`
-> test-cleanup leaks.
+> **All items complete.** Verified on Vulkan (RTX 2070 SUPER, validation-clean) and Metal (M4, slangc 2026.10.2).
 
 | Item | Change | Kind |
 |---|---|---|
 | `instanced_grid` shader | ✅ moved `uniform GridCfg* cfg` module scope → entry-point param | shader edit |
-| `raytracing.rs` (`RQ_BODY` + `Root`) | `tlas` becomes `DescriptorHandle<…>` in `Root`; drop trailing `tlas` param + `bind_acceleration_structure` call; write `tlas.gpu()` into root | shader + test edit |
-| spectral RT shaders (`integrator.rs`, …) | same: handle field in root, drop trailing `tlas` param | shader edit |
-| Vulkan `device.rs` | enable `VK_KHR_ray_tracing_maintenance1` if present | RHI |
-| `command.rs` | remove `bind_acceleration_structure` no-op stub | RHI |
-| Metal `command.rs`/`device.rs` | residency for traced acceleration structures (§3.4) | RHI (Metal) |
-| compile harness (`examples/common`, `tests/common`) | add `-fvk-bind-globals 0 1` for SPIR-V | harness |
-| frontend `device.rs` + `macros.rs` | drop `bind_acceleration_structure`; AS-handle Slang spelling | RHI API |
-
-> Compared to rev. 2 this is dramatically less code: no descriptor heap binding, no Metal
-> argument-table slot, no registration API. The bindless-AS requirement is met by treating AS
-> handles as ordinary 64-bit GPU values — which the RHI's BDA model already supports.
+| `raytracing.rs` (`RQ_BODY` + `Root`) | ✅ `tlas` as `DescriptorHandle<…>` in `Root`; `tlas.gpu()` on CPU side | shader + test edit |
+| spectral RT shaders (`roots.rs`, `integrator.rs`) | ✅ `tlas: GpuAddress as "DescriptorHandle<…>"` in `TraceRoot`; `accel.tlas.gpu()` on CPU side | shader edit |
+| Vulkan `device.rs` | ✅ `VK_KHR_ray_tracing_maintenance1`, `shaderInt64`, `descriptorBindingPartiallyBound` enabled | RHI |
+| `command.rs` | ✅ `bind_acceleration_structure` removed | RHI |
+| Metal `command.rs`/`device.rs` | ✅ `add_accel_to_residency()` at BLAS/TLAS build time | RHI (Metal) |
+| compile harness | ✅ `-fvk-bind-globals 0 1` in `src/compiler/mod.rs` (canonical compile path) | harness |
+| frontend `device.rs` + `macros.rs` | ✅ `bind_acceleration_structure` removed; `as "…"` override used at field site | RHI API |
+| `mesh.rs`/`textures.rs` test leaks | ✅ `destroy_texture` + `free` added for all transient render targets | test cleanup |
 
 ---
 

@@ -62,23 +62,23 @@ impl GpuScene {
         let triangle_count = scene.triangle_count();
         anyhow::ensure!(triangle_count > 0, "scene has no triangles");
 
-        let vertex_buffer = upload_slice(device, &scene.vertices, "vertex buffer");
-        let triangle_material_buffer = upload_slice(
-            device,
-            &scene.triangle_materials,
-            "triangle material buffer",
-        );
+        let vertex_buffer = device.upload_slice(&scene.vertices).expect("vertex buffer");
+        let triangle_material_buffer = device
+            .upload_slice(&scene.triangle_materials)
+            .expect("triangle material buffer");
 
         let baked = light_spectrum.bake(spectral::DEFAULT_RESOLUTION);
-        let spectrum_buffer = upload_slice(device, &baked.texels, "light spectrum table");
-        let lambda_buffer = upload_slice(device, &baked.lambda_texels, "uniform wavelength table");
+        let spectrum_buffer = device.upload_slice(&baked.texels).expect("light spectrum table");
+        let lambda_buffer = device
+            .upload_slice(&baked.lambda_texels)
+            .expect("uniform wavelength table");
 
         let gpu_materials: Vec<GpuMaterial> = scene
             .materials
             .iter()
             .map(|material| material_to_gpu(material, &baked))
             .collect();
-        let material_buffer = upload_slice(device, &gpu_materials, "material buffer");
+        let material_buffer = device.upload_slice(&gpu_materials).expect("material buffer");
 
         let light_triangles: Vec<u32> = scene
             .triangle_materials
@@ -92,7 +92,9 @@ impl GpuScene {
                     .then_some(tri as u32)
             })
             .collect();
-        let light_triangle_buffer = upload_slice(device, &light_triangles, "light triangle buffer");
+        let light_triangle_buffer = device
+            .upload_slice(&light_triangles)
+            .expect("light triangle buffer");
 
         let accel = match build_accel(device, scene, &vertex_buffer) {
             Ok(accel) => Some(accel),
@@ -226,11 +228,3 @@ fn build_accel(
     })
 }
 
-fn upload_slice<T: kiln_rhi::GpuPod>(device: &Device, data: &[T], label: &str) -> GpuAllocation {
-    let size = std::mem::size_of_val(data).max(1) as u64;
-    let buffer = device.malloc(size, MemoryType::Default).expect(label);
-    if !data.is_empty() {
-        buffer.upload_slice(data).expect(label);
-    }
-    buffer
-}

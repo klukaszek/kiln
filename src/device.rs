@@ -1,7 +1,7 @@
 use crate::accel::AccelerationStructure;
 use crate::command::CommandBuffer;
 use crate::error::{RhiError, RhiResult};
-use crate::memory::{BufferDesc, GpuAllocation, GpuBuffer, MemoryType};
+use crate::memory::{BufferDesc, GpuAllocation, GpuBuffer, GpuPod, MemoryType};
 use crate::pipeline::{
     ComputePso, ComputePsoDesc, GraphicsPso, GraphicsPsoDesc, MeshletPso, MeshletPsoDesc,
 };
@@ -204,6 +204,19 @@ impl Device {
         );
 
         Ok(GpuAllocation { buffer, size })
+    }
+
+    /// Allocate a [`MemoryType::Default`] buffer sized for `data` and upload the contents in
+    /// one step. The one-shot form of `malloc` + `GpuAllocation::upload_slice` for persistent
+    /// scene data (vertex buffers, material tables, lookup tables). For GPU-only resources or
+    /// transient per-frame arguments use `malloc`/`malloc_aligned` or a bump allocator.
+    pub fn upload_slice<T: GpuPod>(&self, data: &[T]) -> RhiResult<GpuAllocation> {
+        let size = std::mem::size_of_val(data).max(1) as u64;
+        let alloc = self.malloc(size, MemoryType::Default)?;
+        if !data.is_empty() {
+            alloc.upload_slice(data)?;
+        }
+        Ok(alloc)
     }
 
     /// Free a pointer-first allocation.

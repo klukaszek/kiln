@@ -1,3 +1,5 @@
+//! Shader module loading and stage types.
+
 /// Shader stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShaderStage {

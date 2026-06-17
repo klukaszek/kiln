@@ -161,6 +161,8 @@ fn mesh_fullscreen_color() {
         );
     }
 
+    device.destroy_texture(texture);
+    device.free(tex_mem);
     device.free(root);
     device.free(readback);
 }
@@ -265,6 +267,8 @@ fn render_meshlets(
 
     let pixels = readback.as_slice::<u8>().expect("read readback").to_vec();
     device.free(readback);
+    device.destroy_texture(texture);
+    device.free(tex_mem);
     pixels
 }
 

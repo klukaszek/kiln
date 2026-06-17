@@ -1,3 +1,5 @@
+//! GPU queue for command submission and swapchain presentation.
+
 use crate::command::CommandBuffer;
 use crate::error::RhiResult;
 use crate::swapchain::{AcquiredImage, Swapchain};

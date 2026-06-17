@@ -1,3 +1,5 @@
+//! Swapchain creation, configuration, and image acquisition.
+
 use crate::types::Format;
 
 /// Description for creating/recreating a swapchain.

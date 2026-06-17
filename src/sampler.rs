@@ -1,3 +1,5 @@
+//! Sampler creation and descriptor registration.
+
 use crate::types::{AddressMode, CompareOp, FilterMode, SamplerId};
 
 /// Description for creating a sampler.

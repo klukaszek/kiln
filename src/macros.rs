@@ -73,6 +73,8 @@ macro_rules! gpu_slang_ty {
     // Explicit override (device pointers, or any type without a built-in mapping).
     ($fty:tt, $slang:literal) => { $slang };
 
+    (AccelHandle) => { "DescriptorHandle<RaytracingAccelerationStructure>" };
+
     (f32) => { "float" };
     (u32) => { "uint" };
     (i32) => { "int" };

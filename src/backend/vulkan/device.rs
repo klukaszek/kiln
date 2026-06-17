@@ -139,6 +139,10 @@ pub struct VulkanDevice {
     // Mesh shader support
     /// True when `VK_EXT_mesh_shader` was enabled at device creation.
     pub(crate) mesh_shader_supported: bool,
+    /// Cached mesh-shader loader, cloned into command buffers. Built once — recreating it (or
+    /// the descriptor-buffer loader) per command buffer re-runs `vkGetDeviceProcAddr` for every
+    /// entry point on the hot per-frame path.
+    pub(crate) mesh_shader_loader: Option<vk_mesh_shader::Device>,
 
     /// Present when VK_KHR_acceleration_structure was enabled (for BLAS/TLAS builds).
     pub(crate) acceleration_structure: Option<vk_accel_structure::Device>,
@@ -423,7 +427,16 @@ impl VulkanQueue {
         if let Some(slot) = sc.in_flight_cmd_buffers.borrow_mut().get_mut(frame_index) {
             *slot = raw_cmd;
         }
-        Ok(())
+
+        // Present the rendered image. The frame-loop contract (matching the Metal backend) is that
+        // `submit_frame` both submits *and* presents — the windowing harness never calls `present`
+        // separately. Without this the acquired image is never returned to the swapchain, so after
+        // acquiring every image the next acquire fails (NVIDIA returns VK_NOT_READY). An out-of-date
+        // swapchain here is transient (e.g. mid-resize); swallow it and let the next acquire rebuild.
+        match self.present(sc, image_index, frame_index) {
+            Ok(()) | Err(RhiError::SwapchainOutOfDate) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn wait_idle(&self) {
@@ -538,6 +551,31 @@ pub(crate) fn vk_to_format(format: vk::Format) -> Format {
 }
 
 const MAX_BINDLESS_STORAGE_IMAGES: u32 = 1_000_000;
+
+/// Translate the RHI's `BuildAccelFlags` into Vulkan build flags. Shared by acceleration-structure
+/// creation (which sizes the scratch) and the build command (which must use the *same* flags, or the
+/// driver's scratch requirement won't match the pre-allocated buffer).
+pub(crate) fn build_accel_flags_to_vk(
+    flags: BuildAccelFlags,
+) -> vk::BuildAccelerationStructureFlagsKHR {
+    let mut out = vk::BuildAccelerationStructureFlagsKHR::empty();
+    if flags.contains(BuildAccelFlags::ALLOW_UPDATE) {
+        out |= vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE;
+    }
+    if flags.contains(BuildAccelFlags::ALLOW_COMPACTION) {
+        out |= vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION;
+    }
+    if flags.contains(BuildAccelFlags::PREFER_FAST_TRACE) {
+        out |= vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE;
+    }
+    if flags.contains(BuildAccelFlags::PREFER_FAST_BUILD) {
+        out |= vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD;
+    }
+    if flags.contains(BuildAccelFlags::MINIMIZE_MEMORY) {
+        out |= vk::BuildAccelerationStructureFlagsKHR::LOW_MEMORY;
+    }
+    out
+}
 
 impl VulkanDevice {
     pub fn new(desc: &DeviceDesc) -> RhiResult<Self> {
@@ -701,8 +739,22 @@ impl VulkanDevice {
         // VK_KHR_deferred_host_operations. Ray tracing is inline ray query, not RT pipelines.
         let supports_accel = has_ext(b"VK_KHR_acceleration_structure")
             && has_ext(b"VK_KHR_deferred_host_operations");
+        // Inline ray query (the RHI's only RT path) needs VK_KHR_ray_query on top of accel structs.
+        let supports_ray_query = supports_accel && has_ext(b"VK_KHR_ray_query");
+        // VK_KHR_ray_tracing_maintenance1 makes `OpConvertUToAccelerationStructureKHR` (used by
+        // Slang's `DescriptorHandle<RaytracingAccelerationStructure>` lowering — the RHI's bindless
+        // TLAS path) unambiguously valid: the shader receives the AS device address as a 64-bit
+        // value and converts it in-place, with no acceleration-structure descriptor.
+        let supports_rt_maintenance1 =
+            supports_ray_query && has_ext(b"VK_KHR_ray_tracing_maintenance1");
+        // The bindless-TLAS lowering also emits the `SPV_KHR_ray_tracing` SPIR-V extension, which
+        // the validation layer maps to a `VK_KHR_ray_tracing_pipeline` requirement even though the
+        // RHI only ever does inline ray query (no RT pipelines / SBT). Enable it so the shader
+        // module is spec-valid; we never create a ray-tracing pipeline.
+        let supports_ray_tracing_pipeline =
+            supports_ray_query && has_ext(b"VK_KHR_ray_tracing_pipeline");
         log::info!(
-            "RHI: Optional extensions — mesh_shader={supports_mesh_shader} acceleration_structure={supports_accel}"
+            "RHI: Optional extensions — mesh_shader={supports_mesh_shader} acceleration_structure={supports_accel} ray_query={supports_ray_query} rt_maintenance1={supports_rt_maintenance1} rt_pipeline={supports_ray_tracing_pipeline}"
         );
 
         if desc.bindless_mode == Some(BindlessMode::ArgumentTable) {
@@ -728,6 +780,15 @@ impl VulkanDevice {
             device_extension_names.push(vk_accel_structure::NAME.as_ptr());
             device_extension_names.push(ash::khr::deferred_host_operations::NAME.as_ptr());
         }
+        if supports_ray_query {
+            device_extension_names.push(ash::khr::ray_query::NAME.as_ptr());
+        }
+        if supports_rt_maintenance1 {
+            device_extension_names.push(ash::khr::ray_tracing_maintenance1::NAME.as_ptr());
+        }
+        if supports_ray_tracing_pipeline {
+            device_extension_names.push(ash::khr::ray_tracing_pipeline::NAME.as_ptr());
+        }
 
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
@@ -737,10 +798,16 @@ impl VulkanDevice {
         // All required features that were promoted to Vulkan 1.2/1.3 core go through the
         // consolidated PhysicalDeviceVulkan1{2,3}Features structs — no separate per-feature
         // structs needed since we require Vulkan 1.3.
+        // Slang lowers `SV_InstanceID` (instanced draws) using the SPIR-V DrawParameters
+        // capability, which requires shaderDrawParameters.
+        let mut vulkan11_features =
+            vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
         let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
             .timeline_semaphore(true)
-            .draw_indirect_count(true);
+            .draw_indirect_count(true)
+            // The bindless descriptor heap declares PARTIALLY_BOUND on its bindings.
+            .descriptor_binding_partially_bound(true);
         let mut vulkan13_features = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true);
@@ -756,25 +823,51 @@ impl VulkanDevice {
         let mut accel_structure_features =
             vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
                 .acceleration_structure(true);
+        let mut ray_query_features =
+            vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
+        let mut rt_maintenance1_features =
+            vk::PhysicalDeviceRayTracingMaintenance1FeaturesKHR::default()
+                .ray_tracing_maintenance1(true);
+        let mut rt_pipeline_features =
+            vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default()
+                .ray_tracing_pipeline(true);
 
         let features = vk::PhysicalDeviceFeatures {
             shader_clip_distance: 1,
             fill_mode_non_solid: 1,
             multi_draw_indirect: 1,
+            // Slang's `DescriptorHandle<RaytracingAccelerationStructure>` lowers to a 64-bit
+            // value (the AS device address) → SPIR-V declares the Int64 capability.
+            shader_int64: 1,
             ..Default::default()
         };
 
         let mut features2 = vk::PhysicalDeviceFeatures2::default()
             .features(features)
+            .push_next(&mut vulkan11_features)
             .push_next(&mut vulkan12_features)
             .push_next(&mut vulkan13_features)
             .push_next(&mut descriptor_buffer_features);
 
+        // `push_next` operates on `self` by value and `PhysicalDeviceFeatures2` is `Copy`, so the
+        // result MUST be reassigned — `let _ = features2.push_next(..)` links the node into a
+        // discarded copy and silently leaves the real `features2` chain (and thus the feature)
+        // disabled. That bug left accel/ray-query/maintenance1 off; it only appeared to work
+        // because NVIDIA's driver tolerates the missing features.
         if supports_mesh_shader {
-            let _ = features2.push_next(&mut mesh_shader_features);
+            features2 = features2.push_next(&mut mesh_shader_features);
         }
         if supports_accel {
-            let _ = features2.push_next(&mut accel_structure_features);
+            features2 = features2.push_next(&mut accel_structure_features);
+        }
+        if supports_ray_query {
+            features2 = features2.push_next(&mut ray_query_features);
+        }
+        if supports_rt_maintenance1 {
+            features2 = features2.push_next(&mut rt_maintenance1_features);
+        }
+        if supports_ray_tracing_pipeline {
+            features2 = features2.push_next(&mut rt_pipeline_features);
         }
 
         let priorities = [1.0f32];
@@ -833,6 +926,12 @@ impl VulkanDevice {
         } else {
             None
         };
+        // Mesh-shader loader, built once and cloned into each command buffer.
+        let mesh_shader_loader = if supports_mesh_shader {
+            Some(vk_mesh_shader::Device::new(&instance, &device))
+        } else {
+            None
+        };
         // Create bindless heap layout + storage
         let (texture_descriptor_set_layout, descriptor_buffer_heap) = {
             let loader = descriptor_buffer_loader
@@ -884,6 +983,7 @@ impl VulkanDevice {
             next_sampler_id: RefCell::new(0),
             setup_command_buffer,
             mesh_shader_supported: supports_mesh_shader,
+            mesh_shader_loader,
             acceleration_structure: acceleration_structure_opt,
             accel_counter: RefCell::new(0),
         })
@@ -934,7 +1034,10 @@ impl VulkanDevice {
         };
 
         Ok(Surface {
-            inner: SurfaceInner::Vulkan(VulkanSurface { surface }),
+            inner: SurfaceInner::Vulkan(VulkanSurface {
+                surface,
+                surface_loader: self.surface_loader.clone(),
+            }),
         })
     }
 
@@ -998,6 +1101,8 @@ impl VulkanDevice {
                 rendering_complete_semaphores,
                 in_flight_fences,
                 in_flight_cmd_buffers: RefCell::new(in_flight_cmd_buffers),
+                device: self.device.clone(),
+                swapchain_loader: self.swapchain_loader.clone(),
             }),
         })
     }
@@ -1201,13 +1306,20 @@ impl VulkanDevice {
     // -- Buffer --
 
     pub fn create_buffer(&self, desc: &BufferDesc) -> RhiResult<GpuBuffer> {
-        let usage_flags = vk::BufferUsageFlags::STORAGE_BUFFER
+        let mut usage_flags = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::INDEX_BUFFER
             | vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::INDIRECT_BUFFER
             | vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+        // Any buffer may be used as acceleration-structure build input (vertices, indices, TLAS
+        // instances). The RHI doesn't distinguish buffer roles, so when RT is available every
+        // buffer must carry this usage or `vkCmdBuildAccelerationStructuresKHR` reads it illegally
+        // (device loss on NVIDIA). The flag is only valid when the extension is enabled.
+        if self.acceleration_structure.is_some() {
+            usage_flags |= vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
+        }
 
         let buffer_info = vk::BufferCreateInfo::default()
             .size(desc.size)
@@ -1743,6 +1855,10 @@ impl VulkanDevice {
         };
 
         let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            // The bindless set layout is a descriptor-buffer layout, so the pipeline must opt in
+            // with VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT (VUID-VkComputePipelineCreateInfo-
+            // flags-08984); NVIDIA returns VK_ERROR_UNKNOWN otherwise.
+            .flags(vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT)
             .stage(stage)
             .layout(pipeline_layout);
 
@@ -1758,6 +1874,7 @@ impl VulkanDevice {
                 pipeline_layout,
                 root_constant_size: desc.root_constant_size,
                 threads_per_threadgroup: desc.threads_per_threadgroup,
+                device: self.device.clone(),
             }),
         })
     }
@@ -1832,25 +1949,6 @@ impl VulkanDevice {
 
     // -- Acceleration structures (VK_KHR_acceleration_structure) --
 
-    fn build_flags_to_vk(flags: BuildAccelFlags) -> vk::BuildAccelerationStructureFlagsKHR {
-        let mut out = vk::BuildAccelerationStructureFlagsKHR::empty();
-        if flags.contains(BuildAccelFlags::ALLOW_UPDATE) {
-            out |= vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE;
-        }
-        if flags.contains(BuildAccelFlags::ALLOW_COMPACTION) {
-            out |= vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION;
-        }
-        if flags.contains(BuildAccelFlags::PREFER_FAST_TRACE) {
-            out |= vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE;
-        }
-        if flags.contains(BuildAccelFlags::PREFER_FAST_BUILD) {
-            out |= vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD;
-        }
-        if flags.contains(BuildAccelFlags::MINIMIZE_MEMORY) {
-            out |= vk::BuildAccelerationStructureFlagsKHR::LOW_MEMORY;
-        }
-        out
-    }
 
     pub fn create_blas(&self, desc: &BlasDesc) -> RhiResult<AccelerationStructure> {
         let accel_loader = self.require_accel_loader()?;
@@ -1924,7 +2022,7 @@ impl VulkanDevice {
 
         let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-            .flags(Self::build_flags_to_vk(desc.flags))
+            .flags(build_accel_flags_to_vk(desc.flags))
             .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
             .geometries(&geometries);
 
@@ -1941,6 +2039,7 @@ impl VulkanDevice {
         self.finalize_accel_structure(
             accel_loader,
             size_info.acceleration_structure_size,
+            size_info.build_scratch_size,
             vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
         )
     }
@@ -1975,7 +2074,7 @@ impl VulkanDevice {
 
         let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-            .flags(Self::build_flags_to_vk(desc.flags))
+            .flags(build_accel_flags_to_vk(desc.flags))
             .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
             .geometries(&geometries);
 
@@ -1992,6 +2091,7 @@ impl VulkanDevice {
         self.finalize_accel_structure(
             accel_loader,
             size_info.acceleration_structure_size,
+            size_info.build_scratch_size,
             vk::AccelerationStructureTypeKHR::TOP_LEVEL,
         )
     }
@@ -2012,6 +2112,7 @@ impl VulkanDevice {
         &self,
         accel_loader: &vk_accel_structure::Device,
         size: u64,
+        scratch_size: u64,
         ty: vk::AccelerationStructureTypeKHR,
     ) -> RhiResult<AccelerationStructure> {
         let (buffer, memory) = self.allocate_accel_buffer(size)?;
@@ -2031,6 +2132,13 @@ impl VulkanDevice {
             )
         };
 
+        // Pre-allocate the build scratch. Over-allocate by the required alignment and round the
+        // device address up so `scratch_data` satisfies minAccelerationStructureScratchOffsetAlignment.
+        let scratch_align = self.accel_scratch_alignment();
+        let (scratch_buffer, scratch_memory, scratch_base) =
+            self.allocate_scratch_buffer(scratch_size + scratch_align)?;
+        let scratch_address = scratch_base.next_multiple_of(scratch_align);
+
         let id = {
             let mut next = self.accel_counter.borrow_mut();
             let id = *next;
@@ -2045,10 +2153,78 @@ impl VulkanDevice {
                 buffer,
                 buffer_memory: memory,
                 device_address,
+                scratch_buffer,
+                scratch_memory,
+                scratch_address,
                 device: self.device.clone(),
                 accel_loader: accel_loader.clone(),
             })),
         })
+    }
+
+    /// `minAccelerationStructureScratchOffsetAlignment` — the required alignment for the
+    /// `scratch_data` address passed to `vkCmdBuildAccelerationStructuresKHR`.
+    fn accel_scratch_alignment(&self) -> u64 {
+        let mut accel_props =
+            vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut accel_props);
+        unsafe {
+            self.instance
+                .get_physical_device_properties2(self.physical_device, &mut props2);
+        }
+        accel_props
+            .min_acceleration_structure_scratch_offset_alignment
+            .max(1) as u64
+    }
+
+    /// Allocate a device-local scratch buffer for an acceleration-structure build and return
+    /// its buffer, memory, and base device address. Scratch needs STORAGE_BUFFER usage in
+    /// addition to SHADER_DEVICE_ADDRESS (the AS storage buffer does not).
+    fn allocate_scratch_buffer(
+        &self,
+        size: u64,
+    ) -> RhiResult<(vk::Buffer, vk::DeviceMemory, u64)> {
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe {
+            self.device
+                .create_buffer(&buffer_info, None)
+                .map_err(|e| RhiError::AllocationFailed(e.to_string()))?
+        };
+        let reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let mem_index = find_memorytype_index(
+            &reqs,
+            &self.device_memory_properties,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .ok_or_else(|| RhiError::AllocationFailed("No device-local memory for AS scratch".into()))?;
+        let mut flags_info =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(mem_index)
+            .push_next(&mut flags_info);
+        let memory = unsafe {
+            self.device
+                .allocate_memory(&alloc_info, None)
+                .map_err(|e| RhiError::AllocationFailed(e.to_string()))?
+        };
+        unsafe {
+            self.device
+                .bind_buffer_memory(buffer, memory, 0)
+                .map_err(|e| RhiError::AllocationFailed(e.to_string()))?;
+        }
+        let address = unsafe {
+            self.device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(buffer),
+            )
+        };
+        Ok((buffer, memory, address))
     }
 
     /// Allocate a device-local buffer for an acceleration structure.
@@ -2124,14 +2300,11 @@ impl VulkanDevice {
                 vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT
                     | vk::BufferUsageFlags::SAMPLER_DESCRIPTOR_BUFFER_EXT,
             );
-        let descriptor_buffer_loader =
-            Some(descriptor_buffer::Device::new(&self.instance, &self.device));
+        // Clone the cached loaders (cheap fn-pointer-table copies) rather than rebuilding them
+        // here — this is the per-frame command-buffer path.
+        let descriptor_buffer_loader = self.descriptor_buffer_loader.clone();
         let descriptor_buffer_binding = Some(descriptor_buffer_binding);
-        let mesh_shader = if self.mesh_shader_supported {
-            Some(vk_mesh_shader::Device::new(&self.instance, &self.device))
-        } else {
-            None
-        };
+        let mesh_shader = self.mesh_shader_loader.clone();
         let accel_loader_cmd = self.acceleration_structure.clone();
 
         Ok(CommandBuffer {
@@ -2201,14 +2374,11 @@ impl VulkanDevice {
                 vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT
                     | vk::BufferUsageFlags::SAMPLER_DESCRIPTOR_BUFFER_EXT,
             );
-        let descriptor_buffer_loader =
-            Some(descriptor_buffer::Device::new(&self.instance, &self.device));
+        // Clone the cached loaders (cheap fn-pointer-table copies) rather than rebuilding them
+        // here — this is the per-frame command-buffer path.
+        let descriptor_buffer_loader = self.descriptor_buffer_loader.clone();
         let descriptor_buffer_binding = Some(descriptor_buffer_binding);
-        let mesh_shader = if self.mesh_shader_supported {
-            Some(vk_mesh_shader::Device::new(&self.instance, &self.device))
-        } else {
-            None
-        };
+        let mesh_shader = self.mesh_shader_loader.clone();
         let accel_loader_cmd = self.acceleration_structure.clone();
 
         Ok(CommandBuffer {
@@ -2762,8 +2932,9 @@ impl Drop for VulkanDevice {
                 debug_loader.destroy_debug_utils_messenger(self.debug_callback, None);
             }
 
-            self.surface_loader
-                .destroy_surface(vk::SurfaceKHR::null(), None);
+            // The swapchain and surface own and destroy their own Vulkan objects in their `Drop`
+            // impls; the harness drops them (and all other device children) before the device, so
+            // by here only the device + instance remain.
             self.instance.destroy_instance(None);
         }
     }

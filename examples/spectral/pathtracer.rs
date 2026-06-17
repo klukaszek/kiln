@@ -275,8 +275,7 @@ impl PathTracer {
             light_triangles: gpu_scene.light_triangle_buffer.gpu(),
             spectrum: gpu_scene.spectrum_buffer.gpu(),
             lambda: gpu_scene.lambda_buffer.gpu(),
-            _pad0: 0,
-            _pad1: 0,
+            tlas: accel.tlas.gpu(),
             dims0: UVec4::new(
                 film_extent.x,
                 film_extent.y,
@@ -299,7 +298,6 @@ impl PathTracer {
         .expect("upload trace root");
 
         cmd.set_compute_pipeline(&self.trace_pso);
-        cmd.bind_acceleration_structure(1, &accel.tlas);
         cmd.dispatch(
             root.gpu,
             film_extent.x.div_ceil(integrator::THREADS_X),

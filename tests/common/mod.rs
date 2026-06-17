@@ -10,7 +10,8 @@
 //! should *skip* rather than fail — use [`device_or_skip`] and bail out with
 //! `let Some(device) = common::device_or_skip() else { return; };`.
 
-use kiln_rhi::{Device, DeviceDesc, ShaderModule, ShaderModuleDesc, ShaderStage};
+use kiln_rhi::{Device, DeviceDesc, ShaderModule, ShaderStage};
+use kiln_rhi::compiler::SlangCompiler;
 
 /// Create a headless device for testing, or `None` if no usable backend is available.
 ///
@@ -21,14 +22,43 @@ use kiln_rhi::{Device, DeviceDesc, ShaderModule, ShaderModuleDesc, ShaderStage};
 /// duration of each test so independent devices/queues don't submit concurrently.
 pub type GpuGuard = std::sync::MutexGuard<'static, ()>;
 
+/// Route `log` records (including the Vulkan validation callback) to stderr, once per process.
+/// Only used when `KILN_VALIDATION` is set; run with `-- --nocapture` to see the output.
+fn install_stderr_logger() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    struct StderrLogger;
+    impl log::Log for StderrLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+        fn flush(&self) {}
+    }
+    static LOGGER: StderrLogger = StderrLogger;
+    INIT.call_once(|| {
+        let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Trace));
+    });
+}
+
 pub fn device_or_skip() -> Option<(Device, GpuGuard)> {
     use std::sync::Mutex;
     static GPU_LOCK: Mutex<()> = Mutex::new(());
     // Recover from poisoning: a panicking test holds no GPU invariant we care about.
     let guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
+    // Opt in to backend validation (Vulkan validation layers / Metal validation) and routed
+    // log output with `KILN_VALIDATION=1 cargo test -- --nocapture`. Off by default so the tests
+    // don't depend on the validation layers being installed.
+    let validation = std::env::var_os("KILN_VALIDATION").is_some();
+    if validation {
+        install_stderr_logger();
+    }
+
     let desc = DeviceDesc {
-        validation: false,
+        validation,
         label: Some("rhi-headless-tests".into()),
         ..Default::default()
     };
@@ -100,18 +130,9 @@ pub fn bench(label: &str, iters: u32, mut f: impl FnMut()) {
 // Tests never reference backend-specific shader formats.
 // ---------------------------------------------------------------------------
 
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SHADER_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// True if the `slangc` compiler is available. Shader-path tests skip when it is not.
 pub fn slangc_available() -> bool {
-    Command::new("slangc")
-        .arg("-v")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    SlangCompiler::available()
 }
 
 /// Compile a Slang source to the active backend's shader format and register it as a
@@ -137,59 +158,9 @@ pub fn compile_shader_caps_or_skip(
     stage: ShaderStage,
     capabilities: &[&str],
 ) -> Option<ShaderModule> {
-    if !slangc_available() {
-        eprintln!("skipping: slangc not found on PATH");
-        return None;
-    }
-
-    let (target, ext) = match device.backend_name() {
-        "Vulkan" => ("spirv", "spv"),
-        "Metal" => ("metallib", "metallib"),
-        other => panic!("compile_shader: unsupported backend {other}"),
-    };
-    let slang_stage = match stage {
-        ShaderStage::Compute => "compute",
-        ShaderStage::Vertex => "vertex",
-        ShaderStage::Pixel => "fragment",
-        ShaderStage::Mesh => "mesh",
-    };
-
-    let seq = SHADER_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir();
-    let src_path = dir.join(format!("rhi_test_{}_{seq}.slang", std::process::id()));
-    let out_path = dir.join(format!("rhi_test_{}_{seq}.{ext}", std::process::id()));
-    std::fs::write(&src_path, slang_src).expect("write slang source");
-
-    let output = common_timed_slangc(
-        &src_path,
-        &out_path,
-        target,
-        entry,
-        slang_stage,
-        capabilities,
-    );
-    if !output.status.success() {
-        let _ = std::fs::remove_file(&src_path);
-        panic!(
-            "slangc failed compiling entry `{entry}` for {target}:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let code = std::fs::read(&out_path).expect("read compiled shader");
-    let _ = std::fs::remove_file(&src_path);
-    let _ = std::fs::remove_file(&out_path);
-
-    Some(
-        device
-            .create_shader_module(&ShaderModuleDesc {
-                code: &code,
-                entry_point: entry,
-                stage,
-                label: Some("slang"),
-            })
-            .expect("create_shader_module"),
-    )
+    timed(&format!("slangc {entry}"), || {
+        SlangCompiler::new().compile_or_skip(device, slang_src, entry, stage, capabilities)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -290,29 +261,3 @@ fn zlib_stored(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn common_timed_slangc(
-    src: &std::path::Path,
-    out: &std::path::Path,
-    target: &str,
-    entry: &str,
-    stage: &str,
-    capabilities: &[&str],
-) -> std::process::Output {
-    let start = Instant::now();
-    let mut cmd = Command::new("slangc");
-    cmd.arg(src)
-        .args(["-target", target, "-entry", entry, "-stage", stage]);
-    for cap in capabilities {
-        cmd.args(["-capability", cap]);
-    }
-    let output = cmd
-        .arg("-o")
-        .arg(out)
-        .output()
-        .expect("failed to run slangc");
-    eprintln!(
-        "    ⏱  slangc {entry} → {target}: {}",
-        fmt_dur(start.elapsed())
-    );
-    output
-}

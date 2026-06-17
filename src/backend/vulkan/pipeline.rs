@@ -25,6 +25,17 @@ pub struct VulkanComputePso {
     pub(crate) root_constant_size: u32,
     #[allow(dead_code)]
     pub(crate) threads_per_threadgroup: [u32; 3],
+    pub(crate) device: ash::Device,
+}
+
+impl Drop for VulkanComputePso {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+        }
+    }
 }
 
 pub struct VulkanGraphicsPsoDesc {
@@ -155,6 +166,11 @@ impl VulkanGraphicsPso {
             .stencil_attachment_format(self.desc.stencil_format);
 
         let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            // The pipeline layout references the bindless set layout, which is created with
+            // VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT, so the pipeline must
+            // opt into descriptor buffers too (VUID-VkGraphicsPipelineCreateInfo-flags-08097).
+            // NVIDIA returns VK_ERROR_UNKNOWN if this is omitted.
+            .flags(vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT)
             .stages(&shader_stages)
             .vertex_input_state(&vertex_input_info)
             .input_assembly_state(&input_assembly)
@@ -405,6 +421,10 @@ impl VulkanMeshletPso {
             .stencil_attachment_format(self.desc.stencil_format);
 
         let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            // See the graphics PSO: the bindless set layout is a descriptor-buffer layout, so the
+            // pipeline must carry VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT or NVIDIA fails
+            // creation with VK_ERROR_UNKNOWN.
+            .flags(vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT)
             .stages(&stages)
             .viewport_state(&viewport_state)
             .rasterization_state(&rasterizer)

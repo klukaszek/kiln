@@ -217,6 +217,23 @@ impl MetalCommandBuffer {
         self.residency_dirty.set(true);
     }
 
+    /// Make an acceleration structure resident. Acceleration structures are now referenced
+    /// bindlessly by handle (`accel.gpu()` in a root field) rather than bound via the argument
+    /// table, so nothing else makes them resident — `build_blas`/`build_tlas` add them here so
+    /// they stay resident for any later ray-query dispatch. `MTLAccelerationStructure` conforms
+    /// to `MTLAllocation`, same as buffers above.
+    fn add_accel_to_residency(
+        &self,
+        accel: &ProtocolObject<dyn objc2_metal::MTLAccelerationStructure>,
+    ) {
+        let allocation = unsafe {
+            &*(accel as *const ProtocolObject<dyn objc2_metal::MTLAccelerationStructure>
+                as *const ProtocolObject<dyn MTLAllocation>)
+        };
+        self.residency_set.addAllocation(allocation);
+        self.residency_dirty.set(true);
+    }
+
     fn make_command_buffer_resource(
         &self,
         byte_len: usize,
@@ -945,25 +962,10 @@ impl MetalCommandBuffer {
         }
     }
 
-    /// Bind a TLAS at argument-table slot `slot` (ray-query kernels use slot 1: Slang places
-    /// the trailing `RaytracingAccelerationStructure` after the root). Call after
-    /// `set_compute_pipeline`, before `dispatch`.
-    pub fn bind_acceleration_structure(
-        &mut self,
-        slot: u32,
-        accel: &crate::accel::AccelerationStructure,
-    ) {
-        let rid = match &accel.inner {
-            crate::accel::AccelInner::Metal(a) => a.gpu_resource_id,
-            #[allow(unreachable_patterns)]
-            _ => return,
-        };
-        let resource_id: objc2_metal::MTLResourceID = unsafe { std::mem::transmute(rid) };
-        unsafe {
-            self.argument_table
-                .setResource_atBufferIndex(resource_id, slot as usize);
-        }
-    }
+    // No `bind_acceleration_structure`: acceleration structures are referenced bindlessly by
+    // handle (`accel.gpu()` == the AS `gpuResourceID`, stored in a root field as a
+    // `DescriptorHandle<RaytracingAccelerationStructure>`). Residency is handled at build time
+    // via `add_accel_to_residency`. See docs/design/vulkan-binding-convention.md.
 
     pub fn set_active_texture_heap_ptr(&mut self, heap_ptr: GpuAddress) {
         self.active_texture_heap_ptr_override = if heap_ptr.0 == 0 {
@@ -1637,6 +1639,9 @@ impl MetalCommandBuffer {
             }
         };
 
+        // Keep the BLAS resident: a TLAS trace dereferences its instances' BLAS handles.
+        self.add_accel_to_residency(&vk_as);
+
         let primitive_desc = MTL4PrimitiveAccelerationStructureDescriptor::new();
         primitive_desc.setGeometryDescriptors(Some(&geometries.array));
 
@@ -1685,6 +1690,9 @@ impl MetalCommandBuffer {
                 return;
             }
         };
+
+        // Keep the TLAS resident: the ray-query shader resolves its bindless handle to this AS.
+        self.add_accel_to_residency(&vk_as);
 
         let instance_desc = MTL4InstanceAccelerationStructureDescriptor::new();
         unsafe {

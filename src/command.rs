@@ -1,3 +1,5 @@
+//! Command buffer recording: render passes, draws, dispatches, barriers, and acceleration-structure builds.
+
 use crate::accel::AccelerationStructure;
 use crate::barrier::{HazardFlags, StageFlags};
 use crate::pipeline::{BlendState, ComputePso, DepthStencilState, GraphicsPso, MeshletPso};
@@ -440,11 +442,9 @@ impl CommandBuffer {
 
     // -- Acceleration structure builds --
 
-    /// Bind a TLAS at `slot` for ray queries (kernels use slot 1: Slang places the trailing
-    /// `RaytracingAccelerationStructure` after the root). Call after the pipeline, before dispatch.
-    pub fn bind_acceleration_structure(&mut self, slot: u32, accel: &AccelerationStructure) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.bind_acceleration_structure(slot, accel))
-    }
+    // Acceleration structures are bound bindlessly: store `accel.gpu()` in a root/handle buffer
+    // as a `DescriptorHandle<RaytracingAccelerationStructure>` field and read it in the shader.
+    // There is no `bind_acceleration_structure` — see docs/design/vulkan-binding-convention.md.
 
     /// Build a BLAS. `accel` must come from `device.create_blas(desc)` with the same `desc`.
     pub fn build_blas(&mut self, accel: &AccelerationStructure, desc: &BlasDesc) {

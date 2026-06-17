@@ -76,7 +76,8 @@ fn texture_create_and_view_descriptors() {
         "distinct views should get distinct bindless ids"
     );
 
-    // texture drops before `mem` (reverse declaration order), so the backing outlives it.
+    device.destroy_texture(texture);
+    device.free(mem);
 }
 
 /// Sampler creation cost.
@@ -158,4 +159,6 @@ fn texture_copy_roundtrip() {
 
     device.free(src);
     device.free(dst);
+    device.destroy_texture(texture);
+    device.free(mem);
 }

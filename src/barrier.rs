@@ -1,3 +1,5 @@
+//! Stage and hazard flags for pipeline barriers.
+
 bitflags::bitflags! {
     /// Producer/consumer stages for a barrier. Stage-only — no per-resource state tracking.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

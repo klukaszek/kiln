@@ -5,7 +5,7 @@
 //! which is paired with [`ClearRoot`].
 
 use glam::{DVec3, UVec2, UVec4, Vec4};
-use kiln_rhi::{GpuAddress, gpu_struct};
+use kiln_rhi::{AccelHandle, GpuAddress, gpu_struct};
 
 use crate::scene::Scene;
 /// Zero the spectral film on the GPU (one thread per f32 — bins and counts
@@ -48,10 +48,8 @@ gpu_struct! {
         light_triangles: GpuAddress as "uint*",
         spectrum: GpuAddress as "float4*", // CDF table: (phase, wavelength, flux_shape, p_light)
         lambda: GpuAddress as "float4*", // uniform-λ MIS table, same texel layout
-        // Seven 8-byte pointers would leave the struct 16-byte-misaligned; this
-        // keeps the pointer count even so gpu_struct sees no padding.
-        _pad0: u32,
-        _pad1: u32,
+        // 8th 8-byte slot; keeps the struct 16-byte-aligned for the trailing UVec4s.
+        tlas: AccelHandle,
         dims0: UVec4, // film width, film height, sample_index, max_spp
         dims1: UVec4, // tri_count, light_count, samples_per_frame, spectrum_len
         dims2: UVec4, // spectral_bins, n_light_lanes, n_uniform_lanes, 0

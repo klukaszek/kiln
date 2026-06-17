@@ -1,3 +1,5 @@
+//! GPU memory allocation: buffers, typed allocations, and the bump allocator.
+
 use crate::types::GpuAddress;
 use crate::{RhiError, RhiResult};
 use zerocopy::{FromBytes, IntoBytes};

@@ -1,3 +1,5 @@
+//! Error and result types for the RHI.
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]

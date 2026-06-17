@@ -359,10 +359,11 @@ const PATH_INTEGRATOR: &str = /*slang*/
     r#"
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void traceMain(uint3 tid : SV_DispatchThreadID,
-               uniform TraceRoot* r,
-               uniform RaytracingAccelerationStructure tlas)
+void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
 {
+    // Bindless TLAS: the handle in the root resolves to the acceleration structure (no descriptor
+    // binding / argument-table slot). See docs/design/vulkan-binding-convention.md.
+    RaytracingAccelerationStructure tlas = r.tlas;
     uint width = r.dims0.x;
     uint height = r.dims0.y;
     uint sampleStart = r.dims0.z;

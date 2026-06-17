@@ -1,4 +1,15 @@
+//! Shared primitive types: addresses, handles, formats, and ray-tracing descriptors.
+
 use zerocopy::{FromBytes, Immutable, IntoBytes};
+
+/// Acceleration-structure handle field type for [`gpu_struct!`].
+///
+/// A [`GpuAddress`] that maps to `DescriptorHandle<RaytracingAccelerationStructure>` on
+/// the Slang side with no `as "..."` annotation needed. Assign [`AccelerationStructure::gpu()`]
+/// directly.
+///
+/// [`AccelerationStructure::gpu()`]: crate::AccelerationStructure::gpu
+pub type AccelHandle = GpuAddress;
 
 /// GPU virtual address for buffer device address / Metal gpuAddress.
 ///

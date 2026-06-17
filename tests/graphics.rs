@@ -163,6 +163,9 @@ fn graphics_fullscreen_color() {
 
     device.free(root);
     device.free(readback);
+    // Release the transient render target: destroy the image before freeing its backing memory.
+    device.destroy_texture(texture);
+    device.free(tex_mem);
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +260,9 @@ fn render_draw(
 
     let pixels = readback.as_slice::<u8>().expect("read readback").to_vec();
     device.free(readback);
+    // Release the transient render target: destroy the image before freeing its backing memory.
+    device.destroy_texture(texture);
+    device.free(tex_mem);
     pixels
 }
 
@@ -467,20 +473,18 @@ const GRID_BODY: &str = /*slang*/
     r#"
 struct VOut { float4 pos : SV_Position; float4 color : COLOR; };
 
-// NB: `cfg` is a GLOBAL uniform, not an entry-point parameter. As of slangc
-// 2026.10, a `uniform T*` declared as a parameter of a *struct-returning vertex*
-// shader is silently NOT bound on the Metal target (the generated entry has no
-// [[buffer]] and reads an uninitialized pointer). A module-scope `uniform T*`
-// still lowers to buffer(0) matching Kiln's root model and binds correctly.
-uniform GridCfg* cfg;
-
+// `cfg` is an ENTRY-POINT `uniform` parameter, the RHI's root model: Slang lowers it
+// to a push-constant pointer at offset 0 (Vulkan) / buffer(0) (Metal). A module-scope
+// `uniform T*` must NOT be used — it lowers to a `$Globals` UBO at set 0/binding 0,
+// which both collides with the bindless heap and is never fed the RHI's push-constant
+// root pointer, so the shader reads garbage. See docs/design/vulkan-binding-convention.md.
 static const float2 CORNER[6] = {
     float2(0,0), float2(1,0), float2(0,1),
     float2(0,1), float2(1,0), float2(1,1),
 };
 
 [shader("vertex")]
-VOut vsMain(uint vid : SV_VertexID, uint iid : SV_InstanceID)
+VOut vsMain(uint vid : SV_VertexID, uint iid : SV_InstanceID, uniform GridCfg* cfg)
 {
     uint g = cfg.dim;
     uint gx = iid % g;

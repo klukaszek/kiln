@@ -1,3 +1,5 @@
+//! Timeline semaphore for CPU/GPU and frame synchronization.
+
 /// Timeline semaphore for frame synchronization.
 pub struct TimelineSemaphore {
     pub(crate) inner: TimelineSemaphoreInner,

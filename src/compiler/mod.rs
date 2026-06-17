@@ -23,6 +23,15 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// each entry point. The cache lives at `{temp_dir}/kiln-shader-cache/` and
 /// is automatically invalidated when the slangc version changes.
 ///
+/// ## Vulkan flags applied on every compile
+///
+/// - `-fvk-use-entrypoint-name`: preserves the entry-point name in `OpEntryPoint`
+///   so `ShaderModuleDesc::entry_point` matches what Vulkan expects.
+/// - `-fvk-bind-globals 0 1`: redirects Slang's `$Globals` cbuffer (module-scope
+///   uniforms) from set 0 to set 1. Set 0 is the bindless heap; a stray global
+///   there silently aliases it. With this flag the collision becomes a
+///   missing-binding error.
+///
 /// [`compile`]: SlangCompiler::compile
 /// [`compile_or_skip`]: SlangCompiler::compile_or_skip
 pub struct SlangCompiler {

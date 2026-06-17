@@ -1,3 +1,5 @@
+//! Command buffer recording: render passes, draws, dispatches, barriers, and acceleration-structure builds.
+
 use crate::accel::AccelerationStructure;
 use crate::barrier::{HazardFlags, StageFlags};
 use crate::pipeline::{BlendState, ComputePso, DepthStencilState, GraphicsPso, MeshletPso};

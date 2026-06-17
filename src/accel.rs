@@ -11,7 +11,23 @@ pub struct AccelerationStructure {
 }
 
 impl AccelerationStructure {
-    /// GPU address of this structure, for a root `GpuAddress` field (`TraceRayInline`).
+    /// GPU handle for this acceleration structure.
+    ///
+    /// Assign to an [`AccelHandle`](crate::AccelHandle) field in a root struct:
+    ///
+    /// ```ignore
+    /// gpu_struct! {
+    ///     pub struct TraceRoot {
+    ///         tlas: AccelHandle,
+    ///     }
+    /// }
+    /// root.tlas = tlas_accel.gpu();
+    /// ```
+    ///
+    /// Vulkan: acceleration-structure device address
+    /// (`vkGetAccelerationStructureDeviceAddressKHR`). Metal: `gpuResourceID`. Slang
+    /// converts the stored 64-bit value to a `RaytracingAccelerationStructure` handle
+    /// at the use site. No descriptor set or argument-table slot required.
     pub fn gpu(&self) -> GpuAddress {
         match &self.inner {
             #[cfg(feature = "vulkan")]

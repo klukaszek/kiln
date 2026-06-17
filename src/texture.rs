@@ -1,3 +1,5 @@
+//! Texture creation, view descriptors, and bindless heap registration.
+
 use crate::types::{Format, GpuAddress, SampleCount, TextureDimension, TextureId};
 
 /// Sentinel for `GpuViewDesc::mip_count`: include all mip levels from `base_mip` to the last.

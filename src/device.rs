@@ -1,3 +1,5 @@
+//! Device creation and the top-level resource management API.
+
 use crate::accel::AccelerationStructure;
 use crate::command::CommandBuffer;
 use crate::error::{RhiError, RhiResult};

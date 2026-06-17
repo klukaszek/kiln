@@ -8,18 +8,14 @@ mod common;
 
 use kiln_rhi::gpu_struct;
 use kiln_rhi::{
-    BlasDesc, BlasMeshDesc, BuildAccelFlags, ComputePsoDesc, GeometryFlags, GeometryType,
-    GpuAddress, MemoryType, ShaderStage, StageFlags, TlasDesc, TlasInstance,
+    AccelHandle, BlasDesc, BlasMeshDesc, BuildAccelFlags, ComputePsoDesc, GeometryFlags,
+    GeometryType, GpuAddress, MemoryType, ShaderStage, StageFlags, TlasDesc, TlasInstance,
 };
 
 gpu_struct! {
     pub struct Root {
         output: GpuAddress as "uint*",
-        // The TLAS is a bindless handle carried in the root, not a bound descriptor.
-        // Slang lowers `DescriptorHandle<RaytracingAccelerationStructure>` to the AS device
-        // address (Vulkan, via OpConvertUToAccelerationStructureKHR) / `gpuResourceID` (Metal),
-        // both of which `accel.gpu()` already returns. See docs/design/vulkan-binding-convention.md.
-        tlas: GpuAddress as "DescriptorHandle<RaytracingAccelerationStructure>",
+        tlas: AccelHandle,
     }
 }
 

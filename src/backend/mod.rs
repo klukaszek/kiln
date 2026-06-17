@@ -1,3 +1,6 @@
+//! Backend implementations (Vulkan, Metal) and the `BackendKind` discriminant.
+//! Not part of the public RHI surface; use [`crate::Device`] instead.
+
 #[cfg(feature = "vulkan")]
 pub mod vulkan;
 

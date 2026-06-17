@@ -1,3 +1,5 @@
+//! Platform surface for presentation (wraps raw window handles).
+
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 /// Description for creating a surface.

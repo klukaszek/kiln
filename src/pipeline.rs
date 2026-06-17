@@ -1,3 +1,5 @@
+//! Pipeline state objects: graphics, compute, and mesh-shader PSOs.
+
 use crate::types::*;
 
 /// Per-color-attachment entry in a graphics PSO.

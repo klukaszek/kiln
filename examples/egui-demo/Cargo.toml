@@ -1,0 +1,12 @@
+[package]
+name = "egui-demo"
+version = "0.1.0"
+edition = "2024"
+description = "egui-through-the-Kiln-RHI demo (exercises the kiln-egui painter via the app harness)."
+
+[dependencies]
+kiln-rhi = { path = "../../crates/kiln-rhi" }
+# This demo's content *is* the overlay, so it needs kiln-app's egui feature on.
+kiln-app = { path = "../../crates/kiln-app", features = ["egui"] }
+# The demo builds its UI directly against egui; default_fonts comes from kiln-app's egui dep.
+egui = { version = "0.34", default-features = false }

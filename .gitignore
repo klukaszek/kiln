@@ -2,6 +2,6 @@ target/
 Cargo.lock
 slang/
 # Reference papers kept alongside the spectral example, not vendored
-examples/spectral/*.pdf
+crates/kiln-app/examples/spectral/*.pdf
 .DS_Store
 imgui.ini

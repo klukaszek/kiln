@@ -1,0 +1,18 @@
+[package]
+name = "kiln-egui"
+version = "0.1.0"
+edition = "2024"
+description = "egui painter for the Kiln RHI (renders egui through Kiln's pointer-first command buffer)."
+
+[dependencies]
+kiln-rhi = { path = "../kiln-rhi" }
+# `gpu_struct!` expands to zerocopy derives whose generated impls reference the `zerocopy` crate,
+# so it must be a direct dependency here too (same 0.8 line as kiln-rhi, so cargo unifies it).
+zerocopy = { version = "0.8", features = ["derive"] }
+# egui core only (no fonts/winit pulled into the integration crate). `bytemuck` makes
+# `epaint::Vertex`/`Color32` `Pod` so meshes upload as raw bytes.
+egui = { version = "0.34", default-features = false, features = ["bytemuck"] }
+bytemuck = "1"
+
+# The windowed demo that exercises this painter lives in the `kiln-app` crate (its `egui_demo`
+# example), which owns the winit/egui-winit windowing glue.

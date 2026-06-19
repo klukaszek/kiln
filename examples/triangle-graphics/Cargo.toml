@@ -1,0 +1,10 @@
+[package]
+name = "triangle-graphics"
+version = "0.1.0"
+edition = "2024"
+description = "Windowed graphics-pipeline triangle demo for the Kiln RHI."
+
+[dependencies]
+kiln-rhi = { path = "../../crates/kiln-rhi" }
+# Plain demo: no egui overlay, so drop kiln-app's default `egui` feature.
+kiln-app = { path = "../../crates/kiln-app", default-features = false }

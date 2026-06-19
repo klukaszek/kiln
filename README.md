@@ -267,11 +267,19 @@ Slang shaders.
 
 ### Examples
 
+Each windowed demo is its own binary crate under `examples/`, depending only on what it needs and
+sharing the windowing/present harness in `crates/kiln-app`. Run one with `cargo run -p <name>`:
+
 ```bash
-cargo run --example triangle_graphics   # windowed raster triangle
-cargo run --example triangle_mesh       # mesh-shader pipeline
-cargo run --example spectral         # USD scene + ray tracing
+cargo run -p triangle-graphics   # windowed raster triangle
+cargo run -p triangle-mesh       # mesh-shader pipeline
+cargo run -p spectral            # USD scene + ray tracing
+cargo run -p egui-demo           # egui-through-the-RHI demo
 ```
+
+The `egui-demo` crate turns on `kiln-app`'s `egui` feature for the debug overlay; the others build
+egui-free. Any demo can opt into the overlay (a frame-time HUD plus injectable UI) by enabling that
+feature on its `kiln-app` dependency.
 
 ### Tests
 

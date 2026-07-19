@@ -35,9 +35,9 @@ const CMF_STEP: f32 = 5.0;
 pub const DEFAULT_RESOLUTION: usize = 1024;
 
 /// Number of wavelength bins in the spectral film. The film stores this many
-/// per-band radiance estimates per pixel (plus a sample count), so it is the
-/// spectral-resolution / GPU-memory knob: cost is `width*height*(BINS+1)*4`
-/// bytes (≈560 MB at 4 MP with 32 bins). Bins span [`LAMBDA_MIN`, `LAMBDA_MAX`]
+/// per-band radiance estimates per pixel, so it is the spectral-resolution /
+/// GPU-memory knob: cost is `width*height*BINS*4` bytes. Bins span
+/// [`LAMBDA_MIN`] to [`LAMBDA_MAX`]
 /// uniformly in wavelength, matching how a spectrometer reports bands.
 pub const SPECTRAL_BINS: usize = 32;
 

@@ -12,7 +12,7 @@ use kiln_rhi::{
 
 use kiln_app::FrameCtx;
 
-use crate::scene::gpu::GpuScene;
+use crate::scene::gpu::GpuGeometry;
 use crate::scene::{Scene, Vertex};
 
 /// Triangles per meshlet workgroup. 64 × 3 = 192 mesh-output vertices, within the 256 cap.
@@ -96,7 +96,7 @@ pub struct RasterPreview {
 
 impl RasterPreview {
     /// Build the preview pipeline. Exits cleanly if the device lacks mesh shaders.
-    pub fn build(device: &Device, color_format: Format, scene: &Scene) -> Self {
+    pub fn build(device: &Device, color_format: Format, geometry: &GpuGeometry) -> Self {
         let src = format!("{}{}{}", Vertex::SLANG, Root::SLANG, BODY);
         let ms = kiln_rhi::compiler::compile(device, &src, "msMain", ShaderStage::Mesh);
         let fs = kiln_rhi::compiler::compile(device, &src, "fsMain", ShaderStage::Pixel);
@@ -126,11 +126,11 @@ impl RasterPreview {
                 std::process::exit(0);
             });
 
-        let tri_count = scene.triangle_count();
+        let tri_count = geometry.triangle_count;
         let num_meshlets = tri_count.div_ceil(TRIS_PER_MESHLET);
         eprintln!(
             "raster preview: {} vertices, {tri_count} triangles, {num_meshlets} meshlets",
-            scene.vertices.len()
+            tri_count * 3
         );
 
         // Per-slot bump arenas for the transient draw root, so a recording frame
@@ -160,7 +160,7 @@ impl RasterPreview {
         ctx: &FrameCtx,
         cmd: &mut CommandBuffer,
         scene: &Scene,
-        gpu_scene: &GpuScene,
+        geometry: &GpuGeometry,
     ) {
         let arena = &mut self.frame_arenas[ctx.slot];
         arena.reset();
@@ -177,7 +177,7 @@ impl RasterPreview {
             vp2: vp[2],
             vp3: vp[3],
             cam_pos: cam.extend(1.0),
-            verts: gpu_scene.vertex_buffer.gpu(),
+            verts: geometry.vertex_buffer.gpu(),
             tri_count: self.tri_count,
             _pad: 0,
         })
@@ -192,5 +192,11 @@ impl RasterPreview {
             ..Default::default()
         });
         cmd.draw_meshlets(root.gpu, root.gpu, self.num_meshlets, 1, 1);
+    }
+
+    pub fn destroy(self, device: &Device) {
+        for arena in self.frame_arenas {
+            device.destroy_buffer(arena.into_buffer());
+        }
     }
 }

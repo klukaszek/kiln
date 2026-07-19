@@ -3,8 +3,8 @@
 //!
 //! Loads the `--scene` (a named `.usda` under `examples/spectral/assets`, or any USD
 //! file path) with the pure-Rust `openusd` crate and renders it with a compute
-//! path tracer: Owen-scrambled Sobol' sampling, NEE + MIS, one
-//! importance-sampled wavelength per path from a physically based light
+//! path tracer: Owen-scrambled Sobol' sampling, NEE + MIS, four multiplexed
+//! importance-sampled wavelengths per path from a physically based light
 //! spectrum, and moment-based reflectance spectra fitted to the USD albedos
 //! (Peters 2019). Devices without ray-query support fall back to a mesh-shader
 //! raster preview of the same triangle soup.
@@ -34,11 +34,11 @@ use glam::UVec2;
 use kiln_rhi::{CommandBuffer, Device, DeviceDesc, Format};
 use winit::event::WindowEvent;
 
-use kiln_app::{Example, FrameCtx};
 use controls::{CameraController, debug_camera_roundtrip};
+use kiln_app::{Example, FrameCtx};
 use pathtracer::PathTracer;
 use raster::RasterPreview;
-use scene::gpu::GpuScene;
+use scene::gpu::{GpuGeometry, SpectralGpuScene};
 use scene::{Scene, spectral};
 
 /// Bundled scenes (and the LSPDD drop folder) live here (next to this crate's `Cargo.toml`).
@@ -50,9 +50,13 @@ struct Config {
     /// Target samples per pixel for the progressive render
     #[arg(long, default_value_t = pathtracer::DEFAULT_TARGET_SPP)]
     spp: u32,
-    /// Path samples accumulated per frame
-    #[arg(long, visible_alias = "spf", default_value_t = pathtracer::DEFAULT_SAMPLES_PER_FRAME)]
-    samples_per_frame: u32,
+    /// Spatial tracing passes recorded per frame
+    #[arg(
+        long,
+        visible_aliases = ["samples-per-frame", "spf"],
+        default_value_t = pathtracer::DEFAULT_PASSES_PER_FRAME
+    )]
+    passes_per_frame: u32,
     /// Render offscreen at WxH and write a PNG under target/test-images
     #[arg(long, value_name = "WxH", value_parser = parse_resolution)]
     headless: Option<UVec2>,
@@ -69,6 +73,12 @@ struct Config {
     /// upscales). 2 quarters the per-frame path count on retina displays.
     #[arg(long, default_value_t = 1)]
     render_scale: u32,
+    /// Windowed NxN spatial interleave; the film remains full resolution
+    #[arg(long, default_value_t = 2)]
+    pixel_stride: u32,
+    /// Headless NxN spatial interleave; 1 is the dense reference
+    #[arg(long, default_value_t = 1)]
+    headless_pixel_stride: u32,
     /// Headless: write the full per-pixel spectral film to this path as a
     /// float32 `.npy` of shape (height, width, SPECTRAL_BINS) — band-integrated
     /// radiance per pixel.
@@ -87,8 +97,12 @@ fn parse_pixel(value: &str) -> Result<(u32, u32), String> {
         .split_once(',')
         .ok_or_else(|| format!("expected X,Y, got {value:?}"))?;
     Ok((
-        x.trim().parse().map_err(|_| format!("bad X in {value:?}"))?,
-        y.trim().parse().map_err(|_| format!("bad Y in {value:?}"))?,
+        x.trim()
+            .parse()
+            .map_err(|_| format!("bad X in {value:?}"))?,
+        y.trim()
+            .parse()
+            .map_err(|_| format!("bad Y in {value:?}"))?,
     ))
 }
 
@@ -124,7 +138,9 @@ impl Config {
         if literal.is_file() {
             return Ok(literal);
         }
-        let bundled = Path::new(ASSETS_DIR).join(&self.scene).with_extension("usda");
+        let bundled = Path::new(ASSETS_DIR)
+            .join(&self.scene)
+            .with_extension("usda");
         if bundled.is_file() {
             return Ok(bundled);
         }
@@ -199,7 +215,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 struct App {
     scene: Scene,
-    gpu_scene: GpuScene,
+    geometry: GpuGeometry,
+    spectral_scene: Option<SpectralGpuScene>,
     raster: RasterPreview,
     tracer: Option<PathTracer>,
     controls: CameraController,
@@ -211,7 +228,10 @@ impl Example for App {
     }
 
     fn new(device: &Device, color_format: Format) -> Self {
-        let config = CONFIG.get().cloned().unwrap_or_else(|| Config::parse_from(["spectral"]));
+        let config = CONFIG
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Config::parse_from(["spectral"]));
         let fail = |message: String| -> ! {
             eprintln!("{message}");
             std::process::exit(1);
@@ -225,17 +245,22 @@ impl Example for App {
         let light_spectrum = config
             .light_spectrum()
             .unwrap_or_else(|e| fail(format!("invalid --light-spectrum: {e}")));
-        let gpu_scene = GpuScene::build(device, &scene, &light_spectrum)
-            .unwrap_or_else(|e| fail(format!("failed to upload scene: {e}")));
-        let raster = RasterPreview::build(device, color_format, &scene);
+        let geometry = GpuGeometry::build(device, &scene)
+            .unwrap_or_else(|e| fail(format!("failed to upload geometry: {e}")));
+        let raster = RasterPreview::build(device, color_format, &geometry);
 
-        let tracer = if gpu_scene.accel.is_some() {
+        let spectral_scene = geometry.accel.is_some().then(|| {
+            SpectralGpuScene::build(device, &scene, &light_spectrum)
+                .unwrap_or_else(|e| fail(format!("failed to upload spectral scene: {e}")))
+        });
+        let tracer = if spectral_scene.is_some() {
             match PathTracer::new(
                 device,
                 color_format,
                 config.spp,
-                config.samples_per_frame,
+                config.passes_per_frame,
                 config.render_scale,
+                config.pixel_stride,
             ) {
                 Ok(tracer) => Some(tracer),
                 Err(e) => {
@@ -250,7 +275,8 @@ impl Example for App {
         let controls = CameraController::new(&scene.camera.world, scene.up);
         Self {
             scene,
-            gpu_scene,
+            geometry,
+            spectral_scene,
             raster,
             tracer,
             controls,
@@ -263,8 +289,8 @@ impl Example for App {
 
     fn pre_render(&mut self, ctx: &FrameCtx, cmd: &mut CommandBuffer) {
         self.controls.update(&mut self.scene.camera.world);
-        if let Some(tracer) = &mut self.tracer {
-            tracer.pre_render(ctx, cmd, &self.scene, &self.gpu_scene);
+        if let (Some(tracer), Some(spectral_scene)) = (&mut self.tracer, &self.spectral_scene) {
+            tracer.pre_render(ctx, cmd, &self.scene, &self.geometry, spectral_scene);
         }
     }
 
@@ -273,7 +299,18 @@ impl Example for App {
             tracer.render(ctx, cmd);
             return;
         }
-        self.raster.render(ctx, cmd, &self.scene, &self.gpu_scene);
+        self.raster.render(ctx, cmd, &self.scene, &self.geometry);
+    }
+
+    fn destroy(self, device: &Device) {
+        if let Some(tracer) = self.tracer {
+            tracer.destroy(device);
+        }
+        self.raster.destroy(device);
+        if let Some(spectral_scene) = self.spectral_scene {
+            spectral_scene.destroy(device);
+        }
+        self.geometry.destroy(device);
     }
 }
 
@@ -293,25 +330,27 @@ fn run_headless(config: &Config, resolution: UVec2) -> anyhow::Result<()> {
         debug_camera_roundtrip(&scene);
     }
     let light_spectrum = config.light_spectrum()?;
-    let gpu_scene = GpuScene::build(&device, &scene, &light_spectrum)?;
+    let geometry = GpuGeometry::build(&device, &scene)?;
     anyhow::ensure!(
-        gpu_scene.accel.is_some(),
+        geometry.accel.is_some(),
         "headless render needs ray tracing support"
     );
+    let spectral_scene = SpectralGpuScene::build(&device, &scene, &light_spectrum)?;
     // Headless renders exactly the requested resolution: no render scaling.
     let mut tracer = PathTracer::new(
         &device,
         Format::B8G8R8A8Srgb,
         config.spp,
-        config.samples_per_frame,
+        config.passes_per_frame,
         1,
+        config.headless_pixel_stride,
     )?;
     eprintln!(
-        "spectral headless: {}x{}, target spp={}, samples/frame={}, light spectrum {}",
+        "spectral headless: {}x{}, target spp={}, passes/frame={}, light spectrum {}",
         resolution.x,
         resolution.y,
         tracer.target_spp(),
-        tracer.samples_per_frame(),
+        tracer.passes_per_frame(),
         light_spectrum.name,
     );
 
@@ -325,31 +364,33 @@ fn run_headless(config: &Config, resolution: UVec2) -> anyhow::Result<()> {
     // time): clean ms/spp, free of startup/slangc/BVH-build noise.
     let trace_start = std::time::Instant::now();
     while !tracer.is_complete() {
-        let before = tracer.sample_count();
+        let before = tracer.pass_count();
         let mut cmd = device.create_command_buffer()?;
-        tracer.pre_render(&ctx, &mut cmd, &scene, &gpu_scene);
+        tracer.pre_render(&ctx, &mut cmd, &scene, &geometry, &spectral_scene);
         cmd.end();
         let queue = device.queue();
         queue.submit(cmd)?;
         queue.wait_idle();
 
         anyhow::ensure!(
-            tracer.sample_count() > before,
+            tracer.pass_count() > before,
             "path tracer made no progress; lights={}",
-            gpu_scene.light_count
+            spectral_scene.light_count
         );
     }
     let trace_ms = trace_start.elapsed().as_secs_f64() * 1e3;
-    let spp = tracer.sample_count().max(1) as f64;
+    let spp = f64::from(tracer.sample_count().max(1));
     eprintln!(
-        "spectral trace: {:.1} ms for {} spp = {:.2} ms/spp ({:.2} Mpath/s)",
+        "spectral trace: {:.1} ms for {} spp over {} spatial passes = {:.2} ms/spp, {:.2} ms/pass ({:.2} Mpath/s)",
         trace_ms,
         tracer.sample_count(),
+        tracer.pass_count(),
         trace_ms / spp,
-        (resolution.x * resolution.y) as f64 * spp / (trace_ms * 1e3),
+        trace_ms / f64::from(tracer.pass_count().max(1)),
+        f64::from(resolution.x) * f64::from(resolution.y) * spp / (trace_ms * 1e3),
     );
 
-    let rgba = tracer.tonemapped_rgba8()?;
+    let rgba = tracer.tonemapped_rgba8(&device)?;
     let extent = tracer.extent();
     let name = format!(
         "{}_{}x{}_{}spp",
@@ -363,9 +404,13 @@ fn run_headless(config: &Config, resolution: UVec2) -> anyhow::Result<()> {
 
     export::emit(
         &tracer,
+        &device,
         extent,
         config.spectral_probe,
         config.spectral_dump.as_deref(),
     )?;
+    tracer.destroy(&device);
+    spectral_scene.destroy(&device);
+    geometry.destroy(&device);
     Ok(())
 }

@@ -53,13 +53,12 @@ uint sobol_u32(uint dim, uint index)
     if (dim == 0u) {
         return reversebits(index);
     }
-    uint result = 0u;
-    for (uint bit = 0u; bit < 32u; bit++) {
-        if ((index & (1u << bit)) != 0u) {
-            result ^= SOBOL_DIRECTIONS[dim - 1u][bit];
-        }
-    }
-    return result;
+    uint table = dim - 1u;
+    // Four byte lookups replace the 32-bit direction scan.
+    return SOBOL_BYTE_LUT[table][0][index & 0xffu]
+        ^ SOBOL_BYTE_LUT[table][1][(index >> 8) & 0xffu]
+        ^ SOBOL_BYTE_LUT[table][2][(index >> 16) & 0xffu]
+        ^ SOBOL_BYTE_LUT[table][3][index >> 24];
 }
 
 float scrambled_to_unit(uint x, uint seed)
@@ -67,14 +66,11 @@ float scrambled_to_unit(uint x, uint seed)
     return (float)(nested_uniform_scramble(x, seed) >> 8) * (1.0 / 16777216.0);
 }
 
-// One 4D low-discrepancy point. `group` selects a dimension group: every
-// distinct (pixel, group) pair sees its own shuffled, scrambled sequence, while
-// the four dimensions inside a group share one shuffled index so their joint
-// stratification survives.
-float4 sample_4d(uint pixel, uint sampleIndex, uint group)
+// One 4D point per pixel and dimension group.
+float4 sample_4d(uint pixelSeed, uint sampleIndex, uint group)
 {
-    uint seed = hash_combine(hash_u32(pixel), group);
-    uint index = nested_uniform_scramble(sampleIndex, hash_combine(seed, 0xa511e9b3u));
+    uint seed = hash_combine(pixelSeed, group);
+    uint index = sampleIndex;
     return float4(
         scrambled_to_unit(sobol_u32(0u, index), hash_combine(seed, 1u)),
         scrambled_to_unit(sobol_u32(1u, index), hash_combine(seed, 2u)),
@@ -85,25 +81,44 @@ float4 sample_4d(uint pixel, uint sampleIndex, uint group)
 
 /// The sampler's full Slang source: direction table first, then the functions.
 pub fn source() -> String {
-    [sobol_directions_slang().as_str(), RNG].concat()
+    [sobol_byte_lut_slang().as_str(), RNG].concat()
 }
 
-/// Emit the Sobol' direction-vector table for dimensions 2..=4 as a Slang constant
-/// (dimension 1 needs no table: its point is the bit-reversed sample index).
-fn sobol_directions_slang() -> String {
-    let mut out = String::from("static const uint SOBOL_DIRECTIONS[3][32] = {\n");
-    for directions in sobol_direction_vectors() {
-        out.push_str("    {");
-        for (i, v) in directions.iter().enumerate() {
-            if i % 8 == 0 {
-                out.push_str("\n        ");
+/// Emit byte-folded Sobol direction tables for dimensions 2..=4.
+fn sobol_byte_lut_slang() -> String {
+    let mut out = String::from("static const uint SOBOL_BYTE_LUT[3][4][256] = {\n");
+    for dimension in sobol_byte_lut() {
+        out.push_str("    {\n");
+        for byte in dimension {
+            out.push_str("        {");
+            for (value, folded) in byte.into_iter().enumerate() {
+                if value % 8 == 0 {
+                    out.push_str("\n            ");
+                }
+                out.push_str(&format!("0x{folded:08x}u, "));
             }
-            out.push_str(&format!("0x{v:08x}u, "));
+            out.push_str("\n        },\n");
         }
-        out.push_str("\n    },\n");
+        out.push_str("    },\n");
     }
     out.push_str("};\n");
     out
+}
+
+fn sobol_byte_lut() -> [[[u32; 256]; 4]; SOBOL_DIMS - 1] {
+    let mut lut = [[[0u32; 256]; 4]; SOBOL_DIMS - 1];
+    for (dimension, directions) in lut.iter_mut().zip(sobol_direction_vectors()) {
+        for (byte_index, byte) in dimension.iter_mut().enumerate() {
+            for (value, folded) in byte.iter_mut().enumerate() {
+                for bit in 0..8 {
+                    if value & (1 << bit) != 0 {
+                        *folded ^= directions[byte_index * 8 + bit];
+                    }
+                }
+            }
+        }
+    }
+    lut
 }
 
 /// Direction vectors for Sobol' dimensions 2..=4, computed from the Joe–Kuo

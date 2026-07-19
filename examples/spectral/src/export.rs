@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use glam::UVec2;
+use kiln_rhi::Device;
 
 use crate::pathtracer::PathTracer;
 
@@ -11,6 +12,7 @@ use crate::pathtracer::PathTracer;
 /// probe pixel or a dump path was requested.
 pub fn emit(
     tracer: &PathTracer,
+    device: &Device,
     extent: UVec2,
     probe: Option<(u32, u32)>,
     dump: Option<&Path>,
@@ -19,7 +21,7 @@ pub fn emit(
         return Ok(());
     }
     let centers = PathTracer::spectral_bin_centers();
-    let bands = tracer.spectral_bands()?;
+    let bands = tracer.spectral_bands(device)?;
 
     if let Some((px, py)) = probe {
         let (px, py) = (px.min(extent.x - 1), py.min(extent.y - 1));
@@ -55,7 +57,8 @@ fn write_npy_f32(path: &Path, shape: &[usize], data: &[f32]) -> anyhow::Result<(
     use std::io::Write;
 
     let shape_str = shape.iter().map(|d| format!("{d}, ")).collect::<String>();
-    let mut header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({shape_str}), }}");
+    let mut header =
+        format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({shape_str}), }}");
     // The 10-byte prefix + header + trailing '\n' must be a multiple of 64.
     while (10 + header.len() + 1) % 64 != 0 {
         header.push(' ');

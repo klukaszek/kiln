@@ -1,10 +1,9 @@
-//! Presentation of the spectral film: the fullscreen blit that resolves each
-//! pixel's per-bin radiance to linear sRGB (`Σ_j cmf[j]·band`) and tonemaps it,
-//! plus the matching CPU resolve/tonemap used for PNG readback and spectral
-//! export.
+//! Presentation and CPU readback of the spectral film.
 
-use glam::Vec3;
+use glam::{UVec2, Vec3};
 use kiln_rhi::Format;
+
+use super::schedule::SpatialSchedule;
 
 pub const SOURCE: &str = /*slang*/
     r#"
@@ -24,25 +23,33 @@ VOut displayVs(uint vid : SV_VertexID)
 [shader("fragment")]
 float4 displayFs(VOut i, uniform DisplayRoot* r) : SV_Target
 {
-    uint width = r.dims.x;
-    uint height = r.dims.y;
-    uint bins = r.dims.z;
-    bool targetIsSrgb = r.dims.w != 0u;
-    uint filmW = r.film_dims.x;
-    uint filmH = r.film_dims.y;
-    uint stride = r.film_dims.z;
+    uint width = r.display_width;
+    uint height = r.display_height;
+    uint bins = r.spectral_bins;
+    bool targetIsSrgb = r.target_is_srgb != 0u;
+    uint filmW = r.film_width;
+    uint filmH = r.film_height;
+    uint stride = r.film_stride;
+    uint pixelStride = max(r.pixel_stride, 1u);
     uint x = min((uint)i.pos.x, width - 1u);
     uint y = min((uint)i.pos.y, height - 1u);
     // Nearest-neighbour upscale when the film renders below display resolution.
     uint fx = min(x * filmW / width, filmW - 1u);
     uint fy = min(y * filmH / height, filmH - 1u);
-    uint base = (fy * filmW + fx) * stride;
+    uint phase = (fy % pixelStride) * pixelStride + fx % pixelStride;
+    uint sampleCount = r.completed_samples + (phase < r.remaining_phases ? 1u : 0u);
 
-    // Resolve the per-pixel spectrum to linear sRGB: Σ_j cmf[j]·band_radiance[j],
-    // band_radiance = bin / count (the per-path MIS estimator already sums its
-    // lanes). Per-pixel count keeps mid-render and render-scaled pixels exposed.
-    float count = r.film[base + bins];
-    float inv = 1.0 / max(count, 1.0);
+    // Preview the newest phase until every pixel has a sample.
+    if (sampleCount == 0u && r.remaining_phases > 0u) {
+        uint sampledPhase = r.remaining_phases - 1u;
+        uint tileX = (fx / pixelStride) * pixelStride;
+        uint tileY = (fy / pixelStride) * pixelStride;
+        fx = min(tileX + sampledPhase % pixelStride, filmW - 1u);
+        fy = min(tileY + sampledPhase / pixelStride, filmH - 1u);
+        sampleCount = r.completed_samples + 1u;
+    }
+    uint base = (fy * filmW + fx) * stride;
+    float inv = 1.0 / max((float)sampleCount, 1.0);
     float3 c = float3(0.0);
     for (uint j = 0u; j < bins; j++) {
         c += r.cmf[j].xyz * (r.film[base + j] * inv);
@@ -71,15 +78,10 @@ pub fn format_is_srgb(format: Format) -> bool {
     matches!(format, Format::R8G8B8A8Srgb | Format::B8G8R8A8Srgb)
 }
 
-// ---------------------------------------------------------------------------
-// CPU resolve of the spectral film — the headless twin of `displayFs`. Each
-// film row is `[bin_0..bin_N, count]` (stride = bins + 1).
-// ---------------------------------------------------------------------------
-
 /// Resolve one film row to a pre-exposure linear-sRGB colour: `Σ_j cmf[j] ·
 /// (bin_j / count)` (the per-path MIS estimator already sums its lanes).
-fn resolve_linear(row: &[f32], bins: usize, cmf: &[Vec3]) -> Vec3 {
-    let inv = 1.0 / row[bins].max(1.0);
+fn resolve_linear(row: &[f32], sample_count: u32, cmf: &[Vec3]) -> Vec3 {
+    let inv = 1.0 / sample_count.max(1) as f32;
     cmf.iter()
         .enumerate()
         .map(|(j, c)| *c * (row[j] * inv))
@@ -87,11 +89,19 @@ fn resolve_linear(row: &[f32], bins: usize, cmf: &[Vec3]) -> Vec3 {
 }
 
 /// Tonemap the whole film to RGBA8 for PNG readback, mirroring the blit.
-pub fn film_to_rgba8(rows: &[f32], stride: usize, cmf: &[Vec3]) -> Vec<u8> {
-    let bins = stride - 1;
+pub fn film_to_rgba8(
+    rows: &[f32],
+    stride: usize,
+    extent: UVec2,
+    schedule: SpatialSchedule,
+    pass_count: u32,
+    cmf: &[Vec3],
+) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(rows.len() / stride * 4);
-    for row in rows.chunks_exact(stride) {
-        let lin = resolve_linear(row, bins, cmf);
+    let coordinates = (0..extent.y).flat_map(|y| (0..extent.x).map(move |x| (x, y)));
+    for ((x, y), row) in coordinates.zip(rows.chunks_exact(stride)) {
+        let sample_count = schedule.sample_count_for_pixel(pass_count, x, y);
+        let lin = resolve_linear(row, sample_count, cmf);
         rgba.extend_from_slice(&[
             tonemap_linear(lin.x),
             tonemap_linear(lin.y),
@@ -104,12 +114,20 @@ pub fn film_to_rgba8(rows: &[f32], stride: usize, cmf: &[Vec3]) -> Vec<u8> {
 
 /// Per-pixel band-integrated spectral radiance `bin / count`, row-major
 /// `[height][width][bins]` — the raw spectral capture, flux restored.
-pub fn film_to_bands(rows: &[f32], stride: usize) -> Vec<f32> {
-    let bins = stride - 1;
+pub fn film_to_bands(
+    rows: &[f32],
+    stride: usize,
+    extent: UVec2,
+    schedule: SpatialSchedule,
+    pass_count: u32,
+) -> Vec<f32> {
+    let bins = stride;
     let mut out = Vec::with_capacity(rows.len() / stride * bins);
-    for row in rows.chunks_exact(stride) {
-        let inv = 1.0 / row[bins].max(1.0);
-        out.extend(row[..bins].iter().map(|&b| b * inv));
+    let coordinates = (0..extent.y).flat_map(|y| (0..extent.x).map(move |x| (x, y)));
+    for ((x, y), row) in coordinates.zip(rows.chunks_exact(stride)) {
+        let sample_count = schedule.sample_count_for_pixel(pass_count, x, y);
+        let inv = 1.0 / sample_count.max(1) as f32;
+        out.extend(row.iter().map(|&b| b * inv));
     }
     out
 }

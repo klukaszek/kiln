@@ -9,7 +9,7 @@ use objc2_core_foundation::CGSize;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTL4CommandBuffer, MTL4CommandQueue, MTL4Compiler, MTL4CompilerDescriptor,
-    MTL4ComputePipelineDescriptor, MTL4CounterHeapDescriptor, MTL4CounterHeapType,
+    MTL4ComputePipelineDescriptor, MTL4CounterHeap, MTL4CounterHeapDescriptor, MTL4CounterHeapType,
     MTL4LibraryFunctionDescriptor, MTL4PipelineDescriptor,
     MTL4PipelineOptions, MTL4ShaderReflection, MTLAllocation, MTLBinding, MTLBindingType,
     MTLBuffer, MTLCompileOptions, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
@@ -1068,6 +1068,7 @@ impl MetalDevice {
             .map(format_to_mtl)
             .unwrap_or(MTLPixelFormat::Invalid);
 
+        let initial_blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
         let pipeline_state = MetalGraphicsPso::compile_pipeline_state(
             compiler.as_ref(),
             vert_module.library.as_ref(),
@@ -1077,7 +1078,7 @@ impl MetalDevice {
             &color_formats,
             sample_count,
             desc.alpha_to_coverage,
-            &BlendState::default(),
+            &initial_blend,
         )?;
 
         let graphics_argument_buffer_slots = pipeline_state
@@ -1115,8 +1116,6 @@ impl MetalDevice {
             ),
         };
 
-        // Pre-bake the embedded blend state if provided, otherwise bake the default.
-        let initial_blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
         let mut blend_pipelines = HashMap::new();
         blend_pipelines.insert(initial_blend, pipeline_state.clone());
 

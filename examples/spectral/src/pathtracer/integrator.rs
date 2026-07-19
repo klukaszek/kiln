@@ -1,60 +1,7 @@
-//! The spectral light-transport kernel: geometry helpers, BSDF warps, next-event
-//! estimation with multiple importance sampling, and the `traceMain` entry point.
-//!
-//! Each path traces four stratified wavelengths drawn from the light's baked
-//! sampling table (`TraceRoot::spectrum`) — one Sobol' draw rotated by k/4
-//! through the inverse CDF (hero-wavelength style; the geometric path is shared
-//! because nothing disperses yet). Each fetched texel carries the linear-sRGB
-//! sensor weight for its wavelength and the phase in [-π, 0]. Reflectances are
-//! moment-based spectra evaluated at those phases from per-material Lagrange
-//! multipliers (`GpuMaterial::lagrange_emission.xyz`, prepared on the CPU), so
-//! path throughput is a `float4` of reflectance products; the sensor weights
-//! colour the contribution once at accumulation. Emitter brightness is the
-//! precomputed scalar in `lagrange_emission.w` — the light's flux shape
-//! cancelled against the sampling density when the table was baked.
-//!
-//! Random numbers come from the sampler module's `sample_4d`; dimension groups
-//! are allocated as 0 = camera jitter + wavelength, then per bounce one group
-//! for light sampling and one for the BSDF direction + Russian roulette.
+//! Spectral light transport with four multiplexed wavelengths, NEE, and MIS.
 
 pub const THREADS_X: u32 = 8;
 pub const THREADS_Y: u32 = 8;
-
-const GEOMETRY: &str = /*slang*/
-    r#"
-float3 normal_for_primitive(Vertex* verts, uint primitiveId)
-{
-    float3 p0 = verts[primitiveId * 3u + 0u].pos.xyz;
-    float3 p1 = verts[primitiveId * 3u + 1u].pos.xyz;
-    float3 p2 = verts[primitiveId * 3u + 2u].pos.xyz;
-    return normalize(cross(p1 - p0, p2 - p0));
-}
-
-float triangle_area(Vertex* verts, uint primitiveId)
-{
-    float3 p0 = verts[primitiveId * 3u + 0u].pos.xyz;
-    float3 p1 = verts[primitiveId * 3u + 1u].pos.xyz;
-    float3 p2 = verts[primitiveId * 3u + 2u].pos.xyz;
-    return 0.5 * length(cross(p1 - p0, p2 - p0));
-}
-
-float3 sample_triangle(Vertex* verts, uint primitiveId, float2 u)
-{
-    float su0 = sqrt(u.x);
-    float b0 = 1.0 - su0;
-    float b1 = u.y * su0;
-    float b2 = 1.0 - b0 - b1;
-    float3 p0 = verts[primitiveId * 3u + 0u].pos.xyz;
-    float3 p1 = verts[primitiveId * 3u + 1u].pos.xyz;
-    float3 p2 = verts[primitiveId * 3u + 2u].pos.xyz;
-    return p0 * b0 + p1 * b1 + p2 * b2;
-}
-
-bool any_nonzero(float3 v)
-{
-    return any(v > float3(0.0));
-}
-"#;
 
 const SAMPLING: &str = /*slang*/
     r#"
@@ -81,18 +28,6 @@ float power_heuristic(float a, float b)
     return a2 / max(a2 + b * b, 1e-8);
 }
 
-// Moment-based reflectance (Peters et al. 2019): evaluate the maximum-entropy
-// spectrum at four warped wavelengths at once, given the Lagrange multipliers
-// prepared on the CPU from the material's three trigonometric moments.
-float4 eval_reflectance(float4 phases, float3 lagranges)
-{
-    float4 cos1 = cos(-phases);
-    float4 sin1 = sin(-phases);
-    float4 cos2 = cos1 * cos1 - sin1 * sin1;
-    float4 series = 2.0 * (lagranges.y * cos1 + lagranges.z * cos2 + 0.5 * lagranges.x);
-    return atan(series) * INV_PI + 0.5;
-}
-
 // Four hero wavelengths drawn by two MIS strategies: `n_light` lanes from the
 // light-importance CDF table (rotated by 1/n_light over the CDF), `n_uniform`
 // lanes uniform in wavelength (rotated by 1/n_uniform over [λ_min, λ_max]). Both
@@ -103,27 +38,47 @@ float4 eval_reflectance(float4 phases, float3 lagranges)
 static const float SPECTRAL_LAMBDA_MIN = 360.0;
 static const float SPECTRAL_LAMBDA_MAX = 830.0;
 
-float4 fetch_lane(TraceRoot* r, uint k, float xi, float xiU)
+uint lane_table_index(TraceRoot* r, uint k, float xi, float xiU)
 {
-    uint len = max(r.dims1.w, 1u);
-    uint nLight = r.dims2.y;
+    uint len = max(r.spectrum_len, 1u);
+    uint nLight = r.light_lane_count;
     if (k < nLight) {
         float u = frac(xi + (float)k / (float)nLight);
-        return r.spectrum[min((uint)(u * (float)len), len - 1u)];
+        return min((uint)(u * (float)len), len - 1u);
     }
-    uint nUniform = max(r.dims2.z, 1u);
+    uint nUniform = max(r.uniform_lane_count, 1u);
     float u = frac(xiU + (float)(k - nLight) / (float)nUniform);
-    return r.lambda[min((uint)(u * (float)len), len - 1u)];
+    return min((uint)(u * (float)len), len - 1u);
 }
 
-float4 sample_phases(TraceRoot* r, float xi, float xiU)
+uint4 sample_spectral_indices(TraceRoot* r, float xi, float xiU)
 {
-    float4 phases;
+    uint4 indices;
     [ForceUnroll]
     for (uint k = 0u; k < 4u; k++) {
-        phases[k] = fetch_lane(r, k, xi, xiU).x;
+        indices[k] = lane_table_index(r, k, xi, xiU);
     }
-    return phases;
+    return indices;
+}
+
+float4 fetch_lane(TraceRoot* r, uint k, uint4 indices)
+{
+    return k < r.light_lane_count ? r.spectrum[indices[k]] : r.lambda[indices[k]];
+}
+
+// Pre-evaluated maximum-entropy reflectance.
+float4 lookup_reflectance(TraceRoot* r, uint materialId, uint4 indices)
+{
+    uint len = max(r.spectrum_len, 1u);
+    uint base = materialId * (2u * len);
+    uint nLight = r.light_lane_count;
+    float4 rho;
+    [ForceUnroll]
+    for (uint k = 0u; k < 4u; k++) {
+        uint tableOffset = k < nLight ? 0u : len;
+        rho[k] = r.reflectance[base + tableOffset + indices[k]];
+    }
+    return rho;
 }
 
 // Splat one path's hero-wavelength radiances into the pixel's spectral film bins
@@ -132,17 +87,17 @@ float4 sample_phases(TraceRoot* r, float xi, float xiU)
 // p_uniform`. The uniform term keeps the denominator bounded below in the deep
 // tails (where p_light → 0), so the edge-bin blow-up is gone. Single thread owns
 // the pixel this frame and frames are barrier-serialised, so the += is atomic-free.
-void splat_spectral(TraceRoot* r, uint pixel, float xi, float xiU, float4 radiance)
+void splat_spectral(TraceRoot* r, uint pixel, uint4 indices, float4 radiance)
 {
-    uint bins = r.dims2.x;
-    uint stride = bins + 1u;
-    float nLight = (float)r.dims2.y;
-    float nUniform = (float)r.dims2.z;
+    uint bins = r.spectral_bins;
+    uint stride = bins;
+    float nLight = (float)r.light_lane_count;
+    float nUniform = (float)r.uniform_lane_count;
     float binWidth = (SPECTRAL_LAMBDA_MAX - SPECTRAL_LAMBDA_MIN) / (float)bins;
     float pUniform = 1.0 / (SPECTRAL_LAMBDA_MAX - SPECTRAL_LAMBDA_MIN);
     [ForceUnroll]
     for (uint k = 0u; k < 4u; k++) {
-        float4 texel = fetch_lane(r, k, xi, xiU);
+        float4 texel = fetch_lane(r, k, indices);
         float lambda = texel.y;
         float fluxShape = texel.z;
         float pLight = texel.w;
@@ -161,36 +116,6 @@ void splat_spectral(TraceRoot* r, uint pixel, float xi, float xiU, float4 radian
 // Directions are sampled from a lobe mixture and every evaluation returns the
 // full mixture pdf, so NEE/BSDF MIS stays exact for both lobes.
 // ---------------------------------------------------------------------------
-
-struct Surface {
-    float3 lagranges;   // moment reflectance (albedo / metal F0 tint)
-    float alpha;        // GGX roughness (perceptual roughness squared)
-    float alpha2;
-    float metallic;
-    float f0_dielectric;
-    float spec_prob;    // wavelength-independent lobe-sampling probability
-};
-
-Surface make_surface(GpuMaterial mat)
-{
-    Surface s;
-    s.lagranges = mat.lagrange_emission.xyz;
-    // Clamp away the delta-lobe limit: a perfect mirror needs dedicated
-    // specular-event handling (MIS weight 1, hero-collapse on dispersion).
-    float roughness = clamp(mat.base_roughness.w, 0.045, 1.0);
-    s.alpha = roughness * roughness;
-    s.alpha2 = s.alpha * s.alpha;
-    s.metallic = mat.emission_metallic.w;
-    float ior = max(mat.specular_ior.w, 1.0001);
-    float f0_root = (ior - 1.0) / (ior + 1.0);
-    s.f0_dielectric = f0_root * f0_root;
-
-    float diffuse_lum = dot(mat.base_roughness.xyz, float3(0.2126, 0.7152, 0.0722));
-    float f0_lum = lerp(s.f0_dielectric, diffuse_lum, s.metallic);
-    float diff_weight = (1.0 - s.metallic) * diffuse_lum;
-    s.spec_prob = clamp(f0_lum / max(f0_lum + diff_weight, 1e-4), 0.05, 0.95);
-    return s;
-}
 
 float ggx_d(float alpha2, float cos_h)
 {
@@ -236,7 +161,7 @@ float3 sample_ggx_vndf(float3 wo_local, float alpha, float2 u)
 }
 
 // Full BSDF × cosine for direction wi, per wavelength, plus the mixture pdf.
-float4 bsdf_eval(Surface s, float4 rho, float3 n, float3 wo, float3 wi, out float pdf)
+float4 bsdf_eval(GpuBsdf s, float4 rho, float3 n, float3 wo, float3 wi, out float pdf)
 {
     float cos_o = dot(n, wo);
     float cos_i = dot(n, wi);
@@ -261,7 +186,7 @@ float4 bsdf_eval(Surface s, float4 rho, float3 n, float3 wo, float3 wi, out floa
 
 // Sample wi from the lobe mixture; returns the throughput multiplier
 // f·cos/pdf per wavelength. u.xy drives the chosen lobe, u.w picks it.
-float4 bsdf_sample(Surface s, float4 rho, float3 n, float3 wo,
+float4 bsdf_sample(GpuBsdf s, float4 rho, float3 n, float3 wo,
                    float4 u, out float3 wi, out float pdf)
 {
     float3 t, b;
@@ -303,22 +228,24 @@ float4 sample_direct_light(TraceRoot* r,
                            float3 p,
                            float3 n,
                            float3 wo,
-                           Surface surf,
+                           GpuBsdf surf,
                            float4 rho,
                            float4 u)
 {
-    uint lightCount = r.dims1.y;
+    uint lightCount = r.light_count;
     if (lightCount == 0u) {
         return float4(0.0);
     }
 
     uint pick = min((uint)(u.x * (float)lightCount), lightCount - 1u);
-    uint lightPrim = r.light_triangles[pick];
-    GpuMaterial lightMat = r.materials[r.triangle_materials[lightPrim]];
-    float leScale = lightMat.lagrange_emission.w;
-
-    float3 lp = sample_triangle(r.verts, lightPrim, u.yz);
-    float3 ln = normal_for_primitive(r.verts, lightPrim);
+    GpuLight light = r.lights[pick];
+    float su0 = sqrt(u.y);
+    float b1 = u.z * su0;
+    float b2 = su0 - b1;
+    float3 lp = light.p0_emission.xyz
+        + light.edge1_area.xyz * b1
+        + light.edge2.xyz * b2;
+    float3 ln = light.normal.xyz;
     float3 toLight = lp - p;
     float dist2 = max(dot(toLight, toLight), 1e-6);
     float dist = sqrt(dist2);
@@ -347,11 +274,11 @@ float4 sample_direct_light(TraceRoot* r,
         return float4(0.0);
     }
 
-    float area = triangle_area(r.verts, lightPrim);
     // Solid-angle pdf of this NEE sample, light selection included.
-    float lightPdf = dist2 / max(cosLight * area * (float)lightCount, 1e-8);
+    float lightPdf =
+        dist2 / max(cosLight * light.edge1_area.w * (float)lightCount, 1e-8);
     float misWeight = power_heuristic(lightPdf, bsdfPdf);
-    return fCos * (leScale / lightPdf) * misWeight;
+    return fCos * (light.p0_emission.w / lightPdf) * misWeight;
 }
 "#;
 
@@ -364,42 +291,49 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
     // Bindless TLAS: the handle in the root resolves to the acceleration structure (no descriptor
     // binding / argument-table slot). See docs/design/vulkan-binding-convention.md.
     RaytracingAccelerationStructure tlas = r.tlas;
-    uint width = r.dims0.x;
-    uint height = r.dims0.y;
-    uint sampleStart = r.dims0.z;
-    uint maxSpp = r.dims0.w;
-    uint sampleBatch = max(r.dims1.z, 1u);
-    if (tid.x >= width || tid.y >= height || sampleStart >= maxSpp) {
+    uint width = r.film_width;
+    uint height = r.film_height;
+    uint passStart = r.pass_start;
+    uint maxPasses = r.target_passes;
+    uint sampleBatch = max(r.pass_count, 1u);
+    uint pixelStride = max(r.pixel_stride, 1u);
+    uint tileWidth = (width + pixelStride - 1u) / pixelStride;
+    uint tileHeight = (height + pixelStride - 1u) / pixelStride;
+    uint phaseCount = r.phase_count;
+    if (tid.x >= tileWidth || tid.y >= tileHeight || passStart >= maxPasses) {
         return;
     }
 
-    uint pixel = tid.y * width + tid.x;
-    uint samplesTaken = 0u;
-
-    for (uint sampleOffset = 0u; sampleOffset < sampleBatch; sampleOffset++) {
-        uint sampleIndex = sampleStart + sampleOffset;
-        if (sampleIndex >= maxSpp) {
+    for (uint passOffset = 0u; passOffset < sampleBatch; passOffset++) {
+        uint passIndex = passStart + passOffset;
+        if (passIndex >= maxPasses) {
             break;
         }
-        samplesTaken++;
+        uint sampleIndex = passIndex / phaseCount;
+        uint phase = passIndex - sampleIndex * phaseCount;
+        uint2 phaseOffset = uint2(phase % pixelStride, phase / pixelStride);
+        uint2 pixelCoord = tid.xy * pixelStride + phaseOffset;
+        if (pixelCoord.x >= width || pixelCoord.y >= height) {
+            continue;
+        }
+        uint pixel = pixelCoord.y * width + pixelCoord.x;
+        uint pixelSeed = hash_u32(pixel);
 
         // Group 0 = camera jitter + wavelength; per bounce, one group for light
         // sampling and one for BSDF direction + Russian roulette.
-        float4 camU = sample_4d(pixel, sampleIndex, 0u);
+        float4 camU = sample_4d(pixelSeed, sampleIndex, 0u);
         float2 jitter = camU.xy;
-        float2 uv = (float2((float)tid.x, (float)tid.y) + jitter) / float2((float)width, (float)height);
+        float2 uv = (float2(pixelCoord) + jitter) / float2((float)width, (float)height);
         float2 ndc = float2(2.0 * uv.x - 1.0, 1.0 - 2.0 * uv.y);
         float3 rayDir = normalize(
             r.cam_forward.xyz +
             r.cam_right.xyz * (ndc.x * r.lens.y * r.lens.x) +
             r.cam_up.xyz * (ndc.y * r.lens.y));
 
-        // Four hero wavelengths per path via MIS: `xi` strata the light-CDF
-        // lanes, `xiU` the uniform-λ lanes. Only the phases ride along the path;
-        // wavelength/flux/pdf are refetched from the two strata at splat time.
+        // Light-CDF and uniform-wavelength strata.
         float xi = camU.z;
         float xiU = camU.w;
-        float4 phases = sample_phases(r, xi, xiU);
+        uint4 spectralIndices = sample_spectral_indices(r, xi, xiU);
 
         RayDesc ray;
         ray.Origin = r.cam_pos.xyz;
@@ -425,40 +359,40 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
             }
 
             uint prim = q.CommittedPrimitiveIndex();
-            uint matId = r.triangle_materials[prim];
-            GpuMaterial mat = r.materials[matId];
+            GpuTriangle triangle = r.triangles[prim];
+            uint matId = triangle.material_id;
             float t = q.CommittedRayT();
             float3 p = ray.Origin + ray.Direction * t;
-            float3 n = normal_for_primitive(r.verts, prim);
+            float3 n = triangle.normal_area.xyz;
             if (dot(n, -ray.Direction) < 0.0) {
                 n = -n;
             }
 
-            if (mat.lagrange_emission.w > 0.0) {
+            if (triangle.emission > 0.0) {
                 // MIS against the NEE strategy that could have sampled this
                 // point from the previous vertex; camera hits keep full weight.
                 float misWeight = 1.0;
                 if (bounce > 0u) {
                     float cosLight = abs(dot(n, ray.Direction));
-                    float area = triangle_area(r.verts, prim);
-                    float lightPdf =
-                        (t * t) / max(cosLight * area * (float)r.dims1.y, 1e-8);
+                    float lightPdf = (t * t) / max(
+                            cosLight * triangle.normal_area.w * (float)r.light_count, 1e-8);
                     misWeight = power_heuristic(prevBsdfPdf, lightPdf);
                 }
-                radiance += throughput * (mat.lagrange_emission.w * misWeight);
+                radiance += throughput * (triangle.emission * misWeight);
                 break;
             }
 
+            GpuBsdf surf = r.bsdfs[matId];
             float3 wo = -ray.Direction;
-            Surface surf = make_surface(mat);
-            float4 rho = eval_reflectance(phases, surf.lagranges);
+            float4 rho = lookup_reflectance(r, matId, spectralIndices);
 
-            float4 lightU = sample_4d(pixel, sampleIndex, 1u + bounce * 2u);
+            float4 lightU = sample_4d(pixelSeed, sampleIndex, 1u + bounce * 2u);
             radiance += throughput * sample_direct_light(r, tlas, p, n, wo, surf, rho, lightU);
 
-            float4 bsdfU = sample_4d(pixel, sampleIndex, 2u + bounce * 2u);
+            float4 bsdfU = sample_4d(pixelSeed, sampleIndex, 2u + bounce * 2u);
             float3 wi;
-            float4 sampleWeight = bsdf_sample(surf, rho, n, wo, bsdfU, wi, prevBsdfPdf);
+            float4 sampleWeight = bsdf_sample(
+                surf, rho, n, wo, bsdfU, wi, prevBsdfPdf);
             if (prevBsdfPdf <= 0.0) {
                 break;
             }
@@ -480,18 +414,12 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
             }
         }
 
-        splat_spectral(r, pixel, xi, xiU, radiance);
-    }
-
-    if (samplesTaken > 0u) {
-        uint stride = r.dims2.x + 1u;
-        r.film[pixel * stride + r.dims2.x] += (float)samplesTaken;
+        splat_spectral(r, pixel, spectralIndices, radiance);
     }
 }
 "#;
 
-/// The transport kernel's Slang source. Expects the sampler source and the
-/// `Vertex`/`GpuMaterial`/`TraceRoot` declarations to be prepended.
+/// Slang source for the transport kernel.
 pub fn source() -> String {
-    [GEOMETRY, SAMPLING, RADIOSITY, PATH_INTEGRATOR].concat()
+    [SAMPLING, RADIOSITY, PATH_INTEGRATOR].concat()
 }

@@ -5,9 +5,8 @@
 //! estimate (Peters et al., "Using Moments to Represent Bounded Signals for
 //! Spectral Rendering", SIGGRAPH 2019). [`fit_reflectance`] solves for moments
 //! whose spectrum is a D65 metamer of a target linear-sRGB albedo, then
-//! [`prep_reflectance`] (a CPU port of the reference `spectra.glsl`) lowers them
-//! to Lagrange multipliers so the shader only evaluates a three-coefficient
-//! Fourier series per hit — possible because our albedos are flat colours.
+//! [`prep_reflectance`] lowers them to Lagrange multipliers used to build GPU
+//! lookup tables.
 //!
 //! The moment algorithms are ported from Peters' repository (BSD-3, © Christoph
 //! Peters).
@@ -20,14 +19,14 @@ use super::{LAMBDA_MAX, LAMBDA_MIN, XYZ_TO_LINEAR_SRGB, cmf_xyz, d65, wavelength
 // A reflectance spectrum over the phase domain [-π, 0] is described by three
 // real trigonometric moments; the MESE reconstruction turns them into three
 // Lagrange multipliers, and evaluation at a phase is a tiny Fourier series.
-// The prep step happens here, once per material; shaders only evaluate.
+// Evaluation is performed during scene upload.
 // ---------------------------------------------------------------------------
 
 /// A reflectance spectrum fitted to a target albedo.
 pub struct ReflectanceSpectrum {
     /// The three real trigonometric moments (DC term in `[0, 1]`).
     pub trig_moments: [f32; 3],
-    /// Lagrange multipliers for shader-side evaluation (`eval_reflectance`).
+    /// Lagrange multipliers for spectral evaluation.
     pub lagranges: [f32; 3],
     /// Max channel error of the fit's round-trip RGB, for diagnostics.
     pub fit_error: f32,
@@ -124,8 +123,7 @@ pub fn fit_reflectance(target: Vec3) -> ReflectanceSpectrum {
     }
 }
 
-/// Evaluate the MESE reflectance at a phase in [-π, 0] given Lagrange
-/// multipliers from [`prep_reflectance`]. Mirrors the shader-side evaluation.
+/// Evaluate the MESE reflectance at a phase in [-π, 0].
 pub fn eval_reflectance(phase: f64, lagranges: [f64; 3]) -> f64 {
     let (cos_1, sin_1) = ((-phase).cos(), (-phase).sin());
     let cos_2 = cos_1 * cos_1 - sin_1 * sin_1;

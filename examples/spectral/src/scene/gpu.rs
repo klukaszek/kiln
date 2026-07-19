@@ -1,101 +1,83 @@
-//! The scene, resident on the GPU — buffers, spectral conversions, and
-//! acceleration structures, independent of any render pipeline.
+//! Renderer-facing GPU scene data.
 //!
-//! [`GpuScene`] is built once per loaded stage and shared by every renderer: the
-//! raster preview reads the vertex buffer, the path tracer reads everything.
-//! This is also where host colours become spectral: each material's albedo is
-//! fitted to moment-based reflectance coefficients ([`spectral::fit_reflectance`])
-//! and the chosen light spectrum is baked into its wavelength-sampling table,
-//! so the shaders only ever see ready-to-evaluate spectral data.
+//! [`GpuGeometry`] contains the vertex buffer and optional ray-tracing
+//! acceleration shared by renderers. [`SpectralGpuScene`] contains only path
+//! transport data and wavelength tables.
 
-use glam::{UVec4, Vec3, Vec4};
+use glam::{Vec3, Vec4};
 use kiln_rhi::{
     AccelerationStructure, BlasDesc, BlasMeshDesc, BuildAccelFlags, Device, GeometryFlags,
     GeometryType, GpuAddress, GpuAllocation, MemoryType, TlasDesc, TlasInstance, gpu_struct,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::spectral::{self, Spd};
 use super::{Material, Scene, Vertex};
 
+static NEXT_GPU_REVISION: AtomicU64 = AtomicU64::new(1);
+
 gpu_struct! {
-    pub struct GpuMaterial {
-        base_roughness: Vec4,
-        emission_metallic: Vec4,
-        specular_ior: Vec4,
-        coat_opacity: Vec4,
-        flags: UVec4,
-        // xyz: Lagrange multipliers of the moment-based reflectance spectrum
-        // (prep done on the CPU; the shader only evaluates). w: the emitter
-        // scalar for spectral transport (0 for non-emissive materials).
-        lagrange_emission: Vec4,
+    pub struct GpuBsdf {
+        alpha: f32,
+        alpha2: f32,
+        metallic: f32,
+        f0_dielectric: f32,
+        spec_prob: f32,
+        _pad: [f32; 3],
+    }
+}
+
+gpu_struct! {
+    pub struct GpuLight {
+        p0_emission: Vec4, // xyz: first vertex, w: spectral emission scale
+        edge1_area: Vec4,  // xyz: p1 - p0, w: triangle area
+        edge2: Vec4,       // xyz: p2 - p0
+        normal: Vec4,      // xyz: unit geometric normal
+    }
+}
+
+gpu_struct! {
+    pub struct GpuTriangle {
+        normal_area: Vec4, // xyz: unit geometric normal, w: triangle area
+        material_id: u32,
+        emission: f32,
+        _pad: [f32; 2],
     }
 }
 
 /// Ray-tracing acceleration over the scene. The instance buffer and BLAS are held
 /// alive here because the TLAS references their GPU memory.
 pub struct SceneAccel {
-    _instance_buffer: GpuAllocation,
-    _blas: AccelerationStructure,
+    instance_buffer: GpuAllocation,
+    blas: AccelerationStructure,
     pub tlas: AccelerationStructure,
 }
 
-pub struct GpuScene {
+pub struct GpuGeometry {
     pub vertex_buffer: GpuAllocation,
-    pub triangle_material_buffer: GpuAllocation,
-    pub material_buffer: GpuAllocation,
-    pub light_triangle_buffer: GpuAllocation,
-    /// The light's baked wavelength tables ([`spectral::EmissionSpectrum`],
-    /// texel `(phase, λ, flux_shape, p_light)`): `spectrum_buffer` is the
-    /// inverse-CDF (light-importance) table, `lambda_buffer` the uniform-λ MIS
-    /// partner. Both share `spectrum_len`. One spectrum per scene for now.
-    pub spectrum_buffer: GpuAllocation,
-    pub lambda_buffer: GpuAllocation,
-    pub spectrum_len: u32,
     pub accel: Option<SceneAccel>,
     pub triangle_count: u32,
-    pub light_count: u32,
-    pub material_count: u32,
+    revision: u64,
 }
 
-impl GpuScene {
-    pub fn build(device: &Device, scene: &Scene, light_spectrum: &Spd) -> anyhow::Result<Self> {
-        let triangle_count = scene.triangle_count();
+pub struct SpectralGpuScene {
+    pub triangle_buffer: GpuAllocation,
+    pub bsdf_buffer: GpuAllocation,
+    pub light_buffer: GpuAllocation,
+    pub spectrum_buffer: GpuAllocation,
+    pub lambda_buffer: GpuAllocation,
+    pub reflectance_buffer: GpuAllocation,
+    pub spectrum_len: u32,
+    pub light_count: u32,
+    pub material_count: u32,
+    revision: u64,
+}
+
+impl GpuGeometry {
+    pub fn build(device: &Device, scene: &Scene) -> anyhow::Result<Self> {
+        let triangle_count = u32::try_from(scene.triangle_count())?;
         anyhow::ensure!(triangle_count > 0, "scene has no triangles");
-
-        let vertex_buffer = device.upload_slice(&scene.vertices).expect("vertex buffer");
-        let triangle_material_buffer = device
-            .upload_slice(&scene.triangle_materials)
-            .expect("triangle material buffer");
-
-        let baked = light_spectrum.bake(spectral::DEFAULT_RESOLUTION);
-        let spectrum_buffer = device.upload_slice(&baked.texels).expect("light spectrum table");
-        let lambda_buffer = device
-            .upload_slice(&baked.lambda_texels)
-            .expect("uniform wavelength table");
-
-        let gpu_materials: Vec<GpuMaterial> = scene
-            .materials
-            .iter()
-            .map(|material| material_to_gpu(material, &baked))
-            .collect();
-        let material_buffer = device.upload_slice(&gpu_materials).expect("material buffer");
-
-        let light_triangles: Vec<u32> = scene
-            .triangle_materials
-            .iter()
-            .enumerate()
-            .filter_map(|(tri, &mat)| {
-                scene
-                    .materials
-                    .get(mat as usize)
-                    .is_some_and(|m| m.is_emissive())
-                    .then_some(tri as u32)
-            })
-            .collect();
-        let light_triangle_buffer = device
-            .upload_slice(&light_triangles)
-            .expect("light triangle buffer");
-
+        let vertex_buffer = device.upload_slice(&scene.vertices)?;
         let accel = match build_accel(device, scene, &vertex_buffer) {
             Ok(accel) => Some(accel),
             Err(e) => {
@@ -103,74 +85,222 @@ impl GpuScene {
                 None
             }
         };
+        Ok(Self {
+            vertex_buffer,
+            accel,
+            triangle_count,
+            revision: NEXT_GPU_REVISION.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn destroy(self, device: &Device) {
+        if let Some(accel) = self.accel {
+            accel.destroy(device);
+        }
+        device.free(self.vertex_buffer);
+    }
+}
+
+impl SpectralGpuScene {
+    pub fn build(device: &Device, scene: &Scene, light_spectrum: &Spd) -> anyhow::Result<Self> {
+        let triangle_count = scene.triangle_count();
+        anyhow::ensure!(triangle_count > 0, "scene has no triangles");
+        anyhow::ensure!(
+            scene.vertices.len().is_multiple_of(3)
+                && scene.triangle_materials.len() == triangle_count,
+            "triangle material count does not match geometry"
+        );
+        anyhow::ensure!(
+            scene
+                .triangle_materials
+                .iter()
+                .all(|&material| (material as usize) < scene.materials.len()),
+            "triangle references an invalid material"
+        );
+
+        let baked = light_spectrum.bake(spectral::DEFAULT_RESOLUTION);
+        let material_fits: Vec<spectral::ReflectanceSpectrum> = scene
+            .materials
+            .iter()
+            .map(|material| spectral::fit_reflectance(material.base_color))
+            .collect();
+        for (material, fit) in scene.materials.iter().zip(&material_fits) {
+            if fit.fit_error > 0.01 {
+                eprintln!(
+                    "spectral fit for albedo {:?} off by {:.3} (moments {:?})",
+                    material.base_color, fit.fit_error, fit.trig_moments
+                );
+            }
+        }
+        let gpu_bsdfs: Vec<GpuBsdf> = scene.materials.iter().map(bsdf_to_gpu).collect();
+        let emission_scales: Vec<f32> = scene
+            .materials
+            .iter()
+            .map(|material| {
+                if material.is_emissive() {
+                    baked.emission_scale(material.emission)
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let reflectance_lut = build_reflectance_lut(&material_fits, &baked);
+        let triangles: Vec<GpuTriangle> = scene
+            .vertices
+            .chunks_exact(3)
+            .zip(&scene.triangle_materials)
+            .map(|(vertices, &mat)| {
+                let (normal, area) = triangle_normal_area(vertices);
+                GpuTriangle {
+                    normal_area: normal.extend(area),
+                    material_id: mat,
+                    emission: emission_scales[mat as usize],
+                    _pad: [0.0; 2],
+                }
+            })
+            .collect();
+        let lights: Vec<GpuLight> = scene
+            .triangle_materials
+            .iter()
+            .enumerate()
+            .filter(|&(_, &mat)| scene.materials[mat as usize].is_emissive())
+            .map(|(tri, &mat)| {
+                let vertices = &scene.vertices[tri * 3..tri * 3 + 3];
+                let p0 = vertices[0].pos.truncate();
+                let edge1 = vertices[1].pos.truncate() - p0;
+                let edge2 = vertices[2].pos.truncate() - p0;
+                let (normal, area) = triangle_normal_area(vertices);
+                GpuLight {
+                    p0_emission: p0.extend(emission_scales[mat as usize]),
+                    edge1_area: edge1.extend(area),
+                    edge2: edge2.extend(0.0),
+                    normal: normal.extend(0.0),
+                }
+            })
+            .collect();
+
+        let spectrum_len = u32::try_from(baked.texels.len())?;
+        let light_count = u32::try_from(lights.len())?;
+        let material_count = u32::try_from(gpu_bsdfs.len())?;
+        let spectrum_buffer = device.upload_slice(&baked.texels)?;
+        let lambda_buffer = device.upload_slice(&baked.lambda_texels)?;
+        let bsdf_buffer = device.upload_slice(&gpu_bsdfs)?;
+        let reflectance_buffer = device.upload_slice(&reflectance_lut)?;
+        let triangle_buffer = device.upload_slice(&triangles)?;
+        let light_buffer = device.upload_slice(&lights)?;
 
         eprintln!(
-            "spectral gpu scene: {triangle_count} triangles, {} materials, {} emissive triangles, light spectrum {} ({} texels), accel={}",
-            gpu_materials.len(),
-            light_triangles.len(),
+            "spectral gpu scene: {triangle_count} triangles, {} materials, {} emissive triangles, light spectrum {} ({} texels)",
+            gpu_bsdfs.len(),
+            lights.len(),
             baked.name,
             baked.texels.len(),
-            if accel.is_some() { "yes" } else { "no" },
         );
 
         Ok(Self {
-            vertex_buffer,
-            triangle_material_buffer,
-            material_buffer,
-            light_triangle_buffer,
+            triangle_buffer,
+            bsdf_buffer,
+            light_buffer,
             spectrum_buffer,
             lambda_buffer,
-            spectrum_len: baked.texels.len() as u32,
-            accel,
-            triangle_count,
-            light_count: light_triangles.len() as u32,
-            material_count: gpu_materials.len() as u32,
+            reflectance_buffer,
+            spectrum_len,
+            light_count,
+            material_count,
+            revision: NEXT_GPU_REVISION.fetch_add(1, Ordering::Relaxed),
         })
     }
-}
 
-fn material_to_gpu(material: &Material, light: &spectral::EmissionSpectrum) -> GpuMaterial {
-    let fit = spectral::fit_reflectance(material.base_color);
-    if fit.fit_error > 0.01 {
-        eprintln!(
-            "spectral fit for albedo {:?} off by {:.3} (moments {:?})",
-            material.base_color, fit.fit_error, fit.trig_moments
-        );
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
-    let emission_scale = if material.is_emissive() {
-        light.emission_scale(material.emission)
-    } else {
-        0.0
-    };
 
-    GpuMaterial {
-        base_roughness: material.base_color.extend(material.roughness),
-        emission_metallic: material.emission.extend(material.metallic),
-        specular_ior: material.specular_color.extend(material.ior),
-        coat_opacity: Vec4::new(
-            material.clearcoat,
-            material.clearcoat_roughness,
-            material.opacity,
-            material.opacity_threshold,
-        ),
-        flags: UVec4::new(material.use_specular_workflow as u32, 0, 0, 0),
-        lagrange_emission: Vec3::from_array(fit.lagranges).extend(emission_scale),
+    pub fn destroy(self, device: &Device) {
+        device.free(self.triangle_buffer);
+        device.free(self.bsdf_buffer);
+        device.free(self.light_buffer);
+        device.free(self.spectrum_buffer);
+        device.free(self.lambda_buffer);
+        device.free(self.reflectance_buffer);
     }
 }
 
-/// Build a single-instance BLAS + TLAS over the scene's triangle soup.
+impl SceneAccel {
+    fn destroy(self, device: &Device) {
+        let Self {
+            instance_buffer,
+            blas,
+            tlas,
+        } = self;
+        drop(tlas);
+        drop(blas);
+        device.free(instance_buffer);
+    }
+}
+
+fn triangle_normal_area(vertices: &[Vertex]) -> (Vec3, f32) {
+    let p0 = vertices[0].pos.truncate();
+    let cross = (vertices[1].pos.truncate() - p0).cross(vertices[2].pos.truncate() - p0);
+    let twice_area = cross.length();
+    (cross / twice_area.max(f32::MIN_POSITIVE), 0.5 * twice_area)
+}
+
+fn bsdf_to_gpu(material: &Material) -> GpuBsdf {
+    let roughness = material.roughness.clamp(0.045, 1.0);
+    let alpha = roughness * roughness;
+    let ior = material.ior.max(1.0001);
+    let f0_root = (ior - 1.0) / (ior + 1.0);
+    let f0_dielectric = f0_root * f0_root;
+    let diffuse_lum = material.base_color.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+    let f0_lum = f0_dielectric * (1.0 - material.metallic) + diffuse_lum * material.metallic;
+    let diff_weight = (1.0 - material.metallic) * diffuse_lum;
+    GpuBsdf {
+        alpha,
+        alpha2: alpha * alpha,
+        metallic: material.metallic,
+        f0_dielectric,
+        spec_prob: (f0_lum / (f0_lum + diff_weight).max(1e-4)).clamp(0.05, 0.95),
+        _pad: [0.0; 3],
+    }
+}
+
+fn build_reflectance_lut(
+    fits: &[spectral::ReflectanceSpectrum],
+    light: &spectral::EmissionSpectrum,
+) -> Vec<f32> {
+    let table_len = light.texels.len();
+    debug_assert_eq!(light.lambda_texels.len(), table_len);
+    let mut lut = Vec::with_capacity(fits.len() * table_len * 2);
+    for fit in fits {
+        let lagranges = fit.lagranges.map(f64::from);
+        for table in [&light.texels, &light.lambda_texels] {
+            lut.extend(
+                table
+                    .iter()
+                    .map(|texel| spectral::eval_reflectance(f64::from(texel.x), lagranges) as f32),
+            );
+        }
+    }
+    lut
+}
+
 fn build_accel(
     device: &Device,
     scene: &Scene,
     vertex_buffer: &GpuAllocation,
 ) -> anyhow::Result<SceneAccel> {
+    let vertex_count = u32::try_from(scene.vertices.len())?;
     let blas_desc = BlasDesc {
         meshes: vec![BlasMeshDesc {
             geometry_type: GeometryType::Triangles,
             flags: GeometryFlags::OPAQUE,
             vertex_buffer: vertex_buffer.gpu(),
             vertex_stride: std::mem::size_of::<Vertex>() as u64,
-            vertex_count: scene.vertices.len() as u32,
+            vertex_count,
             index_buffer: GpuAddress(0),
             index_count: 0,
             aabb_buffer: GpuAddress(0),
@@ -188,9 +318,8 @@ fn build_accel(
         queue.wait_idle();
     }
 
-    let instance_buffer = device
-        .malloc(device.tlas_instance_stride() as u64, MemoryType::Default)
-        .expect("alloc TLAS instance buffer");
+    let instance_buffer =
+        device.malloc(device.tlas_instance_stride() as u64, MemoryType::Default)?;
     device.write_tlas_instance(
         &instance_buffer,
         0,
@@ -222,9 +351,8 @@ fn build_accel(
     }
 
     Ok(SceneAccel {
-        _instance_buffer: instance_buffer,
-        _blas: blas,
+        instance_buffer,
+        blas,
         tlas,
     })
 }
-

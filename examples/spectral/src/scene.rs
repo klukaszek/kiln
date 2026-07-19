@@ -48,8 +48,8 @@ pub struct Scene {
 
 impl Scene {
     /// Number of triangles in the soup (three vertices each).
-    pub fn triangle_count(&self) -> u32 {
-        (self.vertices.len() / 3) as u32
+    pub fn triangle_count(&self) -> usize {
+        self.vertices.len() / 3
     }
 
     /// Camera world-space position (translation row of the world transform).

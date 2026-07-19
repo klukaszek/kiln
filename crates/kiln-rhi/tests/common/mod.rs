@@ -250,4 +250,3 @@ fn zlib_stored(data: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&((b << 16) | a).to_be_bytes());
     out
 }
-

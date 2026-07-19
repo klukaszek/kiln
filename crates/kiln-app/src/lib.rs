@@ -87,6 +87,13 @@ pub trait Example {
     /// example still gets the frame-time HUD for free).
     #[cfg(feature = "egui")]
     fn ui(&mut self, _ui: &mut egui::Ui) {}
+
+    /// Release resources whose RHI ownership is explicit rather than RAII.
+    fn destroy(self, _device: &Device)
+    where
+        Self: Sized,
+    {
+    }
 }
 
 /// Harness-level command-line options, parsed with clap. Examples with no CLI of their own get
@@ -257,7 +264,10 @@ impl<E: Example> App<E> {
         // Read this slot's prior timestamps (its fence was waited at acquire) before recording over them.
         #[cfg(feature = "egui")]
         if let Some(egui) = self.egui.as_mut() {
-            if let Ok(Some(ms)) = self.device.gpu_elapsed_ms(&egui.query_pools[frame_index], 0, 1) {
+            if let Ok(Some(ms)) = self
+                .device
+                .gpu_elapsed_ms(&egui.query_pools[frame_index], 0, 1)
+            {
                 egui.gpu_ms = ema(egui.gpu_ms, ms);
             }
         }
@@ -375,7 +385,8 @@ impl<E: Example> App<E> {
             });
             example.ui(ui);
         });
-        egui.state.handle_platform_output(window, out.platform_output);
+        egui.state
+            .handle_platform_output(window, out.platform_output);
         let ppp = out.pixels_per_point;
         let primitives = egui.ctx.tessellate(out.shapes, ppp);
         egui.renderer
@@ -468,6 +479,9 @@ impl<E: Example> ApplicationHandler for App<E> {
                 if let Some((tex, mem)) = self.depth.take() {
                     self.device.destroy_texture(tex);
                     self.device.free(mem);
+                }
+                if let Some(example) = self.example.take() {
+                    example.destroy(&self.device);
                 }
                 #[cfg(feature = "egui")]
                 if let Some(egui) = self.egui.take() {

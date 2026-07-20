@@ -273,7 +273,7 @@ sharing the windowing/present harness in `crates/kiln-app`. Run one with `cargo 
 ```bash
 cargo run -p triangle-graphics   # windowed raster triangle
 cargo run -p triangle-mesh       # mesh-shader pipeline
-cargo run -p spectral            # USD scene + ray tracing
+cargo run -p spectra             # USD scene + ray tracing
 cargo run -p egui-demo           # egui-through-the-RHI demo
 ```
 

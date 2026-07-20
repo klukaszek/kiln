@@ -8,6 +8,6 @@ members = [
     "crates/kiln-app",
     "examples/triangle-graphics",
     "examples/triangle-mesh",
-    "examples/spectral",
+    "examples/spectra",
     "examples/egui-demo",
 ]

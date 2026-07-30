@@ -9,8 +9,8 @@
 
 use kiln_app::{Example, FrameCtx};
 use kiln_rhi::{
-    ColorTarget, CommandBuffer, Cull, Device, Format, GraphicsPso, GraphicsPsoDesc, SampleCount,
-    ShaderStage, Topology,
+    ColorTarget, CommandBuffer, Cull, Device, Format, GpuAddress, GraphicsPso, GraphicsPsoDesc,
+    SampleCount, ShaderStage, Topology,
 };
 
 // Same shader as the headless test: positions and per-vertex colours are static in
@@ -49,7 +49,6 @@ impl Example for TriangleGraphics {
                     color_targets: vec![ColorTarget::new(color_format)],
                     depth_format: None,
                     sample_count: SampleCount::S1,
-                    root_constant_size: 16,
                     cull: Cull::None,
                     label: Some("triangle-graphics".into()),
                     ..Default::default()
@@ -64,7 +63,7 @@ impl Example for TriangleGraphics {
 
     fn render(&mut self, _ctx: &FrameCtx, cmd: &mut CommandBuffer) {
         cmd.set_graphics_pipeline(&self.pso);
-        cmd.draw(None, None, 3, 1, 0, 0);
+        cmd.draw(GpuAddress::NULL, 3, 1, 0, 0);
     }
 }
 

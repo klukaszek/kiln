@@ -17,13 +17,13 @@
 //! # Binding layout
 //!
 //! Set 0 is owned by the RHI. Shaders must not claim anything on set 0; all
-//! per-draw/dispatch data arrives via the root BDA pointer.
+//! per-draw/dispatch data arrives via the root pointer.
 //!
 //! | Resource                | Vulkan                  | Metal            |
 //! |-------------------------|-------------------------|------------------|
-//! | Bindless sampled images | set 0, binding 0        | arg-table slot 1 |
-//! | Bindless samplers       | set 0, binding 1        | arg-table slot 2 |
-//! | Bindless storage images | set 0, binding 2        | (texture heap)   |
+//! | Bindless sampled images | set 0, binding 2        | arg-table slot 1 |
+//! | Bindless samplers       | set 0, binding 0        | arg-table slot 2 |
+//! | Bindless storage images | set 0, binding 2        | inline in root   |
 //! | Root data pointer       | push constant, offset 0 | buffer(0)        |
 //! | All other buffers/SSBO  | BDA inside root struct  | BDA              |
 //! | Acceleration structures | BDA inside root struct  | inline in root   |
@@ -91,10 +91,10 @@
 mod macros;
 
 pub mod accel;
-pub mod compiler;
 pub mod backend;
 pub mod barrier;
 pub mod command;
+pub mod compiler;
 pub mod device;
 pub mod error;
 pub mod memory;
@@ -114,7 +114,6 @@ pub mod types;
 // crates share one zerocopy instance.
 pub use zerocopy;
 
-// Re-export core types at crate root for convenience
 pub use accel::AccelerationStructure;
 pub use barrier::{HazardFlags, StageFlags};
 pub use command::{
@@ -135,7 +134,7 @@ pub use shader::{ShaderModule, ShaderModuleDesc, ShaderStage};
 pub use surface::{Surface, SurfaceDesc};
 pub use swapchain::{AcquiredImage, Swapchain, SwapchainDesc};
 pub use sync::TimelineSemaphore;
-pub use texture::{ALL_LAYERS, ALL_MIPS, GpuViewDesc, Texture, TextureDesc, TextureUsage};
+pub use texture::{ALL_LAYERS, ALL_MIPS, Texture, TextureDesc, TextureUsage, TextureViewDesc};
 pub use types::*;
 pub use types::{
     AccelerationStructureId, BlasDesc, BlasMeshDesc, BuildAccelFlags, GeometryFlags, GeometryType,

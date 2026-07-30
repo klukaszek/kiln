@@ -23,12 +23,17 @@ use crate::types::*;
 
 use super::device::{SharedAllocations, SharedSamplers, SharedTextures};
 
-const ROOT_TABLE_BYTES: usize = 32;
+const ROOT_POINTER_BYTES: usize = std::mem::size_of::<GpuAddress>();
 const ROOT_TABLE_RING_ENTRIES: usize = 65_536;
-const ROOT_TABLE_RING_BYTES: usize = ROOT_TABLE_BYTES * ROOT_TABLE_RING_ENTRIES;
+const ROOT_TABLE_RING_BYTES: usize = ROOT_POINTER_BYTES * ROOT_TABLE_RING_ENTRIES;
 const METAL_BINDLESS_TEXTURE_CAPACITY: usize = 65_536;
 const METAL_BINDLESS_SAMPLER_CAPACITY: usize = 256;
 const MDI_ICB_THREADGROUP_SIZE: usize = 64;
+
+type CachedDepthStencil = (
+    Retained<ProtocolObject<dyn MTLDepthStencilState>>,
+    Option<(f32, f32, f32)>,
+);
 
 #[derive(Clone)]
 struct MetalPipelineBinding {
@@ -46,8 +51,6 @@ struct GeneratedMdiIcb {
     range_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     max_draw_count_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     primitive_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    /// 8-byte argument buffer holding the ICB's gpuResourceID, bound at buffer slot 3 so
-    /// the encode kernel can reach the ICB through its `RhiIcbContainer` argument struct.
     icb_arg_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
@@ -62,74 +65,41 @@ pub struct MetalCommandBuffer {
     pub(crate) command_buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
     #[allow(dead_code)]
     pub(crate) command_allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
-    /// Active render encoder (created by begin_render_pass, consumed by end_render_pass).
     pub(crate) render_encoder: Option<Retained<ProtocolObject<dyn MTL4RenderCommandEncoder>>>,
-    /// Active compute encoder (created by set_compute_pipeline, consumed by end or encoder switch).
     pub(crate) compute_encoder: Option<Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>>>,
-    /// Drawable texture for rendering to swapchain.
     pub(crate) drawable_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
-    /// Depth texture from swapchain.
     pub(crate) depth_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
-    /// Current primitive topology (set by set_graphics_pipeline).
     current_topology: MTLPrimitiveType,
-    /// Device reference for depth stencil state creation.
     pub(crate) device: Retained<ProtocolObject<dyn MTLDevice>>,
-    /// Argument table used for buffer bindings (root + argument buffers).
     argument_table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
-    /// CPU-updated root table ring buffer.
     #[allow(dead_code)]
     root_table_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     root_table_ptr: *mut u8,
     root_table_gpu_base: MTLGPUAddress,
     root_table_cursor: usize,
     root_table_capacity: usize,
-    /// Bindless texture heap: flat array of MTLTexture `gpuResourceID`s (u64), indexed by `TextureId`.
     texture_heap_buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
-    /// Bindless sampler heap: flat array of MTLSamplerState gpuResourceIDs (u64 each), indexed by `SamplerId`.
     sampler_heap_buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
-    /// Shared texture list for heap population.
     pub(crate) textures: SharedTextures,
-    /// Shared sampler list for heap population.
     pub(crate) samplers: SharedSamplers,
-    /// Shared buffer allocation registry for GPU pointer resolution.
     pub(crate) allocations: SharedAllocations,
-    /// Residency set for command-local allocations.
     residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
-    /// Dirty bit for queue residency commits.
     residency_dirty: std::rc::Rc<std::cell::Cell<bool>>,
-    /// Keep depth-stencil state objects alive for Metal 4 command lifetime.
     depth_stencil_states: Vec<Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
-    /// Active blend state used for pipeline selection.
     pub(crate) current_blend_state: BlendState,
-    /// Cached threads-per-threadgroup from the bound compute pipeline.
     current_threads_per_threadgroup: [u32; 3],
-    /// Threads per object threadgroup for the bound meshlet pipeline.
     current_mesh_tpg_object: MTLSize,
-    /// Threads per mesh threadgroup for the bound meshlet pipeline.
     current_mesh_tpg_mesh: MTLSize,
-    /// Root-constant payload size for the currently bound pipeline.
-    root_constant_size: u32,
-    /// Queue barrier to apply on the next encoder begin.
     pending_queue_barrier: Option<PendingQueueBarrier>,
-    /// Pending split barrier producer state.
     pending_split_barrier: Option<(StageFlags, HazardFlags)>,
-    /// Pending value waits consumed at queue submit.
     pub(crate) pending_value_waits: Vec<WaitValueDesc>,
-    /// Pending value signals consumed at queue submit.
     pub(crate) pending_value_signals: Vec<SignalValueDesc>,
     active_texture_heap_slot_enabled: bool,
     active_sampler_heap_slot_enabled: bool,
-    active_texture_heap_ptr_override: Option<MTLGPUAddress>,
-    /// Render pass description, kept while a pass is open so the encoder can be reopened
-    /// (with Load actions) when an MDI draw splits the pass for GPU-side ICB generation.
     render_pass_desc: Option<RenderPassDesc>,
     current_root_table: MTLGPUAddress,
-    /// Render state tracked so it can be re-applied to a fresh encoder after an MDI split.
     current_pipeline: Option<MetalPipelineBinding>,
-    current_depth_stencil: Option<(
-        Retained<ProtocolObject<dyn MTLDepthStencilState>>,
-        Option<(f32, f32, f32)>,
-    )>,
+    current_depth_stencil: Option<CachedDepthStencil>,
     current_viewport: Option<MTLViewport>,
     current_scissor: Option<MTLScissorRect>,
     mdi_icb_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -180,8 +150,9 @@ impl MetalCommandBuffer {
         unsafe {
             self.argument_table.setAddress_atIndex(0, 0);
             let tex_addr = if self.active_texture_heap_slot_enabled {
-                self.active_texture_heap_ptr_override
-                    .or_else(|| self.texture_heap_buffer.as_ref().map(|b| b.gpuAddress()))
+                self.texture_heap_buffer
+                    .as_ref()
+                    .map(|b| b.gpuAddress())
                     .unwrap_or(0)
             } else {
                 0
@@ -217,11 +188,6 @@ impl MetalCommandBuffer {
         self.residency_dirty.set(true);
     }
 
-    /// Make an acceleration structure resident. Acceleration structures are now referenced
-    /// bindlessly by handle (`accel.gpu()` in a root field) rather than bound via the argument
-    /// table, so nothing else makes them resident — `build_blas`/`build_tlas` add them here so
-    /// they stay resident for any later ray-query dispatch. `MTLAccelerationStructure` conforms
-    /// to `MTLAllocation`, same as buffers above.
     fn add_accel_to_residency(
         &self,
         accel: &ProtocolObject<dyn objc2_metal::MTLAccelerationStructure>,
@@ -313,13 +279,12 @@ impl MetalCommandBuffer {
             std::mem::size_of::<u32>(),
             MTLResourceOptions::StorageModeShared,
         );
-        // Argument buffer for the ICB: a single `command_buffer` handle at offset 0.
+        // The ICB is passed through an argument buffer at id 0.
         let icb_arg_buffer = self.make_command_buffer_resource(
             std::mem::size_of::<u64>(),
             MTLResourceOptions::StorageModeShared,
         );
 
-        // MTLResourceID is a transparent wrapper over a u64 GPU handle.
         let icb_resource_id: u64 = unsafe { std::mem::transmute(icb.gpuResourceID()) };
 
         unsafe {
@@ -343,8 +308,7 @@ impl MetalCommandBuffer {
             self.argument_table.setAddress_atIndex(draw_count_addr, 1);
             self.argument_table
                 .setAddress_atIndex(range_buffer.gpuAddress(), 2);
-            // Bind the ICB through its argument buffer (a `command_buffer` handle at id 0).
-            // MSL does not allow `command_buffer` as a direct buffer-slot parameter.
+            // MSL exposes the ICB command buffer through this argument buffer.
             self.argument_table
                 .setAddress_atIndex(icb_arg_buffer.gpuAddress(), 3);
             self.argument_table
@@ -412,10 +376,6 @@ impl MetalCommandBuffer {
         *slot = Some(new_buf);
     }
 
-    /// Refresh the bindless texture and/or sampler heaps. The heaps are flat `[u64]` arrays
-    /// of `gpuResourceID`s, indexed by `TextureId` / `SamplerId`. The shader binds them as
-    /// `device const ulong* heap [[buffer(N)]]` and casts the loaded `ulong` into the
-    /// appropriate `texture<...>` / `sampler` handle using Metal 4 syntax.
     fn refresh_bindless_heaps(&mut self, refresh_textures: bool, refresh_samplers: bool) {
         if refresh_textures {
             let textures = self.textures.borrow();
@@ -492,10 +452,6 @@ impl MetalCommandBuffer {
         (addr, ptr)
     }
 
-    fn alloc_root_table_slot(&mut self) -> (MTLGPUAddress, *mut u8) {
-        self.alloc_root_bytes(ROOT_TABLE_BYTES)
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         command_buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
@@ -522,7 +478,6 @@ impl MetalCommandBuffer {
                 )
             })?;
 
-        // Register for residency.
         let allocation = unsafe {
             &*(root_table_buffer.as_ref() as *const ProtocolObject<dyn MTLBuffer>
                 as *const ProtocolObject<dyn MTLAllocation>)
@@ -580,14 +535,12 @@ impl MetalCommandBuffer {
                 height: 1,
                 depth: 1,
             },
-            root_constant_size: 0,
             pending_queue_barrier: None,
             pending_split_barrier: None,
             pending_value_waits: Vec::new(),
             pending_value_signals: Vec::new(),
             active_texture_heap_slot_enabled: false,
             active_sampler_heap_slot_enabled: false,
-            active_texture_heap_ptr_override: None,
             render_pass_desc: None,
             current_root_table: 0,
             current_pipeline: None,
@@ -604,10 +557,6 @@ impl MetalCommandBuffer {
 
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc) {
         self.end_active_encoders();
-        // Open the render encoder eagerly and encode draws directly into it. The only
-        // case that needs a buffered/replayed command list is MDI (see draw_indirect_multi),
-        // which splits the pass on demand because its ICB must be generated by a compute
-        // pass that precedes the render encoder.
         let encoder = self.begin_metal_render_encoder(desc, false);
         self.render_encoder = Some(encoder);
         self.render_pass_desc = Some(desc.clone());
@@ -627,12 +576,10 @@ impl MetalCommandBuffer {
     ) -> Retained<ProtocolObject<dyn MTL4RenderCommandEncoder>> {
         let pass_desc = MTL4RenderPassDescriptor::new();
 
-        // Configure color attachments
         let color_attachments = pass_desc.colorAttachments();
         for (i, color_att) in desc.color_attachments.iter().enumerate() {
             let attachment = unsafe { color_attachments.objectAtIndexedSubscript(i) };
 
-            // Set texture based on render target
             match &color_att.target {
                 RenderTarget::SwapchainImage(_idx) => {
                     if let Some(tex) = &self.drawable_texture {
@@ -671,7 +618,6 @@ impl MetalCommandBuffer {
             }
         }
 
-        // Configure depth attachment
         if let Some(depth_att) = &desc.depth_attachment {
             let depth = pass_desc.depthAttachment();
 
@@ -707,7 +653,6 @@ impl MetalCommandBuffer {
             }
         }
 
-        // Create the render command encoder
         let encoder = self
             .command_buffer
             .renderCommandEncoderWithDescriptor(&pass_desc)
@@ -752,33 +697,25 @@ impl MetalCommandBuffer {
     }
 
     pub fn set_graphics_pipeline(&mut self, pso: &GraphicsPso) {
-        let (
-            pipeline,
-            cull_mode,
-            winding,
-            topology,
-            root_constant_size,
-            has_texture_heap_slot,
-            has_sampler_heap_slot,
-        ) = match &pso.inner {
-            crate::pipeline::GraphicsPsoInner::Metal(mtl_pso) => {
-                let pipeline = mtl_pso.pipeline_for_blend(&self.current_blend_state);
-                let has_slot = |slot: usize| mtl_pso.graphics_argument_buffer_slots.contains(&slot);
-                (
-                    pipeline,
-                    mtl_pso.cull_mode,
-                    mtl_pso.winding,
-                    mtl_pso.topology,
-                    mtl_pso.root_constant_size,
-                    has_slot(1),
-                    has_slot(2),
-                )
-            }
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("wrong backend"),
-        };
+        let (pipeline, cull_mode, winding, topology, has_texture_heap_slot, has_sampler_heap_slot) =
+            match &pso.inner {
+                crate::pipeline::GraphicsPsoInner::Metal(mtl_pso) => {
+                    let pipeline = mtl_pso.pipeline_for_blend(&self.current_blend_state);
+                    let has_slot =
+                        |slot: usize| mtl_pso.graphics_argument_buffer_slots.contains(&slot);
+                    (
+                        pipeline,
+                        mtl_pso.cull_mode,
+                        mtl_pso.winding,
+                        mtl_pso.topology,
+                        has_slot(1),
+                        has_slot(2),
+                    )
+                }
+                #[allow(unreachable_patterns)]
+                _ => unreachable!("wrong backend"),
+            };
         self.current_topology = topology;
-        self.root_constant_size = root_constant_size;
         self.active_texture_heap_slot_enabled = has_texture_heap_slot;
         self.active_sampler_heap_slot_enabled = has_sampler_heap_slot;
         self.refresh_bindless_heaps(has_texture_heap_slot, has_sampler_heap_slot);
@@ -818,7 +755,6 @@ impl MetalCommandBuffer {
         encoder.setComputePipelineState(&mtl_pso.pipeline);
 
         self.current_threads_per_threadgroup = mtl_pso.threads_per_threadgroup;
-        self.root_constant_size = mtl_pso.root_constant_size;
         let has_slot = |slot: usize| mtl_pso.compute_argument_buffer_slots.contains(&slot);
         self.active_texture_heap_slot_enabled = has_slot(1);
         self.active_sampler_heap_slot_enabled = has_slot(2);
@@ -860,48 +796,34 @@ impl MetalCommandBuffer {
             ds_desc.setBackFaceStencil(None);
         }
 
-        if let Some(ds_state) = self.device.newDepthStencilStateWithDescriptor(&ds_desc) {
-            let depth_bias = if state.depth_bias != 0.0 || state.depth_bias_slope_factor != 0.0 {
-                Some((
-                    state.depth_bias,
-                    state.depth_bias_slope_factor,
-                    state.depth_bias_clamp,
-                ))
-            } else {
-                None
-            };
-            let encoder = self
-                .render_encoder
-                .as_ref()
-                .expect("No active render encoder");
+        let Some(ds_state) = self.device.newDepthStencilStateWithDescriptor(&ds_desc) else {
+            return;
+        };
+        let depth_bias = if state.depth_bias != 0.0 || state.depth_bias_slope_factor != 0.0 {
+            Some((
+                state.depth_bias,
+                state.depth_bias_slope_factor,
+                state.depth_bias_clamp,
+            ))
+        } else {
+            None
+        };
+        if let Some(encoder) = self.render_encoder.as_ref() {
             encoder.setDepthStencilState(Some(&ds_state));
             if let Some((bias, slope, clamp)) = depth_bias {
                 encoder.setDepthBias_slopeScale_clamp(bias, slope, clamp);
             }
-            self.current_depth_stencil = Some((ds_state.clone(), depth_bias));
-            self.depth_stencil_states.push(ds_state);
         }
+        self.current_depth_stencil = Some((ds_state.clone(), depth_bias));
+        self.depth_stencil_states.push(ds_state);
     }
 
     pub fn set_blend_state(&mut self, state: &BlendState) {
-        // Blend state is baked into the pipeline in Metal.
-        // Dynamic blend is limited to blend constants.
+        // Metal bakes blend state into the pipeline; only blend constants are dynamic.
         self.current_blend_state = state.clone();
     }
 
-    pub fn set_root_data(&mut self, vertex_root: GpuAddress, pixel_root: GpuAddress) {
-        // Stash the root pointer in a ring slot, bind that slot at buffer(0) (Slang lowers
-        // `uniform T*` to buffer(0) -> { T* }). Vertex/fragment share one table, so this is a
-        // shared root: pass the same pointer for both; independent roots aren't supported.
-        debug_assert!(
-            self.render_encoder.is_some(),
-            "set_root_data called outside a render pass"
-        );
-        let root = if vertex_root.0 != 0 {
-            vertex_root
-        } else {
-            pixel_root
-        };
+    pub fn set_root_data(&mut self, root: GpuAddress) {
         let (slot_addr, slot_ptr) = self.alloc_root_bytes(std::mem::size_of::<u64>());
         unsafe {
             std::ptr::write_unaligned(slot_ptr as *mut u64, root.0);
@@ -909,70 +831,12 @@ impl MetalCommandBuffer {
         self.current_root_table = slot_addr;
     }
 
-    fn set_root_table(
-        &mut self,
-        vertex_root_base: GpuAddress,
-        vertex_stride: u32,
-        pixel_root_base: GpuAddress,
-        pixel_stride: u32,
-    ) {
-        debug_assert!(
-            self.render_encoder.is_some(),
-            "set_root_table called outside a render pass"
-        );
-        if self.root_constant_size < ROOT_TABLE_BYTES as u32 {
-            panic!(
-                "Root table ({} bytes) exceeds pipeline limit ({} bytes)",
-                ROOT_TABLE_BYTES, self.root_constant_size
-            );
-        }
-
-        let mut bytes = [0u8; ROOT_TABLE_BYTES];
-        bytes[0..8].copy_from_slice(&vertex_root_base.0.to_ne_bytes());
-        bytes[8..12].copy_from_slice(&vertex_stride.to_ne_bytes());
-        bytes[16..24].copy_from_slice(&pixel_root_base.0.to_ne_bytes());
-        bytes[24..28].copy_from_slice(&pixel_stride.to_ne_bytes());
-
-        let (addr, ptr) = self.alloc_root_table_slot();
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
-            self.argument_table.setAddress_atIndex(addr, 0);
-        }
-        self.current_root_table = addr;
-    }
-
     pub fn set_compute_root(&mut self, root: GpuAddress) {
-        debug_assert!(
-            self.compute_encoder.is_some(),
-            "set_compute_root called outside a compute pass"
-        );
-        let root_bytes = std::mem::size_of::<GpuAddress>() as u32;
-        if self.root_constant_size < root_bytes {
-            panic!(
-                "Compute root pointer ({} bytes) exceeds pipeline limit ({} bytes)",
-                root_bytes, self.root_constant_size
-            );
-        }
-        // Stash the root pointer in a ring slot, bind that slot at buffer(0) (Slang lowers the
-        // root to buffer(0) -> { T* }; the indirection Vulkan gets from an inline push).
         let (slot_addr, slot_ptr) = self.alloc_root_bytes(std::mem::size_of::<u64>());
         unsafe {
             std::ptr::write_unaligned(slot_ptr as *mut u64, root.0);
             self.argument_table.setAddress_atIndex(slot_addr, 0);
         }
-    }
-
-    // No `bind_acceleration_structure`: acceleration structures are referenced bindlessly by
-    // handle (`accel.gpu()` == the AS `gpuResourceID`, stored in a root field as a
-    // `DescriptorHandle<RaytracingAccelerationStructure>`). Residency is handled at build time
-    // via `add_accel_to_residency`. See docs/design/vulkan-binding-convention.md.
-
-    pub fn set_active_texture_heap_ptr(&mut self, heap_ptr: GpuAddress) {
-        self.active_texture_heap_ptr_override = if heap_ptr.0 == 0 {
-            None
-        } else {
-            Some(heap_ptr.0)
-        };
     }
 
     pub fn draw(
@@ -1005,9 +869,7 @@ impl MetalCommandBuffer {
     }
 
     pub fn draw_indexed(&mut self, indices: GpuAddress, index_count: u32, instance_count: u32) {
-        // Index format is always U32 — the spec has no IndexFormat concept.
-        // Metal 4 takes the index buffer as a raw GPU address; the exact byte span it
-        // reads is index_count * 4, so no allocation lookup is needed.
+        // Indices are U32 and Metal 4 consumes the buffer as a raw GPU address.
         let index_addr_gpu: MTLGPUAddress = indices.0;
         let index_len = (index_count as u64) * 4;
         let root_table = self.current_root_table;
@@ -1073,10 +935,8 @@ impl MetalCommandBuffer {
     }
 
     pub fn draw_indexed_indirect(&mut self, indices: GpuAddress, args: GpuAddress) {
-        // Index format is always U32.
         let index_addr_gpu: MTLGPUAddress = indices.0;
-        // The index count is GPU-driven, so bound the index buffer length by the bytes
-        // remaining in the allocation.
+        // The GPU supplies the count, so bound the address range by the allocation remainder.
         let index_len = self.allocation_remaining(indices);
         let arg_addr_gpu: MTLGPUAddress = args.0;
         let root_table = self.current_root_table;
@@ -1103,10 +963,7 @@ impl MetalCommandBuffer {
 
     pub fn draw_indirect_multi(
         &mut self,
-        vertex_root: GpuAddress,
-        vertex_stride: u32,
-        pixel_root: GpuAddress,
-        pixel_stride: u32,
+        root: GpuAddress,
         args: GpuAddress,
         draw_count: GpuAddress,
     ) {
@@ -1114,7 +971,7 @@ impl MetalCommandBuffer {
             .render_pass_desc
             .clone()
             .expect("draw_indirect_multi must be recorded inside a render pass");
-        self.set_root_table(vertex_root, vertex_stride, pixel_root, pixel_stride);
+        self.set_root_data(root);
 
         let stride = std::mem::size_of::<DrawIndirectMultiArgs>() as u64;
         let arg_remaining = self.allocation_remaining(args);
@@ -1127,9 +984,7 @@ impl MetalCommandBuffer {
         let topology = self.current_topology;
         let root_table = self.current_root_table;
 
-        // The ICB must be generated by a compute pass before the render encoder runs it, so
-        // split the pass: end the render encoder, dispatch ICB generation, then reopen with
-        // Load actions and execute the generated commands.
+        // Generate the ICB in a compute pass, then reopen the render pass with Load actions.
         if let Some(encoder) = self.render_encoder.take() {
             encoder.endEncoding();
         }
@@ -1179,7 +1034,6 @@ impl MetalCommandBuffer {
             .command_buffer
             .computeCommandEncoder()
             .expect("Failed to create Metal 4 copy encoder");
-        // Apply any barrier enqueued before this copy (copy encoders are discrete).
         self.apply_pending_queue_barrier_compute(&encoder);
         unsafe {
             encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
@@ -1202,7 +1056,6 @@ impl MetalCommandBuffer {
             .command_buffer
             .computeCommandEncoder()
             .expect("Failed to create Metal 4 copy encoder");
-        // Apply any barrier enqueued before this copy (copy encoders are discrete).
         self.apply_pending_queue_barrier_compute(&encoder);
         unsafe {
             encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
@@ -1234,7 +1087,6 @@ impl MetalCommandBuffer {
             .command_buffer
             .computeCommandEncoder()
             .expect("Failed to create Metal 4 copy encoder");
-        // Apply any barrier enqueued before this copy (copy encoders are discrete).
         self.apply_pending_queue_barrier_compute(&encoder);
         unsafe {
             encoder.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
@@ -1320,7 +1172,10 @@ impl MetalCommandBuffer {
         self.end_active_encoders();
         // SAFETY: `index` is within the heap's count (caller's QueryPool contract); the heap is of
         // type Timestamp.
-        unsafe { self.command_buffer.writeTimestampIntoHeap_atIndex(heap, index) };
+        unsafe {
+            self.command_buffer
+                .writeTimestampIntoHeap_atIndex(heap, index)
+        };
     }
 
     pub fn barrier(&mut self, src: StageFlags, dst: StageFlags) {
@@ -1422,6 +1277,7 @@ impl MetalCommandBuffer {
         if let Some(encoder) = self.compute_encoder.as_ref() {
             let needs_queue_barrier = dst.contains(StageFlags::VERTEX_SHADER)
                 || dst.contains(StageFlags::PIXEL_SHADER)
+                || dst.contains(StageFlags::TRANSFER)
                 || dst.contains(StageFlags::RASTER_COLOR_OUT)
                 || dst.contains(StageFlags::RASTER_DEPTH_OUT)
                 || dst.contains(StageFlags::ALL_GRAPHICS)
@@ -1486,35 +1342,25 @@ impl MetalCommandBuffer {
         }
     }
 
-    // -- Mesh shader (meshlet) pipeline + draws --
-
     /// `gpuSetPipeline` for mesh pipelines — binds PSO, refreshes bindless heaps, binds argument table.
     pub fn set_meshlet_pipeline(&mut self, pso: &MeshletPso) {
         use objc2_metal::MTL4RenderCommandEncoder as _;
 
-        let (
-            pipeline,
-            cull_mode,
-            winding,
-            root_constant_size,
-            has_texture_heap_slot,
-            has_sampler_heap_slot,
-        ) = match &pso.inner {
-            crate::pipeline::MeshletPsoInner::Metal(mtl_pso) => {
-                let has_slot = |slot: usize| mtl_pso.argument_buffer_slots.contains(&slot);
-                (
-                    mtl_pso.default_pipeline.clone(),
-                    mtl_pso.cull_mode,
-                    mtl_pso.winding,
-                    mtl_pso.root_constant_size,
-                    has_slot(1),
-                    has_slot(2),
-                )
-            }
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("wrong backend"),
-        };
-        self.root_constant_size = root_constant_size;
+        let (pipeline, cull_mode, winding, has_texture_heap_slot, has_sampler_heap_slot) =
+            match &pso.inner {
+                crate::pipeline::MeshletPsoInner::Metal(mtl_pso) => {
+                    let has_slot = |slot: usize| mtl_pso.argument_buffer_slots.contains(&slot);
+                    (
+                        mtl_pso.default_pipeline.clone(),
+                        mtl_pso.cull_mode,
+                        mtl_pso.winding,
+                        has_slot(1),
+                        has_slot(2),
+                    )
+                }
+                #[allow(unreachable_patterns)]
+                _ => unreachable!("wrong backend"),
+            };
         self.current_mesh_tpg_object = MTLSize {
             width: 1,
             height: 1,
@@ -1547,7 +1393,6 @@ impl MetalCommandBuffer {
         encoder.setRenderPipelineState(&pipeline);
         encoder.setCullMode(cull_mode);
         encoder.setFrontFacingWinding(winding);
-        // Bind the argument table to mesh + fragment stages (object stage handled implicitly).
         encoder.setArgumentTable_atStages(
             &self.argument_table,
             MTLRenderStages::Mesh | MTLRenderStages::Fragment,
@@ -1565,12 +1410,8 @@ impl MetalCommandBuffer {
             depth: z as usize,
         };
         let root_table = self.current_root_table;
-        let encoder = match self.render_encoder.as_ref() {
-            Some(e) => e.clone(),
-            None => {
-                log::warn!("draw_meshlets: no active render encoder");
-                return;
-            }
+        let Some(encoder) = self.render_encoder.as_ref().cloned() else {
+            return;
         };
         unsafe {
             self.argument_table.setAddress_atIndex(root_table, 0);
@@ -1591,12 +1432,8 @@ impl MetalCommandBuffer {
         let tg_obj = self.current_mesh_tpg_object;
         let tg_mesh = self.current_mesh_tpg_mesh;
         let root_table = self.current_root_table;
-        let encoder = match self.render_encoder.as_ref() {
-            Some(e) => e.clone(),
-            None => {
-                log::warn!("draw_meshlets_indirect: no active render encoder");
-                return;
-            }
+        let Some(encoder) = self.render_encoder.as_ref().cloned() else {
+            return;
         };
         unsafe {
             self.argument_table.setAddress_atIndex(root_table, 0);
@@ -1605,15 +1442,12 @@ impl MetalCommandBuffer {
             &self.argument_table,
             MTLRenderStages::Mesh | MTLRenderStages::Fragment,
         );
-        // MTL4 indirect draw takes MTLGPUAddress directly.
         encoder.drawMeshThreadgroupsWithIndirectBuffer_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
             args.0,
             tg_obj,
             tg_mesh,
         );
     }
-
-    // -- Acceleration structure builds (MTL4 compute encoder) --
 
     pub fn build_blas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &BlasDesc) {
         use super::accel::make_blas_geometry_descriptors;
@@ -1622,39 +1456,26 @@ impl MetalCommandBuffer {
             MTLBuffer as _,
         };
 
-        let (vk_as, scratch) = match &accel.inner {
+        let (mtl_as, scratch) = match &accel.inner {
             #[cfg(feature = "metal")]
             crate::accel::AccelInner::Metal(a) => {
                 (a.acceleration_structure.clone(), a.scratch_buffer.clone())
             }
             #[allow(unreachable_patterns)]
-            _ => return,
+            _ => unreachable!("acceleration structure belongs to another backend"),
         };
-        let scratch = match scratch {
-            Some(s) => s,
-            None => {
-                log::warn!(
-                    "build_blas: no scratch buffer — was the BLAS created by device.create_blas?"
-                );
-                return;
-            }
-        };
+        let geometries = make_blas_geometry_descriptors(desc);
 
-        let geometries = match make_blas_geometry_descriptors(desc) {
-            Ok(geometries) => geometries,
-            Err(err) => {
-                log::warn!("build_blas: invalid BLAS descriptor: {err}");
-                return;
-            }
-        };
-
-        // Keep the BLAS resident: a TLAS trace dereferences its instances' BLAS handles.
-        self.add_accel_to_residency(&vk_as);
+        self.add_accel_to_residency(&mtl_as);
 
         let primitive_desc = MTL4PrimitiveAccelerationStructureDescriptor::new();
         primitive_desc.setGeometryDescriptors(Some(&geometries.array));
+        let primitive_base = unsafe {
+            &*(primitive_desc.as_ref() as *const MTL4PrimitiveAccelerationStructureDescriptor
+                as *const objc2_metal::MTLAccelerationStructureDescriptor)
+        };
+        super::accel::set_accel_usage(primitive_base, desc.flags);
 
-        // Get or create compute encoder for the build command.
         self.end_active_encoders();
         let encoder = self
             .command_buffer
@@ -1669,7 +1490,7 @@ impl MetalCommandBuffer {
 
         unsafe {
             encoder.buildAccelerationStructure_descriptor_scratchBuffer(
-                &vk_as,
+                &mtl_as,
                 &*(primitive_desc.as_ref() as *const MTL4PrimitiveAccelerationStructureDescriptor
                     as *const objc2_metal::MTL4AccelerationStructureDescriptor),
                 scratch_range,
@@ -1684,31 +1505,21 @@ impl MetalCommandBuffer {
             MTLBuffer as _,
         };
 
-        let (vk_as, scratch) = match &accel.inner {
+        let (mtl_as, scratch) = match &accel.inner {
             #[cfg(feature = "metal")]
             crate::accel::AccelInner::Metal(a) => {
                 (a.acceleration_structure.clone(), a.scratch_buffer.clone())
             }
             #[allow(unreachable_patterns)]
-            _ => return,
+            _ => unreachable!("acceleration structure belongs to another backend"),
         };
-        let scratch = match scratch {
-            Some(s) => s,
-            None => {
-                log::warn!("build_tlas: no scratch buffer");
-                return;
-            }
-        };
-
-        // Keep the TLAS resident: the ray-query shader resolves its bindless handle to this AS.
-        self.add_accel_to_residency(&vk_as);
+        self.add_accel_to_residency(&mtl_as);
 
         let instance_desc = MTL4InstanceAccelerationStructureDescriptor::new();
         unsafe {
             instance_desc.setInstanceDescriptorBuffer(objc2_metal::MTL4BufferRange {
                 bufferAddress: desc.instance_buffer.0,
-                // Indirect instance-descriptor layout (see device.write_tlas_instance), not
-                // the Vulkan-shaped TlasInstance.
+                // Metal uses its indirect instance layout, written by `Device::write_tlas_instance`.
                 length: (desc.instance_count as u64)
                     * std::mem::size_of::<
                         objc2_metal::MTLIndirectAccelerationStructureInstanceDescriptor,
@@ -1716,6 +1527,11 @@ impl MetalCommandBuffer {
             });
             instance_desc.setInstanceCount(desc.instance_count as usize);
         }
+        let instance_base = unsafe {
+            &*(instance_desc.as_ref() as *const MTL4InstanceAccelerationStructureDescriptor
+                as *const objc2_metal::MTLAccelerationStructureDescriptor)
+        };
+        super::accel::set_accel_usage(instance_base, desc.flags);
 
         self.end_active_encoders();
         let encoder = self
@@ -1731,7 +1547,7 @@ impl MetalCommandBuffer {
 
         unsafe {
             encoder.buildAccelerationStructure_descriptor_scratchBuffer(
-                &vk_as,
+                &mtl_as,
                 &*(instance_desc.as_ref() as *const MTL4InstanceAccelerationStructureDescriptor
                     as *const objc2_metal::MTL4AccelerationStructureDescriptor),
                 scratch_range,
@@ -1837,10 +1653,7 @@ fn visibility_from_hazard(hazard: HazardFlags) -> MTL4VisibilityOptions {
         return MTL4VisibilityOptions::None;
     }
 
-    // DRAW_ARGUMENTS: GPU-written indirect args need Device visibility so the command
-    //   processor sees the updated draw/dispatch parameters.
-    // DEPTH_STENCIL: compute-written depth needs Device visibility to invalidate HiZ.
-    // DESCRIPTORS: descriptor heap write needs Device + ResourceAlias for alias ordering.
+    // Device visibility is required for GPU-written arguments, depth, and descriptor aliases.
     let needs_device = hazard.intersects(
         HazardFlags::DRAW_ARGUMENTS | HazardFlags::DEPTH_STENCIL | HazardFlags::DESCRIPTORS,
     );

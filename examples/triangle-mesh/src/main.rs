@@ -9,8 +9,8 @@
 
 use kiln_app::{Example, FrameCtx};
 use kiln_rhi::{
-    ColorTarget, CommandBuffer, Cull, Device, Format, MeshletPso, MeshletPsoDesc, SampleCount,
-    ShaderStage, Topology,
+    ColorTarget, CommandBuffer, Cull, Device, Format, GpuAddress, MeshletPso, MeshletPsoDesc,
+    SampleCount, ShaderStage, Topology,
 };
 
 // Same shader as the headless test. Note the digit-free `COLOR` varying semantic:
@@ -58,7 +58,6 @@ impl Example for TriangleMesh {
                     cull: Cull::None,
                     support_dual_source_blending: false,
                     blendstate: None,
-                    root_constant_size: 16,
                     label: Some("triangle-mesh".into()),
                 },
                 &ms,
@@ -74,7 +73,7 @@ impl Example for TriangleMesh {
 
     fn render(&mut self, _ctx: &FrameCtx, cmd: &mut CommandBuffer) {
         cmd.set_meshlet_pipeline(&self.pso);
-        cmd.draw_meshlets(None, None, 1, 1, 1);
+        cmd.draw_meshlets(GpuAddress::NULL, 1, 1, 1);
     }
 }
 

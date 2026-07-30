@@ -26,8 +26,8 @@ use kiln_rhi::{
     AddressMode, BlendAttachment, BlendFactor, BlendOp, BlendState, BufferDesc, ColorTarget,
     ColorWriteMask, CommandBuffer, Cull, Device, FilterMode, Format, GpuAddress, GpuAllocation,
     GpuBuffer, GraphicsPso, GraphicsPsoDesc, MAX_FRAMES_IN_FLIGHT, MemoryType, RhiError, RhiResult,
-    SampleCount, Sampler, SamplerDesc, SamplerHandle, ShaderStage, StageFlags, Texture, TextureDesc,
-    TextureDimension, TextureHandle, TextureUsage, Topology, gpu_struct,
+    SampleCount, Sampler, SamplerDesc, SamplerHandle, ShaderStage, StageFlags, Texture,
+    TextureDesc, TextureDimension, TextureHandle, TextureUsage, Topology, gpu_struct,
 };
 
 gpu_struct! {
@@ -175,7 +175,6 @@ impl EguiRenderer {
                 depth_format: None,
                 sample_count: SampleCount::S1,
                 // Two root pointers (vertex + pixel share one EguiRoot): 2 * 8 bytes.
-                root_constant_size: (std::mem::size_of::<GpuAddress>() * 2) as u32,
                 // egui is not consistent about winding; never cull.
                 cull: Cull::None,
                 blendstate: Some(blend.clone()),
@@ -268,9 +267,24 @@ impl EguiRenderer {
         // Grow (reuse) this slot's buffers to fit. Safe to free the old ones: the slot's previous
         // frame has retired (the swapchain fence was waited at acquire time).
         let frame = &mut self.frames[slot];
-        grow(device, &mut frame.vtx, total_verts * VERTEX_SIZE, "egui-vtx")?;
-        grow(device, &mut frame.idx, total_indices * INDEX_SIZE, "egui-idx")?;
-        grow(device, &mut frame.root, mesh_count * ROOT_STRIDE, "egui-root")?;
+        grow(
+            device,
+            &mut frame.vtx,
+            total_verts * VERTEX_SIZE,
+            "egui-vtx",
+        )?;
+        grow(
+            device,
+            &mut frame.idx,
+            total_indices * INDEX_SIZE,
+            "egui-idx",
+        )?;
+        grow(
+            device,
+            &mut frame.root,
+            mesh_count * ROOT_STRIDE,
+            "egui-root",
+        )?;
 
         let vtx = frame.vtx.as_ref().unwrap();
         let idx = frame.idx.as_ref().unwrap();
@@ -280,7 +294,10 @@ impl EguiRenderer {
         let (root_cpu, root_gpu) = (cpu(root), root.gpu());
 
         let [fb_w, fb_h] = framebuffer_px;
-        let screen_size = [fb_w as f32 / pixels_per_point, fb_h as f32 / pixels_per_point];
+        let screen_size = [
+            fb_w as f32 / pixels_per_point,
+            fb_h as f32 / pixels_per_point,
+        ];
         let flags = self.srgb_target as u32;
 
         // Match the blend baked into the PSO so `set_graphics_pipeline` hits the cached pipeline
@@ -347,7 +364,6 @@ impl EguiRenderer {
 
             cmd.set_scissor(sx, sy, sw, sh);
             cmd.draw_indexed(
-                root_addr,
                 root_addr,
                 idx_gpu.offset(i_off * INDEX_SIZE),
                 mesh.indices.len() as u32,
@@ -463,7 +479,13 @@ fn scissor(clip: egui::Rect, ppp: f32, fb_w: u32, fb_h: u32) -> Option<(i32, i32
 }
 
 /// Copy a `[pw, ph]` RGBA8 patch into `shadow` (a `stride`-wide RGBA8 image) at `[px, py]`.
-fn blit(shadow: &mut [u8], stride: usize, [px, py]: [usize; 2], [pw, ph]: [usize; 2], patch: &[u8]) {
+fn blit(
+    shadow: &mut [u8],
+    stride: usize,
+    [px, py]: [usize; 2],
+    [pw, ph]: [usize; 2],
+    patch: &[u8],
+) {
     for row in 0..ph {
         let src = &patch[row * pw * 4..(row + 1) * pw * 4];
         let dst_start = ((py + row) * stride + px) * 4;
@@ -494,7 +516,7 @@ fn create_texture(
     let sa = device.texture_size_align(&desc)?;
     let mem = device.malloc_aligned(sa.size, sa.align, MemoryType::GpuOnly)?;
     let texture = device.create_texture(&desc, mem.gpu())?;
-    let tex_id = device.texture_view_descriptor(&texture, &Default::default())?;
+    let tex_id = device.create_sampled_view(&texture, &Default::default())?;
     let handle = device.bindless_texture_handle(tex_id);
     Ok(ManagedTexture {
         texture,

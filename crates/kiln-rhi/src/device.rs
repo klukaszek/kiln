@@ -14,7 +14,7 @@ use crate::shader::{ShaderModule, ShaderModuleDesc, ShaderModuleInner};
 use crate::surface::{Surface, SurfaceDesc};
 use crate::swapchain::{Swapchain, SwapchainDesc};
 use crate::sync::TimelineSemaphore;
-use crate::texture::{GpuViewDesc, Texture, TextureDesc, TextureSizeAlign};
+use crate::texture::{Texture, TextureDesc, TextureSizeAlign, TextureViewDesc};
 use crate::types::{BlasDesc, ClipSpaceY, GpuAddress, TlasDesc, TlasInstance};
 
 /// Which GPU backend to use.
@@ -52,7 +52,8 @@ pub struct DeviceDesc {
     /// Preferred backend. `None` uses the default for the platform.
     pub preferred_backend: Option<Backend>,
     /// Preferred bindless mode. `None` lets the backend choose the best available mode.
-    /// Vulkan requires DescriptorBuffer to align with Aaltonen; if unsupported, device creation fails.
+    /// Vulkan requires descriptor buffers and mutable image descriptors; device creation fails if
+    /// either is unavailable.
     pub bindless_mode: Option<BindlessMode>,
 }
 
@@ -141,12 +142,7 @@ impl Device {
         backend_dispatch!(&self.inner, DeviceInner, d => d.bindless_mode())
     }
 
-    /// Clip-space Y convention — always [`ClipSpaceY::Up`].
-    ///
-    /// Kiln normalizes clip space to Y-up (Metal/D3D convention) on every backend, so
-    /// the same NDC renders identically everywhere and a single Y-up projection works
-    /// without per-backend branches. The Vulkan backend achieves this with a
-    /// negative-height viewport (see `set_viewport`); Metal is Y-up natively.
+    /// Clip-space Y convention. The RHI normalizes both backends to Y-up.
     pub fn clip_space_y(&self) -> ClipSpaceY {
         ClipSpaceY::Up
     }
@@ -192,27 +188,26 @@ impl Device {
         memory: MemoryType,
     ) -> RhiResult<GpuAllocation> {
         let align = align.max(1);
-        assert!(align.is_power_of_two(), "alignment must be a power of two");
 
+        let backing_size = size
+            .max(1)
+            .checked_add(align - 1)
+            .ok_or_else(|| RhiError::AllocationFailed("allocation size overflow".into()))?;
         let buffer = self.create_buffer(&BufferDesc {
-            size,
+            size: backing_size,
             memory,
             label: None,
         })?;
+        let offset = (align - buffer.gpu().0 % align) % align;
 
-        debug_assert_eq!(
-            buffer.gpu().0 & (align - 1),
-            0,
-            "backend returned a misaligned GPU address for malloc_aligned",
-        );
-
-        Ok(GpuAllocation { buffer, size })
+        Ok(GpuAllocation {
+            buffer,
+            offset,
+            size,
+        })
     }
 
-    /// Allocate a [`MemoryType::Default`] buffer sized for `data` and upload the contents in
-    /// one step. The one-shot form of `malloc` + `GpuAllocation::upload_slice` for persistent
-    /// scene data (vertex buffers, material tables, lookup tables). For GPU-only resources or
-    /// transient per-frame arguments use `malloc`/`malloc_aligned` or a bump allocator.
+    /// Allocate mapped memory and upload `data`.
     pub fn upload_slice<T: GpuPod>(&self, data: &[T]) -> RhiResult<GpuAllocation> {
         let size = std::mem::size_of_val(data).max(1) as u64;
         let alloc = self.malloc(size, MemoryType::Default)?;
@@ -237,8 +232,7 @@ impl Device {
         backend_dispatch!(&self.inner, DeviceInner, d => d.texture_size_align(desc))
     }
 
-    /// Create a texture in caller-owned GPU memory. `texture_gpu` must point to an allocation
-    /// meeting `texture_size_align(desc)` and be kept alive while the texture is live.
+    /// Create a texture in caller-owned GPU memory.
     pub fn create_texture(
         &self,
         desc: &TextureDesc,
@@ -247,23 +241,22 @@ impl Device {
         backend_dispatch!(&self.inner, DeviceInner, d => d.create_texture(desc, texture_gpu))
     }
 
-    /// Register a sampled (SRV) view of `source` in the bindless heap, returning its `TextureId`.
-    /// The view shares `source`'s storage; using the id after `source` is destroyed is UB.
-    pub fn texture_view_descriptor(
+    /// Create a sampled view. The source texture must outlive the returned handle.
+    pub fn create_sampled_view(
         &self,
         source: &Texture,
-        view: &GpuViewDesc,
+        view: &TextureViewDesc,
     ) -> RhiResult<crate::types::TextureId> {
-        backend_dispatch!(&self.inner, DeviceInner, d => d.texture_view_descriptor(source, view))
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_sampled_view(source, view))
     }
 
-    /// Register a storage (UAV) view of `source` in the bindless heap, returning its `TextureId`.
-    pub fn rw_texture_view_descriptor(
+    /// Create a storage view. The source texture must outlive the returned handle.
+    pub fn create_storage_view(
         &self,
         source: &Texture,
-        view: &GpuViewDesc,
+        view: &TextureViewDesc,
     ) -> RhiResult<crate::types::TextureId> {
-        backend_dispatch!(&self.inner, DeviceInner, d => d.rw_texture_view_descriptor(source, view))
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_storage_view(source, view))
     }
 
     /// Create a sampler.
@@ -271,17 +264,12 @@ impl Device {
         backend_dispatch!(&self.inner, DeviceInner, d => d.create_sampler(desc))
     }
 
-    /// Bindless handle to store in a [`TextureHandle`](crate::TextureHandle) root field for the
-    /// sampled view `id` from [`texture_view_descriptor`](Self::texture_view_descriptor). This is
-    /// the texture analogue of [`AccelerationStructure::gpu`](crate::AccelerationStructure::gpu):
-    /// the heap index on Vulkan, the `gpuResourceID` on Metal. The shader samples it with
-    /// `root.tex.Sample(root.smp, uv)`.
+    /// Convert a sampled view ID into a shader-visible handle.
     pub fn bindless_texture_handle(&self, id: crate::types::TextureId) -> GpuAddress {
         backend_dispatch!(&self.inner, DeviceInner, d => d.bindless_texture_handle(id))
     }
 
-    /// Bindless handle to store in a [`SamplerHandle`](crate::SamplerHandle) root field for the
-    /// sampler `id` from [`create_sampler`](Self::create_sampler).
+    /// Convert a sampler ID into a shader-visible handle.
     pub fn bindless_sampler_handle(&self, id: crate::types::SamplerId) -> GpuAddress {
         backend_dispatch!(&self.inner, DeviceInner, d => d.bindless_sampler_handle(id))
     }
@@ -291,10 +279,7 @@ impl Device {
         backend_dispatch!(&self.inner, DeviceInner, d => d.create_shader_module(desc))
     }
 
-    /// Create a graphics pipeline state object.
-    ///
-    /// Matches the spec's `gpuCreateGraphicsPipeline(vertexIR, pixelIR, desc)` — shaders are
-    /// arguments, not part of `desc`. `vertex`/`pixel` must outlive only this call.
+    /// Create a graphics pipeline.
     pub fn create_graphics_pso(
         &self,
         desc: &GraphicsPsoDesc,
@@ -317,9 +302,7 @@ impl Device {
         }
     }
 
-    /// Create a compute pipeline state object.
-    ///
-    /// Matches the spec's `gpuCreateComputePipeline(computeIR)`.
+    /// Create a compute pipeline.
     pub fn create_compute_pso(
         &self,
         desc: &ComputePsoDesc,
@@ -335,9 +318,7 @@ impl Device {
         }
     }
 
-    /// Create a mesh-shader graphics pipeline (spec: `gpuCreateGraphicsMeshletPipeline`).
-    /// Requires `VK_EXT_mesh_shader` on Vulkan; returns `RhiError::Unsupported` if mesh
-    /// shaders are unavailable.
+    /// Create a mesh-shader graphics pipeline.
     pub fn create_meshlet_pso(
         &self,
         desc: &MeshletPsoDesc,
@@ -431,41 +412,27 @@ impl Device {
         backend_dispatch!(&self.inner, DeviceInner, d => d.create_timeline_semaphore(initial_value))
     }
 
-    // -- GPU timestamp queries --
-
-    /// Create a [`QueryPool`] with `count` GPU timestamp slots.
-    ///
-    /// Typical use is two slots per frame-in-flight: write a timestamp at the start and end of
-    /// the frame's command buffer, then read the delta back once that frame's fence has signalled.
-    /// See [`CommandBuffer::write_timestamp`], [`read_timestamps`](Self::read_timestamps), and
-    /// [`gpu_elapsed_ms`](Self::gpu_elapsed_ms).
+    /// Create a GPU timestamp pool.
     pub fn create_query_pool(&self, count: u32) -> RhiResult<QueryPool> {
         backend_dispatch!(&self.inner, DeviceInner, d => d.create_query_pool(count))
     }
 
-    /// Destroy a query pool. Like other RHI resources, pools are freed explicitly; the pool must
-    /// not be in use by an in-flight command buffer.
+    /// Destroy a query pool after its GPU work completes.
     pub fn destroy_query_pool(&self, pool: QueryPool) {
         backend_dispatch!(&self.inner, DeviceInner, d => d.destroy_query_pool(pool))
     }
 
-    /// Nanoseconds per timestamp tick for this device. Multiply a tick delta from
-    /// [`read_timestamps`](Self::read_timestamps) by this to get nanoseconds.
+    /// Nanoseconds per timestamp tick.
     pub fn timestamp_period_ns(&self) -> f64 {
         backend_dispatch!(&self.inner, DeviceInner, d => d.timestamp_period_ns())
     }
 
-    /// Read back all raw timestamp tick values from `pool`. The GPU work that wrote the
-    /// timestamps must have completed (e.g. the frame's fence has been waited) before calling;
-    /// stale or never-written slots read back as `0`.
+    /// Read timestamp ticks after the writing GPU work completes.
     pub fn read_timestamps(&self, pool: &QueryPool) -> RhiResult<Vec<u64>> {
         backend_dispatch!(&self.inner, DeviceInner, d => d.read_timestamps(pool))
     }
 
-    /// Convenience over [`read_timestamps`](Self::read_timestamps): elapsed GPU time in
-    /// milliseconds between timestamp slots `begin` and `end`. Returns `Ok(None)` when either
-    /// slot is unwritten (reads back `0`) or the values are non-monotonic, which happens for the
-    /// first few frames before a slot's pool has been written and waited on.
+    /// Elapsed milliseconds between two timestamp slots, or `None` for invalid samples.
     pub fn gpu_elapsed_ms(&self, pool: &QueryPool, begin: u32, end: u32) -> RhiResult<Option<f64>> {
         let ticks = self.read_timestamps(pool)?;
         let (Some(&b), Some(&e)) = (ticks.get(begin as usize), ticks.get(end as usize)) else {

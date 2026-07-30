@@ -1,5 +1,7 @@
 use super::barrier::{to_vk_access_flags, to_vk_stage_flags};
-use super::device::{SharedAllocations, SharedTextures, build_accel_flags_to_vk};
+use super::device::{
+    SharedAllocations, SharedTextures, build_accel_flags_to_vk, geometry_flags_to_vk,
+};
 use crate::barrier::{HazardFlags, StageFlags};
 use crate::command::{
     DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectMultiArgs, LoadOp, RenderPassDesc,
@@ -21,39 +23,22 @@ use ash::{
 pub struct VulkanCommandBuffer {
     pub(crate) command_buffer: vk::CommandBuffer,
     pub(crate) device: ash::Device,
-    /// Swapchain image views for resolving RenderTarget::SwapchainImage
     pub(crate) swapchain_image_views: Vec<vk::ImageView>,
     pub(crate) swapchain_images: Vec<vk::Image>,
     pub(crate) depth_image_view: vk::ImageView,
-    /// Current pipeline layout for push constants
     pub(crate) pipeline_layout: vk::PipelineLayout,
     pub(crate) descriptor_buffer_loader: Option<descriptor_buffer::Device>,
     pub(crate) descriptor_buffer_binding: Option<vk::DescriptorBufferBindingInfoEXT<'static>>,
-    pub(crate) active_descriptor_buffer_offset: u64,
-    /// Root constant size of the current pipeline
-    pub(crate) root_constant_size: u32,
-    /// Active push-constant stage mask (set by pipeline bind)
     pub(crate) push_constant_stages: vk::ShaderStageFlags,
-    /// Active blend state used for pipeline selection.
     pub(crate) current_blend_state: BlendState,
-    /// Pending split barrier producer state.
     pub(crate) pending_split_barrier: Option<(StageFlags, HazardFlags)>,
-    /// Pending value waits consumed at queue submit.
     pub(crate) pending_value_waits: Vec<WaitValueDesc>,
-    /// Pending value signals consumed at queue submit.
     pub(crate) pending_value_signals: Vec<SignalValueDesc>,
-    /// Allocation registry for GPU pointer resolution
     pub(crate) allocations: SharedAllocations,
-    /// Shared texture storage for RenderTarget::Texture
     pub(crate) textures: SharedTextures,
-    /// Mesh shader extension loader (VK_EXT_mesh_shader).
     pub(crate) mesh_shader: Option<vk_mesh_shader::Device>,
-    /// Acceleration structure extension loader (VK_KHR_acceleration_structure).
     pub(crate) acceleration_structure: Option<vk_accel_structure::Device>,
-    /// Device limit used as the native indirect-count upper bound.
     pub(crate) max_draw_indirect_count: u32,
-    /// Swapchain image indices already targeted by a render pass this command buffer, so a second
-    /// pass enters from `COLOR_ATTACHMENT_OPTIMAL` (not `PRESENT_SRC_KHR`) with a write->read barrier.
     pub(crate) rendered_swapchain_images: Vec<u32>,
 }
 
@@ -82,7 +67,7 @@ impl VulkanCommandBuffer {
                 pipeline_layout,
                 0,
                 &[0],
-                &[self.active_descriptor_buffer_offset],
+                &[0],
             );
         }
     }
@@ -137,15 +122,12 @@ impl VulkanCommandBuffer {
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc) {
         let cmd = self.command_buffer;
 
-        // Transition swapchain images to COLOR_ATTACHMENT_OPTIMAL before rendering.
         for ca in &desc.color_attachments {
             if let RenderTarget::SwapchainImage(idx) = ca.target {
                 let image = self.swapchain_images[idx as usize];
                 let first_pass = !self.rendered_swapchain_images.contains(&idx);
-                // First pass on this image: UNDEFINED (Clear/DontCare) or PRESENT_SRC_KHR (Load
-                // resumes a presented image), ordered loosely from the top of pipe. A later pass
-                // finds it in COLOR_ATTACHMENT_OPTIMAL with the prior pass's writes pending, so
-                // transition from that layout and add a write->read dependency for the Load.
+                // The first pass starts from UNDEFINED or PRESENT; later passes resume from the
+                // previous color-attachment write.
                 let (old_layout, src_stage, src_access, extra_dst_access) = if first_pass {
                     let old = match ca.load_op {
                         LoadOp::Load => vk::ImageLayout::PRESENT_SRC_KHR,
@@ -195,7 +177,6 @@ impl VulkanCommandBuffer {
             }
         }
 
-        // Build color attachments for dynamic rendering
         let color_attachments: Vec<vk::RenderingAttachmentInfo> = desc
             .color_attachments
             .iter()
@@ -232,7 +213,6 @@ impl VulkanCommandBuffer {
             })
             .collect();
 
-        // Build depth attachment
         let depth_attachment = desc.depth_attachment.as_ref().map(|da| {
             let image_view = match da.target {
                 RenderTarget::SwapchainImage(_) => self.depth_image_view,
@@ -291,12 +271,6 @@ impl VulkanCommandBuffer {
         unsafe {
             self.device.cmd_begin_rendering(cmd, &rendering_info);
 
-            // The graphics pipelines declare depth/stencil/bias as dynamic state, so a draw is
-            // only valid once these have been set on the command buffer. Establish safe defaults
-            // here (depth/stencil off, no depth bias) so a draw needs no explicit configuration;
-            // `set_depth_stencil_state` overrides the depth/stencil ones when the caller cares.
-            // `DEPTH_BIAS_ENABLE` in particular is set nowhere else, so without this every draw
-            // trips a validation error.
             self.device.cmd_set_depth_test_enable(cmd, false);
             self.device.cmd_set_depth_write_enable(cmd, false);
             self.device
@@ -310,10 +284,6 @@ impl VulkanCommandBuffer {
         unsafe {
             self.device.cmd_end_rendering(self.command_buffer);
         }
-
-        // Transition swapchain images to PRESENT_SRC_KHR after rendering
-        // This is a simplification -- in practice, the caller should manage this
-        // but for the common case of rendering to swapchain, we handle it here.
     }
 
     pub fn set_graphics_pipeline(&mut self, pso: &GraphicsPso) {
@@ -327,7 +297,6 @@ impl VulkanCommandBuffer {
             vk::PipelineBindPoint::GRAPHICS,
             pipeline,
             vk_pso.pipeline_layout,
-            vk_pso.root_constant_size,
             vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
         );
     }
@@ -342,43 +311,24 @@ impl VulkanCommandBuffer {
             vk::PipelineBindPoint::COMPUTE,
             vk_pso.pipeline,
             vk_pso.pipeline_layout,
-            vk_pso.root_constant_size,
             vk::ShaderStageFlags::COMPUTE,
         );
     }
 
-    /// Bind a pipeline + descriptor buffer and record root-constant state for subsequent
-    /// `set_root_table` / `set_compute_root` push-constant writes.
     fn bind_pipeline(
         &mut self,
         bind_point: vk::PipelineBindPoint,
         pipeline: vk::Pipeline,
         pipeline_layout: vk::PipelineLayout,
-        root_constant_size: u32,
         push_constant_stages: vk::ShaderStageFlags,
     ) {
         self.pipeline_layout = pipeline_layout;
-        self.root_constant_size = root_constant_size;
         self.push_constant_stages = push_constant_stages;
         unsafe {
             self.device
                 .cmd_bind_pipeline(self.command_buffer, bind_point, pipeline);
         }
         self.bind_descriptor_buffer(bind_point, pipeline_layout);
-    }
-
-    pub fn set_active_texture_heap_ptr(&mut self, ptr: GpuAddress) {
-        let binding = self
-            .descriptor_buffer_binding
-            .as_ref()
-            .expect("Descriptor buffer binding missing in descriptor-buffer mode");
-        if ptr.0 < binding.address {
-            panic!(
-                "Active texture heap pointer {:#x} is before descriptor heap base {:#x}",
-                ptr.0, binding.address
-            );
-        }
-        self.active_descriptor_buffer_offset = ptr.0 - binding.address;
     }
 
     pub fn set_depth_stencil_state(&mut self, state: &DepthStencilState) {
@@ -394,7 +344,6 @@ impl VulkanCommandBuffer {
                 .cmd_set_depth_compare_op(cmd, compare_op_to_vk(state.depth_test));
             self.device.cmd_set_stencil_test_enable(cmd, stencil_enable);
 
-            // Per-face stencil ops (STENCIL_OP dynamic state, promoted in Vulkan 1.3)
             self.device.cmd_set_stencil_op(
                 cmd,
                 vk::StencilFaceFlags::FRONT,
@@ -412,7 +361,6 @@ impl VulkanCommandBuffer {
                 compare_op_to_vk(state.stencil_back.test),
             );
 
-            // Read/write masks are shared across faces in our model
             self.device.cmd_set_stencil_compare_mask(
                 cmd,
                 vk::StencilFaceFlags::FRONT_AND_BACK,
@@ -424,7 +372,6 @@ impl VulkanCommandBuffer {
                 state.stencil_write_mask as u32,
             );
 
-            // Per-face stencil reference values
             self.device.cmd_set_stencil_reference(
                 cmd,
                 vk::StencilFaceFlags::FRONT,
@@ -436,7 +383,6 @@ impl VulkanCommandBuffer {
                 state.stencil_back.reference as u32,
             );
 
-            // Depth bias (DEPTH_BIAS_ENABLE promoted in Vulkan 1.3)
             let bias_active = state.depth_bias != 0.0 || state.depth_bias_slope_factor != 0.0;
             self.device.cmd_set_depth_bias_enable(cmd, bias_active);
             if bias_active {
@@ -454,30 +400,8 @@ impl VulkanCommandBuffer {
         self.current_blend_state = _state.clone();
     }
 
-    pub fn set_root_data(&mut self, vertex_root: GpuAddress, pixel_root: GpuAddress) {
-        // Slang lowers a graphics/mesh stage's `uniform T*` to a single push-constant pointer at
-        // offset 0, and the vertex(/mesh) and fragment stages alias that one slot — independent
-        // per-stage roots aren't supported, so callers pass the same pointer for both. Mirror the
-        // Metal backend: push just the 8-byte shared root pointer, not the 32-byte MDI root table
-        // (which is only meaningful to `draw_indirect_multi`). Pushing the full table here both
-        // wrote the pixel root to the wrong offset (16, where no shader reads it) and demanded a
-        // 32-byte push-constant range, which NVIDIA rejected for the 16-byte layouts these draws use.
-        let root = if vertex_root.0 != 0 {
-            vertex_root
-        } else {
-            pixel_root
-        };
+    pub fn set_root_data(&mut self, root: GpuAddress) {
         let bytes = root.0.to_ne_bytes();
-        if bytes.len() > self.root_constant_size as usize {
-            panic!(
-                "Root pointer ({} bytes) exceeds pipeline limit ({} bytes)",
-                bytes.len(),
-                self.root_constant_size
-            );
-        }
-        if self.push_constant_stages.is_empty() {
-            panic!("No pipeline bound before set_root_data");
-        }
         unsafe {
             self.device.cmd_push_constants(
                 self.command_buffer,
@@ -491,19 +415,6 @@ impl VulkanCommandBuffer {
 
     pub fn set_compute_root(&mut self, root: GpuAddress) {
         let bytes = root.0.to_ne_bytes();
-        if bytes.len() > self.root_constant_size as usize {
-            panic!(
-                "Compute root pointer ({} bytes) exceeds pipeline limit ({} bytes)",
-                bytes.len(),
-                self.root_constant_size
-            );
-        }
-        if !self
-            .push_constant_stages
-            .contains(vk::ShaderStageFlags::COMPUTE)
-        {
-            panic!("No compute pipeline bound before set_compute_root");
-        }
         unsafe {
             self.device.cmd_push_constants(
                 self.command_buffer,
@@ -534,7 +445,6 @@ impl VulkanCommandBuffer {
     }
 
     pub fn draw_indexed(&mut self, indices: GpuAddress, index_count: u32, instance_count: u32) {
-        // Index format is always U32 — the spec has no IndexFormat concept.
         let (index_buffer, offset) = self.resolve_buffer(indices, index_count as u64 * 4);
         unsafe {
             self.device.cmd_bind_index_buffer(
@@ -586,14 +496,11 @@ impl VulkanCommandBuffer {
 
     pub fn draw_indirect_multi(
         &mut self,
-        vertex_root: GpuAddress,
-        vertex_stride: u32,
-        pixel_root: GpuAddress,
-        pixel_stride: u32,
+        root: GpuAddress,
         args: GpuAddress,
         draw_count: GpuAddress,
     ) {
-        self.set_root_table(vertex_root, vertex_stride, pixel_root, pixel_stride);
+        self.set_root_data(root);
         let stride = std::mem::size_of::<DrawIndirectMultiArgs>() as u32;
         let (arg_buffer, arg_offset, arg_remaining) =
             self.resolve_buffer_with_remaining(args, stride as u64);
@@ -614,41 +521,6 @@ impl VulkanCommandBuffer {
                 count_offset,
                 max_draw_count,
                 stride,
-            );
-        }
-    }
-
-    fn set_root_table(
-        &mut self,
-        vertex_root_base: GpuAddress,
-        vertex_stride: u32,
-        pixel_root_base: GpuAddress,
-        pixel_stride: u32,
-    ) {
-        let mut bytes = [0u8; 32];
-        bytes[0..8].copy_from_slice(&vertex_root_base.0.to_ne_bytes());
-        bytes[8..12].copy_from_slice(&vertex_stride.to_ne_bytes());
-        bytes[16..24].copy_from_slice(&pixel_root_base.0.to_ne_bytes());
-        bytes[24..28].copy_from_slice(&pixel_stride.to_ne_bytes());
-
-        if bytes.len() > self.root_constant_size as usize {
-            panic!(
-                "Root table ({} bytes) exceeds pipeline limit ({})",
-                bytes.len(),
-                self.root_constant_size
-            );
-        }
-        if self.push_constant_stages.is_empty() {
-            panic!("No pipeline bound before set_root_table");
-        }
-
-        unsafe {
-            self.device.cmd_push_constants(
-                self.command_buffer,
-                self.pipeline_layout,
-                self.push_constant_stages,
-                0,
-                &bytes,
             );
         }
     }
@@ -853,10 +725,8 @@ impl VulkanCommandBuffer {
 
         let mut src_stage = to_vk_stage_flags(src);
         let mut dst_stage = to_vk_stage_flags(dst);
-        // A hazard barrier is additive: it is a normal stage barrier (broad write→read
-        // visibility, matching `barrier()`) PLUS the hazard-specific access. Starting only
-        // from the hazard flags would make this *narrower* than the plain barrier and could
-        // drop general UAV write→read visibility.
+        // Hazard barriers retain the normal write-to-read dependency and add hazard-specific
+        // access masks.
         let src_access =
             vk::AccessFlags2::MEMORY_WRITE | to_vk_access_flags(hazard_for_access, true);
         let mut dst_access = vk::AccessFlags2::MEMORY_READ
@@ -864,8 +734,7 @@ impl VulkanCommandBuffer {
             | to_vk_access_flags(hazard_for_access, false);
 
         if use_descriptor_buffer_hazard {
-            // Descriptor buffer reads happen in shader stages; include them to satisfy access masks.
-            // `DESCRIPTOR_BUFFER_READ_EXT` is an extension access not subsumed by `MEMORY_READ`.
+            // Descriptor-buffer reads are not covered by MEMORY_READ.
             src_stage |= vk::PipelineStageFlags2::VERTEX_SHADER
                 | vk::PipelineStageFlags2::FRAGMENT_SHADER
                 | vk::PipelineStageFlags2::COMPUTE_SHADER;
@@ -926,12 +795,7 @@ impl VulkanCommandBuffer {
         min_depth: f32,
         max_depth: f32,
     ) {
-        // Normalize to a Y-up clip space (Metal/D3D convention) so the same NDC
-        // produces the same image on every backend. Vulkan's NDC is natively
-        // Y-down; a negative-height viewport (core since Vulkan 1.1) flips it,
-        // mapping NDC y=+1 to the top of the framebuffer like Metal. This nets to
-        // the same window-space transform as negating Y in the projection, so the
-        // front-face winding is unchanged (still CCW). See `Device::clip_space_y`.
+        // Use a negative-height viewport so Vulkan matches the RHI's Y-up clip space.
         let viewport = vk::Viewport {
             x,
             y: y + height,
@@ -965,7 +829,7 @@ impl VulkanCommandBuffer {
     }
 
     pub fn write_timestamp(&mut self, pool: vk::QueryPool, query: u32) {
-        // sync2 timestamp at BOTTOM_OF_PIPE; a start/end pair brackets wall-clock GPU time.
+        // Bracket GPU time with bottom-of-pipe timestamps.
         unsafe {
             self.device.cmd_write_timestamp2(
                 self.command_buffer,
@@ -1005,8 +869,6 @@ impl VulkanCommandBuffer {
         }
     }
 
-    // -- Mesh shader pipeline + draws --
-
     pub fn set_meshlet_pipeline(&mut self, pso: &MeshletPso) {
         let vk_pso = match &pso.inner {
             crate::pipeline::MeshletPsoInner::Vulkan(p) => p,
@@ -1018,18 +880,13 @@ impl VulkanCommandBuffer {
             vk::PipelineBindPoint::GRAPHICS,
             pipeline,
             vk_pso.pipeline_layout,
-            vk_pso.root_constant_size,
             vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::FRAGMENT,
         );
     }
 
     pub fn draw_meshlets(&mut self, x: u32, y: u32, z: u32) {
-        let loader = match &self.mesh_shader {
-            Some(l) => l.clone(),
-            None => {
-                log::warn!("draw_meshlets: VK_EXT_mesh_shader not available on this device");
-                return;
-            }
+        let Some(loader) = self.mesh_shader.as_ref() else {
+            return;
         };
         unsafe {
             loader.cmd_draw_mesh_tasks(self.command_buffer, x, y, z);
@@ -1038,14 +895,9 @@ impl VulkanCommandBuffer {
 
     /// `args` points to one `VkDrawMeshTasksIndirectCommandEXT` (x, y, z: u32 = 12 bytes).
     pub fn draw_meshlets_indirect(&mut self, args: GpuAddress) {
-        let loader = match &self.mesh_shader {
-            Some(l) => l.clone(),
-            None => {
-                log::warn!("draw_meshlets_indirect: VK_EXT_mesh_shader not available");
-                return;
-            }
+        let Some(loader) = self.mesh_shader.as_ref() else {
+            return;
         };
-        // Single indirect draw: stride = 3 × u32 = 12 bytes, count = 1.
         let stride = 12u32;
         let (buffer, offset) = self.resolve_buffer(args, stride as u64);
         unsafe {
@@ -1053,19 +905,11 @@ impl VulkanCommandBuffer {
         }
     }
 
-    // -- Acceleration structure builds --
-
-    // No `bind_acceleration_structure`: the TLAS is referenced bindlessly by its device address
-    // (`accel.gpu()`), carried in the root as a `DescriptorHandle<RaytracingAccelerationStructure>`
-    // and resolved in-shader via `OpConvertUToAccelerationStructureKHR`. See the design doc.
-
     pub fn build_blas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &BlasDesc) {
-        let Some((accel_loader, vk_as, scratch_address)) = self.resolve_accel(accel, "build_blas")
-        else {
+        let Some((accel_loader, vk_as, scratch_address)) = self.resolve_accel(accel) else {
             return;
         };
 
-        // Reconstruct geometry (same logic as create_blas; geometry is not stored to avoid lifetimes).
         let geometries: Vec<vk::AccelerationStructureGeometryKHR> = desc
             .meshes
             .iter()
@@ -1086,19 +930,10 @@ impl VulkanCommandBuffer {
                         .index_data(vk::DeviceOrHostAddressConstKHR {
                             device_address: m.index_buffer.0,
                         });
-                    // Carry the geometry flags through: an OPAQUE triangle is auto-committed by
-                    // `RayQuery::Proceed`, whereas a non-opaque one is only ever a *candidate* that
-                    // the shader must explicitly commit — so dropping OPAQUE here turns every hit
-                    // into a miss for the inline-ray-query path.
-                    let flags = if m.flags.contains(GeometryFlags::OPAQUE) {
-                        vk::GeometryFlagsKHR::OPAQUE
-                    } else {
-                        vk::GeometryFlagsKHR::empty()
-                    };
                     vk::AccelerationStructureGeometryKHR::default()
                         .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
                         .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
-                        .flags(flags)
+                        .flags(geometry_flags_to_vk(m.flags))
                 }
                 GeometryType::Aabbs => {
                     let aabbs = vk::AccelerationStructureGeometryAabbsDataKHR::default()
@@ -1106,15 +941,10 @@ impl VulkanCommandBuffer {
                             device_address: m.aabb_buffer.0,
                         })
                         .stride(std::mem::size_of::<vk::AabbPositionsKHR>() as u64);
-                    let flags = if m.flags.contains(GeometryFlags::OPAQUE) {
-                        vk::GeometryFlagsKHR::OPAQUE
-                    } else {
-                        vk::GeometryFlagsKHR::empty()
-                    };
                     vk::AccelerationStructureGeometryKHR::default()
                         .geometry_type(vk::GeometryTypeKHR::AABBS)
                         .geometry(vk::AccelerationStructureGeometryDataKHR { aabbs })
-                        .flags(flags)
+                        .flags(geometry_flags_to_vk(m.flags))
                 }
             })
             .collect();
@@ -1134,8 +964,6 @@ impl VulkanCommandBuffer {
             })
             .collect();
 
-        // Flags must match `create_blas` (which sized the pre-allocated scratch from them) and the
-        // scratch address comes from the structure itself — see `VulkanAccelerationStructure`.
         let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
             .flags(build_accel_flags_to_vk(desc.flags))
@@ -1155,7 +983,6 @@ impl VulkanCommandBuffer {
                 transform_offset: 0,
             })
             .collect();
-        // ash expects &[&[RangeInfo]] — one inner slice per build info.
         let range_infos_ref: &[vk::AccelerationStructureBuildRangeInfoKHR] = &range_infos;
         let build_range_infos: &[&[vk::AccelerationStructureBuildRangeInfoKHR]] =
             std::slice::from_ref(&range_infos_ref);
@@ -1170,8 +997,7 @@ impl VulkanCommandBuffer {
     }
 
     pub fn build_tlas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &TlasDesc) {
-        let Some((accel_loader, vk_as, scratch_address)) = self.resolve_accel(accel, "build_tlas")
-        else {
+        let Some((accel_loader, vk_as, scratch_address)) = self.resolve_accel(accel) else {
             return;
         };
 
@@ -1187,7 +1013,6 @@ impl VulkanCommandBuffer {
             });
         let geometries = [geometry];
 
-        // Flags must match `create_tlas` (scratch was sized from them); scratch comes from the AS.
         let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
             .flags(build_accel_flags_to_vk(desc.flags))
@@ -1215,18 +1040,15 @@ impl VulkanCommandBuffer {
         }
     }
 
-    /// Return the loader + raw `VkAccelerationStructureKHR` for a build command,
-    /// logging and returning `None` if the device lacks RT extensions or the handle
-    /// is not a Vulkan accel structure.
     fn resolve_accel(
         &self,
         accel: &crate::accel::AccelerationStructure,
-        op: &'static str,
-    ) -> Option<(vk_accel_structure::Device, vk::AccelerationStructureKHR, u64)> {
-        let Some(loader) = self.acceleration_structure.as_ref() else {
-            log::warn!("{op}: VK_KHR_acceleration_structure not available");
-            return None;
-        };
+    ) -> Option<(
+        vk_accel_structure::Device,
+        vk::AccelerationStructureKHR,
+        u64,
+    )> {
+        let loader = self.acceleration_structure.as_ref()?;
         match &accel.inner {
             #[cfg(feature = "vulkan")]
             crate::accel::AccelInner::Vulkan(a) => {

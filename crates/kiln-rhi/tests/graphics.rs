@@ -1,8 +1,8 @@
-//! Headless graphics path test (timed), driven by a backend-agnostic Slang shader.
+//! Headless graphics path tests driven by a backend-agnostic Slang shader.
 //!
 //! Renders a full-screen triangle into an offscreen RGBA8 texture, colouring every pixel
 //! from a pointer-first root struct, then reads the texture back and verifies it. Exercises
-//! the render-pass path (begin/end), graphics PSO creation, and the two-stage root binding.
+//! the render-pass path (begin/end), graphics PSO creation, and shared root binding.
 
 mod common;
 
@@ -52,7 +52,8 @@ fn graphics_fullscreen_color() {
     };
 
     let src = format!("{}{}", Root::SLANG, GFX_BODY);
-    let Some(vs) = kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
+    let Some(vs) =
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
     else {
         return;
     };
@@ -69,7 +70,6 @@ fn graphics_fullscreen_color() {
                     color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
                     depth_format: None,
                     sample_count: SampleCount::S1,
-                    root_constant_size: 16,
                     cull: Cull::None,
                     ..Default::default()
                 },
@@ -79,7 +79,6 @@ fn graphics_fullscreen_color() {
             .expect("create_graphics_pso")
     });
 
-    // Offscreen color target.
     let tex_desc = TextureDesc {
         width: SIZE,
         height: SIZE,
@@ -100,9 +99,7 @@ fn graphics_fullscreen_color() {
         .create_texture(&tex_desc, tex_mem.gpu())
         .expect("create_texture");
 
-    // Root color + readback buffer. This test deliberately uses a raw `malloc` for the
-    // root (the dual-pointer primitive); the other render tests source per-draw data
-    // from the bump allocator. See `graphics_root_from_bump_allocator`.
+    // Root color and readback buffer.
     let root = device
         .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
@@ -129,8 +126,7 @@ fn graphics_fullscreen_color() {
         cmd.set_graphics_pipeline(&pso);
         cmd.set_viewport(0.0, 0.0, SIZE as f32, SIZE as f32, 0.0, 1.0);
         cmd.set_scissor(0, 0, SIZE, SIZE);
-        // Vertex shader ignores the root; pixel shader reads the color. Same pointer for both.
-        cmd.draw(root.gpu(), root.gpu(), 3, 1, 0, 0);
+        cmd.draw(root.gpu(), 3, 1, 0, 0);
         cmd.end_render_pass();
 
         cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
@@ -142,10 +138,7 @@ fn graphics_fullscreen_color() {
         queue.wait_idle();
     });
 
-    // Every pixel should be opaque red.
     let pixels = readback.as_slice::<u8>().expect("read readback");
-    // Dump the render so it can be eyeballed (written before asserting, so a bad
-    // render still leaves an image to inspect).
     common::save_rgba_png("graphics_fullscreen_color", SIZE, SIZE, pixels);
     for px in 0..(SIZE * SIZE) as usize {
         let (r, g, b, a) = (
@@ -163,21 +156,17 @@ fn graphics_fullscreen_color() {
 
     device.free(root);
     device.free(readback);
-    // Release the transient render target: destroy the image before freeing its backing memory.
     device.destroy_texture(texture);
     device.free(tex_mem);
 }
 
-// ---------------------------------------------------------------------------
 // Shared helpers for the graphics-pipeline tests below.
-// ---------------------------------------------------------------------------
 
 /// Build a graphics PSO with one RGBA8 colour target, no depth, no culling.
 fn make_graphics_pso(
     device: &Device,
     vs: &ShaderModule,
     fs: &ShaderModule,
-    root_constant_size: u32,
     label: &str,
 ) -> GraphicsPso {
     device
@@ -187,7 +176,6 @@ fn make_graphics_pso(
                 color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
                 depth_format: None,
                 sample_count: SampleCount::S1,
-                root_constant_size,
                 cull: Cull::None,
                 label: Some(label.into()),
                 ..Default::default()
@@ -199,17 +187,16 @@ fn make_graphics_pso(
 }
 
 /// Draw `vertex_count × instance_count` into a fresh `size`×`size` RGBA8 texture
-/// (cleared to opaque black) and read the result back to CPU bytes. `root` is bound
-/// for both the vertex and pixel stages. The texture is transient.
+/// (cleared to opaque black) and read the result back to CPU bytes. `root` is shared
+/// by the vertex and pixel stages. The texture is transient.
 fn render_draw(
     device: &Device,
     pso: &GraphicsPso,
-    root: impl Into<Option<GpuAddress>>,
+    root: GpuAddress,
     size: u32,
     vertex_count: u32,
     instance_count: u32,
 ) -> Vec<u8> {
-    let root = root.into();
     let tex_desc = TextureDesc {
         width: size,
         height: size,
@@ -247,7 +234,7 @@ fn render_draw(
     cmd.set_graphics_pipeline(pso);
     cmd.set_viewport(0.0, 0.0, size as f32, size as f32, 0.0, 1.0);
     cmd.set_scissor(0, 0, size, size);
-    cmd.draw(root, root, vertex_count, instance_count, 0, 0);
+    cmd.draw(root, vertex_count, instance_count, 0, 0);
     cmd.end_render_pass();
 
     cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
@@ -260,7 +247,6 @@ fn render_draw(
 
     let pixels = readback.as_slice::<u8>().expect("read readback").to_vec();
     device.free(readback);
-    // Release the transient render target: destroy the image before freeing its backing memory.
     device.destroy_texture(texture);
     device.free(tex_mem);
     pixels
@@ -280,12 +266,7 @@ fn test_bump(device: &Device) -> BumpAllocator {
     BumpAllocator::new(buffer)
 }
 
-// ---------------------------------------------------------------------------
-// Clip-space orientation: Kiln normalizes every backend to Y-up NDC, so a quad in
-// the top-left NDC quadrant must land in the top-left of the read-back image. The
-// graphics-pipeline counterpart to mesh.rs's `mesh_clip_space_is_y_up`; both share
-// the viewport flip that does the normalization.
-// ---------------------------------------------------------------------------
+// Clip-space orientation: both backends use the RHI's Y-up NDC convention.
 
 const ORIENT_BODY: &str = /*slang*/
     r#"
@@ -323,13 +304,11 @@ fn graphics_clip_space_is_y_up() {
     else {
         return;
     };
-    let pso = make_graphics_pso(&device, &vs, &fs, 16, "orient");
+    let pso = make_graphics_pso(&device, &vs, &fs, "orient");
 
     const SIZE: u32 = 128;
-    // This shader reads no root data, so the draw's root pointer is NULL — a draw
-    // that carries nothing needs no allocation.
     let pixels = common::timed("graphics clip-space orientation · submit+wait", || {
-        render_draw(&device, &pso, None, SIZE, 6, 1)
+        render_draw(&device, &pso, GpuAddress::NULL, SIZE, 6, 1)
     });
     common::save_rgba_png("graphics_clip_space_is_y_up", SIZE, SIZE, &pixels);
 
@@ -353,12 +332,7 @@ fn graphics_clip_space_is_y_up() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Interpolated triangle: per-vertex RGB colours interpolated across the face.
-// Verifies barycentric interpolation and rasterization coverage (corners stay at
-// the clear colour). Orientation-independent: every check is symmetric about the
-// image centre.
-// ---------------------------------------------------------------------------
+// Interpolated triangle: verify barycentric colour interpolation and coverage.
 
 const TRI_BODY: &str = /*slang*/
     r#"
@@ -383,21 +357,21 @@ fn graphics_interpolated_triangle() {
         return;
     };
 
-    let Some(vs) = kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "vsMain", ShaderStage::Vertex)
+    let Some(vs) =
+        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "vsMain", ShaderStage::Vertex)
     else {
         return;
     };
-    let Some(fs) = kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "fsMain", ShaderStage::Pixel)
+    let Some(fs) =
+        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "fsMain", ShaderStage::Pixel)
     else {
         return;
     };
-    let pso = make_graphics_pso(&device, &vs, &fs, 16, "tri");
+    let pso = make_graphics_pso(&device, &vs, &fs, "tri");
 
     const SIZE: u32 = 128;
-    // Per-vertex colours come from the shader; the draw reads no root data, so its
-    // root pointer is NULL.
     let pixels = common::timed("graphics interpolated triangle · submit+wait", || {
-        render_draw(&device, &pso, None, SIZE, 3, 1)
+        render_draw(&device, &pso, GpuAddress::NULL, SIZE, 3, 1)
     });
     common::save_rgba_png("graphics_interpolated_triangle", SIZE, SIZE, &pixels);
 
@@ -406,7 +380,6 @@ fn graphics_interpolated_triangle() {
         (pixels[i], pixels[i + 1], pixels[i + 2])
     };
 
-    // 1) Corners are outside the inset triangle → clear (black).
     for (x, y) in [(0, 0), (SIZE - 1, 0), (0, SIZE - 1), (SIZE - 1, SIZE - 1)] {
         let (r, g, b) = at(x, y);
         assert!(
@@ -415,7 +388,6 @@ fn graphics_interpolated_triangle() {
         );
     }
 
-    // 2) Image centre (NDC origin) ≈ 0.5·red + 0.25·green + 0.25·blue ≈ (128,64,64).
     let (cr, cg, cb) = at(SIZE / 2, SIZE / 2);
     let near = |a: u8, b: i32| (a as i32 - b).abs() <= 6;
     assert!(
@@ -423,7 +395,6 @@ fn graphics_interpolated_triangle() {
         "centre interpolation off: got ({cr},{cg},{cb}), expected ~(128,64,64)"
     );
 
-    // 3) Each vertex colour is reached somewhere (interpolation endpoints).
     let (mut max_r, mut max_g, mut max_b) = ((0u8, 0u8, 0u8), (0u8, 0u8, 0u8), (0u8, 0u8, 0u8));
     for y in 0..SIZE {
         for x in 0..SIZE {
@@ -453,12 +424,7 @@ fn graphics_interpolated_triangle() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Instanced grid: a G×G instanced draw where each instance (SV_InstanceID) emits a
-// quad covering its own NDC cell, coloured by its instance coordinates. The
-// vertex-pipeline analogue of mesh.rs's `mesh_meshlet_grid`; verifies instancing,
-// SV_InstanceID, vertex-stage root reads, and per-instance placement.
-// ---------------------------------------------------------------------------
+// Instanced grid: each SV_InstanceID fills one NDC cell.
 
 const GRID: u32 = 4;
 const GRID_SIZE: u32 = 256;
@@ -473,11 +439,7 @@ const GRID_BODY: &str = /*slang*/
     r#"
 struct VOut { float4 pos : SV_Position; float4 color : COLOR; };
 
-// `cfg` is an ENTRY-POINT `uniform` parameter, the RHI's root model: Slang lowers it
-// to a push-constant pointer at offset 0 (Vulkan) / buffer(0) (Metal). A module-scope
-// `uniform T*` must NOT be used — it lowers to a `$Globals` UBO at set 0/binding 0,
-// which both collides with the bindless heap and is never fed the RHI's push-constant
-// root pointer, so the shader reads garbage. See docs/design/vulkan-binding-convention.md.
+// Entry-point uniforms are the RHI root-data convention.
 static const float2 CORNER[6] = {
     float2(0,0), float2(1,0), float2(0,1),
     float2(0,1), float2(1,0), float2(1,1),
@@ -509,7 +471,8 @@ fn graphics_instanced_grid() {
     };
 
     let src = format!("{}{}", GridCfg::SLANG, GRID_BODY);
-    let Some(vs) = kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
+    let Some(vs) =
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
     else {
         return;
     };
@@ -517,9 +480,8 @@ fn graphics_instanced_grid() {
     else {
         return;
     };
-    let pso = make_graphics_pso(&device, &vs, &fs, 16, "grid");
+    let pso = make_graphics_pso(&device, &vs, &fs, "grid");
 
-    // Per-draw config from the bump allocator (the vertex shader reads grid dim).
     let mut bump = test_bump(&device);
     let cfg = bump
         .alloc(std::mem::size_of::<GridCfg>() as u64, 16)
@@ -531,8 +493,7 @@ fn graphics_instanced_grid() {
     });
     common::save_rgba_png("graphics_instanced_grid", GRID_SIZE, GRID_SIZE, &pixels);
 
-    // Each instance (gx, gy) fills one cell. Y-up: gid.y = 0 is the bottom NDC cell
-    // → the bottom rows, so the pixel-row band for gy is (GRID-1-gy).
+    // Y-up maps gid.y = 0 to the bottom row band.
     let cell = GRID_SIZE / GRID; // 64 px
     let to_u8 = |k: u32| (((k as f32 + 0.5) / GRID as f32) * 255.0).round() as i32;
     let near = |a: u8, b: i32| (a as i32 - b).abs() <= 2;
@@ -554,13 +515,7 @@ fn graphics_instanced_grid() {
     device.destroy_buffer(bump.into_buffer());
 }
 
-// ---------------------------------------------------------------------------
-// Root data from the bump allocator: the doc's preferred path for per-draw GPU
-// arguments (NoGraphicsApi.md appendix). Renders the full-screen-colour shader but
-// sources its root struct from a transient `{ cpu, gpu }` bump allocation instead of
-// a dedicated `malloc`, proving the GPU actually dereferences a bump-provided
-// pointer. Uses blue to distinguish it from `graphics_fullscreen_color` (red).
-// ---------------------------------------------------------------------------
+// Root data from a transient bump allocation.
 
 #[test]
 fn graphics_root_from_bump_allocator() {
@@ -569,7 +524,8 @@ fn graphics_root_from_bump_allocator() {
     };
 
     let src = format!("{}{}", Root::SLANG, GFX_BODY);
-    let Some(vs) = kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
+    let Some(vs) =
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
     else {
         return;
     };
@@ -577,10 +533,9 @@ fn graphics_root_from_bump_allocator() {
     else {
         return;
     };
-    let pso = make_graphics_pso(&device, &vs, &fs, 16, "bump-root");
+    let pso = make_graphics_pso(&device, &vs, &fs, "bump-root");
 
-    // One CPU-mapped buffer behind a per-frame bump allocator; the root is a transient
-    // sub-allocation from it (the appendix's `myBumpAllocator.allocate<Data>()`).
+    // The root is a transient sub-allocation from one CPU-mapped buffer.
     let buffer = device
         .create_buffer(&BufferDesc {
             size: 4096,
@@ -603,7 +558,6 @@ fn graphics_root_from_bump_allocator() {
     });
     common::save_rgba_png("graphics_root_from_bump_allocator", SIZE, SIZE, &pixels);
 
-    // Every pixel opaque blue — the GPU read the colour from the bump allocation.
     for px in 0..(SIZE * SIZE) as usize {
         let (r, g, b, a) = (
             pixels[px * 4],

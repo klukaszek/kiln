@@ -1,25 +1,12 @@
 //! Shared helpers for the headless RHI integration tests.
-//!
-//! Each test binary pulls in this whole module but uses only part of it, so silence the
-//! per-binary "unused helper" warnings here rather than at every call site.
 #![allow(dead_code)]
 
-//!
-//! These tests drive the real backend (Metal 4 / Vulkan 1.3+) without a window or
-//! swapchain. When no usable GPU/driver is present (e.g. CI without a GPU), tests
-//! should *skip* rather than fail — use [`device_or_skip`] and bail out with
-//! `let Some(device) = common::device_or_skip() else { return; };`.
+//! Tests use the real backend without a window or swapchain and skip when no device is available.
 
 use kiln_rhi::compiler::SlangCompiler;
 use kiln_rhi::{Device, DeviceDesc};
 
-/// Create a headless device for testing, or `None` if no usable backend is available.
-///
-/// Uses the default backend for the compiled feature set (Vulkan when the `vulkan`
-/// feature is on, otherwise Metal). Validation layers are disabled so the tests don't
-/// depend on the Vulkan SDK / Metal validation being installed.
-/// Guard serializing GPU access across the parallel test threads in a binary. Held for the
-/// duration of each test so independent devices/queues don't submit concurrently.
+/// Serializes GPU access across test threads in the same binary.
 pub type GpuGuard = std::sync::MutexGuard<'static, ()>;
 
 /// Route `log` records (including the Vulkan validation callback) to stderr, once per process.
@@ -46,12 +33,8 @@ fn install_stderr_logger() {
 pub fn device_or_skip() -> Option<(Device, GpuGuard)> {
     use std::sync::Mutex;
     static GPU_LOCK: Mutex<()> = Mutex::new(());
-    // Recover from poisoning: a panicking test holds no GPU invariant we care about.
     let guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Opt in to backend validation (Vulkan validation layers / Metal validation) and routed
-    // log output with `KILN_VALIDATION=1 cargo test -- --nocapture`. Off by default so the tests
-    // don't depend on the validation layers being installed.
     let validation = std::env::var_os("KILN_VALIDATION").is_some();
     if validation {
         install_stderr_logger();
@@ -70,14 +53,6 @@ pub fn device_or_skip() -> Option<(Device, GpuGuard)> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Timing
-//
-// Every test reports exact runtimes so we can see how the RHI performs. Output
-// goes to stderr; run `cargo test -- --nocapture` to see it (it is hidden for
-// passing tests otherwise).
-// ---------------------------------------------------------------------------
 
 use std::time::{Duration, Instant};
 
@@ -104,49 +79,10 @@ pub fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// Run `iters` iterations of `f` (after one warm-up), printing total and per-iter timings.
-/// Use for throughput/latency of repeated RHI operations.
-pub fn bench(label: &str, iters: u32, mut f: impl FnMut()) {
-    assert!(iters > 0, "bench needs at least one iteration");
-    f(); // warm-up (not measured)
-    let start = Instant::now();
-    for _ in 0..iters {
-        f();
-    }
-    let total = start.elapsed();
-    let per = total / iters;
-    eprintln!(
-        "    ⏱  {label}: {iters} iters · total {} · {}/iter",
-        fmt_dur(total),
-        fmt_dur(per)
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Backend-agnostic shading via Slang
-//
-// Tests write ONE Slang source; `compile_shader` lowers it to whatever the active
-// device consumes (SPIR-V for Vulkan, metallib for Metal) and registers the module.
-// Tests never reference backend-specific shader formats.
-// ---------------------------------------------------------------------------
-
 /// True if the `slangc` compiler is available. Shader-path tests skip when it is not.
 pub fn slangc_available() -> bool {
     SlangCompiler::available()
 }
-
-// Shader compilation goes through the one concrete path, `kiln_rhi::compiler`: tests call
-// `kiln_rhi::compiler::compile_or_skip` / `compile_caps_or_skip` directly (they skip when `slangc`
-// is absent). `slangc_available` above gates whole tests on the compiler's presence.
-
-// ---------------------------------------------------------------------------
-// PNG output
-//
-// The graphics/mesh tests verify their render via pixel assertions, but it's
-// useful to *see* the output too. These helpers dump the read-back image to a
-// PNG so it can be eyeballed. Self-contained encoder — no image crate: 8-bit
-// RGBA, zlib "stored" (uncompressed) deflate. Tiny, but a fully valid PNG.
-// ---------------------------------------------------------------------------
 
 /// Write `rgba` (exactly `width * height * 4` bytes, row-major, `R8G8B8A8`) to
 /// `target/test-images/<name>.png` and return the path. Prints the path to

@@ -1,10 +1,10 @@
-//! Headless texture + sampler path tests (timed).
+//! Headless texture and sampler path tests.
 
 mod common;
 
 use kiln_rhi::{
-    ALL_LAYERS, ALL_MIPS, AddressMode, FilterMode, Format, GpuViewDesc, MemoryType, SampleCount,
-    SamplerDesc, StageFlags, TextureDesc, TextureDimension, TextureUsage,
+    ALL_LAYERS, ALL_MIPS, Format, MemoryType, SampleCount, StageFlags, TextureDesc,
+    TextureDimension, TextureUsage, TextureViewDesc,
 };
 
 const W: u32 = 64;
@@ -31,7 +31,7 @@ fn test_texture_desc() -> TextureDesc {
 
 /// Placement-allocate a texture, then register sampled + storage bindless views.
 #[test]
-fn texture_create_and_view_descriptors() {
+fn texture_create_and_views() {
     let Some((device, _gpu)) = common::device_or_skip() else {
         return;
     };
@@ -54,21 +54,21 @@ fn texture_create_and_view_descriptors() {
             .expect("create_texture")
     });
 
-    let view = GpuViewDesc {
+    let view = TextureViewDesc {
         format: None,
         base_mip: 0,
         mip_count: ALL_MIPS,
         base_layer: 0,
         layer_count: ALL_LAYERS,
     };
-    let sampled = common::timed("texture_view_descriptor (sampled)", || {
+    let sampled = common::timed("create_sampled_view", || {
         device
-            .texture_view_descriptor(&texture, &view)
+            .create_sampled_view(&texture, &view)
             .expect("sampled view")
     });
-    let storage = common::timed("rw_texture_view_descriptor (storage)", || {
+    let storage = common::timed("create_storage_view", || {
         device
-            .rw_texture_view_descriptor(&texture, &view)
+            .create_storage_view(&texture, &view)
             .expect("storage view")
     });
     assert_ne!(
@@ -78,33 +78,6 @@ fn texture_create_and_view_descriptors() {
 
     device.destroy_texture(texture);
     device.free(mem);
-}
-
-/// Sampler creation cost.
-#[test]
-fn sampler_creation() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
-
-    let desc = SamplerDesc {
-        min_filter: FilterMode::Linear,
-        mag_filter: FilterMode::Linear,
-        mip_filter: FilterMode::Linear,
-        address_u: AddressMode::ClampToEdge,
-        address_v: AddressMode::ClampToEdge,
-        address_w: AddressMode::ClampToEdge,
-        mip_lod_bias: 0.0,
-        max_anisotropy: None,
-        compare: None,
-        min_lod: 0.0,
-        max_lod: 0.0,
-        label: Some("rhi-test-sampler".into()),
-    };
-
-    let _sampler = common::timed("create_sampler", || {
-        device.create_sampler(&desc).expect("create_sampler")
-    });
 }
 
 /// Upload a pattern into a texture and read it straight back out — exercises both

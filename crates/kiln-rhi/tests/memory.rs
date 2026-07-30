@@ -1,7 +1,4 @@
-//! Headless memory + allocator tests (timed).
-//!
-//! Black-box successors to the unit tests that used to live in `src/memory.rs`.
-//! Every test reports exact runtimes; run with `cargo test -- --nocapture` to see them.
+//! Headless memory and allocator contract tests.
 
 mod common;
 
@@ -77,31 +74,7 @@ fn host_to_device_pointer_translates_with_offset() {
     device.free(allocation);
 }
 
-/// malloc/free throughput — a feel for raw allocation cost.
-#[test]
-fn malloc_free_throughput() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
-
-    common::bench("malloc(64 KiB) + free", 256, || {
-        let a = device
-            .malloc(64 * 1024, MemoryType::Default)
-            .expect("malloc");
-        device.free(a);
-    });
-}
-
-// ---------------------------------------------------------------------------
-// BumpAllocator — the per-frame transient allocator the doc reaches for in nearly
-// every example (see NoGraphicsApi.md appendix). It wraps one CPU-mapped GpuBuffer,
-// caches the GPU base once, and hands out dual `{ cpu, gpu }` pointers by bumping an
-// offset. These tests pin the contract: alignment, accounting, full-handling, reset
-// reuse, and that the cpu/gpu pair actually refer to the same memory.
-// ---------------------------------------------------------------------------
-
-/// Make a CPU-mapped `BumpAllocator` of `size` bytes, or `None` to skip.
-fn bump_or_skip(device: &kiln_rhi::Device, size: u64) -> Option<BumpAllocator> {
+fn bump(device: &kiln_rhi::Device, size: u64) -> BumpAllocator {
     let buffer = device
         .create_buffer(&BufferDesc {
             size,
@@ -109,7 +82,7 @@ fn bump_or_skip(device: &kiln_rhi::Device, size: u64) -> Option<BumpAllocator> {
             label: Some("bump".into()),
         })
         .expect("create_buffer(Default)");
-    Some(BumpAllocator::new(buffer))
+    BumpAllocator::new(buffer)
 }
 
 /// Allocations honour alignment and accounting advances exactly: each chunk lands at
@@ -119,9 +92,7 @@ fn bump_alloc_aligns_and_accounts() {
     let Some((device, _gpu)) = common::device_or_skip() else {
         return;
     };
-    let Some(mut bump) = bump_or_skip(&device, 64 * 1024) else {
-        return;
-    };
+    let mut bump = bump(&device, 64 * 1024);
 
     assert_eq!(bump.capacity(), 64 * 1024, "capacity is the backing size");
     assert_eq!(bump.used(), 0, "fresh allocator has used nothing");
@@ -155,9 +126,7 @@ fn bump_alloc_cpu_gpu_correspond() {
     let Some((device, _gpu)) = common::device_or_skip() else {
         return;
     };
-    let Some(mut bump) = bump_or_skip(&device, 4096) else {
-        return;
-    };
+    let mut bump = bump(&device, 4096);
 
     // Bump past offset 0 so the correspondence is exercised at a non-base address.
     let _pad = bump.alloc(48, 16).expect("pad");
@@ -191,9 +160,7 @@ fn bump_full_returns_none() {
     let Some((device, _gpu)) = common::device_or_skip() else {
         return;
     };
-    let Some(mut bump) = bump_or_skip(&device, 256) else {
-        return;
-    };
+    let mut bump = bump(&device, 256);
 
     assert!(
         bump.alloc(512, 16).is_none(),
@@ -222,9 +189,7 @@ fn bump_reset_reuses_space() {
     let Some((device, _gpu)) = common::device_or_skip() else {
         return;
     };
-    let Some(mut bump) = bump_or_skip(&device, 4096) else {
-        return;
-    };
+    let mut bump = bump(&device, 4096);
 
     let first = bump.alloc(128, 16).expect("first");
     let (first_cpu, first_gpu) = (first.cpu, first.gpu);

@@ -1,4 +1,4 @@
-//! Headless mesh-shader path test (timed), driven by a backend-agnostic Slang shader.
+//! Headless mesh-shader path tests driven by a backend-agnostic Slang shader.
 //!
 //! A mesh shader emits a full-screen triangle; the pixel shader colours it from a
 //! pointer-first root. Renders to an offscreen texture and verifies via readback.
@@ -70,7 +70,6 @@ fn mesh_fullscreen_color() {
             cull: Cull::None,
             support_dual_source_blending: false,
             blendstate: None,
-            root_constant_size: 16,
             label: Some("mesh".into()),
         },
         &ms,
@@ -103,8 +102,7 @@ fn mesh_fullscreen_color() {
         .create_texture(&tex_desc, tex_mem.gpu())
         .expect("create_texture");
 
-    // Deliberately a raw `malloc` for the root (the dual-pointer primitive); the other
-    // mesh tests source per-draw data from the bump allocator.
+    // Root data is allocated directly; the other mesh tests use the bump allocator.
     let root = device
         .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
@@ -131,7 +129,7 @@ fn mesh_fullscreen_color() {
         cmd.set_meshlet_pipeline(&pso);
         cmd.set_viewport(0.0, 0.0, SIZE as f32, SIZE as f32, 0.0, 1.0);
         cmd.set_scissor(0, 0, SIZE, SIZE);
-        cmd.draw_meshlets(root.gpu(), root.gpu(), 1, 1, 1);
+        cmd.draw_meshlets(root.gpu(), 1, 1, 1);
         cmd.end_render_pass();
 
         cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
@@ -144,8 +142,6 @@ fn mesh_fullscreen_color() {
     });
 
     let pixels = readback.as_slice::<u8>().expect("read readback");
-    // Dump the render so it can be eyeballed (written before asserting, so a bad
-    // render still leaves an image to inspect).
     common::save_rgba_png("mesh_fullscreen_color", SIZE, SIZE, pixels);
     for px in 0..(SIZE * SIZE) as usize {
         let (r, g, b, a) = (
@@ -167,9 +163,7 @@ fn mesh_fullscreen_color() {
     device.free(readback);
 }
 
-// ---------------------------------------------------------------------------
 // Shared helpers for the mesh-shader tests below.
-// ---------------------------------------------------------------------------
 
 /// Build a meshlet PSO with one RGBA8 colour target and no culling, or `None`
 /// (skip) if the device doesn't support mesh shaders.
@@ -177,7 +171,6 @@ fn make_meshlet_pso(
     device: &Device,
     ms: &ShaderModule,
     fs: &ShaderModule,
-    root_constant_size: u32,
     label: &str,
 ) -> Option<MeshletPso> {
     match device.create_meshlet_pso(
@@ -191,7 +184,6 @@ fn make_meshlet_pso(
             cull: Cull::None,
             support_dual_source_blending: false,
             blendstate: None,
-            root_constant_size,
             label: Some(label.into()),
         },
         ms,
@@ -207,16 +199,15 @@ fn make_meshlet_pso(
 
 /// Dispatch `groups` meshlet workgroups of `pso` into a fresh `size`×`size` RGBA8
 /// texture (cleared to opaque black) and read the result back to CPU bytes. `root`
-/// is bound for both the mesh and pixel stages. The texture is transient; only the
+/// is shared by the mesh and pixel stages. The texture is transient; only the
 /// returned pixels outlive the call.
 fn render_meshlets(
     device: &Device,
     pso: &MeshletPso,
-    root: impl Into<Option<GpuAddress>>,
+    root: GpuAddress,
     size: u32,
     groups: [u32; 3],
 ) -> Vec<u8> {
-    let root = root.into();
     let tex_desc = TextureDesc {
         width: size,
         height: size,
@@ -254,7 +245,7 @@ fn render_meshlets(
     cmd.set_meshlet_pipeline(pso);
     cmd.set_viewport(0.0, 0.0, size as f32, size as f32, 0.0, 1.0);
     cmd.set_scissor(0, 0, size, size);
-    cmd.draw_meshlets(root, root, groups[0], groups[1], groups[2]);
+    cmd.draw_meshlets(root, groups[0], groups[1], groups[2]);
     cmd.end_render_pass();
 
     cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
@@ -286,12 +277,7 @@ fn test_bump(device: &Device) -> BumpAllocator {
     BumpAllocator::new(buffer)
 }
 
-// ---------------------------------------------------------------------------
-// Clip-space orientation: Kiln normalizes every backend to Y-up NDC, so a quad
-// in the top-left NDC quadrant must land in the top-left of the read-back image.
-// This is the regression guard for the Vulkan negative-viewport-height flip; it
-// would fail on a Y-down (un-normalized) backend.
-// ---------------------------------------------------------------------------
+// Clip-space orientation: both backends use the RHI's Y-up NDC convention.
 
 const ORIENT_BODY: &str = /*slang*/
     r#"
@@ -333,21 +319,16 @@ fn mesh_clip_space_is_y_up() {
     else {
         return;
     };
-    let Some(pso) = make_meshlet_pso(&device, &ms, &fs, 16, "orient") else {
+    let Some(pso) = make_meshlet_pso(&device, &ms, &fs, "orient") else {
         return;
     };
 
     const SIZE: u32 = 128;
-    // This shader reads no root data, so the draw's root pointer is NULL — a draw
-    // that carries nothing needs no allocation.
     let pixels = common::timed("mesh clip-space orientation · submit+wait", || {
-        render_meshlets(&device, &pso, None, SIZE, [1, 1, 1])
+        render_meshlets(&device, &pso, GpuAddress::NULL, SIZE, [1, 1, 1])
     });
     common::save_rgba_png("mesh_clip_space_is_y_up", SIZE, SIZE, &pixels);
 
-    // White only in the top-left quadrant (rows < SIZE/2 && cols < SIZE/2); black
-    // elsewhere. The quad edges fall on the half-pixel boundaries, so no pixel
-    // centre is ambiguous.
     let half = SIZE / 2;
     for y in 0..SIZE {
         for x in 0..SIZE {
@@ -369,13 +350,7 @@ fn mesh_clip_space_is_y_up() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Meshlet grid: a 4×4 dispatch where each meshlet (SV_GroupID.xy) emits a quad
-// covering its own NDC cell, coloured from its group id. Verifies 2D meshlet
-// dispatch, per-group placement, and that each meshlet rasterizes a clean cell —
-// none of which the single full-screen triangle exercises. Bigger target so each
-// cell is a comfortable 64×64 px.
-// ---------------------------------------------------------------------------
+// Meshlet grid: each SV_GroupID.xy fills one NDC cell.
 
 const GRID: u32 = 4;
 const GRID_SIZE: u32 = 256;
@@ -388,9 +363,7 @@ gpu_struct! {
 
 const GRID_BODY: &str = /*slang*/
     r#"
-// NB: digit-free `COLOR` semantic. Slang lowers a mesh output `COLOR0` to
-// `[[user(COLOR0)]]` but a fragment input `COLOR0` to `[[user(COLOR)]]`, so the
-// indexed form fails to link across separately-compiled mesh/fragment modules.
+// Use the unindexed COLOR semantic so separately compiled stages link in Slang.
 struct VOut { float4 pos : SV_Position; float4 color : COLOR; };
 
 [shader("mesh")]
@@ -408,7 +381,6 @@ void msMain(uint3 gid : SV_GroupID,
     float y0 = -1.0 + float(gid.y) * cell;
     float x1 = x0 + cell;
     float y1 = y0 + cell;
-    // Encode the meshlet's grid coordinates so each cell is uniquely identifiable.
     float4 col = float4((float(gid.x) + 0.5) / g, (float(gid.y) + 0.5) / g, 0.0, 1.0);
     VOut a; a.pos = float4(x0, y0, 0, 1); a.color = col;
     VOut b; b.pos = float4(x1, y0, 0, 1); b.color = col;
@@ -438,11 +410,10 @@ fn mesh_meshlet_grid() {
     else {
         return;
     };
-    let Some(pso) = make_meshlet_pso(&device, &ms, &fs, 16, "grid") else {
+    let Some(pso) = make_meshlet_pso(&device, &ms, &fs, "grid") else {
         return;
     };
 
-    // Per-draw config from the bump allocator (the mesh shader reads grid dim).
     let mut bump = test_bump(&device);
     let cfg = bump
         .alloc(std::mem::size_of::<GridCfg>() as u64, 16)
@@ -454,9 +425,7 @@ fn mesh_meshlet_grid() {
     });
     common::save_rgba_png("mesh_meshlet_grid", GRID_SIZE, GRID_SIZE, &pixels);
 
-    // Each meshlet (gx, gy) fills one cell. In the normalized Y-up clip space,
-    // gid.y = 0 is the bottom NDC cell → the *bottom* rows of the image, so the
-    // pixel-row band for gy is (GRID-1-gy). gid.x = 0 is the left cell as usual.
+    // Y-up maps gid.y = 0 to the bottom row band.
     let cell = GRID_SIZE / GRID; // 64 px
     let to_u8 = |k: u32| (((k as f32 + 0.5) / GRID as f32) * 255.0).round() as i32;
     let near = |a: u8, b: i32| (a as i32 - b).abs() <= 2;
@@ -478,18 +447,11 @@ fn mesh_meshlet_grid() {
     device.destroy_buffer(bump.into_buffer());
 }
 
-// ---------------------------------------------------------------------------
-// Interpolated triangle: one inset triangle with per-vertex RGB colours.
-// Verifies attribute interpolation (barycentric gradient) and rasterization
-// coverage (image corners stay at the clear colour). Orientation-independent:
-// every check is symmetric about the image centre, so it holds on any backend.
-// ---------------------------------------------------------------------------
+// Interpolated triangle: verify attribute interpolation and coverage.
 
 const TRI_BODY: &str = /*slang*/
     r#"
-// NB: digit-free `COLOR` semantic. Slang lowers a mesh output `COLOR0` to
-// `[[user(COLOR0)]]` but a fragment input `COLOR0` to `[[user(COLOR)]]`, so the
-// indexed form fails to link across separately-compiled mesh/fragment modules.
+// Use the unindexed COLOR semantic so separately compiled stages link in Slang.
 struct VOut { float4 pos : SV_Position; float4 color : COLOR; };
 
 [shader("mesh")]
@@ -516,23 +478,23 @@ fn mesh_interpolated_triangle() {
         return;
     };
 
-    let Some(ms) = kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "msMain", ShaderStage::Mesh)
+    let Some(ms) =
+        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "msMain", ShaderStage::Mesh)
     else {
         return;
     };
-    let Some(fs) = kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "fsMain", ShaderStage::Pixel)
+    let Some(fs) =
+        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "fsMain", ShaderStage::Pixel)
     else {
         return;
     };
-    let Some(pso) = make_meshlet_pso(&device, &ms, &fs, 16, "tri") else {
+    let Some(pso) = make_meshlet_pso(&device, &ms, &fs, "tri") else {
         return;
     };
 
     const SIZE: u32 = 128;
-    // Per-vertex colours come from the shader; the draw reads no root data, so its
-    // root pointer is NULL.
     let pixels = common::timed("interpolated triangle · submit+wait", || {
-        render_meshlets(&device, &pso, None, SIZE, [1, 1, 1])
+        render_meshlets(&device, &pso, GpuAddress::NULL, SIZE, [1, 1, 1])
     });
     common::save_rgba_png("mesh_interpolated_triangle", SIZE, SIZE, &pixels);
 
@@ -541,7 +503,6 @@ fn mesh_interpolated_triangle() {
         (pixels[i], pixels[i + 1], pixels[i + 2])
     };
 
-    // 1) All four image corners are outside the inset triangle → clear (black).
     for (x, y) in [(0, 0), (SIZE - 1, 0), (0, SIZE - 1), (SIZE - 1, SIZE - 1)] {
         let (r, g, b) = at(x, y);
         assert!(
@@ -550,9 +511,6 @@ fn mesh_interpolated_triangle() {
         );
     }
 
-    // 2) Image centre (NDC origin) is inside the triangle; by symmetry its colour
-    //    is 0.5·red + 0.25·green + 0.25·blue ≈ (128, 64, 64). This pins down the
-    //    barycentric interpolation, not just "something was drawn".
     let (cr, cg, cb) = at(SIZE / 2, SIZE / 2);
     let near = |a: u8, b: i32| (a as i32 - b).abs() <= 6;
     assert!(
@@ -560,9 +518,6 @@ fn mesh_interpolated_triangle() {
         "centre interpolation off: got ({cr},{cg},{cb}), expected ~(128,64,64)"
     );
 
-    // 3) Each vertex colour is reached somewhere (interpolation endpoints): the
-    //    most-red / most-green / most-blue pixels are strongly that colour. Found
-    //    by scan, so this is independent of where each vertex landed.
     let (mut max_r, mut max_g, mut max_b) = ((0u8, 0u8, 0u8), (0u8, 0u8, 0u8), (0u8, 0u8, 0u8));
     for y in 0..SIZE {
         for x in 0..SIZE {

@@ -263,13 +263,12 @@ impl<E: Example> App<E> {
 
         // Read this slot's prior timestamps (its fence was waited at acquire) before recording over them.
         #[cfg(feature = "egui")]
-        if let Some(egui) = self.egui.as_mut() {
-            if let Ok(Some(ms)) = self
+        if let Some(egui) = self.egui.as_mut()
+            && let Ok(Some(ms)) = self
                 .device
                 .gpu_elapsed_ms(&egui.query_pools[frame_index], 0, 1)
-            {
-                egui.gpu_ms = ema(egui.gpu_ms, ms);
-            }
+        {
+            egui.gpu_ms = ema(egui.gpu_ms, ms);
         }
 
         let mut cmd = self

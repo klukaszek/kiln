@@ -34,7 +34,6 @@ pub struct MetalGraphicsPso {
     pub(crate) stencil_format: objc2_metal::MTLPixelFormat,
     pub(crate) sample_count: usize,
     pub(crate) alpha_to_coverage: bool,
-    pub(crate) root_constant_size: u32,
     pub(crate) graphics_argument_buffer_slots: Vec<usize>,
     pub(crate) blend_pipelines:
         RefCell<HashMap<BlendState, Retained<ProtocolObject<dyn MTLRenderPipelineState>>>>,
@@ -43,14 +42,11 @@ pub struct MetalGraphicsPso {
 pub struct MetalComputePso {
     pub(crate) pipeline: Retained<ProtocolObject<dyn objc2_metal::MTLComputePipelineState>>,
     pub(crate) threads_per_threadgroup: [u32; 3],
-    pub(crate) root_constant_size: u32,
     pub(crate) compute_argument_buffer_slots: Vec<usize>,
 }
 
 impl MetalGraphicsPso {
-    /// Get (compiling+caching on first use) the pipeline variant for `blend`. Called at draw
-    /// time, where the RHI command API has no `Result` channel — a compile failure here is a
-    /// programmer error (an unsupported blend combo) and panics, like other draw-time guards.
+    /// Return the cached blend variant, compiling it when needed.
     pub(crate) fn pipeline_for_blend(
         &self,
         blend: &BlendState,
@@ -119,9 +115,7 @@ impl MetalGraphicsPso {
             apply_blend_to_attachment(att.as_ref(), blend_att);
         }
 
-        // Note: MTL4RenderPipelineDescriptor does not expose depth/stencil attachment format
-        // setters — Metal 4 decouples PSO compilation from attachment formats. Formats are
-        // stored on MetalGraphicsPso for render-pass construction but are not baked into the PSO.
+        // Metal 4 supplies depth/stencil formats when the render pass is created, not here.
 
         unsafe {
             pso_desc.setRasterSampleCount(sample_count);
@@ -210,10 +204,6 @@ fn blend_op_to_mtl(op: BlendOp) -> MTLBlendOperation {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Metal mesh shader pipeline — MTLMeshRenderPipelineDescriptor
-// ---------------------------------------------------------------------------
-
 /// Metal meshlet (mesh shader) pipeline state.
 ///
 /// Requires the Metal 4 mesh render pipeline path.
@@ -231,7 +221,6 @@ pub struct MetalMeshletPso {
     pub(crate) depth_format: objc2_metal::MTLPixelFormat,
     #[allow(dead_code)]
     pub(crate) stencil_format: objc2_metal::MTLPixelFormat,
-    pub(crate) root_constant_size: u32,
     /// Buffer-index slots the mesh+fragment shader declares for bindless heap pointers.
     /// Used to drive selective heap refresh (texture=1, sampler=2).
     pub(crate) argument_buffer_slots: Vec<usize>,
@@ -239,6 +228,5 @@ pub struct MetalMeshletPso {
     #[allow(dead_code)]
     pub(crate) blend_pipelines:
         RefCell<HashMap<BlendState, Retained<ProtocolObject<dyn MTLRenderPipelineState>>>>,
-    // Hold the compiled pipeline state (default blend variant).
     pub(crate) default_pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
 }

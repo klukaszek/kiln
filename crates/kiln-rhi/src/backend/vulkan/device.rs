@@ -62,8 +62,7 @@ pub(crate) struct BufferAllocation {
     pub mapped_ptr: Option<*mut u8>,
 }
 
-// Mapped host pointers are stored only as address ranges for gpuHostToDevicePointer-style
-// translation and are accessed behind the shared allocation mutex.
+// The registry is accessed behind the allocation mutex.
 unsafe impl Send for BufferAllocation {}
 
 pub(crate) struct DescriptorBufferHeap {
@@ -117,30 +116,24 @@ pub struct VulkanDevice {
     /// Nanoseconds per timestamp tick (`VkPhysicalDeviceLimits::timestampPeriod`).
     pub(crate) timestamp_period: f32,
 
-    // Extension loaders
     pub(crate) surface_loader: surface::Instance,
     pub(crate) swapchain_loader: swapchain::Device,
     pub(crate) descriptor_buffer_loader: Option<descriptor_buffer::Device>,
 
-    // Debug
     pub(crate) debug_utils_loader: Option<debug_utils::Instance>,
     pub(crate) debug_callback: vk::DebugUtilsMessengerEXT,
 
-    // Bindless texture heap
     pub(crate) texture_descriptor_set_layout: vk::DescriptorSetLayout,
     pub(crate) descriptor_buffer_heap: Option<DescriptorBufferHeap>,
     pub(crate) textures: SharedTextures,
     pub(crate) next_texture_id: RefCell<u32>,
     pub(crate) allocations: SharedAllocations,
 
-    // Sampler storage
     pub(crate) samplers: RefCell<Vec<vk::Sampler>>,
     pub(crate) next_sampler_id: RefCell<u32>,
 
-    // Setup command buffer
     pub(crate) setup_command_buffer: vk::CommandBuffer,
 
-    // Mesh shader support
     /// True when `VK_EXT_mesh_shader` was enabled at device creation.
     pub(crate) mesh_shader_supported: bool,
     /// Cached mesh-shader loader, cloned into command buffers. Built once — recreating it (or
@@ -341,7 +334,6 @@ impl VulkanQueue {
         frame_index: usize,
     ) -> RhiResult<AcquiredImage> {
         unsafe {
-            // Wait for this frame's fence
             let fence = sc.in_flight_fences[frame_index];
             self.device
                 .wait_for_fences(&[fence], true, u64::MAX)
@@ -350,7 +342,6 @@ impl VulkanQueue {
                 .reset_fences(&[fence])
                 .map_err(|e| RhiError::SyncError(e.to_string()))?;
 
-            // Reclaim the previous command buffer used for this frame.
             {
                 let mut cmd_buffers = sc.in_flight_cmd_buffers.borrow_mut();
                 if let Some(prev) = cmd_buffers.get_mut(frame_index)
@@ -412,9 +403,7 @@ impl VulkanQueue {
         frame_index: usize,
         image_index: u32,
     ) -> RhiResult<()> {
-        // Seed with the swapchain's acquire→render→present semaphores, then append the
-        // command buffer's pending value sync. Value waits use ALL_COMMANDS; the acquire
-        // wait only needs to gate the color attachment write.
+        // Acquire waits gate color writes; timeline waits cover all commands.
         let mut waits = vec![(sc.present_complete_semaphores[frame_index], 0u64)];
         let mut wait_stages = vec![vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         for (sem, val) in self.collect_value_waits(&cmd.pending_value_waits)? {
@@ -427,16 +416,12 @@ impl VulkanQueue {
         let raw_cmd = cmd.command_buffer;
         self.submit_timeline(raw_cmd, &waits, &wait_stages, &signals, fence)?;
 
-        // Track the command buffer so it can be freed after the fence signals.
         if let Some(slot) = sc.in_flight_cmd_buffers.borrow_mut().get_mut(frame_index) {
             *slot = raw_cmd;
         }
 
-        // Present the rendered image. The frame-loop contract (matching the Metal backend) is that
-        // `submit_frame` both submits *and* presents — the windowing harness never calls `present`
-        // separately. Without this the acquired image is never returned to the swapchain, so after
-        // acquiring every image the next acquire fails (NVIDIA returns VK_NOT_READY). An out-of-date
-        // swapchain here is transient (e.g. mid-resize); swallow it and let the next acquire rebuild.
+        // `submit_frame` owns presentation on both backends. A stale swapchain is rebuilt on the
+        // next acquire.
         match self.present(sc, image_index, frame_index) {
             Ok(()) | Err(RhiError::SwapchainOutOfDate) => Ok(()),
             Err(e) => Err(e),
@@ -554,20 +539,12 @@ pub(crate) fn vk_to_format(format: vk::Format) -> Format {
     }
 }
 
-const MAX_BINDLESS_STORAGE_IMAGES: u32 = 1_000_000;
-
-/// Translate the RHI's `BuildAccelFlags` into Vulkan build flags. Shared by acceleration-structure
-/// creation (which sizes the scratch) and the build command (which must use the *same* flags, or the
-/// driver's scratch requirement won't match the pre-allocated buffer).
 pub(crate) fn build_accel_flags_to_vk(
     flags: BuildAccelFlags,
 ) -> vk::BuildAccelerationStructureFlagsKHR {
     let mut out = vk::BuildAccelerationStructureFlagsKHR::empty();
     if flags.contains(BuildAccelFlags::ALLOW_UPDATE) {
         out |= vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE;
-    }
-    if flags.contains(BuildAccelFlags::ALLOW_COMPACTION) {
-        out |= vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION;
     }
     if flags.contains(BuildAccelFlags::PREFER_FAST_TRACE) {
         out |= vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE;
@@ -581,6 +558,17 @@ pub(crate) fn build_accel_flags_to_vk(
     out
 }
 
+pub(crate) fn geometry_flags_to_vk(flags: GeometryFlags) -> vk::GeometryFlagsKHR {
+    let mut out = vk::GeometryFlagsKHR::empty();
+    if flags.contains(GeometryFlags::OPAQUE) {
+        out |= vk::GeometryFlagsKHR::OPAQUE;
+    }
+    if flags.contains(GeometryFlags::NO_DUPLICATE_ANYHIT) {
+        out |= vk::GeometryFlagsKHR::NO_DUPLICATE_ANY_HIT_INVOCATION;
+    }
+    out
+}
+
 impl VulkanDevice {
     pub fn new(desc: &DeviceDesc) -> RhiResult<Self> {
         let entry = unsafe { Entry::load() }
@@ -588,34 +576,27 @@ impl VulkanDevice {
 
         let app_name = c"kiln-rhi";
 
-        // Validation layers
         let mut layer_names_raw: Vec<*const c_char> = Vec::new();
         let layer_name_validation = c"VK_LAYER_KHRONOS_validation";
         if desc.validation {
             layer_names_raw.push(layer_name_validation.as_ptr());
         }
 
-        // Instance extensions
-        // Note: We don't have a window handle here, so surface extensions
-        // will be added when creating the surface. For now, add debug + portability.
         let mut extension_names: Vec<*const c_char> = Vec::new();
         if desc.validation {
             extension_names.push(debug_utils::NAME.as_ptr());
         }
 
-        // macOS portability
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             extension_names.push(ash::khr::portability_enumeration::NAME.as_ptr());
             extension_names.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
         }
 
-        // We also need surface extensions for swapchain -- add the common ones
         extension_names.push(ash::khr::surface::NAME.as_ptr());
 
         #[cfg(target_os = "macos")]
         {
-            // macOS Vulkan surface extension.
             extension_names.push(ash::ext::metal_surface::NAME.as_ptr());
         }
         #[cfg(target_os = "linux")]
@@ -654,7 +635,6 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::DeviceCreation(format!("Failed to create instance: {e}")))?
         };
 
-        // Debug callback
         let (debug_utils_loader, debug_callback) = if desc.validation {
             let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
                 .message_severity(
@@ -679,7 +659,6 @@ impl VulkanDevice {
             (None, vk::DebugUtilsMessengerEXT::null())
         };
 
-        // Physical device selection
         let physical_devices = unsafe {
             instance
                 .enumerate_physical_devices()
@@ -714,7 +693,6 @@ impl VulkanDevice {
             })
             .ok_or(RhiError::NoSuitableGpu)?;
 
-        // Log selected device
         let device_props = unsafe { instance.get_physical_device_properties(physical_device) };
         let device_name = unsafe {
             std::ffi::CStr::from_ptr(device_props.device_name.as_ptr())
@@ -723,7 +701,6 @@ impl VulkanDevice {
         };
         log::info!("RHI: Selected GPU: {}", device_name);
 
-        // Device extension support
         let device_extension_props = unsafe {
             instance
                 .enumerate_device_extension_properties(physical_device)
@@ -738,27 +715,22 @@ impl VulkanDevice {
             })
         };
         let supports_descriptor_buffer = has_ext(b"VK_EXT_descriptor_buffer");
+        let supports_mutable_descriptor_type = has_ext(b"VK_EXT_mutable_descriptor_type");
         let supports_mesh_shader = has_ext(b"VK_EXT_mesh_shader");
-        // Acceleration structures (BLAS/TLAS) need VK_KHR_acceleration_structure +
-        // VK_KHR_deferred_host_operations. Ray tracing is inline ray query, not RT pipelines.
+        // BLAS/TLAS builds require acceleration structure and deferred-host-operation support.
         let supports_accel = has_ext(b"VK_KHR_acceleration_structure")
             && has_ext(b"VK_KHR_deferred_host_operations");
-        // Inline ray query (the RHI's only RT path) needs VK_KHR_ray_query on top of accel structs.
+        // Inline ray queries add VK_KHR_ray_query.
         let supports_ray_query = supports_accel && has_ext(b"VK_KHR_ray_query");
-        // VK_KHR_ray_tracing_maintenance1 makes `OpConvertUToAccelerationStructureKHR` (used by
-        // Slang's `DescriptorHandle<RaytracingAccelerationStructure>` lowering — the RHI's bindless
-        // TLAS path) unambiguously valid: the shader receives the AS device address as a 64-bit
-        // value and converts it in-place, with no acceleration-structure descriptor.
+        // The bindless TLAS lowering uses the address conversion provided by maintenance1.
         let supports_rt_maintenance1 =
             supports_ray_query && has_ext(b"VK_KHR_ray_tracing_maintenance1");
-        // The bindless-TLAS lowering also emits the `SPV_KHR_ray_tracing` SPIR-V extension, which
-        // the validation layer maps to a `VK_KHR_ray_tracing_pipeline` requirement even though the
-        // RHI only ever does inline ray query (no RT pipelines / SBT). Enable it so the shader
-        // module is spec-valid; we never create a ray-tracing pipeline.
+        // Slang's bindless-TLAS lowering also requires the ray-tracing-pipeline extension, even
+        // though the RHI only uses inline ray queries.
         let supports_ray_tracing_pipeline =
             supports_ray_query && has_ext(b"VK_KHR_ray_tracing_pipeline");
         log::info!(
-            "RHI: Optional extensions — mesh_shader={supports_mesh_shader} acceleration_structure={supports_accel} ray_query={supports_ray_query} rt_maintenance1={supports_rt_maintenance1} rt_pipeline={supports_ray_tracing_pipeline}"
+            "RHI: Optional extensions — mesh_shader={supports_mesh_shader} mutable_descriptors={supports_mutable_descriptor_type} acceleration_structure={supports_accel} ray_query={supports_ray_query} rt_maintenance1={supports_rt_maintenance1} rt_pipeline={supports_ray_tracing_pipeline}"
         );
 
         if desc.bindless_mode == Some(BindlessMode::ArgumentTable) {
@@ -771,12 +743,17 @@ impl VulkanDevice {
                 "Vulkan descriptor buffer is required but not supported".into(),
             ));
         }
+        if !supports_mutable_descriptor_type {
+            return Err(RhiError::Unsupported(
+                "Vulkan bindless storage textures require VK_EXT_mutable_descriptor_type".into(),
+            ));
+        }
         let bindless_mode = BindlessMode::DescriptorBuffer;
 
-        // Device extensions
         let mut device_extension_names: Vec<*const c_char> = vec![swapchain::NAME.as_ptr()];
 
         device_extension_names.push(descriptor_buffer::NAME.as_ptr());
+        device_extension_names.push(ash::ext::mutable_descriptor_type::NAME.as_ptr());
         if supports_mesh_shader {
             device_extension_names.push(vk_mesh_shader::NAME.as_ptr());
         }
@@ -799,24 +776,16 @@ impl VulkanDevice {
             device_extension_names.push(ash::khr::portability_subset::NAME.as_ptr());
         }
 
-        // All required features that were promoted to Vulkan 1.2/1.3 core go through the
-        // consolidated PhysicalDeviceVulkan1{2,3}Features structs — no separate per-feature
-        // structs needed since we require Vulkan 1.3.
-        // Slang lowers `SV_InstanceID` (instanced draws) using the SPIR-V DrawParameters
-        // capability, which requires shaderDrawParameters.
+        // Vulkan 1.2/1.3 features use the consolidated core feature structs.
         let mut vulkan11_features =
             vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
         let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
             .timeline_semaphore(true)
             .draw_indirect_count(true)
-            // The bindless descriptor heap declares PARTIALLY_BOUND on its bindings.
             .descriptor_binding_partially_bound(true)
-            // Slang lowers `DescriptorHandle<Texture2D>` / `<SamplerState>` to an unbounded
-            // `__slang_resource_heap[]` (SPIR-V RuntimeDescriptorArray). Required for any shader
-            // that samples a texture through the bindless heap.
+            // Slang lowers bindless handles to an unbounded runtime descriptor array.
             .runtime_descriptor_array(true)
-            // Host-reset query pools at creation (see `create_query_pool`).
             .host_query_reset(true);
         let mut vulkan13_features = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
@@ -824,9 +793,10 @@ impl VulkanDevice {
 
         let mut descriptor_buffer_features =
             vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
+        let mut mutable_descriptor_type_features =
+            vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT::default()
+                .mutable_descriptor_type(true);
 
-        // Optional: mesh shader and ray tracing feature structs (declared unconditionally
-        // so they outlive `features2`, then conditionally chained below).
         let mut mesh_shader_features = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
             .mesh_shader(true)
             .task_shader(true);
@@ -839,15 +809,12 @@ impl VulkanDevice {
             vk::PhysicalDeviceRayTracingMaintenance1FeaturesKHR::default()
                 .ray_tracing_maintenance1(true);
         let mut rt_pipeline_features =
-            vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default()
-                .ray_tracing_pipeline(true);
+            vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
 
         let features = vk::PhysicalDeviceFeatures {
             shader_clip_distance: 1,
             fill_mode_non_solid: 1,
             multi_draw_indirect: 1,
-            // Slang's `DescriptorHandle<RaytracingAccelerationStructure>` lowers to a 64-bit
-            // value (the AS device address) → SPIR-V declares the Int64 capability.
             shader_int64: 1,
             ..Default::default()
         };
@@ -859,14 +826,11 @@ impl VulkanDevice {
             .push_next(&mut vulkan13_features)
             .push_next(&mut descriptor_buffer_features);
 
-        // `push_next` operates on `self` by value and `PhysicalDeviceFeatures2` is `Copy`, so the
-        // result MUST be reassigned — `let _ = features2.push_next(..)` links the node into a
-        // discarded copy and silently leaves the real `features2` chain (and thus the feature)
-        // disabled. That bug left accel/ray-query/maintenance1 off; it only appeared to work
-        // because NVIDIA's driver tolerates the missing features.
+        // Reassign each `push_next` result so the feature chain remains attached.
         if supports_mesh_shader {
             features2 = features2.push_next(&mut mesh_shader_features);
         }
+        features2 = features2.push_next(&mut mutable_descriptor_type_features);
         if supports_accel {
             features2 = features2.push_next(&mut accel_structure_features);
         }
@@ -898,16 +862,11 @@ impl VulkanDevice {
 
         let present_queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
-        // Extension loaders
         let surface_loader = surface::Instance::new(&entry, &instance);
         let swapchain_loader = swapchain::Device::new(&instance, &device);
-        // Note: dynamic_rendering, buffer_device_address, and synchronization2 are Vulkan 1.3 core
-        // — their functionality is available directly on `ash::Device` without a loader.
-
         let device_memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
-        // Command pool
         let pool_create_info = vk::CommandPoolCreateInfo::default()
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
             .queue_family_index(queue_family_index);
@@ -917,7 +876,6 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::DeviceCreation(format!("Command pool: {e}")))?
         };
 
-        // Setup command buffer
         let cmd_alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_buffer_count(1)
             .command_pool(command_pool)
@@ -930,19 +888,16 @@ impl VulkanDevice {
 
         let descriptor_buffer_loader = Some(descriptor_buffer::Device::new(&instance, &device));
 
-        // Acceleration structure loader (for BLAS/TLAS builds).
         let acceleration_structure_opt = if supports_accel {
             Some(vk_accel_structure::Device::new(&instance, &device))
         } else {
             None
         };
-        // Mesh-shader loader, built once and cloned into each command buffer.
         let mesh_shader_loader = if supports_mesh_shader {
             Some(vk_mesh_shader::Device::new(&instance, &device))
         } else {
             None
         };
-        // Create bindless heap layout + storage
         let (texture_descriptor_set_layout, descriptor_buffer_heap) = {
             let loader = descriptor_buffer_loader
                 .as_ref()
@@ -1014,9 +969,7 @@ impl VulkanDevice {
         }
     }
 
-    pub fn wait_for_frame(&self, _frame_index: usize) {
-        // Frame fence waiting is handled in acquire_image
-    }
+    pub fn wait_for_frame(&self, _frame_index: usize) {}
 
     /// Get raw Vulkan handles for escape-hatch scenarios (e.g. ImGui).
     pub fn vulkan_handles(&self) -> VulkanHandles {
@@ -1029,8 +982,6 @@ impl VulkanDevice {
             command_pool: self.command_pool,
         }
     }
-
-    // -- Surface --
 
     pub fn create_surface(&self, desc: &SurfaceDesc) -> RhiResult<Surface> {
         let surface = unsafe {
@@ -1051,8 +1002,6 @@ impl VulkanDevice {
             }),
         })
     }
-
-    // -- Swapchain --
 
     pub fn create_swapchain(
         &self,
@@ -1139,7 +1088,6 @@ impl VulkanDevice {
         let surface = sc.surface;
         let surface_format = sc.surface_format;
 
-        // Tear down old image views, depth buffer, in-flight command buffers, and sync objects.
         unsafe {
             self.device.free_memory(sc.depth_image_memory, None);
             self.device.destroy_image_view(sc.depth_image_view, None);
@@ -1314,8 +1262,6 @@ impl VulkanDevice {
         })
     }
 
-    // -- Buffer --
-
     pub fn create_buffer(&self, desc: &BufferDesc) -> RhiResult<GpuBuffer> {
         let mut usage_flags = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::INDEX_BUFFER
@@ -1324,10 +1270,7 @@ impl VulkanDevice {
             | vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
-        // Any buffer may be used as acceleration-structure build input (vertices, indices, TLAS
-        // instances). The RHI doesn't distinguish buffer roles, so when RT is available every
-        // buffer must carry this usage or `vkCmdBuildAccelerationStructuresKHR` reads it illegally
-        // (device loss on NVIDIA). The flag is only valid when the extension is enabled.
+        // Buffers are untyped in the RHI, so AS-capable devices give every buffer build-input use.
         if self.acceleration_structure.is_some() {
             usage_flags |= vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
         }
@@ -1379,11 +1322,9 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::BufferCreation(e.to_string()))?;
         }
 
-        // Get GPU address
         let addr_info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
         let gpu_addr = unsafe { self.device.get_buffer_device_address(&addr_info) };
 
-        // Map if host-visible
         let mapped_ptr = match desc.memory {
             MemoryType::Default | MemoryType::Readback => {
                 let ptr = unsafe {
@@ -1443,10 +1384,8 @@ impl VulkanDevice {
         None
     }
 
-    // -- Texture --
-
     pub fn texture_size_align(&self, desc: &TextureDesc) -> RhiResult<TextureSizeAlign> {
-        // Create a throwaway image just to query the driver's size/alignment requirements.
+        // Query image requirements before allocating backing memory.
         let (image, _, _) = self.create_image_for_desc(desc)?;
         let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
         unsafe {
@@ -1557,8 +1496,6 @@ impl VulkanDevice {
         let (image, array_layers, vk_format) = self.create_image_for_desc(desc)?;
         let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
 
-        // Resolve the caller-supplied GPU address against the allocation registry.
-        // Any validation failure here is fatal — destroy the partially-built image first.
         let resolve = || -> RhiResult<(vk::DeviceMemory, u64)> {
             let allocations = self.allocations.lock().expect("allocations lock poisoned");
             let alloc = allocations
@@ -1608,7 +1545,6 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::TextureCreation(e.to_string()))?;
         }
 
-        // Create image view
         let view_type = match desc.dimension {
             TextureDimension::D1 => vk::ImageViewType::TYPE_1D,
             TextureDimension::D2 => vk::ImageViewType::TYPE_2D,
@@ -1642,7 +1578,6 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::TextureCreation(e.to_string()))?
         };
 
-        // Allocate texture ID from RefCell
         let texture_id = {
             let mut id = self.next_texture_id.borrow_mut();
             let tid = TextureId(*id);
@@ -1650,7 +1585,6 @@ impl VulkanDevice {
             tid
         };
 
-        // Transition to unified GENERAL layout before first use.
         self.transition_image_to_general(image, aspect, desc.mip_levels, array_layers)?;
 
         if desc.usage.contains(crate::texture::TextureUsage::SAMPLED) {
@@ -1660,7 +1594,6 @@ impl VulkanDevice {
             self.write_image_descriptor(texture_id, image_view, vk::ImageLayout::GENERAL, true)?;
         }
 
-        // Store texture data
         let vk_texture = VulkanTexture {
             image,
             image_view,
@@ -1681,8 +1614,6 @@ impl VulkanDevice {
             desc: desc.clone(),
         })
     }
-
-    // -- Sampler --
 
     pub fn create_sampler(&self, desc: &SamplerDesc) -> RhiResult<Sampler> {
         let mag_filter = match desc.mag_filter {
@@ -1744,8 +1675,6 @@ impl VulkanDevice {
         Ok(Sampler { id })
     }
 
-    // -- Shader --
-
     pub fn create_shader_module(&self, desc: &ShaderModuleDesc) -> RhiResult<ShaderModule> {
         let code: Vec<u32> = desc
             .code
@@ -1774,8 +1703,6 @@ impl VulkanDevice {
         })
     }
 
-    // -- Pipeline --
-
     pub fn create_graphics_pso(
         &self,
         desc: &GraphicsPsoDesc,
@@ -1799,13 +1726,11 @@ impl VulkanDevice {
                 .unwrap_or(vk::Format::UNDEFINED),
         };
 
-        // Push constants for root data
         let push_constant_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(desc.root_constant_size);
+            .size(std::mem::size_of::<GpuAddress>() as u32);
 
-        // Pipeline layout with bindless texture set
         let set_layouts = [self.texture_descriptor_set_layout];
         let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
@@ -1819,13 +1744,11 @@ impl VulkanDevice {
         let mut vk_pso = VulkanGraphicsPso {
             pipeline: vk::Pipeline::null(),
             pipeline_layout,
-            root_constant_size: desc.root_constant_size,
             device: self.device.clone(),
             desc: pso_desc,
             blend_pipelines: RefCell::new(std::collections::HashMap::new()),
         };
-        // Pre-bake the embedded blend state if provided, otherwise bake the default. Unlike the
-        // draw-time `pipeline_for_blend`, creation has a `Result` channel, so propagate failures.
+        // Bake the initial blend variant; later variants are cached on demand.
         let initial_blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
         let pipeline = vk_pso.create_pipeline(&initial_blend)?;
         vk_pso.pipeline = pipeline;
@@ -1852,7 +1775,7 @@ impl VulkanDevice {
         let push_constant_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(desc.root_constant_size);
+            .size(std::mem::size_of::<GpuAddress>() as u32);
 
         let set_layouts = [self.texture_descriptor_set_layout];
         let layout_info = vk::PipelineLayoutCreateInfo::default()
@@ -1866,9 +1789,7 @@ impl VulkanDevice {
         };
 
         let pipeline_info = vk::ComputePipelineCreateInfo::default()
-            // The bindless set layout is a descriptor-buffer layout, so the pipeline must opt in
-            // with VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT (VUID-VkComputePipelineCreateInfo-
-            // flags-08984); NVIDIA returns VK_ERROR_UNKNOWN otherwise.
+            // Descriptor-buffer layouts require the matching pipeline flag.
             .flags(vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT)
             .stage(stage)
             .layout(pipeline_layout);
@@ -1883,14 +1804,11 @@ impl VulkanDevice {
             inner: ComputePsoInner::Vulkan(VulkanComputePso {
                 pipeline: pipelines[0],
                 pipeline_layout,
-                root_constant_size: desc.root_constant_size,
                 threads_per_threadgroup: desc.threads_per_threadgroup,
                 device: self.device.clone(),
             }),
         })
     }
-
-    // -- Mesh-shader pipeline (VK_EXT_mesh_shader) --
 
     pub fn create_meshlet_pso(
         &self,
@@ -1898,7 +1816,6 @@ impl VulkanDevice {
         mesh_module: &VulkanShaderModule,
         frag_module: &VulkanShaderModule,
     ) -> RhiResult<MeshletPso> {
-        // Require mesh-shader extension support.
         if !self.mesh_shader_supported {
             return Err(RhiError::Unsupported(
                 "VK_EXT_mesh_shader not available on this device".into(),
@@ -1924,7 +1841,7 @@ impl VulkanDevice {
         let push_constant_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(desc.root_constant_size);
+            .size(std::mem::size_of::<GpuAddress>() as u32);
 
         let set_layouts = [self.texture_descriptor_set_layout];
         let layout_info = vk::PipelineLayoutCreateInfo::default()
@@ -1940,7 +1857,6 @@ impl VulkanDevice {
         let mut vk_pso = VulkanMeshletPso {
             pipeline: vk::Pipeline::null(),
             pipeline_layout,
-            root_constant_size: desc.root_constant_size,
             device: self.device.clone(),
             desc: pso_desc,
             blend_pipelines: RefCell::new(std::collections::HashMap::new()),
@@ -1958,13 +1874,9 @@ impl VulkanDevice {
         })
     }
 
-    // -- Acceleration structures (VK_KHR_acceleration_structure) --
-
-
     pub fn create_blas(&self, desc: &BlasDesc) -> RhiResult<AccelerationStructure> {
         let accel_loader = self.require_accel_loader()?;
 
-        // Build geometry descriptors.
         let geometries: Vec<vk::AccelerationStructureGeometryKHR> = desc
             .meshes
             .iter()
@@ -1986,15 +1898,10 @@ impl VulkanDevice {
                             device_address: m.index_buffer.0,
                         });
                     let geo_data = vk::AccelerationStructureGeometryDataKHR { triangles };
-                    let flags = if m.flags.contains(GeometryFlags::OPAQUE) {
-                        vk::GeometryFlagsKHR::OPAQUE
-                    } else {
-                        vk::GeometryFlagsKHR::empty()
-                    };
                     vk::AccelerationStructureGeometryKHR::default()
                         .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
                         .geometry(geo_data)
-                        .flags(flags)
+                        .flags(geometry_flags_to_vk(m.flags))
                 }
                 GeometryType::Aabbs => {
                     let aabbs = vk::AccelerationStructureGeometryAabbsDataKHR::default()
@@ -2003,15 +1910,10 @@ impl VulkanDevice {
                         })
                         .stride(std::mem::size_of::<vk::AabbPositionsKHR>() as u64);
                     let geo_data = vk::AccelerationStructureGeometryDataKHR { aabbs };
-                    let flags = if m.flags.contains(GeometryFlags::OPAQUE) {
-                        vk::GeometryFlagsKHR::OPAQUE
-                    } else {
-                        vk::GeometryFlagsKHR::empty()
-                    };
                     vk::AccelerationStructureGeometryKHR::default()
                         .geometry_type(vk::GeometryTypeKHR::AABBS)
                         .geometry(geo_data)
-                        .flags(flags)
+                        .flags(geometry_flags_to_vk(m.flags))
                 }
             })
             .collect();
@@ -2055,8 +1957,7 @@ impl VulkanDevice {
         )
     }
 
-    /// Vulkan's TLAS instance layout is `VkAccelerationStructureInstanceKHR`, which is
-    /// exactly the RHI's `TlasInstance` layout (BLAS referenced by device address).
+    /// Vulkan's native TLAS instance layout matches the public fields byte-for-byte.
     pub fn tlas_instance_stride(&self) -> usize {
         std::mem::size_of::<crate::types::TlasInstance>()
     }
@@ -2143,8 +2044,7 @@ impl VulkanDevice {
             )
         };
 
-        // Pre-allocate the build scratch. Over-allocate by the required alignment and round the
-        // device address up so `scratch_data` satisfies minAccelerationStructureScratchOffsetAlignment.
+        // Leave enough headroom to align the scratch address as required by Vulkan.
         let scratch_align = self.accel_scratch_alignment();
         let (scratch_buffer, scratch_memory, scratch_base) =
             self.allocate_scratch_buffer(scratch_size + scratch_align)?;
@@ -2176,8 +2076,7 @@ impl VulkanDevice {
     /// `minAccelerationStructureScratchOffsetAlignment` — the required alignment for the
     /// `scratch_data` address passed to `vkCmdBuildAccelerationStructuresKHR`.
     fn accel_scratch_alignment(&self) -> u64 {
-        let mut accel_props =
-            vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+        let mut accel_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut accel_props);
         unsafe {
             self.instance
@@ -2191,15 +2090,11 @@ impl VulkanDevice {
     /// Allocate a device-local scratch buffer for an acceleration-structure build and return
     /// its buffer, memory, and base device address. Scratch needs STORAGE_BUFFER usage in
     /// addition to SHADER_DEVICE_ADDRESS (the AS storage buffer does not).
-    fn allocate_scratch_buffer(
-        &self,
-        size: u64,
-    ) -> RhiResult<(vk::Buffer, vk::DeviceMemory, u64)> {
+    fn allocate_scratch_buffer(&self, size: u64) -> RhiResult<(vk::Buffer, vk::DeviceMemory, u64)> {
         let buffer_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = unsafe {
@@ -2213,7 +2108,9 @@ impl VulkanDevice {
             &self.device_memory_properties,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )
-        .ok_or_else(|| RhiError::AllocationFailed("No device-local memory for AS scratch".into()))?;
+        .ok_or_else(|| {
+            RhiError::AllocationFailed("No device-local memory for AS scratch".into())
+        })?;
         let mut flags_info =
             vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
         let alloc_info = vk::MemoryAllocateInfo::default()
@@ -2231,9 +2128,8 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::AllocationFailed(e.to_string()))?;
         }
         let address = unsafe {
-            self.device.get_buffer_device_address(
-                &vk::BufferDeviceAddressInfo::default().buffer(buffer),
-            )
+            self.device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
         };
         Ok((buffer, memory, address))
     }
@@ -2278,8 +2174,6 @@ impl VulkanDevice {
         Ok((buffer, memory))
     }
 
-    // -- Command Buffer --
-
     pub fn create_command_buffer(&self) -> RhiResult<CommandBuffer> {
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_buffer_count(1)
@@ -2311,8 +2205,6 @@ impl VulkanDevice {
                 vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT
                     | vk::BufferUsageFlags::SAMPLER_DESCRIPTOR_BUFFER_EXT,
             );
-        // Clone the cached loaders (cheap fn-pointer-table copies) rather than rebuilding them
-        // here — this is the per-frame command-buffer path.
         let descriptor_buffer_loader = self.descriptor_buffer_loader.clone();
         let descriptor_buffer_binding = Some(descriptor_buffer_binding);
         let mesh_shader = self.mesh_shader_loader.clone();
@@ -2328,8 +2220,6 @@ impl VulkanDevice {
                 pipeline_layout: vk::PipelineLayout::null(),
                 descriptor_buffer_loader,
                 descriptor_buffer_binding,
-                active_descriptor_buffer_offset: 0,
-                root_constant_size: (std::mem::size_of::<GpuAddress>() * 4) as u32,
                 push_constant_stages: vk::ShaderStageFlags::empty(),
                 current_blend_state: BlendState::default(),
                 pending_split_barrier: None,
@@ -2386,8 +2276,6 @@ impl VulkanDevice {
                 vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT
                     | vk::BufferUsageFlags::SAMPLER_DESCRIPTOR_BUFFER_EXT,
             );
-        // Clone the cached loaders (cheap fn-pointer-table copies) rather than rebuilding them
-        // here — this is the per-frame command-buffer path.
         let descriptor_buffer_loader = self.descriptor_buffer_loader.clone();
         let descriptor_buffer_binding = Some(descriptor_buffer_binding);
         let mesh_shader = self.mesh_shader_loader.clone();
@@ -2403,8 +2291,6 @@ impl VulkanDevice {
                 pipeline_layout: vk::PipelineLayout::null(),
                 descriptor_buffer_loader,
                 descriptor_buffer_binding,
-                active_descriptor_buffer_offset: 0,
-                root_constant_size: (std::mem::size_of::<GpuAddress>() * 4) as u32,
                 push_constant_stages: vk::ShaderStageFlags::empty(),
                 current_blend_state: BlendState::default(),
                 pending_split_barrier: None,
@@ -2419,8 +2305,6 @@ impl VulkanDevice {
             })),
         })
     }
-
-    // -- Timeline Semaphore --
 
     pub fn create_timeline_semaphore(&self, initial_value: u64) -> RhiResult<TimelineSemaphore> {
         let mut type_info = vk::SemaphoreTypeCreateInfo::default()
@@ -2442,8 +2326,6 @@ impl VulkanDevice {
             })),
         })
     }
-
-    // -- Destroy --
 
     pub fn destroy_buffer(&self, buffer: GpuBuffer) {
         match buffer.inner {
@@ -2481,18 +2363,18 @@ impl VulkanDevice {
         }
     }
 
-    pub fn texture_view_descriptor(
+    pub fn create_sampled_view(
         &self,
         source: &crate::texture::Texture,
-        view: &crate::texture::GpuViewDesc,
+        view: &crate::texture::TextureViewDesc,
     ) -> RhiResult<TextureId> {
         self.create_view_internal(source, view, false)
     }
 
-    pub fn rw_texture_view_descriptor(
+    pub fn create_storage_view(
         &self,
         source: &crate::texture::Texture,
-        view: &crate::texture::GpuViewDesc,
+        view: &crate::texture::TextureViewDesc,
     ) -> RhiResult<TextureId> {
         self.create_view_internal(source, view, true)
     }
@@ -2509,16 +2391,13 @@ impl VulkanDevice {
         GpuAddress(id.0 as u64)
     }
 
-    // -- GPU timestamp queries --
-
     pub fn create_query_pool(&self, count: u32) -> RhiResult<QueryPool> {
         let info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
             .query_count(count);
         let pool = unsafe { self.device.create_query_pool(&info, None) }
             .map_err(|e| RhiError::Backend(format!("create_query_pool: {e}")))?;
-        // Reset at creation so the first read of an unwritten pool is legal (Vulkan requires each
-        // query be reset before use; the per-frame reset only covers reuse).
+        // Vulkan requires a query to be reset before its first use.
         unsafe { self.device.reset_query_pool(pool, 0, count) };
         Ok(QueryPool {
             inner: QueryPoolInner::Vulkan(VulkanQueryPool { pool }),
@@ -2527,13 +2406,12 @@ impl VulkanDevice {
     }
 
     pub fn destroy_query_pool(&self, pool: QueryPool) {
-        match pool.inner {
-            QueryPoolInner::Vulkan(p) => unsafe {
-                self.device.destroy_query_pool(p.pool, None)
-            },
+        let p = match pool.inner {
+            QueryPoolInner::Vulkan(p) => p,
             #[allow(unreachable_patterns)]
-            _ => {}
-        }
+            _ => return,
+        };
+        unsafe { self.device.destroy_query_pool(p.pool, None) }
     }
 
     pub fn timestamp_period_ns(&self) -> f64 {
@@ -2547,8 +2425,7 @@ impl VulkanDevice {
             _ => unreachable!("query pool backend does not match device backend"),
         };
         let mut data = vec![0u64; pool.count as usize];
-        // No WAIT: the caller already waited the writing frame's fence. An unwritten pool reports
-        // NOT_READY, surfaced as zeros per the "unwritten slots read back as 0" contract.
+        // The frame fence has already completed; unwritten slots remain zero.
         let result = unsafe {
             self.device
                 .get_query_pool_results(vk_pool, 0, &mut data, vk::QueryResultFlags::TYPE_64)
@@ -2563,19 +2440,18 @@ impl VulkanDevice {
     fn create_view_internal(
         &self,
         source: &crate::texture::Texture,
-        view: &crate::texture::GpuViewDesc,
+        view: &crate::texture::TextureViewDesc,
         storage: bool,
     ) -> RhiResult<TextureId> {
         use crate::texture::{ALL_LAYERS, ALL_MIPS};
 
-        // Look up the source VulkanTexture to get the vk::Image and its aspect/format.
         let (src_image, src_format, src_aspect, src_mip_levels, src_array_layers, src_view_type) = {
             let textures = self.textures.lock().expect("textures lock poisoned");
             let src = textures
                 .get(source.id.0 as usize)
                 .and_then(|t| t.as_ref())
                 .ok_or_else(|| {
-                    RhiError::Backend("texture_view_descriptor: invalid source TextureId".into())
+                    RhiError::Backend("create texture view: invalid source TextureId".into())
                 })?;
 
             let fmt = format_to_vk(source.desc().format);
@@ -2628,7 +2504,7 @@ impl VulkanDevice {
         let image_view = unsafe {
             self.device
                 .create_image_view(&view_info, None)
-                .map_err(|e| RhiError::TextureCreation(format!("texture_view_descriptor: {e}")))?
+                .map_err(|e| RhiError::TextureCreation(format!("create texture view: {e}")))?
         };
 
         let texture_id = {
@@ -2656,8 +2532,6 @@ impl VulkanDevice {
 
         Ok(texture_id)
     }
-
-    // -- Private helpers --
 
     fn write_image_descriptor(
         &self,
@@ -2840,7 +2714,6 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?;
         }
 
-        // Transition depth image to optimal layout
         self.transition_depth_image(depth_image)?;
 
         let view_info = vk::ImageViewCreateInfo::default()
@@ -2973,7 +2846,6 @@ impl Drop for VulkanDevice {
                 self.device.destroy_semaphore(state.semaphore, None);
             }
 
-            // Destroy textures
             for t in self
                 .textures
                 .lock()
@@ -2987,12 +2859,9 @@ impl Drop for VulkanDevice {
                 }
             }
 
-            // Destroy samplers
             for sampler in self.samplers.borrow_mut().drain(..) {
                 self.device.destroy_sampler(sampler, None);
             }
-
-            // Shader modules are owned by the frontend `ShaderModule` (RAII) and freed there.
 
             if let Some(heap) = self.descriptor_buffer_heap.as_ref() {
                 self.device.unmap_memory(heap.memory);
@@ -3008,9 +2877,6 @@ impl Drop for VulkanDevice {
                 debug_loader.destroy_debug_utils_messenger(self.debug_callback, None);
             }
 
-            // The swapchain and surface own and destroy their own Vulkan objects in their `Drop`
-            // impls; the harness drops them (and all other device children) before the device, so
-            // by here only the device + instance remain.
             self.instance.destroy_instance(None);
         }
     }
@@ -3026,16 +2892,10 @@ fn create_descriptor_buffer_heap(
     let binding_flags = [
         vk::DescriptorBindingFlags::PARTIALLY_BOUND,
         vk::DescriptorBindingFlags::PARTIALLY_BOUND,
-        vk::DescriptorBindingFlags::PARTIALLY_BOUND,
     ];
     let mut binding_flags_info =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
 
-    // Binding numbers must match Slang's `__slang_resource_heap` lowering, otherwise a shader
-    // that samples through `DescriptorHandle<T>` reads the wrong descriptor type. Slang fixes:
-    // samplers at binding 0, sampled images at binding 2 (and storage images alias binding 2,
-    // but no shader uses storage through the heap yet — keep it on its own binding 1 until one
-    // does, then move it to 2 behind VK_EXT_mutable_descriptor_type).
     let bindings = [
         vk::DescriptorSetLayoutBinding {
             binding: 0,
@@ -3045,25 +2905,31 @@ fn create_descriptor_buffer_heap(
             ..Default::default()
         },
         vk::DescriptorSetLayoutBinding {
-            binding: 1,
-            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
-            descriptor_count: MAX_BINDLESS_STORAGE_IMAGES,
-            stage_flags: vk::ShaderStageFlags::ALL,
-            ..Default::default()
-        },
-        vk::DescriptorSetLayoutBinding {
             binding: 2,
-            descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+            descriptor_type: vk::DescriptorType::MUTABLE_EXT,
             descriptor_count: MAX_BINDLESS_TEXTURES,
             stage_flags: vk::ShaderStageFlags::ALL,
             ..Default::default()
         },
     ];
 
+    let image_descriptor_types = [
+        vk::DescriptorType::SAMPLED_IMAGE,
+        vk::DescriptorType::STORAGE_IMAGE,
+    ];
+    let mutable_descriptor_lists = [
+        vk::MutableDescriptorTypeListEXT::default(),
+        vk::MutableDescriptorTypeListEXT::default().descriptor_types(&image_descriptor_types),
+    ];
+    let mut mutable_descriptor_info = vk::MutableDescriptorTypeCreateInfoEXT::default()
+        .mutable_descriptor_type_lists(&mutable_descriptor_lists);
+
     let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
         .bindings(&bindings)
         .flags(vk::DescriptorSetLayoutCreateFlags::DESCRIPTOR_BUFFER_EXT)
         .push_next(&mut binding_flags_info);
+    let mut layout_info = layout_info;
+    layout_info = layout_info.push_next(&mut mutable_descriptor_info);
 
     let layout = unsafe {
         device
@@ -3078,16 +2944,14 @@ fn create_descriptor_buffer_heap(
     }
 
     let layout_size = unsafe { loader.get_descriptor_set_layout_size(layout) };
-    // Offsets follow the binding numbers above: sampler=0, storage image=1, sampled image=2.
     let sampler_offset = unsafe { loader.get_descriptor_set_layout_binding_offset(layout, 0) };
-    let storage_image_offset =
-        unsafe { loader.get_descriptor_set_layout_binding_offset(layout, 1) };
     let sampled_image_offset =
         unsafe { loader.get_descriptor_set_layout_binding_offset(layout, 2) };
+    let storage_image_offset = sampled_image_offset;
 
     let sampled_image_stride = props.sampled_image_descriptor_size as u64;
     let sampler_stride = props.sampler_descriptor_size as u64;
-    let storage_image_stride = props.storage_image_descriptor_size as u64;
+    let storage_image_stride = sampled_image_stride.max(props.storage_image_descriptor_size as u64);
 
     let align = props.descriptor_buffer_offset_alignment.max(1);
     let aligned_size = (layout_size + align - 1) & !(align - 1);

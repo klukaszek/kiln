@@ -19,18 +19,13 @@ pub struct VulkanSwapchain {
     pub(crate) rendering_complete_semaphores: Vec<vk::Semaphore>,
     pub(crate) in_flight_fences: Vec<vk::Fence>,
     pub(crate) in_flight_cmd_buffers: RefCell<Vec<vk::CommandBuffer>>,
-    // Clones of the device + swapchain loader so teardown is self-contained in `Drop`. The
-    // owning `VulkanDevice` must outlive this (it destroys the `VkDevice`); the example harness
-    // and tests guarantee that by dropping the device last.
+    // Keep the loaders with the swapchain; the device must outlive it.
     pub(crate) device: ash::Device,
     pub(crate) swapchain_loader: ash::khr::swapchain::Device,
 }
 
 impl Drop for VulkanSwapchain {
     fn drop(&mut self) {
-        // The surface is owned by `VulkanSurface`; we only destroy swapchain-owned objects. The
-        // swapchain images themselves are owned by the swapchain (freed by `destroy_swapchain`);
-        // the in-flight command buffers are freed when the device destroys its command pool.
         unsafe {
             for &view in &self.image_views {
                 self.device.destroy_image_view(view, None);

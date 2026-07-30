@@ -1,8 +1,4 @@
-//! Headless ray-tracing path test (timed): inline ray query (RayQuery) in a compute kernel.
-//!
-//! Builds a one-triangle BLAS + a single-instance TLAS, then dispatches a Slang compute
-//! shader that traces one ray at the triangle and writes hit/miss to a buffer. This is the
-//! cross-backend (Metal + Vulkan) ray-tracing model — no RT pipelines / SBT.
+//! Headless inline ray-query test using a one-triangle BLAS and single-instance TLAS.
 
 mod common;
 
@@ -19,8 +15,7 @@ gpu_struct! {
     }
 }
 
-// The TLAS rides the root struct as a bindless handle — no descriptor binding, no argument-table
-// slot. The same source lowers cleanly for both SPIR-V and Metal (prototype-verified).
+// The TLAS is passed as a bindless handle in the root data on both backends.
 const RQ_BODY: &str = /*slang*/
     r#"
 [shader("compute")]
@@ -60,7 +55,6 @@ fn ray_query_triangle_hit() {
 
     let pso = match device.create_compute_pso(
         &ComputePsoDesc {
-            root_constant_size: 8,
             threads_per_threadgroup: [1, 1, 1],
             label: Some("ray-query".into()),
         },
@@ -73,7 +67,7 @@ fn ray_query_triangle_hit() {
         }
     };
 
-    // One triangle at z=0 straddling the ray origin (0,0,-1) travelling +Z.
+    // Triangle at z=0, with the ray starting at z=-1.
     let verts: [[f32; 3]; 3] = [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]];
     let vbuf = device
         .malloc(std::mem::size_of_val(&verts) as u64, MemoryType::Default)
@@ -111,7 +105,7 @@ fn ray_query_triangle_hit() {
         q.wait_idle();
     });
 
-    // Single identity instance referencing the BLAS, encoded in the native layout.
+    // Identity instance referencing the BLAS.
     let stride = device.tlas_instance_stride();
     let instbuf = device
         .malloc(stride as u64, MemoryType::Default)
@@ -146,7 +140,6 @@ fn ray_query_triangle_hit() {
         q.wait_idle();
     });
 
-    // Ray-query dispatch.
     let output = device.malloc(4, MemoryType::Readback).expect("output");
     let root = device
         .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)

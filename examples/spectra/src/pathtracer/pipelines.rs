@@ -1,5 +1,5 @@
 use kiln_rhi::{
-    BlendState, ColorTarget, ComputePso, ComputePsoDesc, Device, Format, GpuAddress, GraphicsPso,
+    BlendState, ColorTarget, ComputePso, ComputePsoDesc, Device, Format, GraphicsPso,
     GraphicsPsoDesc, SampleCount, ShaderStage, Topology,
 };
 
@@ -36,7 +36,6 @@ impl Pipelines {
         );
         let trace = device.create_compute_pso(
             &ComputePsoDesc {
-                root_constant_size: std::mem::size_of::<GpuAddress>() as u32,
                 threads_per_threadgroup: [integrator::THREADS_X, integrator::THREADS_Y, 1],
                 label: Some("spectral-trace".into()),
             },
@@ -48,7 +47,6 @@ impl Pipelines {
             kiln_rhi::compiler::compile(device, &clear_source, "clearMain", ShaderStage::Compute);
         let clear = device.create_compute_pso(
             &ComputePsoDesc {
-                root_constant_size: std::mem::size_of::<GpuAddress>() as u32,
                 threads_per_threadgroup: [CLEAR_THREADS, 1, 1],
                 label: Some("spectral-film-clear".into()),
             },
@@ -66,7 +64,6 @@ impl Pipelines {
                 color_targets: vec![ColorTarget::new(color_format)],
                 depth_format: Some(Format::D32Float),
                 sample_count: SampleCount::S1,
-                root_constant_size: 16,
                 cull: kiln_rhi::Cull::None,
                 blendstate: Some(BlendState::default()),
                 label: Some("spectral-display".into()),

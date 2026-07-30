@@ -1,21 +1,15 @@
-//! Headless compute path test (timed), driven by a backend-agnostic Slang shader.
-//!
-//! One Slang source is compiled to SPIR-V (Vulkan) or metallib (Metal) by the harness and
-//! dispatched through the high-level RHI. The `Data` root struct is declared once (below)
-//! and shared between host and shader via `gpu_struct!`, so there is no manual byte layout.
+//! Headless compute path test driven by a backend-agnostic Slang shader.
 
 mod common;
 
 use kiln_rhi::{ComputePsoDesc, GpuAddress, MemoryType, ShaderStage, StageFlags, gpu_struct};
 
-// Shared host/device data contract. `Data::SLANG` is the matching Slang declaration.
 gpu_struct! {
     pub struct Data {
         input: GpuAddress as "uint*",
         output: GpuAddress as "uint*",
         count: u32,
-        // Explicit tail padding so the struct is padding-free (GpuPod/IntoBytes) and matches
-        // Slang's 24-byte natural layout exactly.
+        // Keep the host and Slang layouts identical.
         _pad: u32,
     }
 }
@@ -49,7 +43,6 @@ fn compute_doubles_buffer() {
         device
             .create_compute_pso(
                 &ComputePsoDesc {
-                    root_constant_size: 16,
                     threads_per_threadgroup: [64, 1, 1],
                     label: Some("double".into()),
                 },
@@ -72,7 +65,6 @@ fn compute_doubles_buffer() {
     input
         .upload_slice(&(0..N).collect::<Vec<u32>>())
         .expect("upload input");
-    // Build the root struct type-safely — no raw pointers, no hand-computed offsets.
     data.upload(&Data {
         input: input.gpu(),
         output: output.gpu(),
@@ -93,8 +85,8 @@ fn compute_doubles_buffer() {
     });
 
     let result = output.as_slice::<u32>().expect("read output");
-    for i in 0..N as usize {
-        assert_eq!(result[i], i as u32 * 2, "element {i} not doubled");
+    for (i, &value) in result.iter().enumerate() {
+        assert_eq!(value, i as u32 * 2, "element {i} not doubled");
     }
 
     device.free(input);

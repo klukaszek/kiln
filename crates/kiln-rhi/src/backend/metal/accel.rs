@@ -1,3 +1,6 @@
+use std::cell::Cell;
+use std::rc::Rc;
+
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSArray;
@@ -5,32 +8,55 @@ use objc2_metal::{
     MTL4AccelerationStructureBoundingBoxGeometryDescriptor,
     MTL4AccelerationStructureGeometryDescriptor,
     MTL4AccelerationStructureTriangleGeometryDescriptor, MTL4BufferRange, MTLAccelerationStructure,
-    MTLBuffer, MTLIndexType,
+    MTLAccelerationStructureDescriptor, MTLAccelerationStructureUsage, MTLAllocation, MTLBuffer,
+    MTLIndexType, MTLResidencySet,
 };
 
-use crate::error::{RhiError, RhiResult};
-use crate::types::{BlasDesc, GeometryFlags, GeometryType};
+use crate::types::{BlasDesc, BuildAccelFlags, GeometryFlags, GeometryType};
 
-/// Metal acceleration structure entry (BLAS or TLAS).
-///
-/// Metal acceleration structures are MTLAccelerationStructure objects that live
-/// in GPU memory.  Their GPU address (stored in `gpu_resource_id`) is placed into
-/// root structs and accessed in intersection shaders / ray generation kernels via the
-/// Metal `intersect(ray, accelerationStructure, ...)` intrinsic.
-///
-/// The raw `u64` GPU resource ID is cached at build time by extracting it via
-/// `unsafe { std::mem::transmute(accelerationStructure.gpuResourceID()) }` —
-/// the `MTLResourceID` struct is guaranteed to be a single `uint64_t` by the Metal spec.
+pub(crate) fn set_accel_usage(
+    descriptor: &MTLAccelerationStructureDescriptor,
+    flags: BuildAccelFlags,
+) {
+    let mut usage = MTLAccelerationStructureUsage::None;
+    if flags.contains(BuildAccelFlags::ALLOW_UPDATE) {
+        usage |= MTLAccelerationStructureUsage::Refit;
+    }
+    if flags.contains(BuildAccelFlags::PREFER_FAST_TRACE) {
+        usage |= MTLAccelerationStructureUsage::PreferFastIntersection;
+    }
+    if flags.contains(BuildAccelFlags::PREFER_FAST_BUILD) {
+        usage |= MTLAccelerationStructureUsage::PreferFastBuild;
+    }
+    if flags.contains(BuildAccelFlags::MINIMIZE_MEMORY) {
+        usage |= MTLAccelerationStructureUsage::MinimizeMemory;
+    }
+    descriptor.setUsage(usage);
+}
+
 pub struct MetalAccelerationStructure {
-    /// The underlying Metal acceleration structure.
     pub(crate) acceleration_structure: Retained<ProtocolObject<dyn MTLAccelerationStructure>>,
-    /// Opaque 64-bit resource ID (raw `MTLResourceID._impl`).
-    /// Stored at build time so callers don't need objc2 access to read it.
     pub(crate) gpu_resource_id: u64,
-    /// Scratch buffer used during build (freed after build completes in a one-shot command).
-    /// Kept alive here until the next build or Drop to avoid UAF.
-    #[allow(dead_code)]
-    pub(crate) scratch_buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    pub(crate) scratch_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    pub(crate) residency_dirty: Rc<Cell<bool>>,
+}
+
+impl Drop for MetalAccelerationStructure {
+    fn drop(&mut self) {
+        let accel = unsafe {
+            &*(self.acceleration_structure.as_ref()
+                as *const ProtocolObject<dyn MTLAccelerationStructure>
+                as *const ProtocolObject<dyn MTLAllocation>)
+        };
+        self.residency_set.removeAllocation(accel);
+        let scratch = unsafe {
+            &*(self.scratch_buffer.as_ref() as *const ProtocolObject<dyn MTLBuffer>
+                as *const ProtocolObject<dyn MTLAllocation>)
+        };
+        self.residency_set.removeAllocation(scratch);
+        self.residency_dirty.set(true);
+    }
 }
 
 enum MetalBlasGeometryDescriptor {
@@ -62,20 +88,12 @@ pub(crate) struct MetalBlasGeometryDescriptors {
     pub(crate) array: Retained<NSArray<MTL4AccelerationStructureGeometryDescriptor>>,
 }
 
-pub(crate) fn make_blas_geometry_descriptors(
-    desc: &BlasDesc,
-) -> RhiResult<MetalBlasGeometryDescriptors> {
+pub(crate) fn make_blas_geometry_descriptors(desc: &BlasDesc) -> MetalBlasGeometryDescriptors {
     let mut descriptors = Vec::with_capacity(desc.meshes.len());
 
     for (mesh_index, mesh) in desc.meshes.iter().enumerate() {
         let descriptor = match mesh.geometry_type {
             GeometryType::Triangles => {
-                if mesh.vertex_buffer.0 == 0 || mesh.vertex_count == 0 {
-                    return Err(RhiError::Backend(
-                        "triangle BLAS geometry requires a non-null vertex_buffer and vertex_count"
-                            .into(),
-                    ));
-                }
                 let geo = MTL4AccelerationStructureTriangleGeometryDescriptor::new();
                 unsafe {
                     geo.setVertexBuffer(MTL4BufferRange {
@@ -95,11 +113,6 @@ pub(crate) fn make_blas_geometry_descriptors(
                 MetalBlasGeometryDescriptor::Triangle(geo)
             }
             GeometryType::Aabbs => {
-                if mesh.aabb_buffer.0 == 0 || mesh.aabb_count == 0 {
-                    return Err(RhiError::Backend(
-                        "AABB BLAS geometry requires a non-null aabb_buffer and aabb_count".into(),
-                    ));
-                }
                 let geo = MTL4AccelerationStructureBoundingBoxGeometryDescriptor::new();
                 geo.setBoundingBoxBuffer(MTL4BufferRange {
                     bufferAddress: mesh.aabb_buffer.0,
@@ -128,7 +141,7 @@ pub(crate) fn make_blas_geometry_descriptors(
         descriptors.iter().map(|g| g.as_base()).collect();
     let array = NSArray::from_slice(&geo_base_refs);
 
-    Ok(MetalBlasGeometryDescriptors { descriptors, array })
+    MetalBlasGeometryDescriptors { descriptors, array }
 }
 
 fn triangle_primitive_count(mesh: &crate::types::BlasMeshDesc) -> u32 {

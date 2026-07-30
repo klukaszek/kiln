@@ -3,8 +3,7 @@ use ash::vk;
 /// Vulkan surface wrapper.
 pub struct VulkanSurface {
     pub(crate) surface: vk::SurfaceKHR,
-    // Clone of the surface loader so `Drop` is self-contained. The owning `VulkanDevice` must
-    // outlive this (it destroys the `VkInstance`); the harness drops the device last.
+    // Keep the loader with the surface; the device must outlive both.
     pub(crate) surface_loader: ash::khr::surface::Instance,
 }
 

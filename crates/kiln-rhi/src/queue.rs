@@ -28,13 +28,11 @@ pub struct SubmitDesc<'a> {
 
 impl Queue {
     /// Submit a command buffer for execution.
-    /// The command buffer is consumed (transient, auto-reclaimed).
     pub fn submit(&self, cmd: CommandBuffer) -> RhiResult<()> {
         self.submit_with_desc(cmd, &SubmitDesc::default())
     }
 
-    /// Submit a command buffer with explicit timeline wait/signal dependencies.
-    /// The command buffer is consumed (transient, auto-reclaimed).
+    /// Submit with timeline dependencies.
     pub fn submit_with_desc(&self, cmd: CommandBuffer, desc: &SubmitDesc<'_>) -> RhiResult<()> {
         match (&self.inner, cmd.inner) {
             #[cfg(feature = "vulkan")]
@@ -91,8 +89,7 @@ impl Queue {
         }
     }
 
-    /// Submit a command buffer for frame presentation.
-    /// Handles semaphore waits/signals and fence signaling for the frame loop.
+    /// Submit a frame command buffer.
     pub fn submit_frame(
         &self,
         cmd: CommandBuffer,

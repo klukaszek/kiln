@@ -10,14 +10,14 @@ use objc2_foundation::NSString;
 use objc2_metal::{
     MTL4CommandBuffer, MTL4CommandQueue, MTL4Compiler, MTL4CompilerDescriptor,
     MTL4ComputePipelineDescriptor, MTL4CounterHeap, MTL4CounterHeapDescriptor, MTL4CounterHeapType,
-    MTL4LibraryFunctionDescriptor, MTL4PipelineDescriptor,
-    MTL4PipelineOptions, MTL4ShaderReflection, MTLAllocation, MTLBinding, MTLBindingType,
-    MTLBuffer, MTLCompileOptions, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
-    MTLCullMode, MTLDevice, MTLDrawable, MTLEvent, MTLHeap, MTLHeapDescriptor, MTLHeapType,
-    MTLLanguageVersion, MTLLibrary, MTLPixelFormat, MTLRenderPipelineState, MTLResidencySet,
-    MTLResidencySetDescriptor, MTLResourceOptions, MTLSamplerDescriptor, MTLSamplerState,
-    MTLSharedEvent, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
-    MTLTextureUsage as MtlTextureUsage, MTLWinding,
+    MTL4LibraryFunctionDescriptor, MTL4PipelineDescriptor, MTL4PipelineOptions,
+    MTL4ShaderReflection, MTLAllocation, MTLBinding, MTLBindingType, MTLBuffer, MTLCompileOptions,
+    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLCullMode, MTLDevice, MTLDrawable,
+    MTLEvent, MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLLanguageVersion, MTLLibrary,
+    MTLPixelFormat, MTLRenderPipelineState, MTLResidencySet, MTLResidencySetDescriptor,
+    MTLResourceOptions, MTLSamplerDescriptor, MTLSamplerState, MTLSharedEvent, MTLStorageMode,
+    MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage as MtlTextureUsage,
+    MTLWinding,
 };
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use raw_window_handle::RawWindowHandle;
@@ -303,23 +303,19 @@ impl MetalQueue {
                 .signalEvent_value(shared_event_as_event(&event), value);
         }
 
-        // Signal a per-frame fence value after GPU work completes.
         let value = self.next_fence_value();
         self.frame_fence_values.borrow_mut()[frame_index] = value;
         self.queue
             .signalEvent_value(shared_event_as_event(&self.frame_event), value);
 
-        // Present the drawable after committing.
         if let Some(drawable) = sc.current_drawable.borrow().as_ref() {
             self.queue.signalDrawable(drawable);
             drawable.present();
         }
 
-        // Clear drawable state
         let _ = sc.current_drawable.borrow_mut().take();
         let _ = sc.current_drawable_texture.borrow_mut().take();
 
-        // Keep the command buffer and associated resources alive until this frame slot completes.
         let mut frame_cmds = self.in_flight_frame_commands.borrow_mut();
         if frame_index >= frame_cmds.len() {
             return Err(RhiError::Backend(
@@ -341,7 +337,6 @@ impl MetalQueue {
     ) -> RhiResult<AcquiredImage> {
         self.reclaim_completed_submissions();
 
-        // Wait for previous GPU work on this frame slot to finish.
         let value = self.frame_fence_values.borrow()[frame_index];
         if value != 0 {
             let _ = self
@@ -357,20 +352,12 @@ impl MetalQueue {
             .nextDrawable()
             .ok_or_else(|| RhiError::SwapchainCreation("nextDrawable returned nil".into()))?;
 
-        // Store the drawable's texture for rendering
         let texture = drawable.texture();
         *sc.current_drawable_texture.borrow_mut() = Some(texture);
 
-        // Store the drawable for presentation
-        // CAMetalDrawable conforms to MTLDrawable, so we need to upcast
         let drawable_proto: Retained<ProtocolObject<dyn MTLDrawable>> =
             ProtocolObject::from_retained(drawable);
-        // Metal 4 decouples drawable availability from display readiness:
-        // nextDrawable can return a drawable the presentation system is still
-        // reading. Apple requires this queue wait "before committing any
-        // command buffers containing commands that target this drawable" —
-        // without it, rendering scribbles over the on-glass image (ghost
-        // frames) and races the pool invalidation during live resize.
+        // A drawable can be available while the display is still reading it.
         self.queue.waitForDrawable(&drawable_proto);
         *sc.current_drawable.borrow_mut() = Some(drawable_proto);
 
@@ -388,8 +375,6 @@ impl MetalQueue {
         _image_index: u32,
         _frame_index: usize,
     ) -> RhiResult<()> {
-        // Present is handled in submit_frame via presentDrawable on the command buffer.
-        // If called separately, we just drop the drawable (it was already presented).
         let _ = sc.current_drawable.borrow_mut().take();
         let _ = sc.current_drawable_texture.borrow_mut().take();
         Ok(())
@@ -449,9 +434,7 @@ struct RhiIcbRange {
     uint length;
 };
 
-// MSL forbids `command_buffer` as a direct `[[buffer(N)]]` kernel parameter; it must be
-// referenced through an argument-buffer struct (a `command_buffer` field at `[[id(0)]]`).
-// The CPU binds an 8-byte argument buffer holding the ICB's gpuResourceID at slot 3.
+// MSL exposes `command_buffer` through an argument buffer; slot 3 carries its resource ID.
 struct RhiIcbContainer {
     command_buffer cmd [[id(0)]];
 };
@@ -466,9 +449,6 @@ static inline primitive_type rhi_primitive_type(uint id) {
     }
 }
 
-// Encodes non-indexed MDI into an MTLIndirectCommandBuffer (bound directly via
-// setResource_atBufferIndex). The draw is non-indexed; the vertex shader does its own index
-// fetch from per-draw root data selected by [[draw_id]] + stride.
 kernel void rhi_encode_mdi_icb(
     device const RhiDrawIndirectMultiArgs* draws [[buffer(0)]],
     device atomic_uint* drawCount [[buffer(1)]],
@@ -555,7 +535,6 @@ impl MetalDevice {
             RhiError::DeviceCreation("Failed to create Metal 4 command queue".into())
         })?;
 
-        // Keep the residency set active on the command queue.
         queue.addResidencySet(&residency_set);
 
         let frame_event = device
@@ -640,8 +619,6 @@ impl MetalDevice {
                 .frame_event
                 .waitUntilSignaledValue_timeoutMS(value, u64::MAX);
         }
-        // `match` (not `if let`) so single-backend builds, where `QueueInner` has only the
-        // Metal variant, don't see an irrefutable pattern.
         match &self.rhi_queue.inner {
             #[cfg(feature = "metal")]
             QueueInner::Metal(q) => {
@@ -663,16 +640,12 @@ impl MetalDevice {
 
                 let ns_view = handle.ns_view.as_ptr() as *mut AnyObject;
 
-                // Create CAMetalLayer
                 let layer = CAMetalLayer::new();
                 layer.setDevice(Some(&self.device));
                 layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm_sRGB);
                 layer.setFramebufferOnly(true);
 
-                // Set the layer on the view
-                // [view setWantsLayer:YES]
                 let _: () = msg_send![ns_view, setWantsLayer: Bool::YES];
-                // [view setLayer:layer]
                 let layer_ptr: *mut AnyObject = objc2::rc::Retained::as_ptr(&layer) as *mut _;
                 let _: () = msg_send![ns_view, setLayer: layer_ptr];
 
@@ -701,7 +674,6 @@ impl MetalDevice {
             _ => unreachable!("wrong backend"),
         };
 
-        // Configure the layer
         let mtl_format = format_to_mtl(desc.format);
         layer.setPixelFormat(mtl_format);
         layer.setDrawableSize(CGSize {
@@ -766,7 +738,7 @@ impl MetalDevice {
                     RhiError::BufferCreation("Metal placed buffer allocation failed".into())
                 })?;
 
-        // Register for residency (Metal 4 pointer model).
+        // Track the texture for Metal 4 residency.
         let allocation = unsafe {
             &*(buffer.as_ref() as *const ProtocolObject<dyn MTLBuffer>
                 as *const ProtocolObject<dyn MTLAllocation>)
@@ -945,7 +917,7 @@ impl MetalDevice {
                     RhiError::TextureCreation("Metal placed texture allocation failed".into())
                 })?;
 
-        // Register for residency (Metal 4 pointer model).
+        // Track the buffer for Metal 4 residency.
         let allocation = unsafe {
             &*(texture.as_ref() as *const ProtocolObject<dyn MTLTexture>
                 as *const ProtocolObject<dyn MTLAllocation>)
@@ -959,7 +931,6 @@ impl MetalDevice {
             texture.setLabel(Some(&ns_label));
         }
 
-        // Add to texture tracking
         let mut textures = self.textures.borrow_mut();
         let id = TextureId(textures.len() as u32);
         textures.push(Some(texture.clone()));
@@ -1057,8 +1028,7 @@ impl MetalDevice {
             SampleCount::S16 => 16,
         };
 
-        // Depth/stencil formats stored on the PSO for render-pass construction;
-        // MTL4RenderPipelineDescriptor does not accept them at compile time.
+        // Metal 4 supplies depth/stencil formats when the render pass is created.
         let depth_format_mtl = desc
             .depth_format
             .map(format_to_mtl)
@@ -1108,8 +1078,7 @@ impl MetalDevice {
         let topology = match desc.topology {
             Topology::TriangleList => objc2_metal::MTLPrimitiveType::Triangle,
             Topology::TriangleStrip => objc2_metal::MTLPrimitiveType::TriangleStrip,
-            // Metal has no native TriangleFan. The caller must rewrite indices to TriangleList
-            // before submission. We panic here to surface the mistake early.
+            // Metal has no native TriangleFan; use TriangleList instead.
             Topology::TriangleFan => panic!(
                 "TriangleFan is not supported on Metal. \
                  Rewrite fan indices to TriangleList before creating this PSO."
@@ -1134,7 +1103,6 @@ impl MetalDevice {
                 stencil_format: stencil_format_mtl,
                 sample_count,
                 alpha_to_coverage: desc.alpha_to_coverage,
-                root_constant_size: desc.root_constant_size,
                 graphics_argument_buffer_slots,
                 blend_pipelines: RefCell::new(blend_pipelines),
             })),
@@ -1204,13 +1172,10 @@ impl MetalDevice {
             inner: ComputePsoInner::Metal(MetalComputePso {
                 pipeline: pipeline_state,
                 threads_per_threadgroup: desc.threads_per_threadgroup,
-                root_constant_size: desc.root_constant_size,
                 compute_argument_buffer_slots,
             }),
         })
     }
-
-    // -- Meshlet (mesh shader) pipeline --
 
     pub fn create_meshlet_pso(
         &self,
@@ -1227,13 +1192,11 @@ impl MetalDevice {
             .newCompilerWithDescriptor_error(&compiler_desc)
             .map_err(|e| RhiError::PipelineCreation(format!("MTL4 compiler: {e}")))?;
 
-        // Mesh function descriptor
         let mesh_fn_name = NSString::from_str(&mesh_module.entry_point);
         let mesh_func_desc = MTL4LibraryFunctionDescriptor::new();
         mesh_func_desc.setName(Some(&mesh_fn_name));
         mesh_func_desc.setLibrary(Some(&mesh_module.library));
 
-        // Fragment function descriptor
         let frag_fn_name = NSString::from_str(&frag_module.entry_point);
         let frag_func_desc = MTL4LibraryFunctionDescriptor::new();
         frag_func_desc.setName(Some(&frag_fn_name));
@@ -1243,7 +1206,6 @@ impl MetalDevice {
         pipeline_desc.setMeshFunctionDescriptor(Some(&mesh_func_desc));
         pipeline_desc.setFragmentFunctionDescriptor(Some(&frag_func_desc));
 
-        // Sample count and alpha-to-coverage
         let sample_count = match desc.sample_count {
             SampleCount::S1 => 1,
             SampleCount::S2 => 2,
@@ -1264,7 +1226,6 @@ impl MetalDevice {
             color_formats.push(super::texture::format_to_mtl(target.format));
         }
 
-        // Color attachment formats
         for (i, &fmt) in color_formats.iter().enumerate() {
             let att = unsafe { pipeline_desc.colorAttachments().objectAtIndexedSubscript(i) };
             att.setPixelFormat(fmt);
@@ -1276,14 +1237,12 @@ impl MetalDevice {
         );
         pipeline_desc.setOptions(Some(&pipeline_options));
 
-        // Fragment function — needed by the argument encoder to build bindless heap layouts.
-        // MTL4MeshRenderPipelineDescriptor inherits from MTL4PipelineDescriptor.
+        // Reflection supplies the bindless argument-buffer slots.
         let base_desc: &MTL4PipelineDescriptor = pipeline_desc.as_ref();
         let default_pipeline = compiler
             .newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(base_desc, None)
             .map_err(|e| RhiError::PipelineCreation(format!("Mesh PSO: {e}")))?;
 
-        // Extract argument buffer slot indices from mesh + fragment shader reflection.
         let argument_buffer_slots = default_pipeline
             .reflection()
             .map(|r| {
@@ -1298,7 +1257,6 @@ impl MetalDevice {
                             }
                         }
                     };
-                // Mesh pipelines expose mesh + fragment bindings in reflection.
                 collect_slots(&r.meshBindings(), &mut slots);
                 collect_slots(&r.fragmentBindings(), &mut slots);
                 slots.sort_unstable();
@@ -1324,7 +1282,6 @@ impl MetalDevice {
                     .stencil_format
                     .map(super::texture::format_to_mtl)
                     .unwrap_or(MTLPixelFormat::Invalid),
-                root_constant_size: desc.root_constant_size,
                 argument_buffer_slots,
                 blend_pipelines: std::cell::RefCell::new(std::collections::HashMap::new()),
                 default_pipeline,
@@ -1332,22 +1289,22 @@ impl MetalDevice {
         })
     }
 
-    // -- Acceleration structures --
-
     pub fn create_blas(&self, desc: &BlasDesc) -> RhiResult<AccelerationStructure> {
         use super::accel::make_blas_geometry_descriptors;
         use objc2_metal::MTL4PrimitiveAccelerationStructureDescriptor;
 
-        let geometries = make_blas_geometry_descriptors(desc)?;
+        let geometries = make_blas_geometry_descriptors(desc);
         let primitive_desc = MTL4PrimitiveAccelerationStructureDescriptor::new();
         primitive_desc.setGeometryDescriptors(Some(&geometries.array));
-
-        let sizes = unsafe {
-            self.device.accelerationStructureSizesWithDescriptor(
-                &*(primitive_desc.as_ref() as *const MTL4PrimitiveAccelerationStructureDescriptor
-                    as *const objc2_metal::MTLAccelerationStructureDescriptor),
-            )
+        let primitive_base = unsafe {
+            &*(primitive_desc.as_ref() as *const MTL4PrimitiveAccelerationStructureDescriptor
+                as *const objc2_metal::MTLAccelerationStructureDescriptor)
         };
+        super::accel::set_accel_usage(primitive_base, desc.flags);
+
+        let sizes = self
+            .device
+            .accelerationStructureSizesWithDescriptor(primitive_base);
         self.finalize_accel_structure(sizes, "BLAS")
     }
 
@@ -1358,21 +1315,21 @@ impl MetalDevice {
         unsafe {
             instance_desc.setInstanceDescriptorBuffer(objc2_metal::MTL4BufferRange {
                 bufferAddress: desc.instance_buffer.0,
-                // MTL4InstanceAccelerationStructureDescriptor defaults to the *indirect*
-                // instance-descriptor type, whose native layout is
-                // MTLIndirectAccelerationStructureInstanceDescriptor (NOT the Vulkan-shaped
-                // TlasInstance). Callers fill the buffer via device.write_tlas_instance.
+                // The descriptor uses Metal's indirect instance layout; callers write it with
+                // `Device::write_tlas_instance`.
                 length: (desc.instance_count as u64) * self.tlas_instance_stride() as u64,
             });
             instance_desc.setInstanceCount(desc.instance_count as usize);
         }
-
-        let sizes = unsafe {
-            self.device.accelerationStructureSizesWithDescriptor(
-                &*(instance_desc.as_ref() as *const MTL4InstanceAccelerationStructureDescriptor
-                    as *const objc2_metal::MTLAccelerationStructureDescriptor),
-            )
+        let instance_base = unsafe {
+            &*(instance_desc.as_ref() as *const MTL4InstanceAccelerationStructureDescriptor
+                as *const objc2_metal::MTLAccelerationStructureDescriptor)
         };
+        super::accel::set_accel_usage(instance_base, desc.flags);
+
+        let sizes = self
+            .device
+            .accelerationStructureSizesWithDescriptor(instance_base);
         self.finalize_accel_structure(sizes, "TLAS")
     }
 
@@ -1404,11 +1361,28 @@ impl MetalDevice {
         let resource_id: MTLResourceID =
             unsafe { std::mem::transmute(inst.acceleration_structure_reference.0) };
 
+        let instance_flags =
+            InstanceFlags::from_bits_retain((inst.instance_sbt_offset_and_flags >> 24) as u8);
+        let mut options = MTLAccelerationStructureInstanceOptions::empty();
+        if instance_flags.contains(InstanceFlags::TRIANGLE_FACING_CULL_DISABLE) {
+            options |= MTLAccelerationStructureInstanceOptions::DisableTriangleCulling;
+        }
+        if instance_flags.contains(InstanceFlags::TRIANGLE_FLIP_FACING) {
+            options |=
+                MTLAccelerationStructureInstanceOptions::TriangleFrontFacingWindingCounterClockwise;
+        }
+        if instance_flags.contains(InstanceFlags::FORCE_OPAQUE) {
+            options |= MTLAccelerationStructureInstanceOptions::Opaque;
+        }
+        if instance_flags.contains(InstanceFlags::FORCE_NO_OPAQUE) {
+            options |= MTLAccelerationStructureInstanceOptions::NonOpaque;
+        }
+
         let desc = MTLIndirectAccelerationStructureInstanceDescriptor {
             transformationMatrix: MTLPackedFloat4x3 {
                 columns: [col(0), col(1), col(2), col(3)],
             },
-            options: MTLAccelerationStructureInstanceOptions::empty(),
+            options,
             mask: (inst.instance_custom_index_and_mask >> 24) & 0xFF,
             intersectionFunctionTableOffset: inst.instance_sbt_offset_and_flags & 0x00FF_FFFF,
             userID: inst.instance_custom_index_and_mask & 0x00FF_FFFF,
@@ -1474,7 +1448,9 @@ impl MetalDevice {
             inner: AccelInner::Metal(Box::new(MetalAccelerationStructure {
                 acceleration_structure: accel,
                 gpu_resource_id,
-                scratch_buffer: Some(scratch),
+                scratch_buffer: scratch,
+                residency_set: self.residency_set.clone(),
+                residency_dirty: self.residency_dirty.clone(),
             })),
         })
     }
@@ -1512,7 +1488,6 @@ impl MetalDevice {
     ) -> RhiResult<CommandBuffer> {
         let mut cmd_buf = self.create_command_buffer()?;
 
-        // Set drawable and depth textures on the Metal command buffer
         match (&mut cmd_buf.inner, &swapchain.inner) {
             (crate::command::CommandBufferInner::Metal(mtl_cmd), SwapchainInner::Metal(sc)) => {
                 mtl_cmd.drawable_texture = sc.current_drawable_texture.borrow().clone();
@@ -1573,21 +1548,19 @@ impl MetalDevice {
         }
     }
 
-    pub fn texture_view_descriptor(
+    pub fn create_sampled_view(
         &self,
         source: &Texture,
-        view: &crate::texture::GpuViewDesc,
+        view: &crate::texture::TextureViewDesc,
     ) -> RhiResult<TextureId> {
         self.create_view_internal(source, view)
     }
 
-    pub fn rw_texture_view_descriptor(
+    pub fn create_storage_view(
         &self,
         source: &Texture,
-        view: &crate::texture::GpuViewDesc,
+        view: &crate::texture::TextureViewDesc,
     ) -> RhiResult<TextureId> {
-        // Metal does not separate sampled vs storage view creation — the same MTLTextureView
-        // is used for both read and read/write access. Usage is controlled by shader binding type.
         self.create_view_internal(source, view)
     }
 
@@ -1614,8 +1587,6 @@ impl MetalDevice {
         GpuAddress(raw)
     }
 
-    // -- GPU timestamp queries --
-
     pub fn create_query_pool(&self, count: u32) -> RhiResult<QueryPool> {
         use objc2_foundation::NSRange;
 
@@ -1627,8 +1598,7 @@ impl MetalDevice {
             .device
             .newCounterHeapWithDescriptor_error(&desc)
             .map_err(|e| RhiError::Backend(format!("newCounterHeapWithDescriptor: {e}")))?;
-        // A fresh heap's entries are undefined; invalidate so unwritten slots resolve to 0 (the
-        // "unwritten slots read back as 0" contract). Safe: the heap is new, not yet in flight.
+        // Invalidate the new heap so unwritten slots resolve to zero.
         unsafe {
             heap.invalidateCounterRange(NSRange {
                 location: 0,
@@ -1641,9 +1611,7 @@ impl MetalDevice {
         })
     }
 
-    pub fn destroy_query_pool(&self, _pool: QueryPool) {
-        // The MTL4CounterHeap is ARC-managed: dropping `_pool` releases it.
-    }
+    pub fn destroy_query_pool(&self, _pool: QueryPool) {}
 
     pub fn timestamp_period_ns(&self) -> f64 {
         let freq = self.device.queryTimestampFrequency();
@@ -1658,8 +1626,7 @@ impl MetalDevice {
             #[allow(unreachable_patterns)]
             _ => unreachable!("query pool backend does not match device backend"),
         };
-        // CPU-timeline resolve (caller waited the writing frame). Each entry is a packed u64 of GPU
-        // ticks (`MTL4TimestampHeapEntry`).
+        // The writing frame has completed, so resolve the timestamp heap directly.
         let range = NSRange {
             location: 0,
             length: pool.count as usize,
@@ -1677,7 +1644,7 @@ impl MetalDevice {
     fn create_view_internal(
         &self,
         source: &Texture,
-        view: &crate::texture::GpuViewDesc,
+        view: &crate::texture::TextureViewDesc,
     ) -> RhiResult<TextureId> {
         use crate::texture::{ALL_LAYERS, ALL_MIPS};
         use objc2_foundation::NSRange;
@@ -1687,9 +1654,7 @@ impl MetalDevice {
             .get(source.id.0 as usize)
             .and_then(|t| t.as_ref())
             .ok_or_else(|| {
-                RhiError::TextureCreation(
-                    "texture_view_descriptor: invalid source TextureId".into(),
-                )
+                RhiError::TextureCreation("create texture view: invalid source TextureId".into())
             })?
             .clone();
         drop(textures_borrow);
@@ -1742,7 +1707,7 @@ impl MetalDevice {
                 })?
         };
 
-        // Register view for residency (it shares memory with the source).
+        // Views share the source allocation but still need residency tracking.
         let allocation = unsafe {
             &*(view_texture.as_ref() as *const ProtocolObject<dyn MTLTexture>
                 as *const ProtocolObject<dyn MTLAllocation>)

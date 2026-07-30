@@ -12,7 +12,6 @@ use crate::types::{BlendFactor, BlendOp, ColorWriteMask, Cull, SampleCount, Topo
 pub struct VulkanGraphicsPso {
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) pipeline_layout: vk::PipelineLayout,
-    pub(crate) root_constant_size: u32,
     pub(crate) device: ash::Device,
     pub(crate) desc: VulkanGraphicsPsoDesc,
     pub(crate) blend_pipelines: RefCell<HashMap<BlendState, vk::Pipeline>>,
@@ -22,7 +21,6 @@ pub struct VulkanGraphicsPso {
 pub struct VulkanComputePso {
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) pipeline_layout: vk::PipelineLayout,
-    pub(crate) root_constant_size: u32,
     #[allow(dead_code)]
     pub(crate) threads_per_threadgroup: [u32; 3],
     pub(crate) device: ash::Device,
@@ -53,8 +51,7 @@ pub struct VulkanGraphicsPsoDesc {
 }
 
 impl VulkanGraphicsPso {
-    /// Draw-time variant fetch: no `Result` channel here, so a compile failure (an
-    /// unsupported blend combo) is a programmer error and panics, like other draw-time guards.
+    /// Return the cached blend variant, creating it when needed.
     pub(crate) fn pipeline_for_blend(&self, blend: &BlendState) -> vk::Pipeline {
         if let Some(p) = self.blend_pipelines.borrow().get(blend) {
             return *p;
@@ -166,10 +163,7 @@ impl VulkanGraphicsPso {
             .stencil_attachment_format(self.desc.stencil_format);
 
         let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-            // The pipeline layout references the bindless set layout, which is created with
-            // VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT, so the pipeline must
-            // opt into descriptor buffers too (VUID-VkGraphicsPipelineCreateInfo-flags-08097).
-            // NVIDIA returns VK_ERROR_UNKNOWN if this is omitted.
+            // The bindless set uses descriptor buffers, so the pipeline must opt in too.
             .flags(vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT)
             .stages(&shader_stages)
             .vertex_input_state(&vertex_input_info)
@@ -282,10 +276,6 @@ fn blend_op_to_vk(op: BlendOp) -> vk::BlendOp {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Vulkan mesh-shader pipeline — VK_EXT_mesh_shader
-// ---------------------------------------------------------------------------
-
 /// Vulkan meshlet (mesh shader) pipeline state.
 ///
 /// Requires `VK_EXT_mesh_shader`.  The pipeline is built without a vertex or
@@ -293,7 +283,6 @@ fn blend_op_to_vk(op: BlendOp) -> vk::BlendOp {
 pub struct VulkanMeshletPso {
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) pipeline_layout: vk::PipelineLayout,
-    pub(crate) root_constant_size: u32,
     pub(crate) device: ash::Device,
     /// Blend variants (same per-draw flyweight mechanism as graphics PSOs).
     pub(crate) desc: VulkanMeshletPsoDesc,
@@ -314,8 +303,7 @@ pub struct VulkanMeshletPsoDesc {
 }
 
 impl VulkanMeshletPso {
-    /// Draw-time variant fetch — panics on compile failure (no `Result` channel), see the
-    /// graphics PSO equivalent.
+    /// Return the cached blend variant, creating it when needed.
     pub(crate) fn pipeline_for_blend(&self, blend: &BlendState) -> vk::Pipeline {
         if let Some(p) = self.blend_pipelines.borrow().get(blend) {
             return *p;
@@ -421,9 +409,7 @@ impl VulkanMeshletPso {
             .stencil_attachment_format(self.desc.stencil_format);
 
         let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-            // See the graphics PSO: the bindless set layout is a descriptor-buffer layout, so the
-            // pipeline must carry VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT or NVIDIA fails
-            // creation with VK_ERROR_UNKNOWN.
+            // The bindless set uses descriptor buffers, so the pipeline must opt in too.
             .flags(vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT)
             .stages(&stages)
             .viewport_state(&viewport_state)

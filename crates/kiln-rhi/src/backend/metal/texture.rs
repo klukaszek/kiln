@@ -25,16 +25,12 @@ pub fn format_to_mtl(format: Format) -> MTLPixelFormat {
         Format::D32Float => MTLPixelFormat::Depth32Float,
         Format::D24UnormS8Uint => MTLPixelFormat::Depth24Unorm_Stencil8,
         Format::D32FloatS8Uint => MTLPixelFormat::Depth32Float_Stencil8,
-        // Index (not used as pixel format, but map for completeness)
         Format::R16Uint => MTLPixelFormat::R16Uint,
         Format::R32Uint => MTLPixelFormat::R32Uint,
     }
 }
 
-/// Convert MTLPixelFormat back to RHI Format — the faithful inverse of [`format_to_mtl`]
-/// (used for swapchain format detection). Panics on a format the RHI does not model rather
-/// than silently substituting a wrong one, which would cause hard-to-debug render-target
-/// format mismatches.
+/// Convert an `MTLPixelFormat` to the corresponding RHI format.
 pub fn mtl_to_format(mtl: MTLPixelFormat) -> Format {
     match mtl {
         MTLPixelFormat::R8Unorm => Format::R8Unorm,

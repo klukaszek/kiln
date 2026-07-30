@@ -36,8 +36,6 @@ pub struct GraphicsPsoDesc {
     pub sample_count: SampleCount,
     /// Enable alpha-to-coverage.
     pub alpha_to_coverage: bool,
-    /// Size of root constants in bytes (root table: base + stride).
-    pub root_constant_size: u32,
     /// Cull mode. Encodes cull direction and implied front-face winding (`Cull::Cw` = standard back-face culling).
     pub cull: Cull,
     /// Separate stencil attachment format (None = no stencil). Distinct from `depth_format`.
@@ -57,7 +55,6 @@ impl Default for GraphicsPsoDesc {
             depth_format: Some(Format::D32Float),
             sample_count: SampleCount::S1,
             alpha_to_coverage: false,
-            root_constant_size: (std::mem::size_of::<GpuAddress>() * 4) as u32,
             cull: Cull::None,
             stencil_format: None,
             support_dual_source_blending: false,
@@ -81,14 +78,10 @@ pub(crate) enum GraphicsPsoInner {
 
 /// Description for creating a compute pipeline.
 ///
-/// The compute shader is passed as a `&ShaderModule` argument to `create_compute_pso`,
-/// matching the spec's `gpuCreateComputePipeline(computeIR)`.
+/// The compute shader is passed to `create_compute_pso` as a `&ShaderModule`.
 #[derive(Clone, Debug)]
 pub struct ComputePsoDesc {
-    /// Size of root constants in bytes.
-    pub root_constant_size: u32,
-    /// Threads per threadgroup (Metal dispatch requires this).
-    /// Vulkan ignores this value.
+    /// Threads per threadgroup for Metal dispatch. Vulkan ignores this value.
     pub threads_per_threadgroup: [u32; 3],
     pub label: Option<String>,
 }
@@ -96,7 +89,6 @@ pub struct ComputePsoDesc {
 impl Default for ComputePsoDesc {
     fn default() -> Self {
         Self {
-            root_constant_size: std::mem::size_of::<GpuAddress>() as u32,
             threads_per_threadgroup: [1, 1, 1],
             label: None,
         }
@@ -230,10 +222,6 @@ impl Default for BlendState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Meshlet (mesh shader) pipeline — gpuCreateGraphicsMeshletPipeline
-// ---------------------------------------------------------------------------
-
 /// Description for a mesh-shader graphics pipeline. The mesh shader replaces the vertex shader;
 /// amplification shaders aren't exposed. Mesh and pixel shaders are passed as `&ShaderModule`
 /// args to `create_meshlet_pso`. Requires `VK_EXT_mesh_shader` on Vulkan.
@@ -250,8 +238,6 @@ pub struct MeshletPsoDesc {
     pub support_dual_source_blending: bool,
     /// Optional pre-baked blend state.
     pub blendstate: Option<BlendState>,
-    /// Root constant size in bytes (passed via the mesh shader's root pointer).
-    pub root_constant_size: u32,
     pub label: Option<String>,
 }
 
@@ -267,7 +253,6 @@ impl Default for MeshletPsoDesc {
             cull: Cull::None,
             support_dual_source_blending: false,
             blendstate: None,
-            root_constant_size: (std::mem::size_of::<crate::types::GpuAddress>() * 2) as u32,
             label: None,
         }
     }

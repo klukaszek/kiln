@@ -44,7 +44,6 @@ impl Swapchain {
 
     /// Get the swapchain extent [width, height].
     pub fn extent(&self) -> [u32; 2] {
-        // Divergent per backend: Vulkan stores a `vk::Extent2D`, Metal a `[u32; 2]`.
         match &self.inner {
             #[cfg(feature = "vulkan")]
             SwapchainInner::Vulkan(sc) => [sc.extent.width, sc.extent.height],

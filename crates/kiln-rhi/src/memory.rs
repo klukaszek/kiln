@@ -4,8 +4,7 @@ use crate::types::GpuAddress;
 use crate::{RhiError, RhiResult};
 use zerocopy::{FromBytes, IntoBytes};
 
-/// Types copyable verbatim to/from GPU memory: `#[repr(C)]`, no padding, valid for any bit
-/// pattern. Auto-implemented via the `zerocopy` derives (see `gpu_struct!`).
+/// A type that can be copied directly between CPU and GPU memory.
 pub trait GpuPod: IntoBytes + FromBytes + zerocopy::Immutable {}
 impl<T> GpuPod for T where T: IntoBytes + FromBytes + zerocopy::Immutable {}
 
@@ -60,21 +59,24 @@ pub struct BufferDesc {
     pub label: Option<String>,
 }
 
-/// A GPU allocation: a CPU-mapped pointer + GPU address over a backing buffer.
+/// A GPU memory allocation.
 pub struct GpuAllocation {
     pub(crate) buffer: GpuBuffer,
+    pub(crate) offset: u64,
     pub(crate) size: u64,
 }
 
 impl GpuAllocation {
-    /// CPU-mapped pointer (`None` for `GpuOnly`). The `.cpu` of the dual-pointer pair.
+    /// CPU mapping, or `None` for `GpuOnly` memory.
     pub fn cpu(&self) -> Option<*mut u8> {
-        self.buffer.cpu()
+        self.buffer
+            .cpu()
+            .map(|ptr| unsafe { ptr.add(self.offset as usize) })
     }
 
-    /// GPU virtual address — the `.gpu` of the dual-pointer pair.
+    /// GPU virtual address.
     pub fn gpu(&self) -> GpuAddress {
-        self.buffer.gpu()
+        self.buffer.gpu().offset(self.offset)
     }
 
     /// Allocation size in bytes.
@@ -130,9 +132,7 @@ impl GpuAllocation {
     }
 }
 
-/// A persistent GPU buffer allocation.
-///
-/// Returns dual pointers: CPU mapped pointer (for upload buffers) + GPU address.
+/// A persistent GPU buffer.
 pub struct GpuBuffer {
     pub(crate) inner: GpuBufferInner,
 }
@@ -161,7 +161,7 @@ impl GpuBuffer {
     }
 }
 
-/// Dual-pointer transient allocation from the bump allocator (the doc's `{ cpu, gpu }`).
+/// A transient slice of mapped GPU memory.
 #[derive(Clone, Copy, Debug)]
 pub struct TransientAllocation {
     pub cpu: *mut u8,
@@ -181,7 +181,7 @@ impl TransientAllocation {
     }
 }
 
-/// Per-frame bump allocator over a large GpuBuffer.
+/// Linear allocator over a mapped GPU buffer.
 pub struct BumpAllocator {
     buffer: GpuBuffer,
     offset: u64,
@@ -199,16 +199,12 @@ impl BumpAllocator {
         }
     }
 
-    /// Allocate `size` bytes with the given alignment.
-    /// Returns None if the allocator is full.
+    /// Allocate `size` bytes with the given power-of-two alignment.
+    /// Returns `None` when the allocator has no room.
     pub fn alloc(&mut self, size: u64, align: u64) -> Option<TransientAllocation> {
         let align = align.max(1);
-        if !align.is_power_of_two() {
-            return None;
-        }
-
-        let aligned_offset = self.offset.checked_add(align - 1)? & !(align - 1);
-        let end = aligned_offset.checked_add(size)?;
+        let aligned_offset = self.offset.div_ceil(align) * align;
+        let end = aligned_offset + size;
         if end > self.capacity {
             return None;
         }
@@ -247,7 +243,3 @@ impl BumpAllocator {
         self.buffer
     }
 }
-
-// Allocator behaviour is covered by the black-box headless tests in `tests/memory.rs`;
-// the bump allocator's end-to-end use as per-draw root data is exercised by
-// `graphics_root_from_bump_allocator` in `tests/graphics.rs`.

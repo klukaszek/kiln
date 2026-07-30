@@ -2,9 +2,9 @@
 
 use crate::types::{Format, GpuAddress, SampleCount, TextureDimension, TextureId};
 
-/// Sentinel for `GpuViewDesc::mip_count`: include all mip levels from `base_mip` to the last.
+/// Sentinel for `TextureViewDesc::mip_count`: include all remaining mip levels.
 pub const ALL_MIPS: u8 = 0xFF;
-/// Sentinel for `GpuViewDesc::layer_count`: include all array layers from `base_layer` to the last.
+/// Sentinel for `TextureViewDesc::layer_count`: include all remaining array layers.
 pub const ALL_LAYERS: u16 = 0xFFFF;
 
 bitflags::bitflags! {
@@ -59,8 +59,7 @@ pub struct TextureSizeAlign {
     pub align: u64,
 }
 
-/// Opaque texture object.
-/// The image is backed by caller-owned GPU memory at `gpu_address`.
+/// A texture backed by caller-owned GPU memory.
 pub struct Texture {
     pub(crate) id: TextureId,
     pub(crate) gpu_address: GpuAddress,
@@ -68,7 +67,7 @@ pub struct Texture {
 }
 
 impl Texture {
-    /// Get the TextureId for use in shaders (bindless index).
+    /// Bindless texture ID.
     pub fn id(&self) -> TextureId {
         self.id
     }
@@ -78,17 +77,15 @@ impl Texture {
         self.gpu_address
     }
 
-    /// Get the texture description.
+    /// Texture description.
     pub fn desc(&self) -> &TextureDesc {
         &self.desc
     }
 }
 
-/// A non-default view of a texture, for `texture_view_descriptor` (SRV) /
-/// `rw_texture_view_descriptor` (UAV). `ALL_MIPS`/`ALL_LAYERS` cover the rest of the range;
-/// `format = None` keeps the source format.
+/// A non-default sampled or storage view.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct GpuViewDesc {
+pub struct TextureViewDesc {
     /// Format override. `None` = same as source texture.
     pub format: Option<Format>,
     /// First mip level included in the view.
@@ -101,7 +98,7 @@ pub struct GpuViewDesc {
     pub layer_count: u16,
 }
 
-impl Default for GpuViewDesc {
+impl Default for TextureViewDesc {
     fn default() -> Self {
         Self {
             format: None,

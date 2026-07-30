@@ -4,8 +4,6 @@ use ash::vk;
 ///
 /// `acceleration_structure` is an opaque `VkAccelerationStructureKHR`.
 /// `buffer` / `buffer_memory` hold the backing storage for the AS data.
-/// `device_address` is the GPU address passed into TLAS instance descriptors
-/// and into the shader for `gpuSetActiveTextureHeapPtr`-style root data.
 pub struct VulkanAccelerationStructure {
     pub(crate) acceleration_structure: vk::AccelerationStructureKHR,
     pub(crate) buffer: vk::Buffer,
@@ -31,10 +29,10 @@ impl Drop for VulkanAccelerationStructure {
         unsafe {
             self.accel_loader
                 .destroy_acceleration_structure(self.acceleration_structure, None);
-            self.device.free_memory(self.buffer_memory, None);
             self.device.destroy_buffer(self.buffer, None);
-            self.device.free_memory(self.scratch_memory, None);
+            self.device.free_memory(self.buffer_memory, None);
             self.device.destroy_buffer(self.scratch_buffer, None);
+            self.device.free_memory(self.scratch_memory, None);
         }
     }
 }

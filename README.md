@@ -63,42 +63,42 @@ frame rather than freed piecewise.
 
 ### Root data: one pointer per draw
 
-There are no descriptor sets and no bind groups. A draw or dispatch carries a single root pointer
-per shader stage. That pointer is the address of a struct you laid out yourself; inside the shader,
+There are no descriptor sets and no bind groups. A draw or dispatch carries one root pointer shared
+by the stages that use it. That pointer is the address of a struct you laid out yourself; inside the shader,
 the struct is dereferenced and its fields (themselves often pointers to vertex data, instance data,
 material tables) are followed from there.
 
 ```rust
 cmd.set_graphics_pipeline(&pso);
-cmd.draw(vertex_root, pixel_root, vertex_count, 1, 0, 0);
+cmd.draw(root, vertex_count, 1, 0, 0);
 ```
 
-`vertex_root` and `pixel_root` are `Option<GpuAddress>`; passing `None` binds a never-dereferenced
-null. Compute is the same shape with one root:
+Pass `GpuAddress::NULL` when the shader does not use root data. Compute has the same shape:
 
 ```rust
 cmd.dispatch(root, groups_x, groups_y, groups_z);
 ```
 
-This is why indirect and multi-draw fall out naturally. For multi-draw, each draw's root is
-`base + draw_id * stride`, so a single recorded command can fan out across thousands of objects
-whose parameters live entirely in GPU memory.
+This is why indirect and multi-draw fall out naturally. For multi-draw, the shader indexes a root
+array by draw ID, so a single recorded command can fan out across thousands of objects whose
+parameters live entirely in GPU memory.
 
 ### Bindless texture heap
 
-Textures are not bound to slots. A texture view is registered once into a global heap and returns
-a `TextureId(u32)`. Shaders index the heap by that integer. The active heap pointer is set once per
-command buffer:
+Textures are not bound to slots. A texture view is registered once into the global heap and returns
+a `TextureId(u32)`. Store `device.bindless_texture_handle(id)` in a `TextureHandle` root field; the
+backend maps that handle to its descriptor-buffer index (Vulkan) or resource ID (Metal). The active
+heap is populated and bound when a pipeline uses raw heap bindings:
 
 ```rust
-let tex_id = device.texture_view_descriptor(&texture, &view)?;   // -> TextureId
-cmd.set_active_texture_heap_ptr(heap_addr);
-// shaders read the heap by tex_id.0
+let tex_id = device.create_sampled_view(&texture, &view)?;
+// shaders use the TextureHandle in their root data
 ```
 
-Sampled views and storage (read-write) views go through `texture_view_descriptor` and
-`rw_texture_view_descriptor` respectively. On Vulkan this is backed by the descriptor buffer
-extension; on Metal by `MTL4ArgumentTable`. The application sees one model.
+Use `create_sampled_view` with `TextureHandle` for sampling and `create_storage_view` with
+`StorageTextureHandle` for read-write access. The source texture must include the matching usage
+flag. Vulkan backs the heap with descriptor buffers and mutable image descriptors; Metal uses
+resource IDs. Device creation rejects Vulkan adapters that cannot provide this common heap layout.
 
 ### Stage-only barriers
 
@@ -136,7 +136,6 @@ let pso = device.create_graphics_pso(
         color_targets: vec![ColorTarget::new(color_format)],
         depth_format: None,
         sample_count: SampleCount::S1,
-        root_constant_size: 16,
         cull: Cull::None,
         ..Default::default()
     },
@@ -156,7 +155,7 @@ explicit pool management at the API surface.
 let mut cmd = device.create_command_buffer()?;
 cmd.begin_render_pass(&pass_desc);
 cmd.set_graphics_pipeline(&pso);
-cmd.draw(root, None, 3, 1, 0, 0);
+cmd.draw(root, 3, 1, 0, 0);
 cmd.end_render_pass();
 queue.submit(cmd)?;
 ```
@@ -246,11 +245,11 @@ let pso = device.create_graphics_pso(
 
 // in the frame loop:
 cmd.set_graphics_pipeline(&pso);
-cmd.draw(None, None, 3, 1, 0, 0);
+cmd.draw(GpuAddress::NULL, 3, 1, 0, 0);
 ```
 
-The vertex and pixel roots are `None` here because this shader generates its positions and colors
-from `SV_VertexID`. A real workload passes the address of a per-draw struct instead.
+The null root is enough here because this shader generates its positions and colors from
+`SV_VertexID`. A real workload passes the address of a per-draw struct instead.
 
 ## Building
 

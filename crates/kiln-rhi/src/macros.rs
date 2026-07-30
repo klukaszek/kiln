@@ -71,28 +71,75 @@ macro_rules! gpu_struct {
 #[macro_export]
 macro_rules! gpu_slang_ty {
     // Explicit override (device pointers, or any type without a built-in mapping).
-    ($fty:tt, $slang:literal) => { $slang };
+    ($fty:tt, $slang:literal) => {
+        $slang
+    };
 
-    (AccelHandle) => { "DescriptorHandle<RaytracingAccelerationStructure>" };
-    (TextureHandle) => { "DescriptorHandle<Texture2D>" };
-    (SamplerHandle) => { "DescriptorHandle<SamplerState>" };
+    (AccelHandle) => {
+        "DescriptorHandle<RaytracingAccelerationStructure>"
+    };
+    (TextureHandle) => {
+        "DescriptorHandle<Texture2D>"
+    };
+    (StorageTextureHandle) => {
+        "DescriptorHandle<RWTexture2D<float>>"
+    };
+    (SamplerHandle) => {
+        "DescriptorHandle<SamplerState>"
+    };
 
-    (f32) => { "float" };
-    (u32) => { "uint" };
-    (i32) => { "int" };
-    (Vec2) => { "float2" };
-    (Vec3) => { "float3" };
-    (Vec4) => { "float4" };
-    (UVec2) => { "uint2" };
-    (UVec3) => { "uint3" };
-    (UVec4) => { "uint4" };
-    (IVec2) => { "int2" };
-    (IVec3) => { "int3" };
-    (IVec4) => { "int4" };
-    (Mat3) => { "float3x3" };
-    (Mat4) => { "float4x4" };
-    ([f32; 2]) => { "float2" };
-    ([f32; 3]) => { "float3" };
-    ([f32; 4]) => { "float4" };
-    ([f32; 16]) => { "float4x4" };
+    (f32) => {
+        "float"
+    };
+    (u32) => {
+        "uint"
+    };
+    (i32) => {
+        "int"
+    };
+    (Vec2) => {
+        "float2"
+    };
+    (Vec3) => {
+        "float3"
+    };
+    (Vec4) => {
+        "float4"
+    };
+    (UVec2) => {
+        "uint2"
+    };
+    (UVec3) => {
+        "uint3"
+    };
+    (UVec4) => {
+        "uint4"
+    };
+    (IVec2) => {
+        "int2"
+    };
+    (IVec3) => {
+        "int3"
+    };
+    (IVec4) => {
+        "int4"
+    };
+    (Mat3) => {
+        "float3x3"
+    };
+    (Mat4) => {
+        "float4x4"
+    };
+    ([f32; 2]) => {
+        "float2"
+    };
+    ([f32; 3]) => {
+        "float3"
+    };
+    ([f32; 4]) => {
+        "float4"
+    };
+    ([f32; 16]) => {
+        "float4x4"
+    };
 }

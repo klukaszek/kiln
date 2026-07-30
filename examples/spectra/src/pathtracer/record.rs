@@ -118,7 +118,7 @@ impl PathTracer {
             stencil_write_mask: 0,
             ..Default::default()
         });
-        cmd.draw(None, root, 3, 1, 0, 0);
+        cmd.draw(root, 3, 1, 0, 0);
     }
 
     fn record_trace(

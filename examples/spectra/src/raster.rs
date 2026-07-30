@@ -116,7 +116,6 @@ impl RasterPreview {
                 cull: Cull::None,
                 support_dual_source_blending: false,
                 blendstate: None,
-                root_constant_size: 16,
                 label: Some("spectral-raster".into()),
             },
             &ms,
@@ -174,7 +173,7 @@ impl RasterPreview {
             stencil_write_mask: 0,
             ..Default::default()
         });
-        cmd.draw_meshlets(root, root, self.num_meshlets, 1, 1);
+        cmd.draw_meshlets(root, self.num_meshlets, 1, 1);
     }
 
     pub fn destroy(self, device: &Device) {

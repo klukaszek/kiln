@@ -20,6 +20,12 @@ pub type AccelHandle = GpuAddress;
 /// [`Device::bindless_texture_handle`]: crate::Device::bindless_texture_handle
 pub type TextureHandle = GpuAddress;
 
+/// Read-write texture handle field type for [`gpu_struct!`].
+///
+/// This maps to `DescriptorHandle<RWTexture2D<float>>`; assign the value from
+/// [`Device::bindless_texture_handle`] for a view created with `create_storage_view`.
+pub type StorageTextureHandle = GpuAddress;
+
 /// Sampler handle field type for [`gpu_struct!`].
 ///
 /// A [`GpuAddress`] that maps to `DescriptorHandle<SamplerState>` on the Slang side with no
@@ -28,12 +34,10 @@ pub type TextureHandle = GpuAddress;
 /// [`Device::bindless_sampler_handle`]: crate::Device::bindless_sampler_handle
 pub type SamplerHandle = GpuAddress;
 
-/// GPU virtual address for buffer device address / Metal gpuAddress.
+/// GPU virtual address for buffer device address / Metal `gpuAddress`.
 ///
-/// Use this type directly as the field type for GPU-pointer fields in [`gpu_struct!`] (the
-/// Slang side stays `"T*"`). It is `#[repr(transparent)]` over `u64` and a [`GpuPod`], so a
-/// pointer field reads as a pointer and you can assign `alloc.gpu()` straight in — no `.0`
-/// unwrap. Reserve raw `u64` fields for genuine integers.
+/// Use it for GPU-pointer fields in [`gpu_struct!`]; the Slang side remains `"T*"`.
+/// Bindless handles and acceleration-structure addresses use the same representation.
 ///
 /// [`gpu_struct!`]: crate::gpu_struct
 /// [`GpuPod`]: crate::GpuPod
@@ -60,7 +64,7 @@ impl GpuAddress {
     /// placement/binding alignment without reaching for `.0`.
     #[inline]
     pub fn is_aligned_to(self, align: u64) -> bool {
-        align != 0 && self.0 & (align - 1) == 0
+        align.is_power_of_two() && self.0 & (align - 1) == 0
     }
 }
 
@@ -256,11 +260,7 @@ pub enum Cull {
     All,
 }
 
-/// Clip-space Y direction.
-///
-/// Kiln normalizes every backend to [`ClipSpaceY::Up`] (see [`Device::clip_space_y`]),
-/// so [`Down`] never arises in practice; it exists only to name the convention. Native
-/// Vulkan is Y-down, but the backend flips its viewport to present Y-up like Metal.
+/// Clip-space Y direction. The RHI presents [`ClipSpaceY::Up`] on every backend.
 ///
 /// [`Down`]: ClipSpaceY::Down
 /// [`Device::clip_space_y`]: crate::Device::clip_space_y
@@ -274,10 +274,6 @@ pub enum ClipSpaceY {
 
 /// Maximum frames in flight.
 pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
-
-// ---------------------------------------------------------------------------
-// Ray tracing types
-// ---------------------------------------------------------------------------
 
 /// Opaque acceleration-structure handle (BLAS or TLAS). Exists so the backend can issue
 /// `build` against the right object; shaders use its GPU address (`accel.gpu()`).
@@ -324,10 +320,9 @@ bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
     pub struct BuildAccelFlags: u8 {
         const ALLOW_UPDATE      = 0x01;
-        const ALLOW_COMPACTION  = 0x02;
-        const PREFER_FAST_TRACE = 0x04;
-        const PREFER_FAST_BUILD = 0x08;
-        const MINIMIZE_MEMORY   = 0x10;
+        const PREFER_FAST_TRACE = 0x02;
+        const PREFER_FAST_BUILD = 0x04;
+        const MINIMIZE_MEMORY   = 0x08;
     }
 }
 
@@ -359,10 +354,10 @@ pub struct BlasDesc {
     pub flags: BuildAccelFlags,
 }
 
-/// One instance entry in a TLAS, stored in GPU-visible memory.
-/// Layout matches `VkAccelerationStructureInstanceKHR` / Metal `MTLAccelerationStructureInstanceDescriptor`.
+/// One logical instance entry in a TLAS, stored in GPU-visible memory.
+/// Each backend encodes it into its native instance-descriptor layout.
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, IntoBytes, FromBytes, Immutable)]
 pub struct TlasInstance {
     /// Row-major 3×4 transform matrix.
     pub transform: [[f32; 4]; 3],

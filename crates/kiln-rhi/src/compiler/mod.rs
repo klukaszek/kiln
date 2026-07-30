@@ -164,10 +164,6 @@ pub fn compile_caps_or_skip(
     SlangCompiler::new().compile_or_skip(device, src, entry, stage, capabilities)
 }
 
-// ---------------------------------------------------------------------------
-// Internals
-// ---------------------------------------------------------------------------
-
 /// Process-wide cached slangc version hash. `None` means slangc is unavailable.
 static SLANGC_VERSION: OnceLock<Option<u64>> = OnceLock::new();
 
@@ -225,15 +221,18 @@ fn invoke_slangc(
     std::fs::write(&src_path, src).expect("write slang source");
 
     let mut cmd = Command::new("slangc");
-    cmd.arg(&src_path)
-        .args(["-target", target, "-entry", entry, "-stage", stage_str(stage)]);
+    cmd.arg(&src_path).args([
+        "-target",
+        target,
+        "-entry",
+        entry,
+        "-stage",
+        stage_str(stage),
+    ]);
     if target == "spirv" {
-        // Keep the real entry-point name so the RHI's `entry_point` matches
-        // the module's `OpEntryPoint`. Without this, Vulkan pipeline creation
-        // references a non-existent entry and fails with VK_ERROR_UNKNOWN.
+        // Keep the entry-point name in `OpEntryPoint` so it matches the RHI.
         cmd.arg("-fvk-use-entrypoint-name");
-        // Redirect stray module-scope uniforms to set 1 instead of letting
-        // them silently collide with the bindless heap on set 0.
+        // Reserve set 0 for the bindless heap.
         cmd.args(["-fvk-bind-globals", "0", "1"]);
     }
     for cap in capabilities {

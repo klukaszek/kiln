@@ -1,4 +1,4 @@
-//! Command buffer recording: render passes, draws, dispatches, barriers, and acceleration-structure builds.
+//! Command buffer recording: passes, draws, dispatches, barriers, copies, and AS builds.
 
 use crate::accel::AccelerationStructure;
 use crate::barrier::{HazardFlags, StageFlags};
@@ -146,13 +146,6 @@ pub struct CommandBuffer {
     pub(crate) inner: CommandBufferInner,
 }
 
-/// Resolve an optional root pointer: `None` (a draw that carries no root data) maps to
-/// the null GPU address, which the backends bind as a never-dereferenced `buffer(0)`.
-#[inline]
-fn root_or_null(root: impl Into<Option<GpuAddress>>) -> GpuAddress {
-    root.into().unwrap_or(GpuAddress::NULL)
-}
-
 pub(crate) enum CommandBufferInner {
     #[cfg(feature = "vulkan")]
     Vulkan(Box<crate::backend::vulkan::command::VulkanCommandBuffer>),
@@ -161,9 +154,7 @@ pub(crate) enum CommandBufferInner {
 }
 
 impl CommandBuffer {
-    // -- Dynamic rendering --
-
-    /// Begin dynamic rendering (no VkRenderPass objects).
+    /// Begin a render pass.
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.begin_render_pass(desc))
     }
@@ -172,8 +163,6 @@ impl CommandBuffer {
     pub fn end_render_pass(&mut self) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.end_render_pass())
     }
-
-    // -- Pipeline state --
 
     /// Set the active graphics pipeline.
     pub fn set_graphics_pipeline(&mut self, pso: &GraphicsPso) {
@@ -185,7 +174,7 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_compute_pipeline(pso))
     }
 
-    /// `gpuSetPipeline` for mesh pipelines — set before `draw_meshlets`/`draw_meshlets_indirect`.
+    /// Set the active mesh pipeline.
     pub fn set_meshlet_pipeline(&mut self, pso: &MeshletPso) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_meshlet_pipeline(pso))
     }
@@ -200,113 +189,85 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_blend_state(state))
     }
 
-    // -- Root data (internal — callers never set these separately) --
-
-    fn set_root_data(&mut self, vertex_root: GpuAddress, pixel_root: GpuAddress) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_root_data(vertex_root, pixel_root))
+    fn set_root_data(&mut self, root: GpuAddress) {
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_root_data(root))
     }
 
     fn set_compute_root(&mut self, root: GpuAddress) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_compute_root(root))
     }
 
-    /// Set the active bindless texture heap pointer for subsequent pipeline binds.
-    /// Relevant for descriptor-buffer style backends.
-    pub fn set_active_texture_heap_ptr(&mut self, heap_ptr: GpuAddress) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_active_texture_heap_ptr(heap_ptr))
-    }
-
-    // -- Draw / Dispatch --
-    // Every call includes its root data pointer(s) — no pre-call dance, no separate set_root_data.
-
-    /// Non-indexed draw. 🔵 Extension (spec only has indexed draws).
-    ///
-    /// Pass `None` for a root the shader doesn't read; otherwise a `GpuAddress` (bare,
-    /// no `Some`). Vertex and pixel share one root table, so pass the same pointer for both.
+    /// Draw non-indexed geometry using `root` as the shared vertex/fragment root.
     pub fn draw(
         &mut self,
-        vertex_root: impl Into<Option<GpuAddress>>,
-        pixel_root: impl Into<Option<GpuAddress>>,
+        root: GpuAddress,
         vertex_count: u32,
         instance_count: u32,
         first_vertex: u32,
         first_instance: u32,
     ) {
-        self.set_root_data(root_or_null(vertex_root), root_or_null(pixel_root));
+        self.set_root_data(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd =>
             cmd.draw(vertex_count, instance_count, first_vertex, first_instance))
     }
 
-    /// `gpuDrawIndexedInstanced(cb, vertexDataGpu, pixelDataGpu, indicesGpu, indexCount, instanceCount)`
+    /// Draw indexed geometry.
     pub fn draw_indexed(
         &mut self,
-        vertex_root: impl Into<Option<GpuAddress>>,
-        pixel_root: impl Into<Option<GpuAddress>>,
+        root: GpuAddress,
         indices: GpuAddress,
         index_count: u32,
         instance_count: u32,
     ) {
-        self.set_root_data(root_or_null(vertex_root), root_or_null(pixel_root));
+        self.set_root_data(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd =>
             cmd.draw_indexed(indices, index_count, instance_count))
     }
 
-    /// `gpuDispatch(cb, dataGpu, gridDimensions)`
-    pub fn dispatch(&mut self, root: impl Into<Option<GpuAddress>>, x: u32, y: u32, z: u32) {
-        self.set_compute_root(root_or_null(root));
+    /// Dispatch compute work.
+    pub fn dispatch(&mut self, root: GpuAddress, x: u32, y: u32, z: u32) {
+        self.set_compute_root(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch(x, y, z))
     }
 
-    /// `gpuDispatchIndirect(cb, dataGpu, gridDimensionsGpu)`
-    pub fn dispatch_indirect(&mut self, root: impl Into<Option<GpuAddress>>, args: GpuAddress) {
-        self.set_compute_root(root_or_null(root));
+    /// Dispatch compute work from GPU arguments.
+    pub fn dispatch_indirect(&mut self, root: GpuAddress, args: GpuAddress) {
+        self.set_compute_root(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch_indirect(args))
     }
 
-    /// `gpuDrawIndexedInstancedIndirect(cb, vertexDataGpu, pixelDataGpu, indicesGpu, argsGpu)`
+    /// Draw indexed geometry from GPU arguments.
     pub fn draw_indexed_indirect(
         &mut self,
-        vertex_root: impl Into<Option<GpuAddress>>,
-        pixel_root: impl Into<Option<GpuAddress>>,
+        root: GpuAddress,
         indices: GpuAddress,
         args: GpuAddress,
     ) {
-        self.set_root_data(root_or_null(vertex_root), root_or_null(pixel_root));
+        self.set_root_data(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indexed_indirect(indices, args))
     }
 
-    /// Multi-draw indirect. `args` is an array of `DrawIndirectMultiArgs`; per-draw root data
-    /// is `root + draw_id * stride` (stride 0 broadcasts one block). Non-indexed — the vertex
-    /// shader does its own index fetch (see [`DrawIndirectMultiArgs`]).
+    /// Multi-draw indirect. `args` is an array of `DrawIndirectMultiArgs`; the shader indexes
+    /// per-draw roots from `root` using its draw ID. Non-indexed; the shader does its own index fetch.
     pub fn draw_indirect_multi(
         &mut self,
-        vertex_root: impl Into<Option<GpuAddress>>,
-        vertex_stride: u32,
-        pixel_root: impl Into<Option<GpuAddress>>,
-        pixel_stride: u32,
+        root: GpuAddress,
         args: GpuAddress,
         draw_count: GpuAddress,
     ) {
-        let (vertex_root, pixel_root) = (root_or_null(vertex_root), root_or_null(pixel_root));
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indirect_multi(
-            vertex_root,
-            vertex_stride,
-            pixel_root,
-            pixel_stride,
+            root,
             args,
             draw_count,
         ))
     }
-
-    // -- Transfer --
 
     /// Copy bytes between two GPU pointers.
     pub fn memcpy(&mut self, dst: GpuAddress, src: GpuAddress, size: u64) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.memcpy(dst, src, size))
     }
 
-    /// Copy a staging buffer into a texture. `texture_gpu` is the texture's backing
-    /// allocation address; `src` is the source buffer address.
+    /// Copy a buffer into a texture.
     pub fn copy_to_texture(
         &mut self,
         texture_gpu: GpuAddress,
@@ -316,8 +277,7 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_to_texture(texture_gpu, src, texture))
     }
 
-    /// Copy a texture into a buffer. `dst` is the destination buffer address; `texture_gpu`
-    /// is the texture's backing allocation address.
+    /// Copy a texture into a buffer.
     pub fn copy_from_texture(
         &mut self,
         dst: GpuAddress,
@@ -326,8 +286,6 @@ impl CommandBuffer {
     ) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_from_texture(dst, texture_gpu, texture))
     }
-
-    // -- Barriers --
 
     /// Stage-only global barrier.
     pub fn barrier(&mut self, src: StageFlags, dst: StageFlags) {
@@ -339,23 +297,15 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.barrier_with_hazard(src, dst, hazard))
     }
 
-    /// `gpuSignalAfter(cb, STAGE before, ptrGpu, value, SIGNAL signal)`
-    ///
-    /// Split-barrier producer: writes `desc.value` to `desc.value_ptr` after `desc.src_stage`
-    /// completes, using the specified atomic operation.
+    /// Signal a GPU value after the producer stage completes.
     pub fn signal_after(&mut self, desc: &SignalValueDesc) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.signal_after_value(desc))
     }
 
-    /// `gpuWaitBefore(cb, STAGE after, ptrGpu, value, OP op, hazards=0, mask=~0)`
-    ///
-    /// Split-barrier consumer: stalls `desc.dst_stage` until the value at `desc.value_ptr`
-    /// satisfies `desc.wait_op` against `desc.value`, then enforces `desc.hazard` visibility.
+    /// Wait on a GPU value before the consumer stage begins.
     pub fn wait_before(&mut self, desc: &WaitValueDesc) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.wait_before_value(desc))
     }
-
-    // -- Viewport / Scissor --
 
     /// Set viewport.
     pub fn set_viewport(
@@ -376,14 +326,7 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_scissor(x, y, width, height))
     }
 
-    // -- GPU timestamp queries --
-
-    /// Reset every slot in `pool` so timestamps can be written into it this frame.
-    ///
-    /// On Vulkan a timestamp pool must be reset before it is written, and the reset cannot occur
-    /// inside a render pass; call this at the top of the command buffer, before
-    /// [`begin_render_pass`](Self::begin_render_pass). On Metal this is a no-op (each
-    /// [`write_timestamp`](Self::write_timestamp) overwrites its slot).
+    /// Reset a timestamp pool outside a render pass.
     pub fn reset_queries(&mut self, pool: &QueryPool) {
         match (&mut self.inner, &pool.inner) {
             #[cfg(feature = "vulkan")]
@@ -397,9 +340,7 @@ impl CommandBuffer {
         }
     }
 
-    /// Write a GPU timestamp into slot `query` of `pool`, captured when prior work in this command
-    /// buffer reaches the bottom of the pipe. Call outside a render pass (before
-    /// `begin_render_pass` or after `end_render_pass`) so the timestamp brackets the whole pass.
+    /// Write a timestamp outside a render pass.
     pub fn write_timestamp(&mut self, pool: &QueryPool, query: u32) {
         match (&mut self.inner, &pool.inner) {
             #[cfg(feature = "vulkan")]
@@ -415,12 +356,8 @@ impl CommandBuffer {
         }
     }
 
-    // -- Presentation --
-
     /// Transition a swapchain image to present-ready layout.
     pub fn transition_to_present(&mut self, _swapchain_image_index: u32) {
-        // Underscored because only the Vulkan arm consumes it; Metal-only builds would
-        // otherwise see it as unused. (`_`-prefixed params are still referenceable.)
         match &mut self.inner {
             #[cfg(feature = "vulkan")]
             CommandBufferInner::Vulkan(cmd) => cmd.transition_to_present(_swapchain_image_index),
@@ -431,8 +368,7 @@ impl CommandBuffer {
         }
     }
 
-    /// Finalize command buffer recording.
-    /// On Vulkan, calls vkEndCommandBuffer. On Metal, this is a no-op.
+    /// Finalize command recording.
     pub fn end(&mut self) {
         match &mut self.inner {
             #[cfg(feature = "vulkan")]
@@ -448,43 +384,17 @@ impl CommandBuffer {
         }
     }
 
-    // -- Mesh shader (meshlet) draws --
-
-    /// Draw using the bound mesh-shader pipeline.
-    /// `gpuDrawMeshlets(cb, meshletDataGpu, pixelDataGpu, uvec3 dim)`
-    ///
-    /// Pipeline must be set first via `set_meshlet_pipeline`.
-    pub fn draw_meshlets(
-        &mut self,
-        mesh_root: impl Into<Option<GpuAddress>>,
-        pixel_root: impl Into<Option<GpuAddress>>,
-        x: u32,
-        y: u32,
-        z: u32,
-    ) {
-        self.set_root_data(root_or_null(mesh_root), root_or_null(pixel_root));
+    /// Draw mesh tasks using the active mesh pipeline.
+    pub fn draw_meshlets(&mut self, root: GpuAddress, x: u32, y: u32, z: u32) {
+        self.set_root_data(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets(x, y, z))
     }
 
-    /// `gpuDrawMeshletsIndirect(cb, meshletDataGpu, pixelDataGpu, dimGpu)`
-    ///
-    /// Pipeline must be set first via `set_meshlet_pipeline`.
-    /// `args` is a GPU address pointing to one `VkDrawMeshTasksIndirectCommandEXT` (12 bytes: x,y,z).
-    pub fn draw_meshlets_indirect(
-        &mut self,
-        mesh_root: impl Into<Option<GpuAddress>>,
-        pixel_root: impl Into<Option<GpuAddress>>,
-        args: GpuAddress,
-    ) {
-        self.set_root_data(root_or_null(mesh_root), root_or_null(pixel_root));
+    /// Draw mesh tasks from GPU arguments.
+    pub fn draw_meshlets_indirect(&mut self, root: GpuAddress, args: GpuAddress) {
+        self.set_root_data(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets_indirect(args))
     }
-
-    // -- Acceleration structure builds --
-
-    // Acceleration structures are bound bindlessly: store `accel.gpu()` in a root/handle buffer
-    // as a `DescriptorHandle<RaytracingAccelerationStructure>` field and read it in the shader.
-    // There is no `bind_acceleration_structure` — see docs/design/vulkan-binding-convention.md.
 
     /// Build a BLAS. `accel` must come from `device.create_blas(desc)` with the same `desc`.
     pub fn build_blas(&mut self, accel: &AccelerationStructure, desc: &BlasDesc) {

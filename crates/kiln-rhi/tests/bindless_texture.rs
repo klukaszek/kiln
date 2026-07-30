@@ -1,11 +1,6 @@
 //! Headless bindless texture-sampling test.
 //!
-//! The repo's first shader that samples a texture through the bindless heap. It locks the
-//! convention the egui painter (and any future textured shader) relies on: a sampled image and
-//! a sampler reach the shader as `DescriptorHandle<Texture2D>` / `DescriptorHandle<SamplerState>`
-//! fields in the pointer-first root struct, carrying the `TextureId` / `SamplerId` returned by
-//! `texture_view_descriptor` / `create_sampler`. A solid-colour texture is sampled across a
-//! full-screen triangle and read back; every pixel must equal the texel.
+//! Samples a bindless texture through handles stored in the root data.
 
 mod common;
 
@@ -17,8 +12,7 @@ use kiln_rhi::{
     TextureUsage, Topology,
 };
 
-// Root carries the bindless handles via the `gpu_struct!` handle types (no `as` override): each
-// maps to `DescriptorHandle<T>` on the Slang side. Fill them with the device's bindless handles.
+// `gpu_struct!` maps these fields to Slang descriptor handles.
 gpu_struct! {
     pub struct Root {
         tex:  TextureHandle,
@@ -62,7 +56,8 @@ fn bindless_texture_sample() {
     };
 
     let src = format!("{}{}", Root::SLANG, BODY);
-    let Some(vs) = kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
+    let Some(vs) =
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
     else {
         return;
     };
@@ -78,7 +73,6 @@ fn bindless_texture_sample() {
                 color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
                 depth_format: None,
                 sample_count: SampleCount::S1,
-                root_constant_size: std::mem::size_of::<Root>() as u32,
                 cull: Cull::None,
                 label: Some("bindless-tex".into()),
                 ..Default::default()
@@ -88,7 +82,6 @@ fn bindless_texture_sample() {
         )
         .expect("create_graphics_pso");
 
-    // -- Sampled texture: solid TEXEL colour --
     let tex_desc = TextureDesc {
         width: TEX,
         height: TEX,
@@ -101,7 +94,9 @@ fn bindless_texture_sample() {
         usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
         label: Some("bindless-src-tex".into()),
     };
-    let tex_sa = device.texture_size_align(&tex_desc).expect("tex size_align");
+    let tex_sa = device
+        .texture_size_align(&tex_desc)
+        .expect("tex size_align");
     let tex_mem = device
         .malloc_aligned(tex_sa.size, tex_sa.align, MemoryType::GpuOnly)
         .expect("tex mem");
@@ -127,10 +122,9 @@ fn bindless_texture_sample() {
         .expect("create_sampler");
 
     let tex_id = device
-        .texture_view_descriptor(&texture, &Default::default())
-        .expect("texture_view_descriptor");
+        .create_sampled_view(&texture, &Default::default())
+        .expect("create_sampled_view");
 
-    // Hand the heap ids to the shader through the root's DescriptorHandle fields.
     let root = device
         .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
@@ -140,7 +134,6 @@ fn bindless_texture_sample() {
     })
     .expect("upload root");
 
-    // -- Offscreen render target + readback --
     let rt_desc = TextureDesc {
         width: SIZE,
         height: SIZE,
@@ -166,8 +159,7 @@ fn bindless_texture_sample() {
 
     common::timed("sample bindless texture · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
-        // Upload the texel data, then make it visible to sampling (and refresh the
-        // freshly-written descriptor) before the draw reads it.
+        // Make the upload and descriptor visible before sampling.
         cmd.copy_to_texture(tex_mem.gpu(), staging.gpu(), &texture);
         cmd.barrier_with_hazard(
             StageFlags::TRANSFER,
@@ -188,7 +180,7 @@ fn bindless_texture_sample() {
         cmd.set_graphics_pipeline(&pso);
         cmd.set_viewport(0.0, 0.0, SIZE as f32, SIZE as f32, 0.0, 1.0);
         cmd.set_scissor(0, 0, SIZE, SIZE);
-        cmd.draw(None, root.gpu(), 3, 1, 0, 0);
+        cmd.draw(root.gpu(), 3, 1, 0, 0);
         cmd.end_render_pass();
 
         cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);

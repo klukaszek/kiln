@@ -1,11 +1,11 @@
-//! Headless GPU transfer tests (timed): record → submit → wait → readback.
+//! Headless GPU transfer tests.
 
 mod common;
 
 use kiln_rhi::{MemoryType, StageFlags};
 
 /// Write a pattern into a CPU-mapped `Default` buffer, GPU-copy it into a `Readback`
-/// buffer, and verify the bytes came through. Reports the full submit→wait latency.
+/// buffer, and verify the bytes came through.
 #[test]
 fn gpu_memcpy_roundtrip() {
     let Some((device, _gpu)) = common::device_or_skip() else {
@@ -45,7 +45,7 @@ fn gpu_memcpy_roundtrip() {
     device.free(dst);
 }
 
-/// Copy-bandwidth sweep across sizes. Each size reports submit→wait time for the copy.
+/// Copy round-trips across several allocation sizes.
 #[test]
 fn gpu_memcpy_size_sweep() {
     let Some((device, _gpu)) = common::device_or_skip() else {

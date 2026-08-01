@@ -368,18 +368,17 @@ impl CommandBuffer {
         }
     }
 
-    /// Finalize command recording.
+    /// Finalize command recording early. This is idempotent and optional because queue submission
+    /// finalizes command buffers on both backends.
     pub fn end(&mut self) {
         match &mut self.inner {
             #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => unsafe {
-                cmd.device
-                    .end_command_buffer(cmd.command_buffer)
-                    .expect("Failed to end command buffer");
-            },
+            CommandBufferInner::Vulkan(cmd) => {
+                cmd.finish().expect("Failed to end command buffer");
+            }
             #[cfg(feature = "metal")]
             CommandBufferInner::Metal(cmd) => {
-                cmd.end_active_encoders();
+                cmd.finish();
             }
         }
     }

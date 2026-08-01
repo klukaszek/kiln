@@ -241,21 +241,25 @@ impl Device {
         backend_dispatch!(&self.inner, DeviceInner, d => d.create_texture(desc, texture_gpu))
     }
 
-    /// Create a sampled view. The source texture must outlive the returned handle.
+    /// Create a sampled view. The source texture must outlive the returned handle; release the
+    /// returned ID with [`Device::destroy_texture_view`] when the view is no longer used.
     pub fn create_sampled_view(
         &self,
         source: &Texture,
         view: &TextureViewDesc,
     ) -> RhiResult<crate::types::TextureId> {
+        validate_texture_view(source, view, crate::texture::TextureUsage::SAMPLED)?;
         backend_dispatch!(&self.inner, DeviceInner, d => d.create_sampled_view(source, view))
     }
 
-    /// Create a storage view. The source texture must outlive the returned handle.
+    /// Create a storage view. The source texture must outlive the returned handle; release the
+    /// returned ID with [`Device::destroy_texture_view`] when the view is no longer used.
     pub fn create_storage_view(
         &self,
         source: &Texture,
         view: &TextureViewDesc,
     ) -> RhiResult<crate::types::TextureId> {
+        validate_texture_view(source, view, crate::texture::TextureUsage::STORAGE)?;
         backend_dispatch!(&self.inner, DeviceInner, d => d.create_storage_view(source, view))
     }
 
@@ -371,9 +375,22 @@ impl Device {
         instance: &TlasInstance,
     ) -> RhiResult<()> {
         let stride = self.tlas_instance_stride();
-        let offset = index * stride;
-        let capacity = dst.size() as usize;
-        if offset + stride > capacity {
+        let offset = index.checked_mul(stride).ok_or_else(|| {
+            RhiError::AllocationFailed(format!(
+                "TLAS instance {index} offset overflows host address space"
+            ))
+        })?;
+        let end = offset.checked_add(stride).ok_or_else(|| {
+            RhiError::AllocationFailed(format!(
+                "TLAS instance {index} range overflows host address space"
+            ))
+        })?;
+        let capacity = usize::try_from(dst.size()).map_err(|_| {
+            RhiError::AllocationFailed(
+                "instance buffer size does not fit in host address space".into(),
+            )
+        })?;
+        if end > capacity {
             return Err(RhiError::AllocationFailed(format!(
                 "TLAS instance {index} (stride {stride}) exceeds instance buffer ({capacity} bytes)"
             )));
@@ -381,7 +398,7 @@ impl Device {
         let base = dst.cpu().ok_or_else(|| {
             RhiError::AllocationFailed("instance buffer is not CPU-mapped".into())
         })?;
-        // SAFETY: `offset + stride <= capacity`, and `base` is valid for `capacity` mapped
+        // SAFETY: `end <= capacity`, and `base` is valid for `capacity` mapped
         // bytes, so `ptr` points to `stride` writable bytes for the backend to fill.
         let ptr = unsafe { base.add(offset) };
         backend_dispatch!(&self.inner, DeviceInner, d => d.write_tlas_instance(ptr, instance));
@@ -398,8 +415,9 @@ impl Device {
     pub fn create_command_buffer_for_swapchain(
         &self,
         swapchain: &Swapchain,
+        frame_index: usize,
     ) -> RhiResult<CommandBuffer> {
-        backend_dispatch!(&self.inner, DeviceInner, d => d.create_command_buffer_for_swapchain(swapchain))
+        backend_dispatch!(&self.inner, DeviceInner, d => d.create_command_buffer_for_swapchain(swapchain, frame_index))
     }
 
     /// Get the primary queue.
@@ -452,14 +470,24 @@ impl Device {
         backend_dispatch!(&self.inner, DeviceInner, d => d.wait_idle())
     }
 
-    /// Destroy a buffer.
+    /// Destroy a buffer. Native storage is released after current recordings and GPU work finish.
     pub fn destroy_buffer(&self, buffer: GpuBuffer) {
         backend_dispatch!(&self.inner, DeviceInner, d => d.destroy_buffer(buffer))
     }
 
-    /// Destroy a texture.
+    /// Destroy a texture. Native storage is released after current recordings and GPU work finish.
     pub fn destroy_texture(&self, texture: Texture) {
         backend_dispatch!(&self.inner, DeviceInner, d => d.destroy_texture(texture))
+    }
+
+    /// Destroy a sampled or storage view after current recordings and GPU work finish.
+    pub fn destroy_texture_view(&self, id: crate::types::TextureId) {
+        backend_dispatch!(&self.inner, DeviceInner, d => d.destroy_texture_view(id))
+    }
+
+    /// Destroy a sampler after current recordings and GPU work finish.
+    pub fn destroy_sampler(&self, sampler: Sampler) {
+        backend_dispatch!(&self.inner, DeviceInner, d => d.destroy_sampler(sampler))
     }
 
     /// Wait for a specific frame's fence before reusing resources.
@@ -479,6 +507,60 @@ impl Device {
     }
 }
 
+fn validate_texture_view(
+    source: &Texture,
+    view: &TextureViewDesc,
+    required_usage: crate::texture::TextureUsage,
+) -> RhiResult<()> {
+    use crate::texture::{ALL_LAYERS, ALL_MIPS};
+
+    if !source.desc().usage.contains(required_usage) {
+        return Err(RhiError::Unsupported(format!(
+            "texture view requires source usage {required_usage:?}"
+        )));
+    }
+    if let Some(format) = view.format
+        && format != source.desc().format
+    {
+        return Err(RhiError::Unsupported(
+            "format-reinterpreting texture views are not in the portable Metal/Vulkan baseline"
+                .into(),
+        ));
+    }
+
+    let base_mip = u32::from(view.base_mip);
+    let mip_count = if view.mip_count == ALL_MIPS {
+        source.desc().mip_levels.saturating_sub(base_mip)
+    } else {
+        u32::from(view.mip_count)
+    };
+    if base_mip >= source.desc().mip_levels
+        || mip_count == 0
+        || mip_count > source.desc().mip_levels - base_mip
+    {
+        return Err(RhiError::Unsupported(
+            "texture view mip range is outside the source texture".into(),
+        ));
+    }
+
+    let base_layer = u32::from(view.base_layer);
+    let layer_count = if view.layer_count == ALL_LAYERS {
+        source.desc().array_layers.saturating_sub(base_layer)
+    } else {
+        u32::from(view.layer_count)
+    };
+    if base_layer >= source.desc().array_layers
+        || layer_count == 0
+        || layer_count > source.desc().array_layers - base_layer
+    {
+        return Err(RhiError::Unsupported(
+            "texture view layer range is outside the source texture".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 impl CommandBuffer {
     /// Get the raw Vulkan command buffer handle for escape-hatch scenarios.
     #[cfg(feature = "vulkan")]
@@ -488,5 +570,54 @@ impl CommandBuffer {
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::texture::TextureUsage;
+    use crate::types::{Format, TextureId};
+
+    fn test_texture() -> Texture {
+        Texture {
+            id: TextureId(0),
+            gpu_address: GpuAddress::NULL,
+            desc: TextureDesc {
+                mip_levels: 4,
+                array_layers: 2,
+                usage: TextureUsage::SAMPLED,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn portable_texture_views_reject_format_reinterpretation() {
+        let source = test_texture();
+        let view = TextureViewDesc {
+            format: Some(Format::R32Float),
+            ..Default::default()
+        };
+        assert!(validate_texture_view(&source, &view, TextureUsage::SAMPLED).is_err());
+    }
+
+    #[test]
+    fn portable_texture_views_validate_subresource_ranges() {
+        let source = test_texture();
+        let valid = TextureViewDesc {
+            base_mip: 1,
+            mip_count: 3,
+            base_layer: 1,
+            layer_count: 1,
+            ..Default::default()
+        };
+        assert!(validate_texture_view(&source, &valid, TextureUsage::SAMPLED).is_ok());
+
+        let invalid = TextureViewDesc {
+            base_mip: 4,
+            ..Default::default()
+        };
+        assert!(validate_texture_view(&source, &invalid, TextureUsage::SAMPLED).is_err());
     }
 }

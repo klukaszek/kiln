@@ -114,6 +114,23 @@ pub mod types;
 // crates share one zerocopy instance.
 pub use zerocopy;
 
+/// Run one frame's work inside whatever scope the backend needs for its temporaries.
+///
+/// On Metal this is an autorelease pool, and it is not optional: `nextDrawable`, its texture and
+/// every encoder are autoreleased, so without a per-frame scope their pending releases pile up
+/// until the event loop drains them all at once — periodic CPU spikes with flat GPU time. On
+/// Vulkan this compiles to a direct call.
+pub fn frame_scope<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(feature = "metal")]
+    {
+        objc2::rc::autoreleasepool(|_| f())
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        f()
+    }
+}
+
 pub use accel::AccelerationStructure;
 pub use barrier::{HazardFlags, StageFlags};
 pub use command::{

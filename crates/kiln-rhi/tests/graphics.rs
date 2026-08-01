@@ -8,10 +8,10 @@ mod common;
 
 use kiln_rhi::gpu_struct;
 use kiln_rhi::{
-    BufferDesc, BumpAllocator, ColorAttachment, ColorTarget, Cull, Device, Format, GpuAddress,
-    GraphicsPso, GraphicsPsoDesc, LoadOp, MemoryType, RenderPassDesc, RenderTarget, SampleCount,
-    ShaderModule, ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension, TextureUsage,
-    Topology,
+    BufferDesc, BumpAllocator, ColorAttachment, ColorTarget, ColorWriteMask, Cull, Device, Format,
+    GpuAddress, GraphicsPso, GraphicsPsoDesc, LoadOp, MemoryType, RenderPassDesc, RenderTarget,
+    SampleCount, ShaderModule, ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension,
+    TextureUsage, Topology,
 };
 
 // Shared host/device root: a single colour, used by the pixel shader.
@@ -158,6 +158,56 @@ fn graphics_fullscreen_color() {
     device.free(readback);
     device.destroy_texture(texture);
     device.free(tex_mem);
+}
+
+#[test]
+fn graphics_static_color_write_mask() {
+    let Some((device, _gpu)) = common::device_or_skip() else {
+        return;
+    };
+
+    let src = format!("{}{}", Root::SLANG, GFX_BODY);
+    let Some(vs) =
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
+    else {
+        return;
+    };
+    let Some(fs) = kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel)
+    else {
+        return;
+    };
+
+    let pso = device
+        .create_graphics_pso(
+            &GraphicsPsoDesc {
+                color_targets: vec![ColorTarget {
+                    format: Format::R8G8B8A8Unorm,
+                    write_mask: ColorWriteMask::R,
+                }],
+                depth_format: None,
+                ..Default::default()
+            },
+            &vs,
+            &fs,
+        )
+        .expect("create masked graphics pso");
+    let root = device
+        .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
+        .expect("root");
+    root.upload(&Root {
+        color: [1.0, 1.0, 1.0, 0.0],
+    })
+    .expect("upload root");
+
+    let pixels = render_draw(&device, &pso, root.gpu(), SIZE, 3, 1);
+    for (pixel_index, pixel) in pixels.chunks_exact(4).enumerate() {
+        assert_eq!(
+            pixel,
+            [255, 0, 0, 255],
+            "pixel {pixel_index} ignored the static red-only write mask"
+        );
+    }
+    device.free(root);
 }
 
 // Shared helpers for the graphics-pipeline tests below.

@@ -68,27 +68,6 @@ impl Queue {
         }
     }
 
-    /// Present a rendered swapchain image.
-    pub fn present(
-        &self,
-        swapchain: &Swapchain,
-        image_index: u32,
-        frame_index: usize,
-    ) -> RhiResult<()> {
-        match (&self.inner, &swapchain.inner) {
-            #[cfg(feature = "vulkan")]
-            (QueueInner::Vulkan(q), crate::swapchain::SwapchainInner::Vulkan(sc)) => {
-                q.present(sc, image_index, frame_index)
-            }
-            #[cfg(feature = "metal")]
-            (QueueInner::Metal(q), crate::swapchain::SwapchainInner::Metal(sc)) => {
-                q.present(sc, image_index, frame_index)
-            }
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("mismatched backend types"),
-        }
-    }
-
     /// Submit a frame command buffer.
     pub fn submit_frame(
         &self,

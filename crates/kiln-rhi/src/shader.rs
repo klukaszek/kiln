@@ -21,9 +21,9 @@ pub struct ShaderModule {
 
 pub(crate) enum ShaderModuleInner {
     #[cfg(feature = "vulkan")]
-    Vulkan(crate::backend::vulkan::shader::VulkanShaderModule),
+    Vulkan(Box<crate::backend::vulkan::shader::VulkanShaderModule>),
     #[cfg(feature = "metal")]
-    Metal(crate::backend::metal::shader::MetalShaderModule),
+    Metal(Box<crate::backend::metal::shader::MetalShaderModule>),
 }
 
 impl ShaderModule {

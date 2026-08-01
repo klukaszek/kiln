@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -8,25 +8,26 @@ use objc2::runtime::ProtocolObject;
 use objc2_core_foundation::CGSize;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4CommandBuffer, MTL4CommandQueue, MTL4Compiler, MTL4CompilerDescriptor,
-    MTL4ComputePipelineDescriptor, MTL4CounterHeap, MTL4CounterHeapDescriptor, MTL4CounterHeapType,
-    MTL4LibraryFunctionDescriptor, MTL4PipelineDescriptor, MTL4PipelineOptions,
-    MTL4ShaderReflection, MTLAllocation, MTLBinding, MTLBindingType, MTLBuffer, MTLCompileOptions,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLCullMode, MTLDevice, MTLDrawable,
-    MTLEvent, MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLLanguageVersion, MTLLibrary,
-    MTLPixelFormat, MTLRenderPipelineState, MTLResidencySet, MTLResidencySetDescriptor,
-    MTLResourceOptions, MTLSamplerDescriptor, MTLSamplerState, MTLSharedEvent, MTLStorageMode,
-    MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage as MtlTextureUsage,
-    MTLWinding,
+    MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandQueue, MTL4Compiler,
+    MTL4CompilerDescriptor, MTL4ComputePipelineDescriptor, MTL4CounterHeap,
+    MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTL4LibraryFunctionDescriptor,
+    MTL4PipelineDescriptor, MTL4PipelineOptions, MTL4ShaderReflection, MTLAllocation, MTLBinding,
+    MTLBindingType, MTLBuffer, MTLCompileOptions, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLCullMode, MTLDevice, MTLDrawable, MTLEvent, MTLHeap,
+    MTLLanguageVersion, MTLLibrary, MTLPixelFormat, MTLRenderPipelineState, MTLResidencySet,
+    MTLResidencySetDescriptor, MTLSamplerDescriptor, MTLSamplerState, MTLSharedEvent,
+    MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
+    MTLTextureUsage as MtlTextureUsage, MTLWinding,
 };
-use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
+use objc2_quartz_core::CAMetalLayer;
 use raw_window_handle::RawWindowHandle;
+use smallvec::SmallVec;
 
 use crate::accel::{AccelInner, AccelerationStructure};
 use crate::command::{CommandBuffer, SignalOp, SignalValueDesc, WaitOp, WaitValueDesc};
 use crate::device::{BindlessMode, DeviceDesc};
 use crate::error::{RhiError, RhiResult};
-use crate::memory::{BufferDesc, GpuBuffer, GpuBufferInner, MemoryType};
+use crate::memory::{BufferDesc, GpuBuffer, GpuBufferInner};
 use crate::pipeline::*;
 use crate::query::{QueryPool, QueryPoolInner};
 use crate::queue::{Queue, QueueInner, SubmitDesc};
@@ -38,26 +39,76 @@ use crate::sync::{TimelineSemaphore, TimelineSemaphoreInner};
 use crate::texture::{Texture, TextureDesc, TextureSizeAlign, TextureUsage};
 use crate::types::*;
 
-use super::command::MetalCommandBuffer;
-use super::memory::MetalBuffer;
+use super::command::{
+    MetalCommandBuffer, MetalFrameTableSlot, MetalTableState, SharedFrameTableSlots,
+    SharedTableSlotPool,
+};
+use super::memory::{MetalBuffer, MetalBufferPool, SharedMetalBufferPool};
 use super::pipeline::{MetalComputePso, MetalGraphicsPso};
 use super::query::MetalQueryPool;
 use super::shader::MetalShaderModule;
 use super::surface::MetalSurface;
-use super::swapchain::MetalSwapchain;
+use super::swapchain::{MetalDrawableSlot, MetalSwapchain};
 use super::sync::MetalTimelineSemaphore;
 use super::texture::{format_to_mtl, mtl_to_format};
 
 type FrameFenceValues = Rc<RefCell<[u64; MAX_FRAMES_IN_FLIGHT]>>;
 type InFlightFrameCommands = Rc<RefCell<Vec<Option<MetalCommandBuffer>>>>;
-type PendingSubmissions = Rc<RefCell<Vec<(u64, MetalCommandBuffer)>>>;
+type PendingSubmissions = Rc<RefCell<VecDeque<(u64, MetalCommandBuffer)>>>;
 pub(crate) type SharedTextures = Rc<RefCell<Vec<Option<Retained<ProtocolObject<dyn MTLTexture>>>>>>;
-pub(crate) type SharedSamplers = Rc<RefCell<Vec<Retained<ProtocolObject<dyn MTLSamplerState>>>>>;
+pub(crate) type SharedSamplers =
+    Rc<RefCell<Vec<Option<Retained<ProtocolObject<dyn MTLSamplerState>>>>>>;
+type SharedTextureFreeIds = Rc<RefCell<Vec<TextureId>>>;
+type SharedSamplerFreeIds = Rc<RefCell<Vec<SamplerId>>>;
 /// Buffer allocations keyed by GPU base address, enabling O(log n) address->buffer
 /// resolution for blit copies and indirect draws instead of a linear scan.
 pub(crate) type SharedAllocations = Rc<RefCell<BTreeMap<u64, BufferAllocation>>>;
+/// Reverse index for CPU-mapped allocations, used by the public pointer bridge.
+type SharedMappedAllocations = Rc<RefCell<BTreeMap<usize, MappedAllocation>>>;
+pub(crate) type SharedBindlessGeneration = Rc<Cell<u64>>;
 type ValueSyncMap = RefCell<HashMap<u64, MetalValueSyncState>>;
-type MetalEventWaits = Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>;
+type MetalEventWaits = SmallVec<[(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64); 4]>;
+/// Events being merged, tagged with the value pointer they sync on. Linear merge: a submission
+/// carries one or two entries, so a `HashMap` would allocate and hash for nothing.
+type MergedEvents = SmallVec<[(u64, Retained<ProtocolObject<dyn MTLSharedEvent>>, u64); 4]>;
+
+/// Record `value` under `key`, folding into any existing entry with `combine`.
+fn merge_event(
+    merged: &mut MergedEvents,
+    key: u64,
+    event: &Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    value: u64,
+    combine: fn(u64, u64) -> u64,
+) {
+    if let Some((_, _, existing)) = merged.iter_mut().find(|(candidate, ..)| *candidate == key) {
+        *existing = combine(*existing, value);
+    } else {
+        merged.push((key, event.clone(), value));
+    }
+}
+
+fn finish_merged_events(merged: MergedEvents) -> MetalEventWaits {
+    merged
+        .into_iter()
+        .map(|(_, event, value)| (event, value))
+        .collect()
+}
+type RetiredResources = Rc<RefCell<VecDeque<(u64, MetalRetiredResource)>>>;
+type PendingRetiredResources = Rc<RefCell<Vec<MetalRetiredResource>>>;
+type SharedPendingRetirementWork = Rc<Cell<bool>>;
+pub(crate) type SharedActiveRecordings = Rc<Cell<usize>>;
+
+pub(crate) enum MetalRetiredResource {
+    Buffer(MetalBuffer),
+    Texture {
+        id: TextureId,
+        texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    },
+    Sampler {
+        id: SamplerId,
+        sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
+    },
+}
 
 fn shared_event_as_event(
     event: &Retained<ProtocolObject<dyn MTLSharedEvent>>,
@@ -75,22 +126,46 @@ pub(crate) struct BufferAllocation {
     pub base: GpuAddress,
     pub size: u64,
     pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub heap: Option<Retained<ProtocolObject<dyn MTLHeap>>>,
-    pub mapped_ptr: Option<*mut u8>,
+    pub heap: Retained<ProtocolObject<dyn MTLHeap>>,
+}
+
+struct MappedAllocation {
+    gpu_base: GpuAddress,
+    size: u64,
+}
+
+fn resolve_mapped_pointer(
+    allocations: &BTreeMap<usize, MappedAllocation>,
+    ptr: usize,
+) -> Option<GpuAddress> {
+    let (&base, allocation) = allocations.range(..=ptr).next_back()?;
+    let offset = (ptr - base) as u64;
+    (offset < allocation.size).then(|| allocation.gpu_base.offset(offset))
 }
 
 pub struct MetalDevice {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
+    buffer_pool: SharedMetalBufferPool,
     rhi_queue: Queue,
     residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
     residency_dirty: Rc<Cell<bool>>,
     textures: SharedTextures,
+    texture_view_flags: RefCell<Vec<bool>>,
+    free_texture_ids: SharedTextureFreeIds,
     samplers: SharedSamplers,
+    free_sampler_ids: SharedSamplerFreeIds,
+    texture_generation: SharedBindlessGeneration,
+    sampler_generation: SharedBindlessGeneration,
     allocations: SharedAllocations,
+    mapped_allocations: SharedMappedAllocations,
+    active_recordings: SharedActiveRecordings,
     /// Per-frame fence values for swapchain acquisition.
     frame_fence_values: FrameFenceValues,
     /// Shared event for per-frame synchronization.
     frame_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    frame_table_slots: SharedFrameTableSlots,
+    /// Free list of table slots for non-swapchain command buffers.
+    table_slot_pool: SharedTableSlotPool,
     bindless_mode: BindlessMode,
     /// Monotonic counter for AccelerationStructureId assignment.
     accel_counter: RefCell<u32>,
@@ -108,6 +183,13 @@ pub struct MetalQueue {
     frame_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     in_flight_frame_commands: InFlightFrameCommands,
     pending_submissions: PendingSubmissions,
+    retired_resources: RetiredResources,
+    pending_retired_resources: PendingRetiredResources,
+    pending_retirement_work: SharedPendingRetirementWork,
+    active_recordings: SharedActiveRecordings,
+    last_submission_value: Cell<Option<u64>>,
+    free_texture_ids: SharedTextureFreeIds,
+    free_sampler_ids: SharedSamplerFreeIds,
     value_sync: ValueSyncMap,
 }
 
@@ -122,31 +204,122 @@ impl MetalQueue {
         self.submit_with_desc(cmd, &SubmitDesc::default())
     }
 
+    pub(crate) fn retire_resource(&self, resource: MetalRetiredResource) {
+        self.pending_retired_resources.borrow_mut().push(resource);
+        self.pending_retirement_work.set(true);
+    }
+
+    fn schedule_pending_retirements(&self) {
+        if !self.pending_retirement_work.get() || self.active_recordings.get() != 0 {
+            return;
+        }
+        let pending = std::mem::take(&mut *self.pending_retired_resources.borrow_mut());
+        self.pending_retirement_work.set(false);
+        if let Some(retire_value) = self.last_submission_value.get() {
+            self.retired_resources
+                .borrow_mut()
+                .extend(pending.into_iter().map(|resource| (retire_value, resource)));
+        } else {
+            for resource in pending {
+                self.release_retired_resource(resource);
+            }
+        }
+    }
+
+    fn release_retired_resource(&self, resource: MetalRetiredResource) {
+        match &resource {
+            MetalRetiredResource::Buffer(buffer) => {
+                let allocation = unsafe {
+                    &*(buffer.buffer.as_ref() as *const ProtocolObject<dyn MTLBuffer>
+                        as *const ProtocolObject<dyn MTLAllocation>)
+                };
+                self.residency_set.removeAllocation(allocation);
+                self.residency_dirty.set(true);
+            }
+            MetalRetiredResource::Texture { texture, .. } => {
+                let allocation = unsafe {
+                    &*(texture.as_ref() as *const ProtocolObject<dyn MTLTexture>
+                        as *const ProtocolObject<dyn MTLAllocation>)
+                };
+                self.residency_set.removeAllocation(allocation);
+                self.residency_dirty.set(true);
+            }
+            // Sampler states are not MTLResource/MTLAllocation objects and do not belong in the
+            // residency set. Retain them until the fence completes, then ARC releases them.
+            MetalRetiredResource::Sampler { sampler, .. } => {
+                let _ = sampler;
+            }
+        }
+        match resource {
+            MetalRetiredResource::Texture { id, .. } => {
+                self.free_texture_ids.borrow_mut().push(id);
+            }
+            MetalRetiredResource::Sampler { id, .. } => {
+                self.free_sampler_ids.borrow_mut().push(id);
+            }
+            MetalRetiredResource::Buffer(buffer) => buffer.release_to_pool(),
+        }
+    }
+
+    fn reclaim_retired_resources(&self) {
+        let completed = self.frame_event.signaledValue();
+        let mut ready = SmallVec::<[MetalRetiredResource; 4]>::new();
+        {
+            let mut retired = self.retired_resources.borrow_mut();
+            while retired
+                .front()
+                .is_some_and(|(value, _)| *value <= completed)
+            {
+                ready.push(
+                    retired
+                        .pop_front()
+                        .expect("retired resource queue front disappeared")
+                        .1,
+                );
+            }
+        }
+        for resource in ready {
+            self.release_retired_resource(resource);
+        }
+        if self
+            .last_submission_value
+            .get()
+            .is_some_and(|value| value <= completed)
+        {
+            self.last_submission_value.set(None);
+        }
+    }
+
     fn ensure_value_sync_state<'a>(
         &self,
         value_ptr: GpuAddress,
         map: &'a mut HashMap<u64, MetalValueSyncState>,
     ) -> RhiResult<&'a mut MetalValueSyncState> {
         let key = value_ptr.0;
-        if let std::collections::hash_map::Entry::Vacant(entry) = map.entry(key) {
-            let event = self.device.newSharedEvent().ok_or_else(|| {
-                RhiError::SyncError(format!("Failed to create Metal value event for {:#x}", key))
-            })?;
-            event.setSignaledValue(0);
-            entry.insert(MetalValueSyncState {
-                event,
-                scheduled_value: 0,
-            });
+        match map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let event = self.device.newSharedEvent().ok_or_else(|| {
+                    RhiError::SyncError(format!(
+                        "Failed to create Metal value event for {:#x}",
+                        key
+                    ))
+                })?;
+                event.setSignaledValue(0);
+                Ok(entry.insert(MetalValueSyncState {
+                    event,
+                    scheduled_value: 0,
+                }))
+            }
         }
-        Ok(map
-            .get_mut(&key)
-            .expect("value sync state should exist after insertion"))
     }
 
     fn collect_value_waits(&self, waits: &[WaitValueDesc]) -> RhiResult<MetalEventWaits> {
+        if waits.is_empty() {
+            return Ok(SmallVec::new());
+        }
         let mut map = self.value_sync.borrow_mut();
-        let mut merged: HashMap<u64, (Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)> =
-            HashMap::new();
+        let mut merged = MergedEvents::new();
         for wait in waits {
             let state = self.ensure_value_sync_state(wait.value_ptr, &mut map)?;
             let required = match wait.wait_op {
@@ -183,18 +356,23 @@ impl MetalQueue {
                 }
             };
             state.scheduled_value = state.scheduled_value.max(required);
-            merged
-                .entry(wait.value_ptr.0)
-                .and_modify(|(_, value)| *value = (*value).max(required))
-                .or_insert((state.event.clone(), required));
+            merge_event(
+                &mut merged,
+                wait.value_ptr.0,
+                &state.event,
+                required,
+                u64::max,
+            );
         }
-        Ok(merged.into_values().collect())
+        Ok(finish_merged_events(merged))
     }
 
     fn collect_value_signals(&self, signals: &[SignalValueDesc]) -> RhiResult<MetalEventWaits> {
+        if signals.is_empty() {
+            return Ok(SmallVec::new());
+        }
         let mut map = self.value_sync.borrow_mut();
-        let mut merged: HashMap<u64, (Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)> =
-            HashMap::new();
+        let mut merged = MergedEvents::new();
         for signal in signals {
             let state = self.ensure_value_sync_state(signal.value_ptr, &mut map)?;
             let target = match signal.signal_op {
@@ -209,9 +387,15 @@ impl MetalQueue {
                 )));
             }
             state.scheduled_value = target;
-            merged.insert(signal.value_ptr.0, (state.event.clone(), target));
+            merge_event(
+                &mut merged,
+                signal.value_ptr.0,
+                &state.event,
+                target,
+                |_, latest| latest,
+            );
         }
-        Ok(merged.into_values().collect())
+        Ok(finish_merged_events(merged))
     }
 
     pub fn submit_with_desc(
@@ -219,6 +403,13 @@ impl MetalQueue {
         cmd: MetalCommandBuffer,
         desc: &SubmitDesc<'_>,
     ) -> RhiResult<()> {
+        for (semaphore, _) in desc.wait_semaphores.iter().chain(desc.signal_semaphores) {
+            if !matches!(&semaphore.inner, TimelineSemaphoreInner::Metal(_)) {
+                return Err(RhiError::SyncError(
+                    "Timeline semaphore backend mismatch on Metal queue submit".into(),
+                ));
+            }
+        }
         let value_waits = self.collect_value_waits(&cmd.pending_value_waits)?;
         let value_signals = self.collect_value_signals(&cmd.pending_value_signals)?;
         if self.residency_dirty.replace(false) {
@@ -271,7 +462,12 @@ impl MetalQueue {
         let value = self.next_fence_value();
         self.queue
             .signalEvent_value(shared_event_as_event(&self.frame_event), value);
-        self.pending_submissions.borrow_mut().push((value, cmd));
+        cmd.resolve_recording();
+        self.pending_submissions
+            .borrow_mut()
+            .push_back((value, cmd));
+        self.last_submission_value.set(Some(value));
+        self.schedule_pending_retirements();
         Ok(())
     }
 
@@ -282,6 +478,13 @@ impl MetalQueue {
         frame_index: usize,
         _image_index: u32,
     ) -> RhiResult<()> {
+        if frame_index >= self.frame_fence_values.borrow().len()
+            || frame_index >= self.in_flight_frame_commands.borrow().len()
+        {
+            return Err(RhiError::Backend(
+                "invalid frame index for Metal queue submission".into(),
+            ));
+        }
         let value_waits = self.collect_value_waits(&cmd.pending_value_waits)?;
         let value_signals = self.collect_value_signals(&cmd.pending_value_signals)?;
         if self.residency_dirty.replace(false) {
@@ -292,6 +495,13 @@ impl MetalQueue {
         for (event, value) in value_waits {
             self.queue
                 .waitForEvent_value(shared_event_as_event(&event), value);
+        }
+
+        // Taken during recording, so the queue-side wait is enqueued here — still before the
+        // commit that renders into it. A frame that never touched the swapchain skips this.
+        let drawable = sc.drawable.current();
+        if let Some(drawable) = drawable.as_ref() {
+            self.queue.waitForDrawable(drawable);
         }
 
         let mut cmd = cmd;
@@ -307,25 +517,21 @@ impl MetalQueue {
         self.frame_fence_values.borrow_mut()[frame_index] = value;
         self.queue
             .signalEvent_value(shared_event_as_event(&self.frame_event), value);
+        cmd.resolve_recording();
 
-        if let Some(drawable) = sc.current_drawable.borrow().as_ref() {
-            self.queue.signalDrawable(drawable);
+        if let Some(drawable) = drawable {
+            self.queue.signalDrawable(&drawable);
             drawable.present();
         }
-
-        let _ = sc.current_drawable.borrow_mut().take();
-        let _ = sc.current_drawable_texture.borrow_mut().take();
+        sc.drawable.release();
 
         let mut frame_cmds = self.in_flight_frame_commands.borrow_mut();
-        if frame_index >= frame_cmds.len() {
-            return Err(RhiError::Backend(
-                "invalid frame index for Metal queue submission".into(),
-            ));
-        }
         if frame_cmds[frame_index].is_some() {
             log::warn!("Overwriting in-flight Metal frame command before completion");
         }
         frame_cmds[frame_index] = Some(cmd);
+        self.last_submission_value.set(Some(value));
+        self.schedule_pending_retirements();
 
         Ok(())
     }
@@ -335,6 +541,11 @@ impl MetalQueue {
         sc: &MetalSwapchain,
         frame_index: usize,
     ) -> RhiResult<AcquiredImage> {
+        if frame_index >= self.frame_fence_values.borrow().len()
+            || frame_index >= self.in_flight_frame_commands.borrow().len()
+        {
+            return Err(RhiError::Backend("invalid Metal frame index".into()));
+        }
         self.reclaim_completed_submissions();
 
         let value = self.frame_fence_values.borrow()[frame_index];
@@ -347,20 +558,8 @@ impl MetalQueue {
             self.in_flight_frame_commands.borrow_mut()[frame_index] = None;
         }
 
-        let drawable = sc
-            .layer
-            .nextDrawable()
-            .ok_or_else(|| RhiError::SwapchainCreation("nextDrawable returned nil".into()))?;
-
-        let texture = drawable.texture();
-        *sc.current_drawable_texture.borrow_mut() = Some(texture);
-
-        let drawable_proto: Retained<ProtocolObject<dyn MTLDrawable>> =
-            ProtocolObject::from_retained(drawable);
-        // A drawable can be available while the display is still reading it.
-        self.queue.waitForDrawable(&drawable_proto);
-        *sc.current_drawable.borrow_mut() = Some(drawable_proto);
-
+        // No `nextDrawable` here: everything below comes from the layer's configuration, so the
+        // drawable stays in the pool until the frame encodes into it. See `MetalDrawableSlot`.
         Ok(AcquiredImage {
             index: 0, // Metal only has one "current" drawable
             format: sc.format,
@@ -369,21 +568,12 @@ impl MetalQueue {
         })
     }
 
-    pub fn present(
-        &self,
-        sc: &MetalSwapchain,
-        _image_index: u32,
-        _frame_index: usize,
-    ) -> RhiResult<()> {
-        let _ = sc.current_drawable.borrow_mut().take();
-        let _ = sc.current_drawable_texture.borrow_mut().take();
-        Ok(())
-    }
-
     pub fn wait_idle(&self) {
         let value = self.next_fence_value();
         self.queue
             .signalEvent_value(shared_event_as_event(&self.frame_event), value);
+        self.last_submission_value.set(Some(value));
+        self.schedule_pending_retirements();
         let _ = self
             .frame_event
             .waitUntilSignaledValue_timeoutMS(value, u64::MAX);
@@ -391,6 +581,7 @@ impl MetalQueue {
         for slot in self.in_flight_frame_commands.borrow_mut().iter_mut() {
             *slot = None;
         }
+        self.reclaim_retired_resources();
     }
 
     fn next_fence_value(&self) -> u64 {
@@ -401,9 +592,16 @@ impl MetalQueue {
 
     fn reclaim_completed_submissions(&self) {
         let completed = self.frame_event.signaledValue();
-        self.pending_submissions
-            .borrow_mut()
-            .retain(|(value, _)| *value > completed);
+        let mut pending = self.pending_submissions.borrow_mut();
+        while pending
+            .front()
+            .is_some_and(|(value, _)| *value <= completed)
+        {
+            pending
+                .pop_front()
+                .expect("pending submission queue front disappeared");
+        }
+        self.reclaim_retired_resources();
     }
 
     fn commit_single(&self, cmd: &Retained<ProtocolObject<dyn MTL4CommandBuffer>>) {
@@ -540,6 +738,8 @@ impl MetalDevice {
         let frame_event = device
             .newSharedEvent()
             .ok_or_else(|| RhiError::DeviceCreation("Failed to create MTLSharedEvent".into()))?;
+        let buffer_pool: SharedMetalBufferPool =
+            Rc::new(RefCell::new(MetalBufferPool::new(device.clone())));
         let frame_fence_values: FrameFenceValues =
             Rc::new(RefCell::new([0u64; MAX_FRAMES_IN_FLIGHT]));
         let frame_fence_next = Rc::new(Cell::new(0u64));
@@ -548,19 +748,30 @@ impl MetalDevice {
                 .take(MAX_FRAMES_IN_FLIGHT)
                 .collect(),
         ));
-        let pending_submissions: PendingSubmissions = Rc::new(RefCell::new(Vec::new()));
+        let pending_submissions: PendingSubmissions = Rc::new(RefCell::new(VecDeque::new()));
+        let free_texture_ids = Rc::new(RefCell::new(Vec::new()));
+        let free_sampler_ids = Rc::new(RefCell::new(Vec::new()));
+        let active_recordings = Rc::new(Cell::new(0));
 
         let residency_dirty = Rc::new(Cell::new(false));
+        let frame_table_slots = Rc::new(RefCell::new(vec![None; MAX_FRAMES_IN_FLIGHT]));
         let metal_queue = MetalQueue {
             queue: queue.clone(),
             device: device.clone(),
             residency_set: residency_set.clone(),
             residency_dirty: residency_dirty.clone(),
             frame_fence_values: frame_fence_values.clone(),
-            frame_fence_next: frame_fence_next.clone(),
+            frame_fence_next,
             frame_event: frame_event.clone(),
             in_flight_frame_commands,
             pending_submissions,
+            retired_resources: Rc::new(RefCell::new(VecDeque::new())),
+            pending_retired_resources: Rc::new(RefCell::new(Vec::new())),
+            pending_retirement_work: Rc::new(Cell::new(false)),
+            active_recordings: active_recordings.clone(),
+            last_submission_value: Cell::new(None),
+            free_texture_ids: free_texture_ids.clone(),
+            free_sampler_ids: free_sampler_ids.clone(),
             value_sync: RefCell::new(HashMap::new()),
         };
 
@@ -580,14 +791,24 @@ impl MetalDevice {
 
         let device = Self {
             device,
+            buffer_pool,
             rhi_queue,
             residency_set,
             residency_dirty,
             textures: Rc::new(RefCell::new(Vec::new())),
+            texture_view_flags: RefCell::new(Vec::new()),
+            free_texture_ids,
             samplers: Rc::new(RefCell::new(Vec::new())),
+            free_sampler_ids,
+            texture_generation: Rc::new(Cell::new(1)),
+            sampler_generation: Rc::new(Cell::new(1)),
             allocations: Rc::new(RefCell::new(BTreeMap::new())),
+            mapped_allocations: Rc::new(RefCell::new(BTreeMap::new())),
+            active_recordings,
             frame_fence_values,
             frame_event,
+            frame_table_slots,
+            table_slot_pool: Rc::new(RefCell::new(Vec::new())),
             bindless_mode,
             accel_counter: RefCell::new(0),
             mdi_icb_pipeline: mdi_icb,
@@ -610,10 +831,16 @@ impl MetalDevice {
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
         }
+        // Heaps are only handed back here, never on the retire path, so this cannot land
+        // mid-frame. The queue is idle already.
+        self.buffer_pool.borrow_mut().trim();
     }
 
     pub fn wait_for_frame(&self, frame_index: usize) {
-        let value = self.frame_fence_values.borrow()[frame_index];
+        let Some(value) = self.frame_fence_values.borrow().get(frame_index).copied() else {
+            log::warn!("Ignoring invalid Metal frame index {frame_index}");
+            return;
+        };
         if value != 0 {
             let _ = self
                 .frame_event
@@ -676,6 +903,8 @@ impl MetalDevice {
 
         let mtl_format = format_to_mtl(desc.format);
         layer.setPixelFormat(mtl_format);
+        layer.setDisplaySyncEnabled(desc.vsync);
+        layer.setMaximumDrawableCount(desc.image_count.clamp(2, 3) as usize);
         layer.setDrawableSize(CGSize {
             width: desc.width as f64,
             height: desc.height as f64,
@@ -684,13 +913,11 @@ impl MetalDevice {
         let format = mtl_to_format(layer.pixelFormat());
 
         Ok(Swapchain {
-            inner: SwapchainInner::Metal(MetalSwapchain {
-                layer: layer.clone(),
+            inner: SwapchainInner::Metal(Box::new(MetalSwapchain {
+                drawable: Rc::new(MetalDrawableSlot::new(layer.clone())),
                 format,
                 extent: [desc.width, desc.height],
-                current_drawable: RefCell::new(None),
-                current_drawable_texture: RefCell::new(None),
-            }),
+            })),
         })
     }
 
@@ -701,10 +928,17 @@ impl MetalDevice {
     ) -> RhiResult<()> {
         match &mut swapchain.inner {
             SwapchainInner::Metal(sc) => {
-                sc.layer.setDrawableSize(CGSize {
+                self.wait_idle();
+                sc.drawable.release();
+                let layer = &sc.drawable.layer;
+                layer.setPixelFormat(format_to_mtl(desc.format));
+                layer.setDisplaySyncEnabled(desc.vsync);
+                layer.setMaximumDrawableCount(desc.image_count.clamp(2, 3) as usize);
+                layer.setDrawableSize(CGSize {
                     width: desc.width as f64,
                     height: desc.height as f64,
                 });
+                sc.format = mtl_to_format(layer.pixelFormat());
                 sc.extent = [desc.width, desc.height];
                 Ok(())
             }
@@ -714,33 +948,15 @@ impl MetalDevice {
     }
 
     pub fn create_buffer(&self, desc: &BufferDesc) -> RhiResult<GpuBuffer> {
-        let options = match desc.memory {
-            MemoryType::Default | MemoryType::Readback => MTLResourceOptions::StorageModeShared,
-            MemoryType::GpuOnly => MTLResourceOptions::StorageModePrivate,
-        };
-
-        let buffer_size = self
-            .device
-            .heapBufferSizeAndAlignWithLength_options(desc.size as usize, options);
-        let heap_desc = MTLHeapDescriptor::new();
-        heap_desc.setType(MTLHeapType::Placement);
-        heap_desc.setSize(buffer_size.size);
-        heap_desc.setResourceOptions(options);
-
-        let heap = self
-            .device
-            .newHeapWithDescriptor(&heap_desc)
-            .ok_or_else(|| RhiError::BufferCreation("Metal heap allocation failed".into()))?;
-
-        let buffer =
-            unsafe { heap.newBufferWithLength_options_offset(desc.size as usize, options, 0) }
-                .ok_or_else(|| {
-                    RhiError::BufferCreation("Metal placed buffer allocation failed".into())
-                })?;
+        let length = usize::try_from(desc.size).map_err(|_| {
+            RhiError::BufferCreation("Metal buffer size exceeds the host address space".into())
+        })?;
+        let metal_buffer =
+            MetalBufferPool::allocate_shared(&self.buffer_pool, length, desc.memory)?;
 
         // Track the texture for Metal 4 residency.
         let allocation = unsafe {
-            &*(buffer.as_ref() as *const ProtocolObject<dyn MTLBuffer>
+            &*(metal_buffer.buffer.as_ref() as *const ProtocolObject<dyn MTLBuffer>
                 as *const ProtocolObject<dyn MTLAllocation>)
         };
         self.residency_set.addAllocation(allocation);
@@ -749,17 +965,8 @@ impl MetalDevice {
         if let Some(label) = &desc.label {
             use objc2_metal::MTLResource;
             let ns_label = NSString::from_str(label);
-            buffer.setLabel(Some(&ns_label));
+            metal_buffer.buffer.setLabel(Some(&ns_label));
         }
-
-        let is_shared = matches!(desc.memory, MemoryType::Default | MemoryType::Readback);
-
-        let metal_buffer = MetalBuffer {
-            buffer,
-            heap: Some(heap),
-            size: desc.size,
-            is_shared,
-        };
 
         {
             let mut allocations = self.allocations.borrow_mut();
@@ -770,7 +977,15 @@ impl MetalDevice {
                     size: metal_buffer.size,
                     buffer: metal_buffer.buffer.clone(),
                     heap: metal_buffer.heap.clone(),
-                    mapped_ptr: metal_buffer.mapped_ptr(),
+                },
+            );
+        }
+        if let Some(mapped_ptr) = metal_buffer.mapped_ptr() {
+            self.mapped_allocations.borrow_mut().insert(
+                mapped_ptr as usize,
+                MappedAllocation {
+                    gpu_base: metal_buffer.gpu_address(),
+                    size: metal_buffer.size,
                 },
             );
         }
@@ -785,18 +1000,8 @@ impl MetalDevice {
             return None;
         }
         let ptr = cpu_ptr as usize;
-        let allocations = self.allocations.borrow();
-        for alloc in allocations.values() {
-            if let Some(mapped) = alloc.mapped_ptr {
-                let base = mapped as usize;
-                let end = base + alloc.size as usize;
-                if ptr >= base && ptr < end {
-                    let offset = (ptr - base) as u64;
-                    return Some(GpuAddress(alloc.base.0 + offset));
-                }
-            }
-        }
-        None
+        let allocations = self.mapped_allocations.borrow();
+        resolve_mapped_pointer(&allocations, ptr)
     }
 
     /// Build the native `MTLTextureDescriptor` for a `TextureDesc`. Shared by
@@ -860,6 +1065,30 @@ impl MetalDevice {
         })
     }
 
+    fn allocate_texture_id(&self) -> RhiResult<TextureId> {
+        if let Some(id) = self.free_texture_ids.borrow_mut().pop() {
+            return Ok(id);
+        }
+        let next = self.textures.borrow().len();
+        if next > u32::MAX as usize {
+            return Err(RhiError::TextureCreation(
+                "Metal texture ID space exhausted".into(),
+            ));
+        }
+        Ok(TextureId(next as u32))
+    }
+
+    fn allocate_sampler_id(&self) -> RhiResult<SamplerId> {
+        if let Some(id) = self.free_sampler_ids.borrow_mut().pop() {
+            return Ok(id);
+        }
+        let next = self.samplers.borrow().len();
+        if next > u32::MAX as usize {
+            return Err(RhiError::Backend("Metal sampler ID space exhausted".into()));
+        }
+        Ok(SamplerId(next as u32))
+    }
+
     pub fn create_texture(
         &self,
         desc: &TextureDesc,
@@ -879,7 +1108,7 @@ impl MetalDevice {
                 .range(..=texture_gpu.0)
                 .next_back()
                 .map(|(_, alloc)| alloc)
-                .filter(|alloc| texture_gpu.0 < alloc.base.0 + alloc.size)
+                .filter(|alloc| texture_gpu.0 - alloc.base.0 < alloc.size)
                 .ok_or_else(|| {
                     RhiError::TextureCreation(format!(
                         "texture allocation address 0x{:x} was not returned by gpuMalloc",
@@ -894,7 +1123,7 @@ impl MetalDevice {
                     texture_gpu.0, size_align.align
                 )));
             }
-            if offset + size_align.size as u64 > alloc.size {
+            if size_align.size as u64 > alloc.size - offset {
                 return Err(RhiError::TextureCreation(format!(
                     "texture allocation address 0x{:x} has {} bytes available, needs {}",
                     texture_gpu.0,
@@ -902,13 +1131,7 @@ impl MetalDevice {
                     size_align.size
                 )));
             }
-            let heap = alloc.heap.clone().ok_or_else(|| {
-                RhiError::TextureCreation(
-                    "texture allocation is not backed by a Metal placement heap".into(),
-                )
-            })?;
-
-            (heap, offset)
+            (alloc.heap.clone(), offset)
         };
 
         let texture =
@@ -931,10 +1154,21 @@ impl MetalDevice {
             texture.setLabel(Some(&ns_label));
         }
 
+        let id = self.allocate_texture_id()?;
+        let idx = id.0 as usize;
         let mut textures = self.textures.borrow_mut();
-        let id = TextureId(textures.len() as u32);
-        textures.push(Some(texture.clone()));
+        if textures.len() <= idx {
+            textures.resize_with(idx + 1, || None);
+        }
+        textures[idx] = Some(texture.clone());
         drop(textures);
+        let mut view_flags = self.texture_view_flags.borrow_mut();
+        if view_flags.len() <= idx {
+            view_flags.resize(idx + 1, false);
+        }
+        view_flags[idx] = false;
+        self.texture_generation
+            .set(self.texture_generation.get().wrapping_add(1));
 
         Ok(Texture {
             id,
@@ -969,10 +1203,16 @@ impl MetalDevice {
             .newSamplerStateWithDescriptor(&mtl_desc)
             .ok_or_else(|| RhiError::Backend("Failed to create Metal sampler".into()))?;
 
+        let id = self.allocate_sampler_id()?;
+        let idx = id.0 as usize;
         let mut samplers = self.samplers.borrow_mut();
-        let id = SamplerId(samplers.len() as u32);
-        samplers.push(sampler.clone());
+        if samplers.len() <= idx {
+            samplers.resize_with(idx + 1, || None);
+        }
+        samplers[idx] = Some(sampler.clone());
         drop(samplers);
+        self.sampler_generation
+            .set(self.sampler_generation.get().wrapping_add(1));
 
         Ok(Sampler { id })
     }
@@ -993,10 +1233,10 @@ impl MetalDevice {
             })?;
 
         Ok(ShaderModule {
-            inner: crate::shader::ShaderModuleInner::Metal(MetalShaderModule {
+            inner: crate::shader::ShaderModuleInner::Metal(Box::new(MetalShaderModule {
                 library,
                 entry_point: desc.entry_point.to_string(),
-            }),
+            })),
             stage: desc.stage,
         })
     }
@@ -1016,8 +1256,10 @@ impl MetalDevice {
             })?;
 
         let mut color_formats = Vec::with_capacity(desc.color_targets.len());
+        let mut color_write_masks = Vec::with_capacity(desc.color_targets.len());
         for target in &desc.color_targets {
             color_formats.push(format_to_mtl(target.format));
+            color_write_masks.push(target.write_mask);
         }
 
         let sample_count = match desc.sample_count {
@@ -1028,16 +1270,6 @@ impl MetalDevice {
             SampleCount::S16 => 16,
         };
 
-        // Metal 4 supplies depth/stencil formats when the render pass is created.
-        let depth_format_mtl = desc
-            .depth_format
-            .map(format_to_mtl)
-            .unwrap_or(MTLPixelFormat::Invalid);
-        let stencil_format_mtl = desc
-            .stencil_format
-            .map(format_to_mtl)
-            .unwrap_or(MTLPixelFormat::Invalid);
-
         let initial_blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
         let pipeline_state = MetalGraphicsPso::compile_pipeline_state(
             compiler.as_ref(),
@@ -1046,6 +1278,7 @@ impl MetalDevice {
             frag_module.library.as_ref(),
             &frag_module.entry_point,
             &color_formats,
+            &color_write_masks,
             sample_count,
             desc.alpha_to_coverage,
             &initial_blend,
@@ -1099,8 +1332,7 @@ impl MetalDevice {
                 fragment_library: frag_module.library.clone(),
                 fragment_entry_point: frag_module.entry_point.clone(),
                 color_formats,
-                depth_format: depth_format_mtl,
-                stencil_format: stencil_format_mtl,
+                color_write_masks,
                 sample_count,
                 alpha_to_coverage: desc.alpha_to_coverage,
                 graphics_argument_buffer_slots,
@@ -1169,11 +1401,11 @@ impl MetalDevice {
             .unwrap_or_default();
 
         Ok(ComputePso {
-            inner: ComputePsoInner::Metal(MetalComputePso {
+            inner: ComputePsoInner::Metal(Box::new(MetalComputePso {
                 pipeline: pipeline_state,
                 threads_per_threadgroup: desc.threads_per_threadgroup,
                 compute_argument_buffer_slots,
-            }),
+            })),
         })
     }
 
@@ -1271,19 +1503,7 @@ impl MetalDevice {
             inner: crate::pipeline::MeshletPsoInner::Metal(Box::new(MetalMeshletPso {
                 cull_mode,
                 winding,
-                sample_count,
-                alpha_to_coverage: desc.alpha_to_coverage,
-                color_formats,
-                depth_format: desc
-                    .depth_format
-                    .map(super::texture::format_to_mtl)
-                    .unwrap_or(MTLPixelFormat::Invalid),
-                stencil_format: desc
-                    .stencil_format
-                    .map(super::texture::format_to_mtl)
-                    .unwrap_or(MTLPixelFormat::Invalid),
                 argument_buffer_slots,
-                blend_pipelines: std::cell::RefCell::new(std::collections::HashMap::new()),
                 default_pipeline,
             })),
         })
@@ -1455,42 +1675,123 @@ impl MetalDevice {
         })
     }
 
-    pub fn create_command_buffer(&self) -> RhiResult<CommandBuffer> {
-        let allocator = self.device.newCommandAllocator().ok_or_else(|| {
-            RhiError::CommandBuffer("Failed to create MTL4CommandAllocator".into())
+    /// Build a fresh table slot. `pool` is the free list it returns to on drop; swapchain slots
+    /// pass `None`.
+    fn new_table_slot(
+        &self,
+        pool: Option<SharedTableSlotPool>,
+        what: &str,
+    ) -> RhiResult<Rc<MetalFrameTableSlot>> {
+        let state = MetalTableState::new(
+            self.device.as_ref(),
+            self.residency_set.as_ref(),
+            &self.residency_dirty,
+        )?;
+        let command_allocator = self.device.newCommandAllocator().ok_or_else(|| {
+            RhiError::CommandBuffer(format!("Failed to create {what} MTL4CommandAllocator"))
         })?;
+        let command_buffer = self.device.newCommandBuffer().ok_or_else(|| {
+            RhiError::CommandBuffer(format!("Failed to create {what} MTL4CommandBuffer"))
+        })?;
+        Ok(Rc::new(MetalFrameTableSlot {
+            state: Rc::new(RefCell::new(state)),
+            command_allocator,
+            command_buffer,
+            argument_table: RefCell::new(None),
+            in_use: Cell::new(false),
+            pool,
+        }))
+    }
 
-        let cmd = self
-            .device
-            .newCommandBuffer()
-            .ok_or_else(|| RhiError::CommandBuffer("Failed to create MTL4CommandBuffer".into()))?;
+    fn acquire_frame_table_slot(&self, frame_index: usize) -> RhiResult<Rc<MetalFrameTableSlot>> {
+        let mut slots = self.frame_table_slots.borrow_mut();
+        let slot_entry = slots
+            .get_mut(frame_index)
+            .ok_or_else(|| RhiError::CommandBuffer("invalid Metal frame index".into()))?;
+        let slot = if let Some(slot) = slot_entry {
+            slot.clone()
+        } else {
+            let slot = self.new_table_slot(None, "frame")?;
+            *slot_entry = Some(slot.clone());
+            slot
+        };
+        if slot.in_use.replace(true) {
+            return Err(RhiError::CommandBuffer(
+                "Metal frame table slot is still in use".into(),
+            ));
+        }
+        slot.command_allocator.reset();
+        Ok(slot)
+    }
 
+    /// Take a generic table slot from the free list, or build one when empty. Without this,
+    /// `create_command_buffer` rebuilt an allocator, command buffer, argument table and 1 MiB root
+    /// ring on every call — Vulkan pools all of its command buffers, so this keeps parity.
+    fn acquire_pooled_table_slot(&self) -> RhiResult<Rc<MetalFrameTableSlot>> {
+        let pooled = self.table_slot_pool.borrow_mut().pop();
+        let slot = match pooled {
+            Some(slot) => slot,
+            None => self.new_table_slot(Some(self.table_slot_pool.clone()), "pooled")?,
+        };
+        debug_assert!(!slot.in_use.get(), "pooled slot handed out while in use");
+        slot.in_use.set(true);
+        slot.command_allocator.reset();
+        Ok(slot)
+    }
+
+    /// Wrap an acquired slot in a recording command buffer, releasing it again on failure so a
+    /// failed create never strands it as in-use.
+    fn create_command_buffer_in_slot(
+        &self,
+        slot: Rc<MetalFrameTableSlot>,
+    ) -> RhiResult<CommandBuffer> {
         let mtl_cmd = MetalCommandBuffer::new(
-            cmd,
-            allocator,
+            slot.command_buffer.clone(),
+            slot.command_allocator.clone(),
             self.device.clone(),
             self.residency_set.clone(),
             self.residency_dirty.clone(),
             self.textures.clone(),
             self.samplers.clone(),
+            self.texture_generation.clone(),
+            self.sampler_generation.clone(),
             self.allocations.clone(),
+            self.active_recordings.clone(),
+            Some(slot.clone()),
             self.mdi_icb_pipeline.clone(),
-        )?;
+        );
+        let mtl_cmd = match mtl_cmd {
+            Ok(cmd) => cmd,
+            Err(error) => {
+                slot.in_use.set(false);
+                if let Some(pool) = slot.pool.clone() {
+                    pool.borrow_mut().push(slot);
+                }
+                return Err(error);
+            }
+        };
 
         Ok(CommandBuffer {
             inner: crate::command::CommandBufferInner::Metal(Box::new(mtl_cmd)),
         })
     }
 
+    pub fn create_command_buffer(&self) -> RhiResult<CommandBuffer> {
+        let slot = self.acquire_pooled_table_slot()?;
+        self.create_command_buffer_in_slot(slot)
+    }
+
     pub fn create_command_buffer_for_swapchain(
         &self,
         swapchain: &Swapchain,
+        frame_index: usize,
     ) -> RhiResult<CommandBuffer> {
-        let mut cmd_buf = self.create_command_buffer()?;
+        let frame_table_slot = self.acquire_frame_table_slot(frame_index)?;
+        let mut cmd_buf = self.create_command_buffer_in_slot(frame_table_slot)?;
 
         match (&mut cmd_buf.inner, &swapchain.inner) {
             (crate::command::CommandBufferInner::Metal(mtl_cmd), SwapchainInner::Metal(sc)) => {
-                mtl_cmd.drawable_texture = sc.current_drawable_texture.borrow().clone();
+                mtl_cmd.drawable_slot = Some(sc.drawable.clone());
             }
             #[allow(unreachable_patterns)]
             _ => unreachable!("wrong backend"),
@@ -1513,6 +1814,7 @@ impl MetalDevice {
         })
     }
 
+    #[allow(irrefutable_let_patterns)]
     pub fn destroy_buffer(&self, buffer: GpuBuffer) {
         match buffer.inner {
             #[cfg(feature = "metal")]
@@ -1521,30 +1823,96 @@ impl MetalDevice {
                     let mut allocations = self.allocations.borrow_mut();
                     allocations.remove(&mtl.gpu_address().0);
                 }
-                let allocation = unsafe {
-                    &*(mtl.buffer.as_ref() as *const ProtocolObject<dyn MTLBuffer>
-                        as *const ProtocolObject<dyn MTLAllocation>)
-                };
-                self.residency_set.removeAllocation(allocation);
-                self.residency_dirty.set(true);
+                if let Some(mapped_ptr) = mtl.mapped_ptr() {
+                    self.mapped_allocations
+                        .borrow_mut()
+                        .remove(&(mapped_ptr as usize));
+                }
+                if let QueueInner::Metal(queue) = &self.rhi_queue.inner {
+                    queue.retire_resource(MetalRetiredResource::Buffer(mtl));
+                }
             }
             #[cfg(feature = "vulkan")]
             GpuBufferInner::Vulkan(_) => {}
         }
     }
 
+    #[allow(irrefutable_let_patterns)]
     pub fn destroy_texture(&self, texture: Texture) {
-        let mut textures = self.textures.borrow_mut();
-        let idx = texture.id.0 as usize;
-        if idx < textures.len()
-            && let Some(tex) = textures[idx].take()
-        {
-            let allocation = unsafe {
-                &*(tex.as_ref() as *const ProtocolObject<dyn MTLTexture>
-                    as *const ProtocolObject<dyn MTLAllocation>)
-            };
-            self.residency_set.removeAllocation(allocation);
-            self.residency_dirty.set(true);
+        let retired = {
+            let mut textures = self.textures.borrow_mut();
+            let idx = texture.id.0 as usize;
+            if idx < textures.len() {
+                textures[idx].take()
+            } else {
+                None
+            }
+        };
+        if let Some(tex) = retired {
+            if let Some(is_view) = self
+                .texture_view_flags
+                .borrow_mut()
+                .get_mut(texture.id.0 as usize)
+            {
+                *is_view = false;
+            }
+            self.texture_generation
+                .set(self.texture_generation.get().wrapping_add(1));
+            if let QueueInner::Metal(queue) = &self.rhi_queue.inner {
+                queue.retire_resource(MetalRetiredResource::Texture {
+                    id: texture.id,
+                    texture: tex,
+                });
+            }
+        }
+    }
+
+    #[allow(irrefutable_let_patterns)]
+    pub fn destroy_texture_view(&self, id: TextureId) {
+        // Claim the view in one borrow, mirroring the Vulkan path.
+        let was_view = self
+            .texture_view_flags
+            .borrow_mut()
+            .get_mut(id.0 as usize)
+            .is_some_and(|flag| std::mem::replace(flag, false));
+        if !was_view {
+            return;
+        }
+        let retired = self
+            .textures
+            .borrow_mut()
+            .get_mut(id.0 as usize)
+            .and_then(Option::take);
+        if let Some(texture) = retired {
+            self.texture_generation
+                .set(self.texture_generation.get().wrapping_add(1));
+            if let QueueInner::Metal(queue) = &self.rhi_queue.inner {
+                queue.retire_resource(MetalRetiredResource::Texture { id, texture });
+            }
+        }
+    }
+
+    #[allow(irrefutable_let_patterns)]
+    pub fn destroy_sampler(&self, sampler: Sampler) {
+        let sampler_id = sampler.id();
+        let retired = {
+            let mut samplers = self.samplers.borrow_mut();
+            let idx = sampler_id.0 as usize;
+            if idx < samplers.len() {
+                samplers[idx].take()
+            } else {
+                None
+            }
+        };
+        if let Some(sampler) = retired {
+            self.sampler_generation
+                .set(self.sampler_generation.get().wrapping_add(1));
+            if let QueueInner::Metal(queue) = &self.rhi_queue.inner {
+                queue.retire_resource(MetalRetiredResource::Sampler {
+                    id: sampler_id,
+                    sampler,
+                });
+            }
         }
     }
 
@@ -1582,6 +1950,7 @@ impl MetalDevice {
         let samplers = self.samplers.borrow();
         let raw = samplers
             .get(id.0 as usize)
+            .and_then(|s| s.as_ref())
             .map(|s| s.gpuResourceID().to_raw())
             .unwrap_or(0);
         GpuAddress(raw)
@@ -1619,26 +1988,38 @@ impl MetalDevice {
     }
 
     pub fn read_timestamps(&self, pool: &QueryPool) -> RhiResult<Vec<u64>> {
+        use objc2::rc::autoreleasepool;
         use objc2_foundation::NSRange;
 
-        let heap = match &pool.inner {
-            QueryPoolInner::Metal(p) => &p.heap,
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("query pool backend does not match device backend"),
-        };
-        // The writing frame has completed, so resolve the timestamp heap directly.
-        let range = NSRange {
-            location: 0,
-            length: pool.count as usize,
-        };
-        let data = unsafe { heap.resolveCounterRange(range) }
-            .ok_or_else(|| RhiError::Backend("resolveCounterRange returned nil".into()))?;
-        let bytes = data.to_vec();
-        let mut out = vec![0u64; pool.count as usize];
-        for (slot, chunk) in out.iter_mut().zip(bytes.chunks_exact(8)) {
-            *slot = u64::from_ne_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
-        }
-        Ok(out)
+        // MTL4CounterHeap::resolveCounterRange returns a newly allocated autoreleased NSData.
+        // The window event loop does not guarantee a pool around every render callback, so keep
+        // the resolve and byte copy inside an explicit pool; otherwise the HUD's App Memory grows
+        // once per frame even though Metal residency remains flat.
+        autoreleasepool(|_| {
+            let heap = match &pool.inner {
+                QueryPoolInner::Metal(p) => &p.heap,
+                #[allow(unreachable_patterns)]
+                _ => unreachable!("query pool backend does not match device backend"),
+            };
+            // The writing frame has completed, so resolve the timestamp heap directly.
+            let range = NSRange {
+                location: 0,
+                length: pool.count as usize,
+            };
+            let data = unsafe { heap.resolveCounterRange(range) }
+                .ok_or_else(|| RhiError::Backend("resolveCounterRange returned nil".into()))?;
+            let mut out = vec![0u64; pool.count as usize];
+            // `NSData::as_bytes_unchecked` is safe here: `data` remains alive and immutable for
+            // the whole copy, and Metal returns exactly one packed u64 per counter slot.
+            for (slot, chunk) in out
+                .iter_mut()
+                .zip(unsafe { data.as_bytes_unchecked() }.chunks_exact(8))
+            {
+                *slot =
+                    u64::from_ne_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
+            }
+            Ok(out)
+        })
     }
 
     fn create_view_internal(
@@ -1715,10 +2096,28 @@ impl MetalDevice {
         self.residency_set.addAllocation(allocation);
         self.residency_dirty.set(true);
 
+        let id = match self.allocate_texture_id() {
+            Ok(id) => id,
+            Err(err) => {
+                self.residency_set.removeAllocation(allocation);
+                self.residency_dirty.set(true);
+                return Err(err);
+            }
+        };
+        let idx = id.0 as usize;
         let mut textures = self.textures.borrow_mut();
-        let id = TextureId(textures.len() as u32);
-        textures.push(Some(view_texture));
+        if textures.len() <= idx {
+            textures.resize_with(idx + 1, || None);
+        }
+        textures[idx] = Some(view_texture);
         drop(textures);
+        let mut view_flags = self.texture_view_flags.borrow_mut();
+        if view_flags.len() <= idx {
+            view_flags.resize(idx + 1, false);
+        }
+        view_flags[idx] = true;
+        self.texture_generation
+            .set(self.texture_generation.get().wrapping_add(1));
 
         Ok(id)
     }
@@ -1757,5 +2156,40 @@ fn compare_op_to_mtl(op: CompareOp) -> objc2_metal::MTLCompareFunction {
         CompareOp::NotEqual => objc2_metal::MTLCompareFunction::NotEqual,
         CompareOp::GreaterOrEqual => objc2_metal::MTLCompareFunction::GreaterEqual,
         CompareOp::Always => objc2_metal::MTLCompareFunction::Always,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapped_pointer_lookup_uses_predecessor_and_respects_end() {
+        let mut allocations = BTreeMap::new();
+        allocations.insert(
+            0x1000,
+            MappedAllocation {
+                gpu_base: GpuAddress(0x8000),
+                size: 0x20,
+            },
+        );
+        allocations.insert(
+            0x2000,
+            MappedAllocation {
+                gpu_base: GpuAddress(0x9000),
+                size: 0x10,
+            },
+        );
+
+        assert_eq!(
+            resolve_mapped_pointer(&allocations, 0x100f),
+            Some(GpuAddress(0x800f))
+        );
+        assert_eq!(
+            resolve_mapped_pointer(&allocations, 0x200f),
+            Some(GpuAddress(0x900f))
+        );
+        assert_eq!(resolve_mapped_pointer(&allocations, 0x1020), None);
+        assert_eq!(resolve_mapped_pointer(&allocations, 0x1fff), None);
     }
 }

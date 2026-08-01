@@ -102,9 +102,9 @@ pub struct ComputePso {
 
 pub(crate) enum ComputePsoInner {
     #[cfg(feature = "vulkan")]
-    Vulkan(crate::backend::vulkan::pipeline::VulkanComputePso),
+    Vulkan(Box<crate::backend::vulkan::pipeline::VulkanComputePso>),
     #[cfg(feature = "metal")]
-    Metal(crate::backend::metal::pipeline::MetalComputePso),
+    Metal(Box<crate::backend::metal::pipeline::MetalComputePso>),
 }
 
 /// Per-face stencil operation descriptor.

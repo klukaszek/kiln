@@ -15,6 +15,7 @@ raw-window-handle = "0.6"
 log = "0.4"
 thiserror = "2"
 bitflags = "2"
+smallvec = "1"
 
 # Vulkan backend
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"], optional = true }

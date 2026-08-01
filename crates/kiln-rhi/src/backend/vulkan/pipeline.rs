@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use ash::vk;
 
-use super::device::format_to_vk;
+use super::device::{SharedPendingRetirements, VulkanRetiredResource, format_to_vk};
 use crate::error::{RhiError, RhiResult};
 use crate::pipeline::{BlendAttachment, BlendState, ColorTarget};
 use crate::types::{BlendFactor, BlendOp, ColorWriteMask, Cull, SampleCount, Topology};
@@ -13,8 +13,10 @@ pub struct VulkanGraphicsPso {
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) pipeline_layout: vk::PipelineLayout,
     pub(crate) device: ash::Device,
+    pub(crate) pipeline_cache: vk::PipelineCache,
     pub(crate) desc: VulkanGraphicsPsoDesc,
     pub(crate) blend_pipelines: RefCell<HashMap<BlendState, vk::Pipeline>>,
+    pub(crate) pending_retired_resources: SharedPendingRetirements,
 }
 
 /// Vulkan compute pipeline state.
@@ -23,16 +25,18 @@ pub struct VulkanComputePso {
     pub(crate) pipeline_layout: vk::PipelineLayout,
     #[allow(dead_code)]
     pub(crate) threads_per_threadgroup: [u32; 3],
-    pub(crate) device: ash::Device,
+    pub(crate) pending_retired_resources: SharedPendingRetirements,
 }
 
 impl Drop for VulkanComputePso {
     fn drop(&mut self) {
-        unsafe {
-            self.device.destroy_pipeline(self.pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-        }
+        self.pending_retired_resources
+            .lock()
+            .expect("pending retired resource lock poisoned")
+            .push(VulkanRetiredResource::Pipeline {
+                pipelines: vec![self.pipeline],
+                layout: self.pipeline_layout,
+            });
     }
 }
 
@@ -179,7 +183,7 @@ impl VulkanGraphicsPso {
 
         let pipelines = unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .create_graphics_pipelines(self.pipeline_cache, &[pipeline_info], None)
                 .map_err(|(_, e)| {
                     RhiError::PipelineCreation(format!("Vulkan graphics pipeline creation: {e:?}"))
                 })?
@@ -191,16 +195,19 @@ impl VulkanGraphicsPso {
 
 impl Drop for VulkanGraphicsPso {
     fn drop(&mut self) {
-        unsafe {
-            self.device.destroy_pipeline(self.pipeline, None);
-            for (_, pipe) in self.blend_pipelines.borrow_mut().drain() {
-                if pipe != self.pipeline {
-                    self.device.destroy_pipeline(pipe, None);
-                }
+        let mut pipelines = vec![self.pipeline];
+        for (_, pipeline) in self.blend_pipelines.borrow_mut().drain() {
+            if pipeline != self.pipeline {
+                pipelines.push(pipeline);
             }
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
         }
+        self.pending_retired_resources
+            .lock()
+            .expect("pending retired resource lock poisoned")
+            .push(VulkanRetiredResource::Pipeline {
+                pipelines,
+                layout: self.pipeline_layout,
+            });
     }
 }
 
@@ -284,9 +291,11 @@ pub struct VulkanMeshletPso {
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) pipeline_layout: vk::PipelineLayout,
     pub(crate) device: ash::Device,
+    pub(crate) pipeline_cache: vk::PipelineCache,
     /// Blend variants (same per-draw flyweight mechanism as graphics PSOs).
     pub(crate) desc: VulkanMeshletPsoDesc,
     pub(crate) blend_pipelines: RefCell<HashMap<BlendState, vk::Pipeline>>,
+    pub(crate) pending_retired_resources: SharedPendingRetirements,
 }
 
 pub struct VulkanMeshletPsoDesc {
@@ -328,15 +337,7 @@ impl VulkanMeshletPso {
             .name(&self.desc.frag_entry);
         let stages = [mesh_stage, frag_stage];
 
-        let (cull_mode, front_face) = match self.desc.cull {
-            Cull::None => (vk::CullModeFlags::NONE, vk::FrontFace::COUNTER_CLOCKWISE),
-            Cull::Cw => (vk::CullModeFlags::BACK, vk::FrontFace::COUNTER_CLOCKWISE),
-            Cull::Ccw => (vk::CullModeFlags::FRONT, vk::FrontFace::COUNTER_CLOCKWISE),
-            Cull::All => (
-                vk::CullModeFlags::FRONT_AND_BACK,
-                vk::FrontFace::COUNTER_CLOCKWISE,
-            ),
-        };
+        let (cull_mode, front_face) = cull_to_vk(self.desc.cull);
         let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
             .line_width(1.0)
@@ -423,7 +424,7 @@ impl VulkanMeshletPso {
 
         let pipelines = unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .create_graphics_pipelines(self.pipeline_cache, &[pipeline_info], None)
                 .map_err(|(_, e)| {
                     RhiError::PipelineCreation(format!("Vulkan meshlet pipeline creation: {e:?}"))
                 })?
@@ -434,15 +435,18 @@ impl VulkanMeshletPso {
 
 impl Drop for VulkanMeshletPso {
     fn drop(&mut self) {
-        unsafe {
-            self.device.destroy_pipeline(self.pipeline, None);
-            for (_, pipe) in self.blend_pipelines.borrow_mut().drain() {
-                if pipe != self.pipeline {
-                    self.device.destroy_pipeline(pipe, None);
-                }
+        let mut pipelines = vec![self.pipeline];
+        for (_, pipeline) in self.blend_pipelines.borrow_mut().drain() {
+            if pipeline != self.pipeline {
+                pipelines.push(pipeline);
             }
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
         }
+        self.pending_retired_resources
+            .lock()
+            .expect("pending retired resource lock poisoned")
+            .push(VulkanRetiredResource::Pipeline {
+                pipelines,
+                layout: self.pipeline_layout,
+            });
     }
 }

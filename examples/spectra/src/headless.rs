@@ -34,6 +34,8 @@ pub fn run(config: &Config, resolution: UVec2) -> anyhow::Result<()> {
         config.passes_per_frame,
         1,
         config.headless_pixel_stride,
+        spectral_scene.light_count,
+        spectral_scene.spectrum_len,
     )?;
 
     let result = (|| {
@@ -53,18 +55,23 @@ pub fn run(config: &Config, resolution: UVec2) -> anyhow::Result<()> {
         };
         let start = Instant::now();
         while !tracer.is_complete() {
-            let previous_passes = tracer.pass_count();
-            let mut cmd = device.create_command_buffer()?;
-            tracer.pre_render(&ctx, &mut cmd, &scene, &geometry, &spectral_scene);
-            cmd.end();
-            let queue = device.queue();
-            queue.submit(cmd)?;
-            queue.wait_idle();
-            anyhow::ensure!(
-                tracer.pass_count() > previous_passes,
-                "path tracer made no progress; lights={}",
-                spectral_scene.light_count
-            );
+            // Same reason the windowed harness wraps its frame: each pass creates autoreleased
+            // encoders that would otherwise accumulate for the whole trace.
+            kiln_rhi::frame_scope(|| -> anyhow::Result<()> {
+                let previous_passes = tracer.pass_count();
+                let mut cmd = device.create_command_buffer()?;
+                tracer.pre_render(&ctx, &mut cmd, &scene, &geometry, &spectral_scene);
+                cmd.end();
+                let queue = device.queue();
+                queue.submit(cmd)?;
+                queue.wait_idle();
+                anyhow::ensure!(
+                    tracer.pass_count() > previous_passes,
+                    "path tracer made no progress; lights={}",
+                    spectral_scene.light_count
+                );
+                Ok(())
+            })?;
         }
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;

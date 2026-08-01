@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use crate::types::Format;
 use ash::vk;
@@ -7,8 +8,8 @@ use ash::vk;
 pub struct VulkanSwapchain {
     pub(crate) swapchain: vk::SwapchainKHR,
     pub(crate) surface: vk::SurfaceKHR,
-    pub(crate) images: Vec<vk::Image>,
-    pub(crate) image_views: Vec<vk::ImageView>,
+    pub(crate) images: Arc<[vk::Image]>,
+    pub(crate) image_views: Arc<[vk::ImageView]>,
     pub(crate) format: Format,
     pub(crate) surface_format: vk::SurfaceFormatKHR,
     pub(crate) extent: vk::Extent2D,
@@ -27,7 +28,7 @@ pub struct VulkanSwapchain {
 impl Drop for VulkanSwapchain {
     fn drop(&mut self) {
         unsafe {
-            for &view in &self.image_views {
+            for &view in self.image_views.iter() {
                 self.device.destroy_image_view(view, None);
             }
             self.device.destroy_image_view(self.depth_image_view, None);

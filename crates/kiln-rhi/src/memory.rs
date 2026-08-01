@@ -10,7 +10,10 @@ impl<T> GpuPod for T where T: IntoBytes + FromBytes + zerocopy::Immutable {}
 
 /// Copy `bytes` into a CPU-mapped region, bounds-checked.
 fn mapped_write(ptr: Option<*mut u8>, capacity: u64, bytes: &[u8]) -> RhiResult<()> {
-    if bytes.len() as u64 > capacity {
+    let byte_count = u64::try_from(bytes.len()).map_err(|_| {
+        RhiError::AllocationFailed("upload size does not fit in a GPU allocation".into())
+    })?;
+    if byte_count > capacity {
         return Err(RhiError::AllocationFailed(format!(
             "upload of {} bytes exceeds mapped region ({capacity} bytes)",
             bytes.len()
@@ -71,7 +74,8 @@ impl GpuAllocation {
     pub fn cpu(&self) -> Option<*mut u8> {
         self.buffer
             .cpu()
-            .map(|ptr| unsafe { ptr.add(self.offset as usize) })
+            .zip(usize::try_from(self.offset).ok())
+            .map(|(ptr, offset)| unsafe { ptr.add(offset) })
     }
 
     /// GPU virtual address.
@@ -111,8 +115,13 @@ impl GpuAllocation {
         let ptr = self
             .cpu()
             .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
+        let size = usize::try_from(self.size).map_err(|_| {
+            RhiError::AllocationFailed(
+                "allocation size does not fit in the host address space".into(),
+            )
+        })?;
         // SAFETY: `ptr` is valid for `self.size` bytes for the lifetime of `&self`.
-        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, self.size as usize) };
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
         <[T]>::ref_from_bytes(bytes).map_err(|_| {
             RhiError::AllocationFailed("size is not a multiple of element size".into())
         })
@@ -123,9 +132,14 @@ impl GpuAllocation {
         let ptr = self
             .cpu()
             .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
+        let size = usize::try_from(self.size).map_err(|_| {
+            RhiError::AllocationFailed(
+                "allocation size does not fit in the host address space".into(),
+            )
+        })?;
         // SAFETY: `ptr` is valid for `self.size` bytes; `&mut self` guarantees no other CPU
         // reference aliases it.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, self.size as usize) };
+        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
         <[T]>::mut_from_bytes(bytes).map_err(|_| {
             RhiError::AllocationFailed("size is not a multiple of element size".into())
         })
@@ -184,6 +198,8 @@ impl TransientAllocation {
 /// Linear allocator over a mapped GPU buffer.
 pub struct BumpAllocator {
     buffer: GpuBuffer,
+    cpu_base: Option<*mut u8>,
+    gpu_base: GpuAddress,
     offset: u64,
     capacity: u64,
 }
@@ -191,9 +207,13 @@ pub struct BumpAllocator {
 impl BumpAllocator {
     /// Create a new bump allocator with the given buffer.
     pub fn new(buffer: GpuBuffer) -> Self {
+        let cpu_base = buffer.cpu();
+        let gpu_base = buffer.gpu();
         let capacity = buffer.size();
         Self {
             buffer,
+            cpu_base,
+            gpu_base,
             offset: 0,
             capacity,
         }
@@ -202,16 +222,12 @@ impl BumpAllocator {
     /// Allocate `size` bytes with the given power-of-two alignment.
     /// Returns `None` when the allocator has no room.
     pub fn alloc(&mut self, size: u64, align: u64) -> Option<TransientAllocation> {
-        let align = align.max(1);
-        let aligned_offset = self.offset.div_ceil(align) * align;
-        let end = aligned_offset + size;
-        if end > self.capacity {
-            return None;
-        }
+        let (aligned_offset, end) = aligned_bump_range(self.offset, size, align, self.capacity)?;
 
-        let cpu = self.buffer.cpu()?;
-        let gpu = self.buffer.gpu().offset(aligned_offset);
-        let cpu = unsafe { cpu.add(aligned_offset as usize) };
+        let cpu = self.cpu_base?;
+        let gpu = self.gpu_base.offset(aligned_offset);
+        let cpu_offset = usize::try_from(aligned_offset).ok()?;
+        let cpu = unsafe { cpu.add(cpu_offset) };
 
         self.offset = end;
 
@@ -225,7 +241,7 @@ impl BumpAllocator {
 
     /// The underlying buffer's base GPU address.
     pub fn gpu(&self) -> GpuAddress {
-        self.buffer.gpu()
+        self.gpu_base
     }
 
     /// How many bytes have been allocated so far.
@@ -241,5 +257,31 @@ impl BumpAllocator {
     /// Consume the allocator and return the backing buffer.
     pub fn into_buffer(self) -> GpuBuffer {
         self.buffer
+    }
+}
+
+fn aligned_bump_range(offset: u64, size: u64, align: u64, capacity: u64) -> Option<(u64, u64)> {
+    let align = align.max(1);
+    let remainder = offset % align;
+    let padding = if remainder == 0 { 0 } else { align - remainder };
+    let aligned_offset = offset.checked_add(padding)?;
+    let end = aligned_offset.checked_add(size)?;
+    (end <= capacity).then_some((aligned_offset, end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aligned_bump_range;
+
+    #[test]
+    fn bump_range_rejects_overflow() {
+        assert_eq!(aligned_bump_range(u64::MAX - 7, 16, 16, u64::MAX), None);
+        assert_eq!(aligned_bump_range(8, u64::MAX, 1, u64::MAX), None);
+    }
+
+    #[test]
+    fn bump_range_aligns_without_overflow() {
+        assert_eq!(aligned_bump_range(17, 8, 16, 64), Some((32, 40)));
+        assert_eq!(aligned_bump_range(17, 33, 16, 64), None);
     }
 }

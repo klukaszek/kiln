@@ -27,7 +27,7 @@ use kiln_rhi::{
     ColorWriteMask, CommandBuffer, Cull, Device, FilterMode, Format, GpuAddress, GpuAllocation,
     GpuBuffer, GraphicsPso, GraphicsPsoDesc, MAX_FRAMES_IN_FLIGHT, MemoryType, RhiError, RhiResult,
     SampleCount, Sampler, SamplerDesc, SamplerHandle, ShaderStage, StageFlags, Texture,
-    TextureDesc, TextureDimension, TextureHandle, TextureUsage, Topology, gpu_struct,
+    TextureDesc, TextureDimension, TextureHandle, TextureId, TextureUsage, Topology, gpu_struct,
 };
 
 gpu_struct! {
@@ -112,12 +112,21 @@ float4 fsMain(VOut i, uniform EguiRoot* r) : SV_Target
 /// (the RHI's `copy_to_texture` has no sub-rect form).
 struct ManagedTexture {
     texture: Texture,
+    view: TextureId,
     mem: GpuAllocation,
     /// Value for the root's [`TextureHandle`] field (heap index on Vulkan, `gpuResourceID` on Metal).
     handle: GpuAddress,
     width: u32,
     height: u32,
     shadow: Vec<u8>, // RGBA8, width*height*4
+}
+
+impl ManagedTexture {
+    fn destroy(self, device: &Device) {
+        device.destroy_texture_view(self.view);
+        device.destroy_texture(self.texture);
+        device.free(self.mem);
+    }
 }
 
 /// Per-frame-in-flight geometry buffers. Reused (and grown) once their slot's prior frame has
@@ -150,8 +159,8 @@ impl EguiRenderer {
     pub fn new(device: &Device, color_format: Format) -> RhiResult<Self> {
         let src = format!("{}{}{}", EguiVertex::SLANG, EguiRoot::SLANG, SHADER_BODY);
         let compiler = SlangCompiler::new();
-        let vs = compiler.compile(device, &src, "vsMain", ShaderStage::Vertex, &[]);
-        let fs = compiler.compile(device, &src, "fsMain", ShaderStage::Pixel, &[]);
+        let vs = compiler.try_compile(device, &src, "vsMain", ShaderStage::Vertex, &[])?;
+        let fs = compiler.try_compile(device, &src, "fsMain", ShaderStage::Pixel, &[])?;
 
         // Premultiplied-alpha blending: out = src + dst*(1-src.a); alpha accumulates so the
         // result composites correctly even when rendering egui into an offscreen target.
@@ -227,8 +236,7 @@ impl EguiRenderer {
     pub fn free_textures(&mut self, device: &Device, free: &[egui::TextureId]) {
         for id in free {
             if let Some(m) = self.textures.remove(id) {
-                device.destroy_texture(m.texture);
-                device.free(m.mem);
+                m.destroy(device);
             }
         }
     }
@@ -380,15 +388,21 @@ impl EguiRenderer {
     /// Release all GPU resources. Dropping leaks textures/buffers (RHI handles are not RAII for
     /// device-owned storage), so call this before the device is destroyed.
     pub fn destroy(self, device: &Device) {
-        for (_, m) in self.textures {
-            device.destroy_texture(m.texture);
-            device.free(m.mem);
+        let EguiRenderer {
+            textures,
+            frames,
+            _sampler,
+            ..
+        } = self;
+        for (_, m) in textures {
+            m.destroy(device);
         }
-        for f in self.frames {
+        for f in frames {
             for b in [f.vtx, f.idx, f.root].into_iter().flatten() {
                 device.destroy_buffer(b);
             }
         }
+        device.destroy_sampler(_sampler);
     }
 
     /// Apply one egui texture delta (create / full update / sub-region patch), then upload the
@@ -418,8 +432,7 @@ impl EguiRenderer {
                 .is_none_or(|m| m.width as usize != pw || m.height as usize != ph);
             if recreate {
                 if let Some(old) = self.textures.remove(&id) {
-                    device.destroy_texture(old.texture);
-                    device.free(old.mem);
+                    old.destroy(device);
                 }
                 let m = create_texture(device, pw as u32, ph as u32, patch.to_vec())?;
                 self.textures.insert(id, m);
@@ -516,10 +529,18 @@ fn create_texture(
     let sa = device.texture_size_align(&desc)?;
     let mem = device.malloc_aligned(sa.size, sa.align, MemoryType::GpuOnly)?;
     let texture = device.create_texture(&desc, mem.gpu())?;
-    let tex_id = device.create_sampled_view(&texture, &Default::default())?;
+    let tex_id = match device.create_sampled_view(&texture, &Default::default()) {
+        Ok(id) => id,
+        Err(error) => {
+            device.destroy_texture(texture);
+            device.free(mem);
+            return Err(error);
+        }
+    };
     let handle = device.bindless_texture_handle(tex_id);
     Ok(ManagedTexture {
         texture,
+        view: tex_id,
         mem,
         handle,
         width,

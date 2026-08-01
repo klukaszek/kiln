@@ -76,6 +76,8 @@ fn texture_create_and_views() {
         "distinct views should get distinct bindless ids"
     );
 
+    device.destroy_texture_view(sampled);
+    device.destroy_texture_view(storage);
     device.destroy_texture(texture);
     device.free(mem);
 }

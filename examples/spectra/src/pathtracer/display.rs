@@ -1,11 +1,15 @@
 //! Presentation and CPU readback of the spectral film.
 
+use std::fmt::Write as _;
+
 use glam::{UVec2, Vec3};
 use kiln_rhi::Format;
 
+use crate::scene::spectral;
+
 use super::schedule::SpatialSchedule;
 
-pub const SOURCE: &str = /*slang*/
+const BODY: &str = /*slang*/
     r#"
 struct VOut {
     float4 pos : SV_Position;
@@ -25,12 +29,10 @@ float4 displayFs(VOut i, uniform DisplayRoot* r) : SV_Target
 {
     uint width = r.display_width;
     uint height = r.display_height;
-    uint bins = r.spectral_bins;
     bool targetIsSrgb = r.target_is_srgb != 0u;
     uint filmW = r.film_width;
     uint filmH = r.film_height;
-    uint stride = r.film_stride;
-    uint pixelStride = max(r.pixel_stride, 1u);
+    uint pixelStride = DISPLAY_PIXEL_STRIDE;
     uint x = min((uint)i.pos.x, width - 1u);
     uint y = min((uint)i.pos.y, height - 1u);
     // Nearest-neighbour upscale when the film renders below display resolution.
@@ -48,11 +50,18 @@ float4 displayFs(VOut i, uniform DisplayRoot* r) : SV_Target
         fy = min(tileY + sampledPhase / pixelStride, filmH - 1u);
         sampleCount = r.completed_samples + 1u;
     }
-    uint base = (fy * filmW + fx) * stride;
+    // The film is pixel-major and SPECTRAL_BINS is a multiple of four. Read
+    // four adjacent bands at a time so the display pass issues vector loads.
+    uint base = (fy * filmW + fx) * DISPLAY_BIN_VECS;
     float inv = 1.0 / max((float)sampleCount, 1.0);
     float3 c = float3(0.0);
-    for (uint j = 0u; j < bins; j++) {
-        c += r.cmf[j].xyz * (r.film[base + j] * inv);
+    [ForceUnroll]
+    for (uint v = 0u; v < DISPLAY_BIN_VECS; v++) {
+        float4 bins = r.film[base + v] * inv;
+        c += DISPLAY_CMF[v * 4u + 0u].xyz * bins.x;
+        c += DISPLAY_CMF[v * 4u + 1u].xyz * bins.y;
+        c += DISPLAY_CMF[v * 4u + 2u].xyz * bins.z;
+        c += DISPLAY_CMF[v * 4u + 3u].xyz * bins.w;
     }
 
     c *= 0.25; // exposure
@@ -63,6 +72,35 @@ float4 displayFs(VOut i, uniform DisplayRoot* r) : SV_Target
     return float4(c, 1.0);
 }
 "#;
+
+pub fn source(pixel_stride: u32) -> String {
+    assert!(
+        spectral::SPECTRAL_BINS.is_multiple_of(4),
+        "spectral display requires a multiple of four bins"
+    );
+
+    let cmf = spectral::cmf_bins_linear_srgb();
+    let mut cmf_source = String::with_capacity(cmf.len() * 48);
+    cmf_source.push_str("static const float4 DISPLAY_CMF[DISPLAY_BINS] = {\n");
+    for color in cmf {
+        writeln!(
+            cmf_source,
+            "    float4({}, {}, {}, 0.0),",
+            color.x, color.y, color.z
+        )
+        .expect("writing to a String cannot fail");
+    }
+    cmf_source.push_str("};\n");
+
+    format!(
+        "static const uint DISPLAY_BINS = {}u;\n\
+         static const uint DISPLAY_BIN_VECS = {}u;\n\
+         static const uint DISPLAY_PIXEL_STRIDE = {pixel_stride}u;\n\n\
+         {cmf_source}\n{BODY}",
+        spectral::SPECTRAL_BINS,
+        spectral::SPECTRAL_BINS / 4,
+    )
+}
 
 /// CPU twin of `displayFs`'s tonemap for headless readback: takes one resolved
 /// linear-sRGB channel (`Σ_j cmf·band` already summed on the CPU) and applies

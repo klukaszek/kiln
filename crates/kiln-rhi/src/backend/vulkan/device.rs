@@ -1,7 +1,10 @@
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use ash::{
     Device, Entry, Instance,
@@ -9,6 +12,7 @@ use ash::{
     khr::{acceleration_structure as vk_accel_structure, surface, swapchain},
     vk,
 };
+use smallvec::SmallVec;
 
 use crate::command::{
     CommandBuffer, CommandBufferInner, SignalOp, SignalValueDesc, WaitOp, WaitValueDesc,
@@ -29,7 +33,7 @@ use crate::types::*;
 
 use super::accel::VulkanAccelerationStructure;
 use super::command::VulkanCommandBuffer;
-use super::memory::VulkanBuffer;
+use super::memory::{SharedBufferPool, VulkanBuffer, VulkanBufferPool};
 use super::pipeline::{
     VulkanComputePso, VulkanGraphicsPso, VulkanGraphicsPsoDesc, VulkanMeshletPso,
     VulkanMeshletPsoDesc,
@@ -58,8 +62,28 @@ pub(crate) struct BufferAllocation {
     pub size: u64,
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
+    /// Offset within the pooled block; images placed here bind at this plus their own offset.
+    pub memory_offset: u64,
     pub memory_type_index: u32,
-    pub mapped_ptr: Option<*mut u8>,
+}
+
+/// Reverse index for CPU-mapped allocations.
+///
+/// GPU command encoding uses the allocation's GPU base address, while the public pointer bridge
+/// starts from a CPU address. Keeping a second index lets both directions use predecessor lookup
+/// without scanning unrelated allocations.
+struct MappedAllocation {
+    gpu_base: GpuAddress,
+    size: u64,
+}
+
+fn resolve_mapped_pointer(
+    allocations: &BTreeMap<usize, MappedAllocation>,
+    ptr: usize,
+) -> Option<GpuAddress> {
+    let (&base, allocation) = allocations.range(..=ptr).next_back()?;
+    let offset = (ptr - base) as u64;
+    (offset < allocation.size).then(|| allocation.gpu_base.offset(offset))
 }
 
 // The registry is accessed behind the allocation mutex.
@@ -75,15 +99,33 @@ pub(crate) struct DescriptorBufferHeap {
     pub sampled_image_offset: u64,
     pub sampler_offset: u64,
     pub storage_image_offset: u64,
-    pub sampled_image_stride: u64,
+    /// Sampled and storage images share this mutable binding. Each slot uses the larger
+    /// descriptor size.
+    pub image_descriptor_stride: u64,
+    pub sampled_image_descriptor_size: u64,
+    pub storage_image_descriptor_size: u64,
     pub sampler_stride: u64,
-    pub storage_image_stride: u64,
 }
 
 /// Buffer allocations keyed by GPU base address, enabling O(log n) address->buffer
 /// resolution instead of a linear scan on every indirect/copy/index command.
 pub(crate) type SharedAllocations = Arc<Mutex<BTreeMap<u64, BufferAllocation>>>;
+type SharedMappedAllocations = Arc<Mutex<BTreeMap<usize, MappedAllocation>>>;
 pub(crate) type SharedTextures = Arc<Mutex<Vec<Option<VulkanTexture>>>>;
+pub(crate) type SharedPendingRetirements = Arc<Mutex<Vec<VulkanRetiredResource>>>;
+type SharedPendingRetirementWork = Arc<AtomicBool>;
+pub(crate) type SharedActiveRecordings = Arc<AtomicUsize>;
+type SharedTextureFreeIds = Arc<Mutex<Vec<TextureId>>>;
+type SharedSamplerFreeIds = Arc<Mutex<Vec<SamplerId>>>;
+
+#[derive(Clone, Copy)]
+struct VulkanCapabilities {
+    mesh_shader: bool,
+    acceleration_structure: bool,
+    ray_query: bool,
+    ray_tracing_maintenance1: bool,
+    ray_tracing_pipeline: bool,
+}
 
 /// Components produced by `build_swapchain_contents` (shared between create and recreate).
 struct SwapchainContents {
@@ -108,8 +150,13 @@ pub struct VulkanDevice {
     pub(crate) physical_device: vk::PhysicalDevice,
     pub(crate) queue_family_index: u32,
     pub(crate) queue: Queue,
+    pending_retired_resources: SharedPendingRetirements,
+    active_recordings: SharedActiveRecordings,
     pub(crate) present_queue: vk::Queue,
     pub(crate) command_pool: vk::CommandPool,
+    pub(crate) pipeline_cache: vk::PipelineCache,
+    /// Shared with the queue so retirement can hand ranges back.
+    buffer_pool: SharedBufferPool,
     pub(crate) device_memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub(crate) bindless_mode: BindlessMode,
     pub(crate) max_draw_indirect_count: u32,
@@ -126,13 +173,19 @@ pub struct VulkanDevice {
     pub(crate) texture_descriptor_set_layout: vk::DescriptorSetLayout,
     pub(crate) descriptor_buffer_heap: Option<DescriptorBufferHeap>,
     pub(crate) textures: SharedTextures,
+    texture_view_flags: Mutex<Vec<bool>>,
     pub(crate) next_texture_id: RefCell<u32>,
+    free_texture_ids: SharedTextureFreeIds,
     pub(crate) allocations: SharedAllocations,
+    mapped_allocations: SharedMappedAllocations,
 
-    pub(crate) samplers: RefCell<Vec<vk::Sampler>>,
+    pub(crate) samplers: RefCell<Vec<Option<vk::Sampler>>>,
     pub(crate) next_sampler_id: RefCell<u32>,
+    free_sampler_ids: SharedSamplerFreeIds,
 
     pub(crate) setup_command_buffer: vk::CommandBuffer,
+    /// Whether the batched setup command buffer is currently recording initial image layouts.
+    setup_recording: Cell<bool>,
 
     /// True when `VK_EXT_mesh_shader` was enabled at device creation.
     pub(crate) mesh_shader_supported: bool,
@@ -154,6 +207,50 @@ pub struct VulkanQueue {
     pub(crate) swapchain_loader: swapchain::Device,
     pub(crate) command_pool: vk::CommandPool,
     value_sync: Mutex<HashMap<u64, VulkanValueSyncState>>,
+    buffer_pool: SharedBufferPool,
+    /// Generic command buffers are returned to the pool once their queue timeline value is
+    /// complete. Swapchain command buffers have their own frame fences and are intentionally not
+    /// placed in this list.
+    pending_commands: Mutex<VecDeque<(vk::CommandBuffer, u64)>>,
+    available_commands: Mutex<Vec<vk::CommandBuffer>>,
+    active_recordings: SharedActiveRecordings,
+    completion_semaphore: vk::Semaphore,
+    next_completion_value: Mutex<u64>,
+    last_submission_value: Mutex<Option<u64>>,
+    retired_resources: Mutex<VecDeque<VulkanRetiredResourceWithValue>>,
+    pending_retired_resources: SharedPendingRetirements,
+    pending_retirement_work: SharedPendingRetirementWork,
+    free_texture_ids: SharedTextureFreeIds,
+    free_sampler_ids: SharedSamplerFreeIds,
+}
+
+pub(crate) enum VulkanRetiredResource {
+    Buffer(VulkanBuffer),
+    Texture {
+        id: TextureId,
+        texture: VulkanTexture,
+    },
+    Sampler {
+        id: SamplerId,
+        sampler: vk::Sampler,
+    },
+    Pipeline {
+        pipelines: Vec<vk::Pipeline>,
+        layout: vk::PipelineLayout,
+    },
+    AccelerationStructure {
+        acceleration_structure: vk::AccelerationStructureKHR,
+        buffer: vk::Buffer,
+        buffer_memory: vk::DeviceMemory,
+        scratch_buffer: vk::Buffer,
+        scratch_memory: vk::DeviceMemory,
+        accel_loader: vk_accel_structure::Device,
+    },
+}
+
+struct VulkanRetiredResourceWithValue {
+    value: u64,
+    resource: VulkanRetiredResource,
 }
 
 #[derive(Clone, Copy)]
@@ -163,8 +260,197 @@ struct VulkanValueSyncState {
 }
 
 impl VulkanQueue {
+    fn acquire_command_buffer(&self) -> RhiResult<vk::CommandBuffer> {
+        if let Some(command_buffer) = self
+            .available_commands
+            .lock()
+            .expect("available command lock poisoned")
+            .pop()
+        {
+            unsafe {
+                self.device
+                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                    .map_err(|e| RhiError::CommandBuffer(format!("Reset command buffer: {e}")))?;
+            }
+            return Ok(command_buffer);
+        }
+
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_buffer_count(1)
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY);
+        unsafe {
+            self.device
+                .allocate_command_buffers(&alloc_info)
+                .map(|buffers| buffers[0])
+                .map_err(|e| RhiError::CommandBuffer(e.to_string()))
+        }
+    }
+
+    fn recycle_command_buffer(&self, command_buffer: vk::CommandBuffer) {
+        self.available_commands
+            .lock()
+            .expect("available command lock poisoned")
+            .push(command_buffer);
+    }
+
     pub fn submit(&self, cmd: VulkanCommandBuffer) -> RhiResult<()> {
         self.submit_with_desc(cmd, &SubmitDesc::default())
+    }
+
+    pub(crate) fn retire_resource(&self, resource: VulkanRetiredResource) {
+        self.pending_retired_resources
+            .lock()
+            .expect("pending retired resource lock poisoned")
+            .push(resource);
+        self.pending_retirement_work.store(true, Ordering::Release);
+    }
+
+    fn schedule_pending_retirements(&self) {
+        if !self.pending_retirement_work.load(Ordering::Acquire)
+            || self.active_recordings.load(Ordering::Acquire) != 0
+            || !self.pending_retirement_work.swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        let pending = std::mem::take(
+            &mut *self
+                .pending_retired_resources
+                .lock()
+                .expect("pending retired resource lock poisoned"),
+        );
+        if pending.is_empty() {
+            return;
+        }
+        let value = *self
+            .last_submission_value
+            .lock()
+            .expect("last submission value lock poisoned");
+        if let Some(value) = value {
+            self.retired_resources
+                .lock()
+                .expect("retired resource lock poisoned")
+                .extend(
+                    pending
+                        .into_iter()
+                        .map(|resource| VulkanRetiredResourceWithValue { value, resource }),
+                );
+        } else {
+            for resource in pending {
+                self.release_retired_resource(resource);
+            }
+        }
+    }
+
+    fn release_retired_resource(&self, resource: VulkanRetiredResource) {
+        unsafe {
+            match &resource {
+                // The block owns the mapping and the memory; the buffer only returns its range.
+                VulkanRetiredResource::Buffer(buffer) => {
+                    self.device.destroy_buffer(buffer.buffer, None);
+                    self.buffer_pool
+                        .lock()
+                        .expect("buffer pool lock poisoned")
+                        .release(buffer.block_index, buffer.block_offset, buffer.block_range);
+                }
+                VulkanRetiredResource::Texture { texture, .. } => {
+                    self.device.destroy_image_view(texture.image_view, None);
+                    if !texture.is_view {
+                        self.device.destroy_image(texture.image, None);
+                    }
+                }
+                VulkanRetiredResource::Sampler { sampler, .. } => {
+                    self.device.destroy_sampler(*sampler, None);
+                }
+                VulkanRetiredResource::Pipeline { pipelines, layout } => {
+                    for pipeline in pipelines {
+                        self.device.destroy_pipeline(*pipeline, None);
+                    }
+                    self.device.destroy_pipeline_layout(*layout, None);
+                }
+                VulkanRetiredResource::AccelerationStructure {
+                    acceleration_structure,
+                    buffer,
+                    buffer_memory,
+                    scratch_buffer,
+                    scratch_memory,
+                    accel_loader,
+                } => {
+                    accel_loader.destroy_acceleration_structure(*acceleration_structure, None);
+                    self.device.destroy_buffer(*buffer, None);
+                    self.device.free_memory(*buffer_memory, None);
+                    self.device.destroy_buffer(*scratch_buffer, None);
+                    self.device.free_memory(*scratch_memory, None);
+                }
+            }
+        }
+        match resource {
+            VulkanRetiredResource::Texture { id, .. } => {
+                self.free_texture_ids
+                    .lock()
+                    .expect("free texture ID lock poisoned")
+                    .push(id);
+            }
+            VulkanRetiredResource::Sampler { id, .. } => {
+                self.free_sampler_ids
+                    .lock()
+                    .expect("free sampler ID lock poisoned")
+                    .push(id);
+            }
+            VulkanRetiredResource::Buffer(_)
+            | VulkanRetiredResource::Pipeline { .. }
+            | VulkanRetiredResource::AccelerationStructure { .. } => {}
+        }
+    }
+
+    fn completed_submission_value(&self) -> u64 {
+        unsafe {
+            self.device
+                .get_semaphore_counter_value(self.completion_semaphore)
+                .unwrap_or(0)
+        }
+    }
+
+    fn reclaim_retired_resources(&self, completed: u64) {
+        let mut ready = SmallVec::<[VulkanRetiredResource; 4]>::new();
+        {
+            let mut retired = self
+                .retired_resources
+                .lock()
+                .expect("retired resource lock poisoned");
+            while retired
+                .front()
+                .is_some_and(|entry| entry.value <= completed)
+            {
+                ready.push(
+                    retired
+                        .pop_front()
+                        .expect("retired resource queue front disappeared")
+                        .resource,
+                );
+            }
+        }
+        for resource in ready {
+            self.release_retired_resource(resource);
+        }
+        let mut last = self
+            .last_submission_value
+            .lock()
+            .expect("last submission value lock poisoned");
+        if last.is_some_and(|value| value <= completed) {
+            *last = None;
+        }
+    }
+
+    fn next_completion_value(&self) -> RhiResult<u64> {
+        let mut next = self
+            .next_completion_value
+            .lock()
+            .expect("next completion value lock poisoned");
+        *next = next
+            .checked_add(1)
+            .ok_or_else(|| RhiError::QueueSubmit("Vulkan completion timeline exhausted".into()))?;
+        Ok(*next)
     }
 
     fn ensure_value_sync_state<'a>(
@@ -173,37 +459,37 @@ impl VulkanQueue {
         map: &'a mut HashMap<u64, VulkanValueSyncState>,
     ) -> RhiResult<&'a mut VulkanValueSyncState> {
         let key = value_ptr.0;
-        if let std::collections::hash_map::Entry::Vacant(entry) = map.entry(key) {
-            let mut type_info = vk::SemaphoreTypeCreateInfo::default()
-                .semaphore_type(vk::SemaphoreType::TIMELINE)
-                .initial_value(0);
-            let semaphore_info = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
-            let semaphore = unsafe {
-                self.device
-                    .create_semaphore(&semaphore_info, None)
-                    .map_err(|e| {
-                        RhiError::SyncError(format!(
-                            "Failed to create Vulkan value semaphore for {:#x}: {e}",
-                            key
-                        ))
-                    })?
-            };
-            entry.insert(VulkanValueSyncState {
-                semaphore,
-                scheduled_value: 0,
-            });
+        match map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let mut type_info = vk::SemaphoreTypeCreateInfo::default()
+                    .semaphore_type(vk::SemaphoreType::TIMELINE)
+                    .initial_value(0);
+                let semaphore_info = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
+                let semaphore = unsafe {
+                    self.device
+                        .create_semaphore(&semaphore_info, None)
+                        .map_err(|e| {
+                            RhiError::SyncError(format!(
+                                "Failed to create Vulkan value semaphore for {:#x}: {e}",
+                                key
+                            ))
+                        })?
+                };
+                Ok(entry.insert(VulkanValueSyncState {
+                    semaphore,
+                    scheduled_value: 0,
+                }))
+            }
         }
-        Ok(map
-            .get_mut(&key)
-            .expect("value sync state should exist after insertion"))
     }
 
-    fn collect_value_waits(
-        &self,
-        waits: &[WaitValueDesc],
-    ) -> RhiResult<HashMap<vk::Semaphore, u64>> {
+    fn collect_value_waits(&self, waits: &[WaitValueDesc]) -> RhiResult<ValuePairs> {
+        if waits.is_empty() {
+            return Ok(ValuePairs::new());
+        }
         let mut map = self.value_sync.lock().expect("value sync lock poisoned");
-        let mut merged: HashMap<vk::Semaphore, u64> = HashMap::new();
+        let mut merged = ValuePairs::new();
         for wait in waits {
             let state = self.ensure_value_sync_state(wait.value_ptr, &mut map)?;
             let required = match wait.wait_op {
@@ -240,20 +526,18 @@ impl VulkanQueue {
                 }
             };
             state.scheduled_value = state.scheduled_value.max(required);
-            merged
-                .entry(state.semaphore)
-                .and_modify(|v| *v = (*v).max(required))
-                .or_insert(required);
+            let semaphore = state.semaphore;
+            merge_value_pair(&mut merged, semaphore, required, u64::max);
         }
         Ok(merged)
     }
 
-    fn collect_value_signals(
-        &self,
-        signals: &[SignalValueDesc],
-    ) -> RhiResult<HashMap<vk::Semaphore, u64>> {
+    fn collect_value_signals(&self, signals: &[SignalValueDesc]) -> RhiResult<ValuePairs> {
+        if signals.is_empty() {
+            return Ok(ValuePairs::new());
+        }
         let mut map = self.value_sync.lock().expect("value sync lock poisoned");
-        let mut merged: HashMap<vk::Semaphore, u64> = HashMap::new();
+        let mut merged = ValuePairs::new();
         for signal in signals {
             let state = self.ensure_value_sync_state(signal.value_ptr, &mut map)?;
             let target = match signal.signal_op {
@@ -268,28 +552,79 @@ impl VulkanQueue {
                 )));
             }
             state.scheduled_value = target;
-            merged.insert(state.semaphore, target);
+            let semaphore = state.semaphore;
+            merge_value_pair(&mut merged, semaphore, target, |_, latest| latest);
         }
         Ok(merged)
     }
 
     pub fn submit_with_desc(
         &self,
-        cmd: VulkanCommandBuffer,
+        mut cmd: VulkanCommandBuffer,
         desc: &SubmitDesc<'_>,
     ) -> RhiResult<()> {
-        let mut waits = timeline_pairs(desc.wait_semaphores, "wait")?;
+        self.reclaim_completed_commands();
+        if let Err(error) = cmd.finish() {
+            unsafe {
+                self.device
+                    .free_command_buffers(self.command_pool, &[cmd.command_buffer]);
+            }
+            return Err(error);
+        }
+        let mut waits: SmallVec<[(vk::Semaphore, u64); 4]> =
+            timeline_pairs(desc.wait_semaphores, "wait")?;
         waits.extend(self.collect_value_waits(&cmd.pending_value_waits)?);
-        let mut signals = timeline_pairs(desc.signal_semaphores, "signal")?;
+        let mut signals: SmallVec<[(vk::Semaphore, u64); 4]> =
+            timeline_pairs(desc.signal_semaphores, "signal")?;
         signals.extend(self.collect_value_signals(&cmd.pending_value_signals)?);
-        let wait_stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
-        self.submit_timeline(
+        let wait_stages: SmallVec<[vk::PipelineStageFlags; 4]> =
+            SmallVec::from_elem(vk::PipelineStageFlags::ALL_COMMANDS, waits.len());
+        let completion_value = self.next_completion_value()?;
+        signals.push((self.completion_semaphore, completion_value));
+        if let Err(err) = self.submit_timeline(
             cmd.command_buffer,
             &waits,
             &wait_stages,
             &signals,
             vk::Fence::null(),
-        )
+        ) {
+            unsafe {
+                self.device
+                    .free_command_buffers(self.command_pool, &[cmd.command_buffer]);
+            }
+            return Err(err);
+        }
+        self.pending_commands
+            .lock()
+            .expect("pending command lock poisoned")
+            .push_back((cmd.command_buffer, completion_value));
+        cmd.resolve_recording();
+        *self
+            .last_submission_value
+            .lock()
+            .expect("last submission value lock poisoned") = Some(completion_value);
+        self.schedule_pending_retirements();
+        Ok(())
+    }
+
+    /// Reclaim completed generic command buffers without waiting. Submission stays asynchronous;
+    /// the next submission pays one timeline-counter query and then reclaims a prefix of work.
+    fn reclaim_completed_commands(&self) {
+        let completed = self.completed_submission_value();
+        self.reclaim_retired_resources(completed);
+        let mut pending = self
+            .pending_commands
+            .lock()
+            .expect("pending command lock poisoned");
+        while pending
+            .front()
+            .is_some_and(|(_, value)| *value <= completed)
+        {
+            let (command_buffer, _) = pending
+                .pop_front()
+                .expect("pending command queue front disappeared");
+            self.recycle_command_buffer(command_buffer);
+        }
     }
 
     /// Encode a `vkQueueSubmit` with timeline-semaphore wait/signal pairs.
@@ -305,10 +640,18 @@ impl VulkanQueue {
         fence: vk::Fence,
     ) -> RhiResult<()> {
         let command_buffers = [cmd];
-        let wait_semaphores: Vec<vk::Semaphore> = waits.iter().map(|(s, _)| *s).collect();
-        let wait_values: Vec<u64> = waits.iter().map(|(_, v)| *v).collect();
-        let signal_semaphores: Vec<vk::Semaphore> = signals.iter().map(|(s, _)| *s).collect();
-        let signal_values: Vec<u64> = signals.iter().map(|(_, v)| *v).collect();
+        let mut wait_semaphores = SmallVec::<[vk::Semaphore; 4]>::with_capacity(waits.len());
+        let mut wait_values = SmallVec::<[u64; 4]>::with_capacity(waits.len());
+        for &(semaphore, value) in waits {
+            wait_semaphores.push(semaphore);
+            wait_values.push(value);
+        }
+        let mut signal_semaphores = SmallVec::<[vk::Semaphore; 4]>::with_capacity(signals.len());
+        let mut signal_values = SmallVec::<[u64; 4]>::with_capacity(signals.len());
+        for &(semaphore, value) in signals {
+            signal_semaphores.push(semaphore);
+            signal_values.push(value);
+        }
         let mut submit_info = vk::SubmitInfo::default()
             .wait_semaphores(&wait_semaphores)
             .wait_dst_stage_mask(wait_stages)
@@ -333,11 +676,16 @@ impl VulkanQueue {
         sc: &VulkanSwapchain,
         frame_index: usize,
     ) -> RhiResult<AcquiredImage> {
+        if frame_index >= sc.in_flight_fences.len() {
+            return Err(RhiError::SyncError("invalid Vulkan frame index".into()));
+        }
         unsafe {
             let fence = sc.in_flight_fences[frame_index];
             self.device
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .map_err(|e| RhiError::SyncError(e.to_string()))?;
+            self.reclaim_completed_commands();
+            self.reclaim_retired_resources(self.completed_submission_value());
             self.device
                 .reset_fences(&[fence])
                 .map_err(|e| RhiError::SyncError(e.to_string()))?;
@@ -347,8 +695,7 @@ impl VulkanQueue {
                 if let Some(prev) = cmd_buffers.get_mut(frame_index)
                     && *prev != vk::CommandBuffer::null()
                 {
-                    self.device
-                        .free_command_buffers(self.command_pool, std::slice::from_ref(prev));
+                    self.recycle_command_buffer(*prev);
                     *prev = vk::CommandBuffer::null();
                 }
             }
@@ -377,7 +724,11 @@ impl VulkanQueue {
         image_index: u32,
         _frame_index: usize,
     ) -> RhiResult<()> {
-        let wait_semaphores = [sc.rendering_complete_semaphores[image_index as usize]];
+        let image_index_usize = image_index as usize;
+        let Some(&wait_semaphore) = sc.rendering_complete_semaphores.get(image_index_usize) else {
+            return Err(RhiError::PresentFailed("invalid Vulkan image index".into()));
+        };
+        let wait_semaphores = [wait_semaphore];
         let swapchains = [sc.swapchain];
         let image_indices = [image_index];
         let present_info = vk::PresentInfoKHR::default()
@@ -398,31 +749,56 @@ impl VulkanQueue {
 
     pub fn submit_frame(
         &self,
-        cmd: super::command::VulkanCommandBuffer,
+        mut cmd: super::command::VulkanCommandBuffer,
         sc: &super::swapchain::VulkanSwapchain,
         frame_index: usize,
         image_index: u32,
     ) -> RhiResult<()> {
         // Acquire waits gate color writes; timeline waits cover all commands.
-        let mut waits = vec![(sc.present_complete_semaphores[frame_index], 0u64)];
-        let mut wait_stages = vec![vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        if frame_index >= sc.in_flight_fences.len() {
+            return Err(RhiError::QueueSubmit("invalid Vulkan frame index".into()));
+        }
+        let image_index = image_index as usize;
+        if image_index >= sc.rendering_complete_semaphores.len() {
+            return Err(RhiError::QueueSubmit("invalid Vulkan image index".into()));
+        }
+        if let Err(error) = cmd.finish() {
+            unsafe {
+                self.device
+                    .free_command_buffers(self.command_pool, &[cmd.command_buffer]);
+            }
+            return Err(error);
+        }
+        let mut waits: SmallVec<[(vk::Semaphore, u64); 4]> = SmallVec::new();
+        waits.push((sc.present_complete_semaphores[frame_index], 0));
+        let mut wait_stages: SmallVec<[vk::PipelineStageFlags; 4]> = SmallVec::new();
+        wait_stages.push(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT);
         for (sem, val) in self.collect_value_waits(&cmd.pending_value_waits)? {
             waits.push((sem, val));
             wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
         }
-        let mut signals = vec![(sc.rendering_complete_semaphores[image_index as usize], 0u64)];
+        let mut signals: SmallVec<[(vk::Semaphore, u64); 4]> = SmallVec::new();
+        signals.push((sc.rendering_complete_semaphores[image_index], 0));
         signals.extend(self.collect_value_signals(&cmd.pending_value_signals)?);
+        let completion_value = self.next_completion_value()?;
+        signals.push((self.completion_semaphore, completion_value));
         let fence = sc.in_flight_fences[frame_index];
         let raw_cmd = cmd.command_buffer;
         self.submit_timeline(raw_cmd, &waits, &wait_stages, &signals, fence)?;
+        cmd.resolve_recording();
+        *self
+            .last_submission_value
+            .lock()
+            .expect("last submission value lock poisoned") = Some(completion_value);
 
         if let Some(slot) = sc.in_flight_cmd_buffers.borrow_mut().get_mut(frame_index) {
             *slot = raw_cmd;
         }
+        self.schedule_pending_retirements();
 
         // `submit_frame` owns presentation on both backends. A stale swapchain is rebuilt on the
         // next acquire.
-        match self.present(sc, image_index, frame_index) {
+        match self.present(sc, image_index as u32, frame_index) {
             Ok(()) | Err(RhiError::SwapchainOutOfDate) => Ok(()),
             Err(e) => Err(e),
         }
@@ -432,15 +808,41 @@ impl VulkanQueue {
         unsafe {
             let _ = self.device.queue_wait_idle(self.queue);
         }
+        self.schedule_pending_retirements();
+        self.reclaim_completed_commands();
+        self.reclaim_retired_resources(self.completed_submission_value());
+        // Blocks are only freed here, never on the retire path, so this cannot land mid-frame.
+        self.buffer_pool
+            .lock()
+            .expect("buffer pool lock poisoned")
+            .trim(&self.device);
+    }
+}
+
+/// Semaphore/value pairs for one submission. Merged with a linear scan: a submission carries one
+/// or two entries, so a `HashMap` would allocate and hash for nothing.
+type ValuePairs = SmallVec<[(vk::Semaphore, u64); 4]>;
+
+/// Record `value` under `semaphore`, folding into any existing entry with `combine`.
+fn merge_value_pair(
+    pairs: &mut ValuePairs,
+    semaphore: vk::Semaphore,
+    value: u64,
+    combine: fn(u64, u64) -> u64,
+) {
+    if let Some((_, existing)) = pairs
+        .iter_mut()
+        .find(|(candidate, _)| *candidate == semaphore)
+    {
+        *existing = combine(*existing, value);
+    } else {
+        pairs.push((semaphore, value));
     }
 }
 
 /// Unwrap a slice of `(TimelineSemaphore, u64)` into `(vk::Semaphore, u64)` pairs,
 /// erroring out if any handle is from a non-Vulkan backend.
-fn timeline_pairs(
-    pairs: &[(TimelineSemaphore, u64)],
-    kind: &'static str,
-) -> RhiResult<Vec<(vk::Semaphore, u64)>> {
+fn timeline_pairs(pairs: &[(TimelineSemaphore, u64)], kind: &'static str) -> RhiResult<ValuePairs> {
     pairs
         .iter()
         .map(|(sem, value)| match &sem.inner {
@@ -665,9 +1067,12 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::DeviceCreation(format!("Enumerate devices: {e}")))?
         };
 
-        let (physical_device, queue_family_index) = physical_devices
+        // Filter on the complete required feature set before scoring devices. Selecting the
+        // first Vulkan 1.3 queue and discovering missing descriptor-buffer features later makes
+        // adapter choice depend on enumeration order and can fail on perfectly usable systems.
+        let (physical_device, queue_family_index, capabilities) = physical_devices
             .iter()
-            .find_map(|pdevice| {
+            .filter_map(|pdevice| {
                 let props = unsafe { instance.get_physical_device_properties(*pdevice) };
                 let api_version = props.api_version;
                 let supports_vulkan_13 = vk::api_version_major(api_version) > 1
@@ -677,20 +1082,129 @@ impl VulkanDevice {
                     return None;
                 }
 
-                unsafe { instance.get_physical_device_queue_family_properties(*pdevice) }
-                    .iter()
-                    .enumerate()
-                    .find_map(|(index, info)| {
-                        if info
-                            .queue_flags
-                            .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
-                        {
-                            Some((*pdevice, index as u32))
-                        } else {
-                            None
-                        }
+                let extensions =
+                    unsafe { instance.enumerate_device_extension_properties(*pdevice) }.ok()?;
+                let has_ext = |needle: &[u8]| {
+                    extensions.iter().any(|ext| {
+                        let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
+                        name.to_bytes() == needle
                     })
+                };
+                if !has_ext(b"VK_KHR_swapchain")
+                    || !has_ext(b"VK_EXT_descriptor_buffer")
+                    || !has_ext(b"VK_EXT_mutable_descriptor_type")
+                {
+                    return None;
+                }
+
+                let mut vulkan11 = vk::PhysicalDeviceVulkan11Features::default();
+                let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
+                let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default();
+                let mut descriptor_buffer =
+                    vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
+                let mut mutable_descriptor =
+                    vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT::default();
+                let has_mesh_ext = has_ext(b"VK_EXT_mesh_shader");
+                let has_accel_ext = has_ext(b"VK_KHR_acceleration_structure")
+                    && has_ext(b"VK_KHR_deferred_host_operations");
+                let has_ray_query_ext = has_accel_ext && has_ext(b"VK_KHR_ray_query");
+                let has_rt_maintenance1_ext =
+                    has_ray_query_ext && has_ext(b"VK_KHR_ray_tracing_maintenance1");
+                let has_rt_pipeline_ext =
+                    has_ray_query_ext && has_ext(b"VK_KHR_ray_tracing_pipeline");
+                let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+                let mut accel = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
+                let mut ray_query = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
+                let mut rt_maintenance1 =
+                    vk::PhysicalDeviceRayTracingMaintenance1FeaturesKHR::default();
+                let mut rt_pipeline = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default();
+
+                let mut features2 = vk::PhysicalDeviceFeatures2::default()
+                    .push_next(&mut vulkan11)
+                    .push_next(&mut vulkan12)
+                    .push_next(&mut vulkan13)
+                    .push_next(&mut descriptor_buffer)
+                    .push_next(&mut mutable_descriptor);
+                if has_mesh_ext {
+                    features2 = features2.push_next(&mut mesh);
+                }
+                if has_accel_ext {
+                    features2 = features2.push_next(&mut accel);
+                }
+                if has_ray_query_ext {
+                    features2 = features2.push_next(&mut ray_query);
+                }
+                if has_rt_maintenance1_ext {
+                    features2 = features2.push_next(&mut rt_maintenance1);
+                }
+                if has_rt_pipeline_ext {
+                    features2 = features2.push_next(&mut rt_pipeline);
+                }
+                unsafe { instance.get_physical_device_features2(*pdevice, &mut features2) };
+
+                let base = features2.features;
+                let required = base.shader_clip_distance != 0
+                    && base.fill_mode_non_solid != 0
+                    && base.multi_draw_indirect != 0
+                    && base.shader_int64 != 0
+                    && vulkan11.shader_draw_parameters != 0
+                    && vulkan12.buffer_device_address != 0
+                    && vulkan12.timeline_semaphore != 0
+                    && vulkan12.draw_indirect_count != 0
+                    && vulkan12.descriptor_binding_partially_bound != 0
+                    && vulkan12.runtime_descriptor_array != 0
+                    && vulkan12.host_query_reset != 0
+                    && vulkan13.dynamic_rendering != 0
+                    && vulkan13.synchronization2 != 0
+                    && descriptor_buffer.descriptor_buffer != 0
+                    && mutable_descriptor.mutable_descriptor_type != 0;
+                if !required {
+                    return None;
+                }
+
+                let queue_family =
+                    unsafe { instance.get_physical_device_queue_family_properties(*pdevice) }
+                        .iter()
+                        .enumerate()
+                        .find(|(_, info)| {
+                            info.queue_flags
+                                .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+                        })
+                        .map(|(index, _)| index as u32)?;
+
+                let capabilities = VulkanCapabilities {
+                    mesh_shader: has_mesh_ext && mesh.mesh_shader != 0,
+                    acceleration_structure: has_accel_ext && accel.acceleration_structure != 0,
+                    ray_query: has_ray_query_ext && ray_query.ray_query != 0,
+                    ray_tracing_maintenance1: has_rt_maintenance1_ext
+                        && rt_maintenance1.ray_tracing_maintenance1 != 0,
+                    ray_tracing_pipeline: has_rt_pipeline_ext
+                        && rt_pipeline.ray_tracing_pipeline != 0,
+                };
+                let type_score = match props.device_type {
+                    vk::PhysicalDeviceType::DISCRETE_GPU => 4u64,
+                    vk::PhysicalDeviceType::INTEGRATED_GPU => 3,
+                    vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+                    vk::PhysicalDeviceType::CPU => 1,
+                    _ => 0,
+                };
+                let memory_score =
+                    unsafe { instance.get_physical_device_memory_properties(*pdevice) }
+                        .memory_heaps[..]
+                        .iter()
+                        .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                        .map(|heap| heap.size / (1024 * 1024))
+                        .max()
+                        .unwrap_or(0);
+                Some((
+                    *pdevice,
+                    queue_family,
+                    capabilities,
+                    (type_score << 48) | memory_score.min((1 << 48) - 1),
+                ))
             })
+            .max_by_key(|candidate| candidate.3)
+            .map(|(pdevice, family, capabilities, _)| (pdevice, family, capabilities))
             .ok_or(RhiError::NoSuitableGpu)?;
 
         let device_props = unsafe { instance.get_physical_device_properties(physical_device) };
@@ -716,19 +1230,16 @@ impl VulkanDevice {
         };
         let supports_descriptor_buffer = has_ext(b"VK_EXT_descriptor_buffer");
         let supports_mutable_descriptor_type = has_ext(b"VK_EXT_mutable_descriptor_type");
-        let supports_mesh_shader = has_ext(b"VK_EXT_mesh_shader");
+        let supports_mesh_shader = capabilities.mesh_shader;
         // BLAS/TLAS builds require acceleration structure and deferred-host-operation support.
-        let supports_accel = has_ext(b"VK_KHR_acceleration_structure")
-            && has_ext(b"VK_KHR_deferred_host_operations");
+        let supports_accel = capabilities.acceleration_structure;
         // Inline ray queries add VK_KHR_ray_query.
-        let supports_ray_query = supports_accel && has_ext(b"VK_KHR_ray_query");
+        let supports_ray_query = capabilities.ray_query;
         // The bindless TLAS lowering uses the address conversion provided by maintenance1.
-        let supports_rt_maintenance1 =
-            supports_ray_query && has_ext(b"VK_KHR_ray_tracing_maintenance1");
+        let supports_rt_maintenance1 = capabilities.ray_tracing_maintenance1;
         // Slang's bindless-TLAS lowering also requires the ray-tracing-pipeline extension, even
         // though the RHI only uses inline ray queries.
-        let supports_ray_tracing_pipeline =
-            supports_ray_query && has_ext(b"VK_KHR_ray_tracing_pipeline");
+        let supports_ray_tracing_pipeline = capabilities.ray_tracing_pipeline;
         log::info!(
             "RHI: Optional extensions — mesh_shader={supports_mesh_shader} mutable_descriptors={supports_mutable_descriptor_type} acceleration_structure={supports_accel} ray_query={supports_ray_query} rt_maintenance1={supports_rt_maintenance1} rt_pipeline={supports_ray_tracing_pipeline}"
         );
@@ -773,7 +1284,9 @@ impl VulkanDevice {
 
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
-            device_extension_names.push(ash::khr::portability_subset::NAME.as_ptr());
+            if has_ext(b"VK_KHR_portability_subset") {
+                device_extension_names.push(ash::khr::portability_subset::NAME.as_ptr());
+            }
         }
 
         // Vulkan 1.2/1.3 features use the consolidated core feature structs.
@@ -797,9 +1310,10 @@ impl VulkanDevice {
             vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT::default()
                 .mutable_descriptor_type(true);
 
-        let mut mesh_shader_features = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
-            .mesh_shader(true)
-            .task_shader(true);
+        // Mesh only: task/amplification shaders are not exposed (see `pipeline.rs`), and asking
+        // for one would exclude mesh-only devices. The adapter filter must agree.
+        let mut mesh_shader_features =
+            vk::PhysicalDeviceMeshShaderFeaturesEXT::default().mesh_shader(true);
         let mut accel_structure_features =
             vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
                 .acceleration_structure(true);
@@ -876,6 +1390,12 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::DeviceCreation(format!("Command pool: {e}")))?
         };
 
+        let pipeline_cache = unsafe {
+            device
+                .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+                .map_err(|e| RhiError::DeviceCreation(format!("Pipeline cache: {e}")))?
+        };
+
         let cmd_alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_buffer_count(1)
             .command_pool(command_pool)
@@ -911,6 +1431,27 @@ impl VulkanDevice {
             )?;
             (heap.layout, Some(heap))
         };
+        let free_texture_ids = Arc::new(Mutex::new(Vec::new()));
+        let free_sampler_ids = Arc::new(Mutex::new(Vec::new()));
+        let pending_retired_resources = Arc::new(Mutex::new(Vec::new()));
+        let pending_retirement_work = Arc::new(AtomicBool::new(false));
+        let active_recordings = Arc::new(AtomicUsize::new(0));
+        let mut completion_type_info = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let completion_info =
+            vk::SemaphoreCreateInfo::default().push_next(&mut completion_type_info);
+        let completion_semaphore = unsafe {
+            device
+                .create_semaphore(&completion_info, None)
+                .map_err(|e| RhiError::DeviceCreation(format!("Completion timeline: {e}")))?
+        };
+
+        // `bufferImageGranularity` is the separation buffers and images need when they share a
+        // `VkDeviceMemory`; the pool pads every suballocation to it.
+        let buffer_pool: SharedBufferPool = Arc::new(Mutex::new(VulkanBufferPool::new(
+            device_props.limits.buffer_image_granularity,
+        )));
 
         let queue = Queue {
             inner: QueueInner::Vulkan(Box::new(VulkanQueue {
@@ -919,6 +1460,18 @@ impl VulkanDevice {
                 swapchain_loader: swapchain::Device::new(&instance, &device),
                 command_pool,
                 value_sync: Mutex::new(HashMap::new()),
+                buffer_pool: buffer_pool.clone(),
+                pending_commands: Mutex::new(VecDeque::new()),
+                available_commands: Mutex::new(Vec::new()),
+                active_recordings: active_recordings.clone(),
+                completion_semaphore,
+                next_completion_value: Mutex::new(0),
+                last_submission_value: Mutex::new(None),
+                retired_resources: Mutex::new(VecDeque::new()),
+                pending_retired_resources: pending_retired_resources.clone(),
+                pending_retirement_work,
+                free_texture_ids: free_texture_ids.clone(),
+                free_sampler_ids: free_sampler_ids.clone(),
             })),
         };
 
@@ -929,8 +1482,12 @@ impl VulkanDevice {
             physical_device,
             queue_family_index,
             queue,
+            pending_retired_resources,
+            active_recordings,
             present_queue,
             command_pool,
+            pipeline_cache,
+            buffer_pool,
             device_memory_properties,
             bindless_mode,
             max_draw_indirect_count: device_props.limits.max_draw_indirect_count,
@@ -943,11 +1500,16 @@ impl VulkanDevice {
             texture_descriptor_set_layout,
             descriptor_buffer_heap,
             textures: Arc::new(Mutex::new(Vec::new())),
+            texture_view_flags: Mutex::new(Vec::new()),
             next_texture_id: RefCell::new(0),
+            free_texture_ids,
             allocations: Arc::new(Mutex::new(BTreeMap::new())),
+            mapped_allocations: Arc::new(Mutex::new(BTreeMap::new())),
             samplers: RefCell::new(Vec::new()),
             next_sampler_id: RefCell::new(0),
+            free_sampler_ids,
             setup_command_buffer,
+            setup_recording: Cell::new(false),
             mesh_shader_supported: supports_mesh_shader,
             mesh_shader_loader,
             acceleration_structure: acceleration_structure_opt,
@@ -963,9 +1525,10 @@ impl VulkanDevice {
         self.bindless_mode
     }
 
+    #[allow(irrefutable_let_patterns)]
     pub fn wait_idle(&self) {
-        unsafe {
-            let _ = self.device.device_wait_idle();
+        if let QueueInner::Vulkan(queue) = &self.queue.inner {
+            queue.wait_idle();
         }
     }
 
@@ -1046,11 +1609,11 @@ impl VulkanDevice {
         )?;
 
         Ok(Swapchain {
-            inner: SwapchainInner::Vulkan(VulkanSwapchain {
+            inner: SwapchainInner::Vulkan(Box::new(VulkanSwapchain {
                 swapchain,
                 surface: vk_surface,
-                images,
-                image_views,
+                images: images.into(),
+                image_views: image_views.into(),
                 format: vk_to_format(surface_format.format),
                 surface_format,
                 extent,
@@ -1063,7 +1626,7 @@ impl VulkanDevice {
                 in_flight_cmd_buffers: RefCell::new(in_flight_cmd_buffers),
                 device: self.device.clone(),
                 swapchain_loader: self.swapchain_loader.clone(),
-            }),
+            })),
         })
     }
 
@@ -1092,7 +1655,7 @@ impl VulkanDevice {
             self.device.free_memory(sc.depth_image_memory, None);
             self.device.destroy_image_view(sc.depth_image_view, None);
             self.device.destroy_image(sc.depth_image, None);
-            for &view in &sc.image_views {
+            for &view in sc.image_views.iter() {
                 self.device.destroy_image_view(view, None);
             }
         }
@@ -1104,9 +1667,8 @@ impl VulkanDevice {
                 .filter(|c| *c != vk::CommandBuffer::null())
                 .collect();
             if !to_free.is_empty() {
-                unsafe {
-                    self.device
-                        .free_command_buffers(self.command_pool, &to_free);
+                for command_buffer in to_free {
+                    self.recycle_command_buffer(command_buffer);
                 }
             }
             cmd_buffers.clear();
@@ -1131,8 +1693,8 @@ impl VulkanDevice {
         }
 
         sc.swapchain = contents.swapchain;
-        sc.images = contents.images;
-        sc.image_views = contents.image_views;
+        sc.images = contents.images.into();
+        sc.image_views = contents.image_views.into();
         sc.extent = contents.extent;
         sc.depth_image = contents.depth_image;
         sc.depth_image_view = contents.depth_image_view;
@@ -1288,61 +1850,79 @@ impl VulkanDevice {
 
         let mem_requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
 
-        let mem_flags = match desc.memory {
-            MemoryType::GpuOnly => vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            MemoryType::Default => {
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
-            }
-            MemoryType::Readback => {
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_CACHED
-            }
-        };
+        let mem_flags = buffer_memory_flags(desc.memory);
 
-        let mem_type_index =
+        let preferred_flags = match desc.memory {
+            MemoryType::Default => vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            MemoryType::GpuOnly | MemoryType::Readback => vk::MemoryPropertyFlags::empty(),
+        };
+        let mem_type_index = find_memorytype_index(
+            &mem_requirements,
+            &self.device_memory_properties,
+            mem_flags | preferred_flags,
+        )
+        .or_else(|| {
             find_memorytype_index(&mem_requirements, &self.device_memory_properties, mem_flags)
-                .ok_or_else(|| RhiError::AllocationFailed("No suitable memory type".into()))?;
+        })
+        .ok_or_else(|| RhiError::AllocationFailed("No suitable memory type".into()))?;
 
-        let mut alloc_flags_info =
-            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_requirements.size)
-            .memory_type_index(mem_type_index)
-            .push_next(&mut alloc_flags_info);
-
-        let memory = unsafe {
-            self.device
-                .allocate_memory(&alloc_info, None)
-                .map_err(|e| RhiError::AllocationFailed(e.to_string()))?
+        // Follows the memory type's real properties, not the requested `MemoryType`: on UMA one
+        // type serves both, and a block created by a `GpuOnly` buffer must still be mappable for
+        // a `Default` buffer landing in it later.
+        let host_visible = self.device_memory_properties.memory_types[mem_type_index as usize]
+            .property_flags
+            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
+        let suballocation = {
+            let mut pool = self.buffer_pool.lock().expect("buffer pool lock poisoned");
+            pool.allocate(
+                &self.device,
+                &mem_requirements,
+                mem_type_index,
+                host_visible,
+            )
+        };
+        let suballocation = match suballocation {
+            Ok(suballocation) => suballocation,
+            Err(error) => {
+                unsafe { self.device.destroy_buffer(buffer, None) };
+                return Err(error);
+            }
         };
 
-        unsafe {
+        if let Err(error) = unsafe {
             self.device
-                .bind_buffer_memory(buffer, memory, 0)
-                .map_err(|e| RhiError::BufferCreation(e.to_string()))?;
+                .bind_buffer_memory(buffer, suballocation.memory, suballocation.offset)
+        } {
+            unsafe { self.device.destroy_buffer(buffer, None) };
+            self.buffer_pool
+                .lock()
+                .expect("buffer pool lock poisoned")
+                .release(
+                    suballocation.block_index,
+                    suballocation.offset,
+                    suballocation.range,
+                );
+            return Err(RhiError::BufferCreation(error.to_string()));
         }
 
         let addr_info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
         let gpu_addr = unsafe { self.device.get_buffer_device_address(&addr_info) };
 
+        // `GpuOnly` promises no CPU pointer even when it happens to land in host-visible memory.
         let mapped_ptr = match desc.memory {
-            MemoryType::Default | MemoryType::Readback => {
-                let ptr = unsafe {
-                    self.device
-                        .map_memory(memory, 0, desc.size, vk::MemoryMapFlags::empty())
-                        .map_err(|e| RhiError::AllocationFailed(e.to_string()))?
-                };
-                Some(ptr as *mut u8)
-            }
+            MemoryType::Default | MemoryType::Readback => suballocation.mapped_ptr,
             MemoryType::GpuOnly => None,
         };
 
         let vk_buffer = VulkanBuffer {
             buffer,
-            memory,
+            memory: suballocation.memory,
             size: desc.size,
             mapped_ptr,
             gpu_address: GpuAddress(gpu_addr),
+            block_index: suballocation.block_index,
+            block_offset: suballocation.offset,
+            block_range: suballocation.range,
         };
 
         {
@@ -1354,10 +1934,22 @@ impl VulkanDevice {
                     size: vk_buffer.size,
                     buffer: vk_buffer.buffer,
                     memory: vk_buffer.memory,
+                    memory_offset: vk_buffer.block_offset,
                     memory_type_index: mem_type_index,
-                    mapped_ptr: vk_buffer.mapped_ptr,
                 },
             );
+        }
+        if let Some(mapped_ptr) = vk_buffer.mapped_ptr {
+            self.mapped_allocations
+                .lock()
+                .expect("mapped allocations lock poisoned")
+                .insert(
+                    mapped_ptr as usize,
+                    MappedAllocation {
+                        gpu_base: vk_buffer.gpu_address,
+                        size: vk_buffer.size,
+                    },
+                );
         }
 
         Ok(GpuBuffer {
@@ -1370,18 +1962,11 @@ impl VulkanDevice {
             return None;
         }
         let ptr = cpu_ptr as usize;
-        let allocations = self.allocations.lock().expect("allocations lock poisoned");
-        for alloc in allocations.values() {
-            if let Some(mapped) = alloc.mapped_ptr {
-                let base = mapped as usize;
-                let end = base + alloc.size as usize;
-                if ptr >= base && ptr < end {
-                    let offset = (ptr - base) as u64;
-                    return Some(GpuAddress(alloc.base.0 + offset));
-                }
-            }
-        }
-        None
+        let allocations = self
+            .mapped_allocations
+            .lock()
+            .expect("mapped allocations lock poisoned");
+        resolve_mapped_pointer(&allocations, ptr)
     }
 
     pub fn texture_size_align(&self, desc: &TextureDesc) -> RhiResult<TextureSizeAlign> {
@@ -1482,6 +2067,54 @@ impl VulkanDevice {
         Ok((image, array_layers, vk_format))
     }
 
+    fn allocate_texture_id(&self) -> RhiResult<TextureId> {
+        if let Some(id) = self
+            .free_texture_ids
+            .lock()
+            .expect("free texture ID lock poisoned")
+            .pop()
+        {
+            return Ok(id);
+        }
+        let mut next = self.next_texture_id.borrow_mut();
+        let id = TextureId(*next);
+        *next = next
+            .checked_add(1)
+            .ok_or_else(|| RhiError::TextureCreation("Vulkan texture ID space exhausted".into()))?;
+        Ok(id)
+    }
+
+    fn recycle_texture_id(&self, id: TextureId) {
+        self.free_texture_ids
+            .lock()
+            .expect("free texture ID lock poisoned")
+            .push(id);
+    }
+
+    fn allocate_sampler_id(&self) -> RhiResult<SamplerId> {
+        if let Some(id) = self
+            .free_sampler_ids
+            .lock()
+            .expect("free sampler ID lock poisoned")
+            .pop()
+        {
+            return Ok(id);
+        }
+        let mut next = self.next_sampler_id.borrow_mut();
+        let id = SamplerId(*next);
+        *next = next
+            .checked_add(1)
+            .ok_or_else(|| RhiError::Backend("Vulkan sampler ID space exhausted".into()))?;
+        Ok(id)
+    }
+
+    fn recycle_sampler_id(&self, id: SamplerId) {
+        self.free_sampler_ids
+            .lock()
+            .expect("free sampler ID lock poisoned")
+            .push(id);
+    }
+
     pub fn create_texture(
         &self,
         desc: &TextureDesc,
@@ -1502,7 +2135,7 @@ impl VulkanDevice {
                 .range(..=texture_gpu.0)
                 .next_back()
                 .map(|(_, alloc)| alloc)
-                .filter(|alloc| texture_gpu.0 < alloc.base.0 + alloc.size)
+                .filter(|alloc| texture_gpu.0 - alloc.base.0 < alloc.size)
                 .ok_or_else(|| {
                     RhiError::TextureCreation(format!(
                         "texture allocation address 0x{:x} was not returned by gpuMalloc",
@@ -1510,13 +2143,14 @@ impl VulkanDevice {
                     ))
                 })?;
             let offset = texture_gpu.0 - alloc.base.0;
-            if !offset.is_multiple_of(mem_reqs.alignment) {
+            let memory_offset = alloc.memory_offset + offset;
+            if !memory_offset.is_multiple_of(mem_reqs.alignment) {
                 return Err(RhiError::TextureCreation(format!(
-                    "texture allocation address 0x{:x} has memory offset {offset}, expected alignment {}",
+                    "texture allocation address 0x{:x} has memory offset {memory_offset}, expected alignment {}",
                     texture_gpu.0, mem_reqs.alignment
                 )));
             }
-            if offset + mem_reqs.size > alloc.size {
+            if mem_reqs.size > alloc.size - offset {
                 return Err(RhiError::TextureCreation(format!(
                     "texture allocation address 0x{:x} has {} bytes available, needs {}",
                     texture_gpu.0,
@@ -1529,7 +2163,7 @@ impl VulkanDevice {
                     "texture allocation memory type is not compatible with this image".into(),
                 ));
             }
-            Ok((alloc.memory, offset))
+            Ok((alloc.memory, memory_offset))
         };
         let (memory, memory_offset) = match resolve() {
             Ok(v) => v,
@@ -1578,25 +2212,55 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::TextureCreation(e.to_string()))?
         };
 
-        let texture_id = {
-            let mut id = self.next_texture_id.borrow_mut();
-            let tid = TextureId(*id);
-            *id += 1;
-            tid
-        };
+        let texture_id = self.allocate_texture_id()?;
 
-        self.transition_image_to_general(image, aspect, desc.mip_levels, array_layers)?;
-
-        if desc.usage.contains(crate::texture::TextureUsage::SAMPLED) {
-            self.write_image_descriptor(texture_id, image_view, vk::ImageLayout::GENERAL, false)?;
+        let initial_layout = initial_image_layout(desc);
+        if let Err(err) = self.transition_image_to_layout(
+            image,
+            aspect,
+            desc.mip_levels,
+            array_layers,
+            initial_layout,
+        ) {
+            unsafe {
+                self.device.destroy_image_view(image_view, None);
+                self.device.destroy_image(image, None);
+            }
+            return Err(err);
         }
-        if desc.usage.contains(crate::texture::TextureUsage::STORAGE) {
-            self.write_image_descriptor(texture_id, image_view, vk::ImageLayout::GENERAL, true)?;
+
+        let descriptor_result = (|| {
+            if desc.usage.contains(crate::texture::TextureUsage::SAMPLED) {
+                self.write_image_descriptor(
+                    texture_id,
+                    image_view,
+                    sampled_image_layout(desc),
+                    false,
+                )?;
+            }
+            if desc.usage.contains(crate::texture::TextureUsage::STORAGE) {
+                self.write_image_descriptor(
+                    texture_id,
+                    image_view,
+                    vk::ImageLayout::GENERAL,
+                    true,
+                )?;
+            }
+            Ok::<(), RhiError>(())
+        })();
+        if let Err(err) = descriptor_result {
+            unsafe {
+                self.device.destroy_image_view(image_view, None);
+                self.device.destroy_image(image, None);
+            }
+            self.recycle_texture_id(texture_id);
+            return Err(err);
         }
 
         let vk_texture = VulkanTexture {
             image,
             image_view,
+            layout: initial_layout,
             is_view: false,
         };
 
@@ -1606,6 +2270,16 @@ impl VulkanDevice {
                 textures.resize_with(texture_id.0 as usize + 1, || None);
             }
             textures[texture_id.0 as usize] = Some(vk_texture);
+        }
+        {
+            let mut flags = self
+                .texture_view_flags
+                .lock()
+                .expect("texture view flags lock poisoned");
+            if flags.len() <= texture_id.0 as usize {
+                flags.resize(texture_id.0 as usize + 1, false);
+            }
+            flags[texture_id.0 as usize] = false;
         }
 
         Ok(Texture {
@@ -1661,16 +2335,26 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::Backend(format!("Sampler creation: {e}")))?
         };
 
-        let id = {
-            let mut sid = self.next_sampler_id.borrow_mut();
-            let id = SamplerId(*sid);
-            *sid += 1;
-            id
+        let id = match self.allocate_sampler_id() {
+            Ok(id) => id,
+            Err(err) => {
+                unsafe { self.device.destroy_sampler(sampler, None) };
+                return Err(err);
+            }
         };
 
-        self.write_sampler_descriptor(id, sampler)?;
+        if let Err(err) = self.write_sampler_descriptor(id, sampler) {
+            unsafe { self.device.destroy_sampler(sampler, None) };
+            self.recycle_sampler_id(id);
+            return Err(err);
+        }
 
-        self.samplers.borrow_mut().push(sampler);
+        let idx = id.0 as usize;
+        let mut samplers = self.samplers.borrow_mut();
+        if samplers.len() <= idx {
+            samplers.resize_with(idx + 1, || None);
+        }
+        samplers[idx] = Some(sampler);
 
         Ok(Sampler { id })
     }
@@ -1694,11 +2378,11 @@ impl VulkanDevice {
             .map_err(|e| RhiError::ShaderCompilation(e.to_string()))?;
 
         Ok(ShaderModule {
-            inner: ShaderModuleInner::Vulkan(VulkanShaderModule::new(
+            inner: ShaderModuleInner::Vulkan(Box::new(VulkanShaderModule::new(
                 self.device.clone(),
                 module,
                 entry_point,
-            )),
+            ))),
             stage: desc.stage,
         })
     }
@@ -1745,8 +2429,10 @@ impl VulkanDevice {
             pipeline: vk::Pipeline::null(),
             pipeline_layout,
             device: self.device.clone(),
+            pipeline_cache: self.pipeline_cache,
             desc: pso_desc,
             blend_pipelines: RefCell::new(std::collections::HashMap::new()),
+            pending_retired_resources: self.pending_retired_resources.clone(),
         };
         // Bake the initial blend variant; later variants are cached on demand.
         let initial_blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
@@ -1796,17 +2482,17 @@ impl VulkanDevice {
 
         let pipelines = unsafe {
             self.device
-                .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .create_compute_pipelines(self.pipeline_cache, &[pipeline_info], None)
                 .map_err(|e| RhiError::PipelineCreation(format!("{e:?}")))?
         };
 
         Ok(ComputePso {
-            inner: ComputePsoInner::Vulkan(VulkanComputePso {
+            inner: ComputePsoInner::Vulkan(Box::new(VulkanComputePso {
                 pipeline: pipelines[0],
                 pipeline_layout,
                 threads_per_threadgroup: desc.threads_per_threadgroup,
-                device: self.device.clone(),
-            }),
+                pending_retired_resources: self.pending_retired_resources.clone(),
+            })),
         })
     }
 
@@ -1858,8 +2544,10 @@ impl VulkanDevice {
             pipeline: vk::Pipeline::null(),
             pipeline_layout,
             device: self.device.clone(),
+            pipeline_cache: self.pipeline_cache,
             desc: pso_desc,
             blend_pipelines: RefCell::new(std::collections::HashMap::new()),
+            pending_retired_resources: self.pending_retired_resources.clone(),
         };
         let initial_blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
         let pipeline = vk_pso.create_pipeline(&initial_blend)?;
@@ -2067,8 +2755,8 @@ impl VulkanDevice {
                 scratch_buffer,
                 scratch_memory,
                 scratch_address,
-                device: self.device.clone(),
                 accel_loader: accel_loader.clone(),
+                pending_retired_resources: self.pending_retired_resources.clone(),
             })),
         })
     }
@@ -2174,17 +2862,28 @@ impl VulkanDevice {
         Ok((buffer, memory))
     }
 
-    pub fn create_command_buffer(&self) -> RhiResult<CommandBuffer> {
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_buffer_count(1)
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY);
+    fn acquire_command_buffer(&self) -> RhiResult<vk::CommandBuffer> {
+        match &self.queue.inner {
+            QueueInner::Vulkan(queue) => queue.acquire_command_buffer(),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!(),
+        }
+    }
 
-        let cmd = unsafe {
-            self.device
-                .allocate_command_buffers(&alloc_info)
-                .map_err(|e| RhiError::CommandBuffer(e.to_string()))?
-        }[0];
+    fn recycle_command_buffer(&self, command_buffer: vk::CommandBuffer) {
+        match &self.queue.inner {
+            QueueInner::Vulkan(queue) => queue.recycle_command_buffer(command_buffer),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn create_command_buffer(&self) -> RhiResult<CommandBuffer> {
+        // Texture creation records initial-layout transitions into one reusable setup command
+        // buffer. Flush the batch once before user work starts instead of queue-idling once per
+        // texture.
+        self.flush_setup_barriers()?;
+        let cmd = self.acquire_command_buffer()?;
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -2209,28 +2908,33 @@ impl VulkanDevice {
         let descriptor_buffer_binding = Some(descriptor_buffer_binding);
         let mesh_shader = self.mesh_shader_loader.clone();
         let accel_loader_cmd = self.acceleration_structure.clone();
+        self.active_recordings.fetch_add(1, Ordering::AcqRel);
 
         Ok(CommandBuffer {
             inner: CommandBufferInner::Vulkan(Box::new(VulkanCommandBuffer {
                 command_buffer: cmd,
                 device: self.device.clone(),
-                swapchain_image_views: Vec::new(),
-                swapchain_images: Vec::new(),
+                swapchain_image_views: Arc::from([]),
+                swapchain_images: Arc::from([]),
                 depth_image_view: vk::ImageView::null(),
                 pipeline_layout: vk::PipelineLayout::null(),
                 descriptor_buffer_loader,
                 descriptor_buffer_binding,
                 push_constant_stages: vk::ShaderStageFlags::empty(),
                 current_blend_state: BlendState::default(),
+                current_depth_stencil: None,
                 pending_split_barrier: None,
-                pending_value_waits: Vec::new(),
-                pending_value_signals: Vec::new(),
+                pending_value_waits: SmallVec::new(),
+                pending_value_signals: SmallVec::new(),
                 allocations: self.allocations.clone(),
                 textures: self.textures.clone(),
                 mesh_shader,
                 acceleration_structure: accel_loader_cmd,
                 max_draw_indirect_count: self.max_draw_indirect_count,
-                rendered_swapchain_images: Vec::new(),
+                rendered_swapchain_images: SmallVec::new(),
+                ended: false,
+                active_recordings: self.active_recordings.clone(),
+                recording_active: true,
             })),
         })
     }
@@ -2239,23 +2943,19 @@ impl VulkanDevice {
     pub fn create_command_buffer_for_swapchain(
         &self,
         swapchain: &Swapchain,
+        frame_index: usize,
     ) -> RhiResult<CommandBuffer> {
         let sc = match &swapchain.inner {
             SwapchainInner::Vulkan(s) => s,
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
         };
+        if frame_index >= sc.in_flight_fences.len() {
+            return Err(RhiError::CommandBuffer("invalid Vulkan frame index".into()));
+        }
+        self.flush_setup_barriers()?;
 
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_buffer_count(1)
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY);
-
-        let cmd = unsafe {
-            self.device
-                .allocate_command_buffers(&alloc_info)
-                .map_err(|e| RhiError::CommandBuffer(e.to_string()))?
-        }[0];
+        let cmd = self.acquire_command_buffer()?;
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -2280,6 +2980,7 @@ impl VulkanDevice {
         let descriptor_buffer_binding = Some(descriptor_buffer_binding);
         let mesh_shader = self.mesh_shader_loader.clone();
         let accel_loader_cmd = self.acceleration_structure.clone();
+        self.active_recordings.fetch_add(1, Ordering::AcqRel);
 
         Ok(CommandBuffer {
             inner: CommandBufferInner::Vulkan(Box::new(VulkanCommandBuffer {
@@ -2293,15 +2994,19 @@ impl VulkanDevice {
                 descriptor_buffer_binding,
                 push_constant_stages: vk::ShaderStageFlags::empty(),
                 current_blend_state: BlendState::default(),
+                current_depth_stencil: None,
                 pending_split_barrier: None,
-                pending_value_waits: Vec::new(),
-                pending_value_signals: Vec::new(),
+                pending_value_waits: SmallVec::new(),
+                pending_value_signals: SmallVec::new(),
                 allocations: self.allocations.clone(),
                 textures: self.textures.clone(),
                 mesh_shader,
                 acceleration_structure: accel_loader_cmd,
                 max_draw_indirect_count: self.max_draw_indirect_count,
-                rendered_swapchain_images: Vec::new(),
+                rendered_swapchain_images: SmallVec::new(),
+                ended: false,
+                active_recordings: self.active_recordings.clone(),
+                recording_active: true,
             })),
         })
     }
@@ -2327,39 +3032,100 @@ impl VulkanDevice {
         })
     }
 
+    #[allow(irrefutable_let_patterns)]
     pub fn destroy_buffer(&self, buffer: GpuBuffer) {
         match buffer.inner {
-            GpuBufferInner::Vulkan(b) => unsafe {
+            GpuBufferInner::Vulkan(b) => {
                 {
                     let mut allocations =
                         self.allocations.lock().expect("allocations lock poisoned");
                     allocations.remove(&b.gpu_address.0);
                 }
-                if b.mapped_ptr.is_some() {
-                    self.device.unmap_memory(b.memory);
+                if let Some(mapped_ptr) = b.mapped_ptr {
+                    self.mapped_allocations
+                        .lock()
+                        .expect("mapped allocations lock poisoned")
+                        .remove(&(mapped_ptr as usize));
                 }
-                self.device.destroy_buffer(b.buffer, None);
-                self.device.free_memory(b.memory, None);
-            },
+                if let QueueInner::Vulkan(queue) = &self.queue.inner {
+                    queue.retire_resource(VulkanRetiredResource::Buffer(b));
+                }
+            }
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
         }
     }
 
+    #[allow(irrefutable_let_patterns)]
     pub fn destroy_texture(&self, texture: Texture) {
-        let idx = texture.id.0 as usize;
-        let mut textures = self.textures.lock().expect("textures lock poisoned");
-        if let Some(Some(vk_tex)) = textures.get(idx) {
-            unsafe {
-                self.device.destroy_image_view(vk_tex.image_view, None);
-                // View-only entries don't own the underlying image.
-                if !vk_tex.is_view {
-                    self.device.destroy_image(vk_tex.image, None);
-                }
+        let texture_id = texture.id;
+        let idx = texture_id.0 as usize;
+        let retired = self
+            .textures
+            .lock()
+            .expect("textures lock poisoned")
+            .get_mut(idx)
+            .and_then(Option::take);
+        if let Some(texture) = retired {
+            if let Some(is_view) = self
+                .texture_view_flags
+                .lock()
+                .expect("texture view flags lock poisoned")
+                .get_mut(idx)
+            {
+                *is_view = false;
+            }
+            if let QueueInner::Vulkan(queue) = &self.queue.inner {
+                queue.retire_resource(VulkanRetiredResource::Texture {
+                    id: texture_id,
+                    texture,
+                });
             }
         }
-        if idx < textures.len() {
-            textures[idx] = None;
+    }
+
+    #[allow(irrefutable_let_patterns)]
+    pub fn destroy_texture_view(&self, id: TextureId) {
+        let idx = id.0 as usize;
+        // Claim the view in one critical section. Splitting the test and the clear lets two
+        // callers both observe `true` for the same ID.
+        let was_view = self
+            .texture_view_flags
+            .lock()
+            .expect("texture view flags lock poisoned")
+            .get_mut(idx)
+            .is_some_and(|flag| std::mem::replace(flag, false));
+        if !was_view {
+            return;
+        }
+        let retired = self
+            .textures
+            .lock()
+            .expect("textures lock poisoned")
+            .get_mut(idx)
+            .and_then(Option::take);
+        if let Some(texture) = retired
+            && let QueueInner::Vulkan(queue) = &self.queue.inner
+        {
+            queue.retire_resource(VulkanRetiredResource::Texture { id, texture });
+        }
+    }
+
+    #[allow(irrefutable_let_patterns)]
+    pub fn destroy_sampler(&self, sampler: Sampler) {
+        let sampler_id = sampler.id();
+        let retired = self
+            .samplers
+            .borrow_mut()
+            .get_mut(sampler_id.0 as usize)
+            .and_then(Option::take);
+        if let Some(sampler) = retired
+            && let QueueInner::Vulkan(queue) = &self.queue.inner
+        {
+            queue.retire_resource(VulkanRetiredResource::Sampler {
+                id: sampler_id,
+                sampler,
+            });
         }
     }
 
@@ -2507,18 +3273,23 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::TextureCreation(format!("create texture view: {e}")))?
         };
 
-        let texture_id = {
-            let mut id = self.next_texture_id.borrow_mut();
-            let tid = TextureId(*id);
-            *id += 1;
-            tid
-        };
+        let texture_id = self.allocate_texture_id()?;
 
-        self.write_image_descriptor(texture_id, image_view, vk::ImageLayout::GENERAL, storage)?;
+        let layout = if storage {
+            vk::ImageLayout::GENERAL
+        } else {
+            sampled_image_layout(source.desc())
+        };
+        if let Err(err) = self.write_image_descriptor(texture_id, image_view, layout, storage) {
+            unsafe { self.device.destroy_image_view(image_view, None) };
+            self.recycle_texture_id(texture_id);
+            return Err(err);
+        }
 
         let vk_texture = VulkanTexture {
             image: vk::Image::null(),
             image_view,
+            layout,
             is_view: true,
         };
 
@@ -2528,6 +3299,16 @@ impl VulkanDevice {
                 textures.resize_with(texture_id.0 as usize + 1, || None);
             }
             textures[texture_id.0 as usize] = Some(vk_texture);
+        }
+        {
+            let mut flags = self
+                .texture_view_flags
+                .lock()
+                .expect("texture view flags lock poisoned");
+            if flags.len() <= texture_id.0 as usize {
+                flags.resize(texture_id.0 as usize + 1, false);
+            }
+            flags[texture_id.0 as usize] = true;
         }
 
         Ok(texture_id)
@@ -2549,24 +3330,24 @@ impl VulkanDevice {
             .as_ref()
             .ok_or_else(|| RhiError::Backend("Descriptor buffer loader missing".into()))?;
 
-        let (base, stride, ty, kind) = if storage {
+        let (base, descriptor_size, ty, kind) = if storage {
             (
                 heap.storage_image_offset,
-                heap.storage_image_stride,
+                heap.storage_image_descriptor_size,
                 vk::DescriptorType::STORAGE_IMAGE,
                 "Storage",
             )
         } else {
             (
                 heap.sampled_image_offset,
-                heap.sampled_image_stride,
+                heap.sampled_image_descriptor_size,
                 vk::DescriptorType::SAMPLED_IMAGE,
                 "Sampled",
             )
         };
 
-        let offset = base + (id.0 as u64) * stride;
-        if offset + stride > heap.size {
+        let offset = base + (id.0 as u64) * heap.image_descriptor_stride;
+        if offset + heap.image_descriptor_stride > heap.size {
             return Err(RhiError::Backend(format!(
                 "{kind} image descriptor heap overflow"
             )));
@@ -2591,7 +3372,7 @@ impl VulkanDevice {
         unsafe {
             let dst = std::slice::from_raw_parts_mut(
                 heap.mapped_ptr.add(offset as usize),
-                stride as usize,
+                descriptor_size as usize,
             );
             loader.get_descriptor(&get_info, dst);
         }
@@ -2759,19 +3540,20 @@ impl VulkanDevice {
         )
     }
 
-    fn transition_image_to_general(
+    fn transition_image_to_layout(
         &self,
         image: vk::Image,
         aspect: vk::ImageAspectFlags,
         mip_levels: u32,
         layer_count: u32,
+        new_layout: vk::ImageLayout,
     ) -> RhiResult<()> {
         let barrier = vk::ImageMemoryBarrier::default()
             .image(image)
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
             .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::GENERAL)
+            .new_layout(new_layout)
             .subresource_range(
                 vk::ImageSubresourceRange::default()
                     .aspect_mask(aspect)
@@ -2785,27 +3567,30 @@ impl VulkanDevice {
         )
     }
 
-    /// Record a single image barrier on the setup command buffer, submit it, and
-    /// block on the queue. Used for one-shot UNDEFINED → initial-layout transitions
-    /// that happen outside the normal command-buffer flow.
+    /// Append an image barrier to the reusable setup command buffer. The batch is submitted when
+    /// the next user command buffer is created, so loading a scene with many textures incurs one
+    /// setup submission rather than one queue idle per texture.
     fn submit_setup_barrier(
         &self,
         barrier: vk::ImageMemoryBarrier<'_>,
         src_stage: vk::PipelineStageFlags,
         dst_stage: vk::PipelineStageFlags,
     ) -> RhiResult<()> {
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
-            self.device
-                .reset_command_buffer(
-                    self.setup_command_buffer,
-                    vk::CommandBufferResetFlags::empty(),
-                )
-                .map_err(|e| RhiError::CommandBuffer(e.to_string()))?;
-            self.device
-                .begin_command_buffer(self.setup_command_buffer, &begin_info)
-                .map_err(|e| RhiError::CommandBuffer(e.to_string()))?;
+            if !self.setup_recording.get() {
+                self.device
+                    .reset_command_buffer(
+                        self.setup_command_buffer,
+                        vk::CommandBufferResetFlags::empty(),
+                    )
+                    .map_err(|e| RhiError::CommandBuffer(e.to_string()))?;
+                let begin_info = vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+                self.device
+                    .begin_command_buffer(self.setup_command_buffer, &begin_info)
+                    .map_err(|e| RhiError::CommandBuffer(e.to_string()))?;
+                self.setup_recording.set(true);
+            }
             self.device.cmd_pipeline_barrier(
                 self.setup_command_buffer,
                 src_stage,
@@ -2815,6 +3600,15 @@ impl VulkanDevice {
                 &[],
                 &[barrier],
             );
+        }
+        Ok(())
+    }
+
+    fn flush_setup_barriers(&self) -> RhiResult<()> {
+        if !self.setup_recording.replace(false) {
+            return Ok(());
+        }
+        unsafe {
             self.device
                 .end_command_buffer(self.setup_command_buffer)
                 .map_err(|e| RhiError::CommandBuffer(e.to_string()))?;
@@ -2833,18 +3627,18 @@ impl VulkanDevice {
 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
+        let q = match &self.queue.inner {
+            QueueInner::Vulkan(q) => q,
+            #[allow(unreachable_patterns)]
+            _ => unreachable!(),
+        };
+        q.wait_idle();
         unsafe {
-            let _ = self.device.device_wait_idle();
-
-            let q = match &self.queue.inner {
-                QueueInner::Vulkan(q) => q,
-                #[allow(unreachable_patterns)]
-                _ => unreachable!(),
-            };
             let mut value_sync = q.value_sync.lock().expect("value sync lock poisoned");
             for (_ptr, state) in value_sync.drain() {
                 self.device.destroy_semaphore(state.semaphore, None);
             }
+            self.device.destroy_semaphore(q.completion_semaphore, None);
 
             for t in self
                 .textures
@@ -2859,7 +3653,7 @@ impl Drop for VulkanDevice {
                 }
             }
 
-            for sampler in self.samplers.borrow_mut().drain(..) {
+            for sampler in self.samplers.borrow_mut().drain(..).flatten() {
                 self.device.destroy_sampler(sampler, None);
             }
 
@@ -2870,7 +3664,21 @@ impl Drop for VulkanDevice {
                 self.device.destroy_descriptor_set_layout(heap.layout, None);
             }
 
+            self.device
+                .destroy_pipeline_cache(self.pipeline_cache, None);
             self.device.destroy_command_pool(self.command_pool, None);
+
+            // Buffers the application never destroyed are still bound into pool blocks, and
+            // freeing block memory underneath a live buffer is invalid usage.
+            for (_, allocation) in std::mem::take(
+                &mut *self.allocations.lock().expect("allocations lock poisoned"),
+            ) {
+                self.device.destroy_buffer(allocation.buffer, None);
+            }
+            self.buffer_pool
+                .lock()
+                .expect("buffer pool lock poisoned")
+                .destroy_all(&self.device);
             self.device.destroy_device(None);
 
             if let Some(ref debug_loader) = self.debug_utils_loader {
@@ -2949,9 +3757,13 @@ fn create_descriptor_buffer_heap(
         unsafe { loader.get_descriptor_set_layout_binding_offset(layout, 2) };
     let storage_image_offset = sampled_image_offset;
 
-    let sampled_image_stride = props.sampled_image_descriptor_size as u64;
+    let sampled_image_descriptor_size = props.sampled_image_descriptor_size as u64;
+    let storage_image_descriptor_size = props.storage_image_descriptor_size as u64;
+    let image_descriptor_stride = mutable_image_descriptor_stride(
+        sampled_image_descriptor_size,
+        storage_image_descriptor_size,
+    );
     let sampler_stride = props.sampler_descriptor_size as u64;
-    let storage_image_stride = sampled_image_stride.max(props.storage_image_descriptor_size as u64);
 
     let align = props.descriptor_buffer_offset_alignment.max(1);
     let aligned_size = (layout_size + align - 1) & !(align - 1);
@@ -3019,9 +3831,10 @@ fn create_descriptor_buffer_heap(
         sampled_image_offset,
         sampler_offset,
         storage_image_offset,
-        sampled_image_stride,
+        image_descriptor_stride,
+        sampled_image_descriptor_size,
+        storage_image_descriptor_size,
         sampler_stride,
-        storage_image_stride,
     })
 }
 
@@ -3047,9 +3860,188 @@ fn compare_op_to_vk(op: CompareOp) -> vk::CompareOp {
     }
 }
 
+fn buffer_memory_flags(memory: MemoryType) -> vk::MemoryPropertyFlags {
+    match memory {
+        MemoryType::GpuOnly => vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        MemoryType::Default => {
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+        }
+        MemoryType::Readback => {
+            vk::MemoryPropertyFlags::HOST_VISIBLE
+                | vk::MemoryPropertyFlags::HOST_CACHED
+                | vk::MemoryPropertyFlags::HOST_COHERENT
+        }
+    }
+}
+
+fn mutable_image_descriptor_stride(sampled_size: u64, storage_size: u64) -> u64 {
+    sampled_size.max(storage_size)
+}
+
 fn is_depth_format(format: Format) -> bool {
     matches!(
         format,
         Format::D16Unorm | Format::D32Float | Format::D24UnormS8Uint | Format::D32FloatS8Uint
     )
+}
+
+/// The layout a newly-created image lives in for its whole life. There is no per-resource layout
+/// tracker, so nothing transitions it afterwards except the round-trip inside a copy — which makes
+/// this the single source of truth for both the image and its descriptors. Any usage mix needing
+/// different layouts at different points must therefore settle on GENERAL.
+fn initial_image_layout(desc: &TextureDesc) -> vk::ImageLayout {
+    use crate::texture::TextureUsage;
+
+    const ATTACHMENT: TextureUsage =
+        TextureUsage::COLOR_ATTACHMENT.union(TextureUsage::DEPTH_STENCIL_ATTACHMENT);
+
+    let usage = desc.usage;
+    if usage
+        .intersects(TextureUsage::STORAGE | TextureUsage::TRANSFER_SRC | TextureUsage::TRANSFER_DST)
+    {
+        return vk::ImageLayout::GENERAL;
+    }
+    // Render-then-sample would need an attachment layout and SHADER_READ_ONLY_OPTIMAL at
+    // different times; with no tracker, GENERAL is the only one correct for both.
+    if usage.contains(TextureUsage::SAMPLED) && usage.intersects(ATTACHMENT) {
+        return vk::ImageLayout::GENERAL;
+    }
+    if usage.contains(TextureUsage::DEPTH_STENCIL_ATTACHMENT)
+        && !usage.contains(TextureUsage::COLOR_ATTACHMENT)
+    {
+        return vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    }
+    if usage.contains(TextureUsage::COLOR_ATTACHMENT)
+        && !usage.contains(TextureUsage::DEPTH_STENCIL_ATTACHMENT)
+    {
+        return vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    }
+    if usage.contains(TextureUsage::SAMPLED) {
+        return vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    }
+    vk::ImageLayout::GENERAL
+}
+
+/// The layout a sampled descriptor must declare — necessarily the one the image was created in.
+fn sampled_image_layout(desc: &TextureDesc) -> vk::ImageLayout {
+    initial_image_layout(desc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapped_pointer_lookup_uses_predecessor_and_respects_end() {
+        let mut allocations = BTreeMap::new();
+        allocations.insert(
+            0x1000,
+            MappedAllocation {
+                gpu_base: GpuAddress(0x8000),
+                size: 0x20,
+            },
+        );
+        allocations.insert(
+            0x2000,
+            MappedAllocation {
+                gpu_base: GpuAddress(0x9000),
+                size: 0x10,
+            },
+        );
+
+        assert_eq!(
+            resolve_mapped_pointer(&allocations, 0x100f),
+            Some(GpuAddress(0x800f))
+        );
+        assert_eq!(
+            resolve_mapped_pointer(&allocations, 0x200f),
+            Some(GpuAddress(0x900f))
+        );
+        assert_eq!(resolve_mapped_pointer(&allocations, 0x1020), None);
+        assert_eq!(resolve_mapped_pointer(&allocations, 0x1fff), None);
+    }
+
+    #[test]
+    fn mutable_image_descriptors_use_the_union_stride() {
+        assert_eq!(mutable_image_descriptor_stride(32, 64), 64);
+        assert_eq!(mutable_image_descriptor_stride(64, 32), 64);
+        assert_eq!(mutable_image_descriptor_stride(32, 32), 32);
+    }
+
+    #[test]
+    fn readback_memory_is_host_coherent() {
+        let flags = buffer_memory_flags(MemoryType::Readback);
+        assert!(flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE));
+        assert!(flags.contains(vk::MemoryPropertyFlags::HOST_CACHED));
+        assert!(flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT));
+    }
+
+    fn texture_with(usage: crate::texture::TextureUsage) -> TextureDesc {
+        TextureDesc {
+            usage,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sampled_descriptors_declare_the_layout_the_image_is_actually_in() {
+        use crate::texture::TextureUsage;
+
+        for usage in [
+            TextureUsage::SAMPLED,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+            TextureUsage::SAMPLED | TextureUsage::STORAGE,
+            TextureUsage::SAMPLED | TextureUsage::COLOR_ATTACHMENT,
+            TextureUsage::SAMPLED | TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+        ] {
+            let desc = texture_with(usage);
+            assert_eq!(
+                sampled_image_layout(&desc),
+                initial_image_layout(&desc),
+                "sampled layout diverged from the created layout for {usage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attachments_that_are_also_sampled_stay_general() {
+        use crate::texture::TextureUsage;
+
+        assert_eq!(
+            initial_image_layout(&texture_with(
+                TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED
+            )),
+            vk::ImageLayout::GENERAL
+        );
+        assert_eq!(
+            initial_image_layout(&texture_with(
+                TextureUsage::DEPTH_STENCIL_ATTACHMENT | TextureUsage::SAMPLED
+            )),
+            vk::ImageLayout::GENERAL
+        );
+    }
+
+    #[test]
+    fn single_purpose_images_keep_optimal_layouts() {
+        use crate::texture::TextureUsage;
+
+        assert_eq!(
+            initial_image_layout(&texture_with(TextureUsage::SAMPLED)),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        );
+        assert_eq!(
+            initial_image_layout(&texture_with(TextureUsage::COLOR_ATTACHMENT)),
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        );
+        assert_eq!(
+            initial_image_layout(&texture_with(TextureUsage::DEPTH_STENCIL_ATTACHMENT)),
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        );
+        assert_eq!(
+            initial_image_layout(&texture_with(
+                TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC
+            )),
+            vk::ImageLayout::GENERAL
+        );
+    }
 }

@@ -1,9 +1,9 @@
 use std::sync::atomic::Ordering;
 
 use glam::Vec3;
-use kiln_rhi::{Device, GpuAllocation, GpuPod};
+use kiln_rhi::Device;
 
-use super::{GpuBsdf, GpuLight, GpuTriangle, NEXT_GPU_REVISION, SpectralGpuScene};
+use super::{GpuBsdf, GpuLight, GpuTriangle, GpuUploadBatch, NEXT_GPU_REVISION, SpectralGpuScene};
 use crate::scene::spectral::{self, Spd};
 use crate::scene::{Material, Scene, Vertex};
 
@@ -65,7 +65,7 @@ pub(super) fn build(
     let spectrum_len = u32::try_from(spectrum.texels.len())?;
     let light_count = u32::try_from(lights.len())?;
     let material_count = u32::try_from(bsdfs.len())?;
-    let mut uploads = UploadBatch::new(device);
+    let mut uploads = GpuUploadBatch::new(device);
     uploads.upload(&spectrum.texels)?;
     uploads.upload(&spectrum.lambda_texels)?;
     uploads.upload(&bsdfs)?;
@@ -189,41 +189,4 @@ fn build_reflectance_lut(
         }
     }
     lut
-}
-
-struct UploadBatch<'a> {
-    device: &'a Device,
-    allocations: Vec<GpuAllocation>,
-}
-
-impl<'a> UploadBatch<'a> {
-    fn new(device: &'a Device) -> Self {
-        Self {
-            device,
-            allocations: Vec::new(),
-        }
-    }
-
-    fn upload<T: GpuPod>(&mut self, data: &[T]) -> anyhow::Result<()> {
-        self.allocations.push(self.device.upload_slice(data)?);
-        Ok(())
-    }
-
-    fn finish<const N: usize>(mut self) -> anyhow::Result<[GpuAllocation; N]> {
-        match std::mem::take(&mut self.allocations).try_into() {
-            Ok(allocations) => Ok(allocations),
-            Err(allocations) => {
-                self.allocations = allocations;
-                anyhow::bail!("internal upload count mismatch")
-            }
-        }
-    }
-}
-
-impl Drop for UploadBatch<'_> {
-    fn drop(&mut self) {
-        for allocation in self.allocations.drain(..) {
-            self.device.free(allocation);
-        }
-    }
 }

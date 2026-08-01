@@ -7,6 +7,9 @@ pub mod vulkan;
 #[cfg(feature = "metal")]
 pub mod metal;
 
+#[cfg(any(feature = "vulkan", feature = "metal"))]
+pub(crate) mod suballoc;
+
 /// Active backend kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {

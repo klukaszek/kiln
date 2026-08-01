@@ -55,10 +55,6 @@ impl SpatialSchedule {
         self.pixel_stride
     }
 
-    pub fn phase_count(self) -> u32 {
-        self.phase_count
-    }
-
     pub fn target_passes(self) -> u32 {
         self.target_passes
     }

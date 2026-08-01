@@ -3,8 +3,6 @@ use kiln_rhi::{
     GeometryType, GpuAddress, GpuAllocation, MemoryType, TlasDesc, TlasInstance,
 };
 
-use crate::scene::{Scene, Vertex};
-
 /// Ray-tracing acceleration over the scene. The instance buffer and BLAS stay
 /// alive because the TLAS references their GPU memory.
 pub struct SceneAccel {
@@ -16,18 +14,20 @@ pub struct SceneAccel {
 impl SceneAccel {
     pub(super) fn build(
         device: &Device,
-        scene: &Scene,
         vertices: &GpuAllocation,
+        vertex_count: u32,
+        indices: &GpuAllocation,
+        index_count: u32,
     ) -> anyhow::Result<Self> {
         let blas_desc = BlasDesc {
             meshes: vec![BlasMeshDesc {
                 geometry_type: GeometryType::Triangles,
                 flags: GeometryFlags::OPAQUE,
                 vertex_buffer: vertices.gpu(),
-                vertex_stride: std::mem::size_of::<Vertex>() as u64,
-                vertex_count: u32::try_from(scene.vertices.len())?,
-                index_buffer: GpuAddress(0),
-                index_count: 0,
+                vertex_stride: std::mem::size_of::<[f32; 3]>() as u64,
+                vertex_count,
+                index_buffer: indices.gpu(),
+                index_count,
                 aabb_buffer: GpuAddress(0),
                 aabb_count: 0,
             }],

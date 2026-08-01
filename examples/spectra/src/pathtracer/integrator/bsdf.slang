@@ -61,11 +61,14 @@ float4 bsdf_eval(GpuBsdf s, float4 rho, float3 n, float3 wo, float3 wi, out floa
     }
     float3 h = normalize(wo + wi);
     float cos_h = saturate(dot(n, h));
-    // Saturated: an epsilon above 1 would feed pow() a negative base (NaN).
+    // Saturated before the Schlick polynomial so an epsilon above 1 cannot produce a NaN.
     float h_dot_o = saturate(dot(h, wo));
 
     float4 f0 = lerp(float4(s.f0_dielectric), rho, s.metallic);
-    float4 fresnel = f0 + (1.0 - f0) * pow(1.0 - h_dot_o, 5.0);
+    float one_minus_h = 1.0 - h_dot_o;
+    float one_minus_h2 = one_minus_h * one_minus_h;
+    float fresnel_factor = one_minus_h2 * one_minus_h2 * one_minus_h;
+    float4 fresnel = f0 + (1.0 - f0) * fresnel_factor;
     float4 specular = fresnel * (ggx_d(s.alpha2, cos_h) * ggx_visibility(s.alpha2, cos_o, cos_i));
     float4 diffuse = rho * ((1.0 - s.metallic) * INV_PI);
 

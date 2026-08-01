@@ -17,8 +17,7 @@ pub fn world_xform(stage: &Stage, prim: &sdf::Path) -> anyhow::Result<DMat4> {
         if path.name().is_none() {
             break;
         }
-        let local =
-            DMat4::from_cols_array(&compute_local_to_parent_transform(stage, &path, 0.0)?);
+        let local = DMat4::from_cols_array(&compute_local_to_parent_transform(stage, &path, 0.0)?);
         world = local * world;
         cur = path.parent();
     }

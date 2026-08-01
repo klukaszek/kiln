@@ -2,7 +2,7 @@
 
 use glam::UVec2;
 use kiln_app::FrameCtx;
-use kiln_rhi::{CommandBuffer, CompareOp, DepthFlags, DepthStencilState, StageFlags};
+use kiln_rhi::{CommandBuffer, StageFlags};
 
 use crate::scene::Scene;
 use crate::scene::gpu::{GpuGeometry, SceneAccel, SpectralGpuScene};
@@ -10,7 +10,7 @@ use crate::scene::gpu::{GpuGeometry, SceneAccel, SpectralGpuScene};
 use super::film::FilmSignature;
 use super::roots::{CLEAR_THREADS, CameraGpu, ClearRoot, DisplayRoot, TraceRoot};
 use super::schedule::TraceBatch;
-use super::{FILM_STRIDE, N_LIGHT_LANES, N_UNIFORM_LANES, PathTracer, integrator};
+use super::{FILM_STRIDE, PathTracer, integrator};
 
 impl PathTracer {
     pub fn pre_render(
@@ -95,14 +95,11 @@ impl PathTracer {
             ctx.slot,
             &DisplayRoot {
                 film: accum.gpu(),
-                cmf: self.cmf_bins.gpu(),
                 display_width: ctx.extent.x,
                 display_height: ctx.extent.y,
                 film_width: film.x,
                 film_height: film.y,
                 film_stride: FILM_STRIDE,
-                spectral_bins: FILM_STRIDE,
-                pixel_stride: self.schedule.pixel_stride(),
                 completed_samples: progress.completed_samples,
                 remaining_phases: progress.remaining_phases,
                 target_is_srgb: u32::from(self.display_target_is_srgb),
@@ -111,13 +108,6 @@ impl PathTracer {
         );
 
         cmd.set_graphics_pipeline(&self.pipelines.display);
-        cmd.set_depth_stencil_state(&DepthStencilState {
-            depth_mode: DepthFlags::empty(),
-            depth_test: CompareOp::Always,
-            stencil_read_mask: 0,
-            stencil_write_mask: 0,
-            ..Default::default()
-        });
         cmd.draw(root, 3, 1, 0, 0);
     }
 
@@ -153,13 +143,9 @@ impl PathTracer {
                 pass_start: batch.start,
                 pass_count: batch.count,
                 target_passes: batch.target,
-                phase_count: self.schedule.phase_count(),
-                pixel_stride: self.schedule.pixel_stride(),
-                light_count: gpu_scene.light_count,
-                spectrum_len: gpu_scene.spectrum_len,
-                spectral_bins: FILM_STRIDE,
-                light_lane_count: N_LIGHT_LANES,
-                uniform_lane_count: N_UNIFORM_LANES,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
             },
         );
 

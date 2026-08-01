@@ -47,27 +47,20 @@ gpu_struct! {
         pass_start: u32,
         pass_count: u32,
         target_passes: u32,
-        phase_count: u32,
-        pixel_stride: u32,
-        light_count: u32,
-        spectrum_len: u32,
-        spectral_bins: u32,
-        light_lane_count: u32,
-        uniform_lane_count: u32,
+        _pad0: u32,
+        _pad1: u32,
+        _pad2: u32,
     }
 }
 
 gpu_struct! {
     pub struct DisplayRoot {
-        film: GpuAddress as "Ptr<float, Access.Read>",
-        cmf: GpuAddress as "Ptr<float4, Access.Read>",
+        film: GpuAddress as "Ptr<float4, Access.Read>",
         display_width: u32,
         display_height: u32,
         film_width: u32,
         film_height: u32,
         film_stride: u32,
-        spectral_bins: u32,
-        pixel_stride: u32,
         completed_samples: u32,
         remaining_phases: u32,
         target_is_srgb: u32,

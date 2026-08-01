@@ -39,7 +39,7 @@ pub const DEFAULT_RESOLUTION: usize = 1024;
 /// GPU-memory knob: cost is `width*height*BINS*4` bytes. Bins span
 /// [`LAMBDA_MIN`] to [`LAMBDA_MAX`]
 /// uniformly in wavelength, matching how a spectrometer reports bands.
-pub const SPECTRAL_BINS: usize = 32;
+pub const SPECTRAL_BINS: usize = 4;
 
 /// Width of one spectral bin, in nanometres.
 pub const SPECTRAL_BIN_WIDTH: f32 = (LAMBDA_MAX - LAMBDA_MIN) / SPECTRAL_BINS as f32;
@@ -59,8 +59,8 @@ pub fn spectral_bin_of(nm: f32) -> usize {
 /// `Σ_j cmf_bin[j] · radiance[j]`, so this is the sensor side of the spectral
 /// estimator — independent of the light, computed once and shared CPU/GPU.
 pub fn cmf_bins_linear_srgb() -> Vec<Vec3> {
-    let mut sums = vec![Vec3::ZERO; SPECTRAL_BINS];
-    let mut counts = vec![0u32; SPECTRAL_BINS];
+    let mut sums = [Vec3::ZERO; SPECTRAL_BINS];
+    let mut counts = [0u32; SPECTRAL_BINS];
     let mut nm = LAMBDA_MIN;
     while nm <= LAMBDA_MAX {
         let j = spectral_bin_of(nm);

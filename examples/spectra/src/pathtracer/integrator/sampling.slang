@@ -33,14 +33,12 @@ static const float SPECTRAL_LAMBDA_MAX = 830.0;
 
 uint lane_table_index(TraceRoot* r, uint k, float xi, float xiU)
 {
-    uint len = max(r.spectrum_len, 1u);
-    uint nLight = r.light_lane_count;
-    if (k < nLight) {
-        float u = frac(xi + (float)k / (float)nLight);
+    uint len = SPECTRUM_LEN;
+    if (k < LIGHT_LANE_COUNT) {
+        float u = frac(xi + (float)k / (float)LIGHT_LANE_COUNT);
         return min((uint)(u * (float)len), len - 1u);
     }
-    uint nUniform = max(r.uniform_lane_count, 1u);
-    float u = frac(xiU + (float)(k - nLight) / (float)nUniform);
+    float u = frac(xiU + (float)(k - LIGHT_LANE_COUNT) / (float)UNIFORM_LANE_COUNT);
     return min((uint)(u * (float)len), len - 1u);
 }
 
@@ -56,19 +54,18 @@ uint4 sample_spectral_indices(TraceRoot* r, float xi, float xiU)
 
 float4 fetch_lane(TraceRoot* r, uint k, uint4 indices)
 {
-    return k < r.light_lane_count ? r.spectrum[indices[k]] : r.lambda[indices[k]];
+    return k < LIGHT_LANE_COUNT ? r.spectrum[indices[k]] : r.lambda[indices[k]];
 }
 
 // Pre-evaluated maximum-entropy reflectance.
 float4 lookup_reflectance(TraceRoot* r, uint materialId, uint4 indices)
 {
-    uint len = max(r.spectrum_len, 1u);
+    uint len = SPECTRUM_LEN;
     uint base = materialId * (2u * len);
-    uint nLight = r.light_lane_count;
     float4 rho;
     [ForceUnroll]
     for (uint k = 0u; k < 4u; k++) {
-        uint tableOffset = k < nLight ? 0u : len;
+        uint tableOffset = k < LIGHT_LANE_COUNT ? 0u : len;
         rho[k] = r.reflectance[base + tableOffset + indices[k]];
     }
     return rho;
@@ -82,11 +79,9 @@ float4 lookup_reflectance(TraceRoot* r, uint materialId, uint4 indices)
 // the pixel this frame and frames are barrier-serialised, so the += is atomic-free.
 void splat_spectral(TraceRoot* r, uint pixel, uint4 indices, float4 radiance)
 {
-    uint bins = r.spectral_bins;
-    uint stride = bins;
-    float nLight = (float)r.light_lane_count;
-    float nUniform = (float)r.uniform_lane_count;
-    float binWidth = (SPECTRAL_LAMBDA_MAX - SPECTRAL_LAMBDA_MIN) / (float)bins;
+    float nLight = (float)LIGHT_LANE_COUNT;
+    float nUniform = (float)UNIFORM_LANE_COUNT;
+    float binWidth = (SPECTRAL_LAMBDA_MAX - SPECTRAL_LAMBDA_MIN) / (float)SPECTRAL_BINS;
     float pUniform = 1.0 / (SPECTRAL_LAMBDA_MAX - SPECTRAL_LAMBDA_MIN);
     [ForceUnroll]
     for (uint k = 0u; k < 4u; k++) {
@@ -96,7 +91,7 @@ void splat_spectral(TraceRoot* r, uint pixel, uint4 indices, float4 radiance)
         float pLight = texel.w;
         float radianceL = fluxShape * radiance[k];
         float denom = max(nLight * pLight + nUniform * pUniform, 1e-20);
-        uint bin = min((uint)((lambda - SPECTRAL_LAMBDA_MIN) / binWidth), bins - 1u);
-        r.film[pixel * stride + bin] += radianceL / denom;
+        uint bin = min((uint)((lambda - SPECTRAL_LAMBDA_MIN) / binWidth), SPECTRAL_BINS - 1u);
+        r.film[pixel * SPECTRAL_BINS + bin] += radianceL / denom;
     }
 }

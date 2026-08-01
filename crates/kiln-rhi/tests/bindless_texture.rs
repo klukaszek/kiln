@@ -215,8 +215,10 @@ fn bindless_texture_sample() {
     device.free(root);
     device.free(staging);
     device.free(readback);
+    device.destroy_texture_view(tex_id);
     device.destroy_texture(texture);
     device.free(tex_mem);
     device.destroy_texture(rt);
     device.free(rt_mem);
+    device.destroy_sampler(sampler);
 }

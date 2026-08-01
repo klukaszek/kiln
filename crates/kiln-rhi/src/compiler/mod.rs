@@ -13,9 +13,26 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{Device, ShaderModule, ShaderModuleDesc, ShaderStage};
+use crate::{Device, RhiError, RhiResult, ShaderModule, ShaderModuleDesc, ShaderStage};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
+
+// Slang defaults to optimization level 1 when no `-O` flag is supplied. Level 2 enables the
+// aggressive speed optimizations we want for runtime shaders without the code-size and compile-time
+// tradeoffs of level 3.
+const SLANG_OPTIMIZATION_LEVEL: &str = "2";
+
+struct TempShaderFiles {
+    source: PathBuf,
+    output: PathBuf,
+}
+
+impl Drop for TempShaderFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.source);
+        let _ = std::fs::remove_file(&self.output);
+    }
+}
 
 /// Slang source compiler backed by a file-based cache.
 ///
@@ -69,8 +86,22 @@ impl SlangCompiler {
         stage: ShaderStage,
         capabilities: &[&str],
     ) -> ShaderModule {
-        let (target, ext) = backend_target(device);
-        let code = self.get_or_compile(src, entry, stage, target, ext, capabilities);
+        self.try_compile(device, src, entry, stage, capabilities)
+            .unwrap_or_else(|error| panic!("SlangCompiler failed: {error}"))
+    }
+
+    /// Fallible form of [`compile`](Self::compile), suitable for library code that should
+    /// propagate shader and toolchain failures to its caller.
+    pub fn try_compile(
+        &self,
+        device: &Device,
+        src: &str,
+        entry: &str,
+        stage: ShaderStage,
+        capabilities: &[&str],
+    ) -> RhiResult<ShaderModule> {
+        let (target, ext) = backend_target(device)?;
+        let code = self.get_or_compile(src, entry, stage, target, ext, capabilities)?;
         make_module(device, &code, entry, stage)
     }
 
@@ -102,15 +133,23 @@ impl SlangCompiler {
         target: &str,
         ext: &str,
         capabilities: &[&str],
-    ) -> Vec<u8> {
-        let key = cache_key(self.version_hash, src, entry, stage, target, capabilities);
+    ) -> RhiResult<Vec<u8>> {
+        let key = cache_key(
+            self.version_hash,
+            src,
+            entry,
+            stage,
+            target,
+            capabilities,
+            SLANG_OPTIMIZATION_LEVEL,
+        );
         let path = self.cache_dir.join(format!("{key:016x}.{ext}"));
         if let Ok(cached) = std::fs::read(&path) {
-            return cached;
+            return Ok(cached);
         }
-        let code = invoke_slangc(src, entry, stage, target, ext, capabilities);
+        let code = invoke_slangc(src, entry, stage, target, ext, capabilities)?;
         let _ = std::fs::write(&path, &code);
-        code
+        Ok(code)
     }
 }
 
@@ -191,6 +230,7 @@ fn cache_key(
     stage: ShaderStage,
     target: &str,
     capabilities: &[&str],
+    optimization_level: &str,
 ) -> u64 {
     let mut h = DefaultHasher::new();
     version_hash.hash(&mut h);
@@ -198,6 +238,7 @@ fn cache_key(
     entry.hash(&mut h);
     stage_str(stage).hash(&mut h);
     target.hash(&mut h);
+    optimization_level.hash(&mut h);
     let mut caps = capabilities.to_vec();
     caps.sort_unstable();
     caps.hash(&mut h);
@@ -211,17 +252,21 @@ fn invoke_slangc(
     target: &str,
     ext: &str,
     capabilities: &[&str],
-) -> Vec<u8> {
+) -> RhiResult<Vec<u8>> {
     let dir = std::env::temp_dir();
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    let src_path = dir.join(format!("kiln_{pid}_{seq}.slang"));
-    let out_path = dir.join(format!("kiln_{pid}_{seq}.{ext}"));
+    let files = TempShaderFiles {
+        source: dir.join(format!("kiln_{pid}_{seq}.slang")),
+        output: dir.join(format!("kiln_{pid}_{seq}.{ext}")),
+    };
 
-    std::fs::write(&src_path, src).expect("write slang source");
+    std::fs::write(&files.source, src).map_err(|error| {
+        RhiError::ShaderCompilation(format!("write `{}`: {error}", files.source.display()))
+    })?;
 
     let mut cmd = Command::new("slangc");
-    cmd.arg(&src_path).args([
+    cmd.arg(&files.source).args([
         "-target",
         target,
         "-entry",
@@ -229,6 +274,7 @@ fn invoke_slangc(
         "-stage",
         stage_str(stage),
     ]);
+    cmd.arg(format!("-O{SLANG_OPTIMIZATION_LEVEL}"));
     if target == "spirv" {
         // Keep the entry-point name in `OpEntryPoint` so it matches the RHI.
         cmd.arg("-fvk-use-entrypoint-name");
@@ -238,40 +284,45 @@ fn invoke_slangc(
     for cap in capabilities {
         cmd.args(["-capability", cap]);
     }
-    cmd.arg("-o").arg(&out_path);
+    cmd.arg("-o").arg(&files.output);
 
-    let output = cmd.output().expect("failed to run slangc");
-    let _ = std::fs::remove_file(&src_path);
+    let output = cmd
+        .output()
+        .map_err(|error| RhiError::ShaderCompilation(format!("run slangc: {error}")))?;
 
     if !output.status.success() {
-        let _ = std::fs::remove_file(&out_path);
-        panic!(
+        return Err(RhiError::ShaderCompilation(format!(
             "slangc failed compiling `{entry}` for {target}:\n{}",
             String::from_utf8_lossy(&output.stderr)
-        );
+        )));
     }
 
-    let code = std::fs::read(&out_path).expect("read compiled shader");
-    let _ = std::fs::remove_file(&out_path);
-    code
+    std::fs::read(&files.output).map_err(|error| {
+        RhiError::ShaderCompilation(format!("read `{}`: {error}", files.output.display()))
+    })
 }
 
-fn make_module(device: &Device, code: &[u8], entry: &str, stage: ShaderStage) -> ShaderModule {
-    device
-        .create_shader_module(&ShaderModuleDesc {
-            code,
-            entry_point: entry,
-            stage,
-            label: Some(entry),
-        })
-        .expect("create_shader_module")
+fn make_module(
+    device: &Device,
+    code: &[u8],
+    entry: &str,
+    stage: ShaderStage,
+) -> RhiResult<ShaderModule> {
+    device.create_shader_module(&ShaderModuleDesc {
+        code,
+        entry_point: entry,
+        stage,
+        label: Some(entry),
+    })
 }
 
-fn backend_target(device: &Device) -> (&'static str, &'static str) {
+fn backend_target(device: &Device) -> RhiResult<(&'static str, &'static str)> {
     match device.backend_name() {
-        "Vulkan" => ("spirv", "spv"),
-        "Metal" => ("metallib", "metallib"),
-        other => panic!("SlangCompiler: unsupported backend `{other}`"),
+        "Vulkan" => Ok(("spirv", "spv")),
+        "Metal" => Ok(("metallib", "metallib")),
+        other => Err(RhiError::Unsupported(format!(
+            "SlangCompiler: unsupported backend `{other}`"
+        ))),
     }
 }
 

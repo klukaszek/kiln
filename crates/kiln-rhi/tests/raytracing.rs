@@ -157,6 +157,14 @@ fn ray_query_triangle_hit() {
         cmd.barrier(StageFlags::COMPUTE, StageFlags::ALL_COMMANDS);
         cmd.end();
         let q = device.queue();
+        // Unrelated work must not retire acceleration structures referenced by `cmd`.
+        drop(tlas);
+        drop(blas);
+        let unrelated = device
+            .create_command_buffer()
+            .expect("unrelated command buffer");
+        q.submit(unrelated).expect("submit unrelated work");
+        q.wait_idle();
         q.submit(cmd).expect("submit");
         q.wait_idle();
     });

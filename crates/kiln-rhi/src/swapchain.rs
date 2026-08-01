@@ -31,9 +31,9 @@ pub struct Swapchain {
 
 pub(crate) enum SwapchainInner {
     #[cfg(feature = "vulkan")]
-    Vulkan(crate::backend::vulkan::swapchain::VulkanSwapchain),
+    Vulkan(Box<crate::backend::vulkan::swapchain::VulkanSwapchain>),
     #[cfg(feature = "metal")]
-    Metal(crate::backend::metal::swapchain::MetalSwapchain),
+    Metal(Box<crate::backend::metal::swapchain::MetalSwapchain>),
 }
 
 impl Swapchain {

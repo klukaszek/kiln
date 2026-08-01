@@ -16,6 +16,7 @@
 
 #![allow(dead_code)]
 
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use clap::Parser;
@@ -34,6 +35,11 @@ use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
+
+/// Read once: `var_os` allocates and takes the environment lock, which the frame loop should not
+/// pay — least of all in the path that exists to measure it.
+static FRAME_BENCH: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("KILN_FRAME_BENCH").is_some());
 
 /// Per-frame recording context: the device, the target extent, and which of the
 /// [`MAX_FRAMES_IN_FLIGHT`] slots this frame occupies.
@@ -59,10 +65,7 @@ pub trait Example {
 
     /// Opt into a depth buffer. When `Some(format)`, the harness creates a swapchain-sized depth
     /// texture (recreated on resize) and binds it cleared to 1.0 for every render pass.
-    fn depth_format() -> Option<Format>
-    where
-        Self: Sized,
-    {
+    fn depth_format(&self) -> Option<Format> {
         None
     }
 
@@ -107,6 +110,34 @@ pub struct HarnessOpts {
     /// Enable RHI validation layers (also honoured via the `KILN_VALIDATION` env var).
     #[arg(long)]
     pub validation: bool,
+
+    /// Present without display sync.
+    ///
+    /// This does not uncap the frame rate: the swapchain still only recycles images as the
+    /// compositor releases them, so acquisition blocks for what vsync would have waited anyway,
+    /// just unevenly. Uncapped rendering needs the headless path.
+    #[arg(long)]
+    pub no_vsync: bool,
+
+    /// Swapchain images (Vulkan) / drawables (Metal).
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(2..=3))]
+    pub image_count: u32,
+}
+
+impl HarnessOpts {
+    fn present(&self) -> PresentOpts {
+        PresentOpts {
+            vsync: !self.no_vsync,
+            image_count: self.image_count,
+        }
+    }
+}
+
+/// Applied on every (re)creation of the swapchain.
+#[derive(Clone, Copy)]
+struct PresentOpts {
+    vsync: bool,
+    image_count: u32,
 }
 
 /// Run `E` in an 800×600 window titled `title`, clearing each frame to `clear`, parsing
@@ -142,6 +173,7 @@ pub fn run_with<E: Example + 'static>(
     let mut app = App::<E> {
         title: title.into(),
         clear,
+        present: opts.present(),
         device,
         window: None,
         surface: None,
@@ -149,6 +181,7 @@ pub fn run_with<E: Example + 'static>(
         depth: None,
         example: None,
         frame_index: 0,
+        benchmark_frame_count: 0,
         surface_size: (0, 0),
         #[cfg(feature = "egui")]
         egui: None,
@@ -193,6 +226,8 @@ struct App<E: Example> {
     depth: Option<(Texture, GpuAllocation)>,
     example: Option<E>,
     frame_index: usize,
+    benchmark_frame_count: u32,
+    present: PresentOpts,
     // Tracked to skip the duplicate Resized events macOS streams during a live resize.
     surface_size: (u32, u32),
     #[cfg(feature = "egui")]
@@ -213,21 +248,32 @@ impl<E: Example> App<E> {
                 &SwapchainDesc {
                     width: w,
                     height: h,
+                    vsync: self.present.vsync,
+                    image_count: self.present.image_count,
                     ..Default::default()
                 },
             )
             .expect("recreate_swapchain");
         self.surface_size = (w, h);
         // Destruction is explicit: dropping a Texture leaves it resident, leaking one per resize.
+        let depth_format = self
+            .example
+            .as_ref()
+            .and_then(|example| example.depth_format());
         if let Some((tex, mem)) = self.depth.take() {
             self.device.destroy_texture(tex);
             self.device.free(mem);
-            self.depth = Some(make_depth(&self.device, E::depth_format().unwrap(), w, h));
         }
+        self.depth = depth_format.map(|fmt| make_depth(&self.device, fmt, w, h));
     }
 
-    /// Acquire → record → present one frame for the current `frame_index` slot.
+    /// Acquire → record → present one frame for the current `frame_index` slot. The
+    /// [`kiln_rhi::frame_scope`] releases the backend's temporaries at the frame boundary.
     fn render_frame(&mut self) {
+        kiln_rhi::frame_scope(|| self.render_frame_inner());
+    }
+
+    fn render_frame_inner(&mut self) {
         let _cpu_start = Instant::now();
 
         // Build the overlay UI first: its texture deltas must upload before the render pass.
@@ -273,7 +319,7 @@ impl<E: Example> App<E> {
 
         let mut cmd = self
             .device
-            .create_command_buffer_for_swapchain(swapchain)
+            .create_command_buffer_for_swapchain(swapchain, frame_index)
             .expect("create_command_buffer_for_swapchain");
 
         // Bracket the frame's GPU work. The pool reset must be outside any render pass.
@@ -353,6 +399,26 @@ impl<E: Example> App<E> {
                 egui.renderer.free_textures(&self.device, &frame.free);
             }
             egui.cpu_ms = ema(egui.cpu_ms, _cpu_start.elapsed().as_secs_f64() * 1.0e3);
+            if *FRAME_BENCH {
+                egui.debug_frame_count += 1;
+                if egui.debug_frame_count.is_multiple_of(20) {
+                    eprintln!(
+                        "kiln frame benchmark: cpu={:.3}ms gpu={:.3}ms",
+                        egui.cpu_ms, egui.gpu_ms
+                    );
+                }
+            }
+        }
+
+        if *FRAME_BENCH {
+            self.benchmark_frame_count += 1;
+            if self.benchmark_frame_count.is_multiple_of(20) {
+                eprintln!(
+                    "kiln frame benchmark: frame={} cpu={:.3}ms",
+                    self.benchmark_frame_count,
+                    _cpu_start.elapsed().as_secs_f64() * 1.0e3
+                );
+            }
         }
     }
 
@@ -405,12 +471,14 @@ impl<E: Example> ApplicationHandler for App<E> {
             return; // already initialized (resumed can fire more than once)
         }
 
+        let mut window_attributes = Window::default_attributes()
+            .with_title(&self.title)
+            .with_inner_size(LogicalSize::new(800.0, 600.0));
+        if *FRAME_BENCH {
+            window_attributes = window_attributes.with_resizable(false);
+        }
         let window = event_loop
-            .create_window(
-                Window::default_attributes()
-                    .with_title(&self.title)
-                    .with_inner_size(LogicalSize::new(800.0, 600.0)),
-            )
+            .create_window(window_attributes)
             .expect("create window");
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
@@ -432,12 +500,16 @@ impl<E: Example> ApplicationHandler for App<E> {
                 &SwapchainDesc {
                     width: w,
                     height: h,
+                    vsync: self.present.vsync,
+                    image_count: self.present.image_count,
                     ..Default::default()
                 },
             )
             .expect("create_swapchain");
         let example = E::new(&self.device, swapchain.format());
-        let depth = E::depth_format().map(|fmt| make_depth(&self.device, fmt, w, h));
+        let depth = example
+            .depth_format()
+            .map(|fmt| make_depth(&self.device, fmt, w, h));
 
         // The overlay is gated by the build feature alone: with `egui` on, it is always active.
         #[cfg(feature = "egui")]
@@ -531,6 +603,7 @@ struct Egui {
     query_pools: Vec<kiln_rhi::QueryPool>,
     cpu_ms: f64,
     gpu_ms: f64,
+    debug_frame_count: u32,
 }
 
 #[cfg(feature = "egui")]
@@ -557,6 +630,7 @@ impl Egui {
             query_pools,
             cpu_ms: 0.0,
             gpu_ms: 0.0,
+            debug_frame_count: 0,
         }
     }
 

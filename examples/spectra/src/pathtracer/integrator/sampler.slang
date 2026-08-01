@@ -61,3 +61,15 @@ float4 sample_4d(uint pixelSeed, uint sampleIndex, uint group)
         scrambled_to_unit(sobol_u32(2u, index), hash_combine(seed, 3u)),
         scrambled_to_unit(sobol_u32(3u, index), hash_combine(seed, 4u)));
 }
+
+// Next-event estimation consumes only xyz. Keep the fourth Sobol dimension
+// out of the hot path instead of computing and discarding it every bounce.
+float3 sample_3d(uint pixelSeed, uint sampleIndex, uint group)
+{
+    uint seed = hash_combine(pixelSeed, group);
+    uint index = sampleIndex;
+    return float3(
+        scrambled_to_unit(sobol_u32(0u, index), hash_combine(seed, 1u)),
+        scrambled_to_unit(sobol_u32(1u, index), hash_combine(seed, 2u)),
+        scrambled_to_unit(sobol_u32(2u, index), hash_combine(seed, 3u)));
+}

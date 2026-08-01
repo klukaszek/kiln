@@ -78,8 +78,14 @@ fn compute_doubles_buffer() {
         cmd.set_compute_pipeline(&pso);
         cmd.dispatch(data.gpu(), N.div_ceil(64), 1, 1);
         cmd.barrier(StageFlags::COMPUTE, StageFlags::ALL_COMMANDS);
-        cmd.end();
+        // Submitting unrelated work must not retire a pipeline referenced by `cmd`.
+        drop(pso);
         let queue = device.queue();
+        let unrelated = device
+            .create_command_buffer()
+            .expect("unrelated command buffer");
+        queue.submit(unrelated).expect("submit unrelated work");
+        queue.wait_idle();
         queue.submit(cmd).expect("submit");
         queue.wait_idle();
     });

@@ -26,12 +26,7 @@ pub struct MetalGraphicsPso {
     pub(crate) fragment_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pub(crate) fragment_entry_point: String,
     pub(crate) color_formats: Vec<objc2_metal::MTLPixelFormat>,
-    /// Stored for render-pass construction; not baked into the MTL4 PSO at compile time.
-    #[allow(dead_code)]
-    pub(crate) depth_format: objc2_metal::MTLPixelFormat,
-    /// Stored for render-pass construction; not baked into the MTL4 PSO at compile time.
-    #[allow(dead_code)]
-    pub(crate) stencil_format: objc2_metal::MTLPixelFormat,
+    pub(crate) color_write_masks: Vec<ColorWriteMask>,
     pub(crate) sample_count: usize,
     pub(crate) alpha_to_coverage: bool,
     pub(crate) graphics_argument_buffer_slots: Vec<usize>,
@@ -74,6 +69,7 @@ impl MetalGraphicsPso {
             self.fragment_library.as_ref(),
             &self.fragment_entry_point,
             &self.color_formats,
+            &self.color_write_masks,
             self.sample_count,
             self.alpha_to_coverage,
             blend,
@@ -88,6 +84,7 @@ impl MetalGraphicsPso {
         fragment_library: &ProtocolObject<dyn MTLLibrary>,
         fragment_entry_point: &str,
         color_formats: &[objc2_metal::MTLPixelFormat],
+        color_write_masks: &[ColorWriteMask],
         sample_count: usize,
         alpha_to_coverage: bool,
         blend: &BlendState,
@@ -111,7 +108,11 @@ impl MetalGraphicsPso {
         for (i, fmt) in color_formats.iter().enumerate() {
             let att = unsafe { color_attachments.objectAtIndexedSubscript(i) };
             att.setPixelFormat(*fmt);
-            let blend_att = blend.attachments.get(i).cloned().unwrap_or_default();
+            let mut blend_att = blend.attachments.get(i).cloned().unwrap_or_default();
+            blend_att.write_mask &= color_write_masks
+                .get(i)
+                .copied()
+                .unwrap_or(ColorWriteMask::ALL);
             apply_blend_to_attachment(att.as_ref(), blend_att);
         }
 
@@ -211,22 +212,8 @@ fn blend_op_to_mtl(op: BlendOp) -> MTLBlendOperation {
 pub struct MetalMeshletPso {
     pub(crate) cull_mode: MTLCullMode,
     pub(crate) winding: MTLWinding,
-    #[allow(dead_code)]
-    pub(crate) sample_count: usize,
-    #[allow(dead_code)]
-    pub(crate) alpha_to_coverage: bool,
-    #[allow(dead_code)]
-    pub(crate) color_formats: Vec<objc2_metal::MTLPixelFormat>,
-    #[allow(dead_code)]
-    pub(crate) depth_format: objc2_metal::MTLPixelFormat,
-    #[allow(dead_code)]
-    pub(crate) stencil_format: objc2_metal::MTLPixelFormat,
     /// Buffer-index slots the mesh+fragment shader declares for bindless heap pointers.
     /// Used to drive selective heap refresh (texture=1, sampler=2).
     pub(crate) argument_buffer_slots: Vec<usize>,
-    /// Blend pipeline variants (same flyweight mechanism as graphics PSOs).
-    #[allow(dead_code)]
-    pub(crate) blend_pipelines:
-        RefCell<HashMap<BlendState, Retained<ProtocolObject<dyn MTLRenderPipelineState>>>>,
     pub(crate) default_pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
 }

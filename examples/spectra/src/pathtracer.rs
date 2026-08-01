@@ -12,8 +12,8 @@ mod roots;
 mod sampler;
 mod schedule;
 
-use glam::{UVec2, Vec3, Vec4};
-use kiln_rhi::{Device, Format, GpuAllocation};
+use glam::{UVec2, Vec3};
+use kiln_rhi::{Device, Format};
 
 use crate::frame_arena::FrameArenas;
 use crate::scene::spectral;
@@ -39,7 +39,6 @@ pub struct PathTracer {
     film: Film,
     schedule: SpatialSchedule,
     render_scale: u32,
-    cmf_bins: GpuAllocation,
     cmf_bins_cpu: Vec<Vec3>,
     display_target_is_srgb: bool,
 }
@@ -52,22 +51,21 @@ impl PathTracer {
         passes_per_frame: u32,
         render_scale: u32,
         pixel_stride: u32,
+        light_count: u32,
+        spectrum_len: u32,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(render_scale > 0, "render scale must be greater than zero");
         let schedule = SpatialSchedule::new(target_spp, passes_per_frame, pixel_stride)?;
-        let pipelines = Pipelines::new(device, color_format)?;
+        let pipelines = Pipelines::new(
+            device,
+            color_format,
+            schedule.pixel_stride(),
+            light_count,
+            spectrum_len,
+        )?;
 
         let cmf_bins_cpu = spectral::cmf_bins_linear_srgb();
-        let cmf_padded: Vec<Vec4> = cmf_bins_cpu.iter().map(|c| c.extend(0.0)).collect();
-        let cmf_bins = device.upload_slice(&cmf_padded)?;
-        let frame_arenas = match FrameArenas::new(device, FRAME_ARENA_SIZE, "spectral-frame-arena")
-        {
-            Ok(arenas) => arenas,
-            Err(error) => {
-                device.free(cmf_bins);
-                return Err(error);
-            }
-        };
+        let frame_arenas = FrameArenas::new(device, FRAME_ARENA_SIZE, "spectral-frame-arena")?;
 
         Ok(Self {
             pipelines,
@@ -75,7 +73,6 @@ impl PathTracer {
             film: Film::new(FILM_STRIDE),
             schedule,
             render_scale,
-            cmf_bins,
             cmf_bins_cpu,
             display_target_is_srgb: display::format_is_srgb(color_format),
         })
@@ -146,13 +143,9 @@ impl PathTracer {
 
     pub fn destroy(self, device: &Device) {
         let Self {
-            frame_arenas,
-            film,
-            cmf_bins,
-            ..
+            frame_arenas, film, ..
         } = self;
         film.destroy(device);
-        device.free(cmf_bins);
         frame_arenas.destroy(device);
     }
 

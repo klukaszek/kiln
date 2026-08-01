@@ -113,7 +113,9 @@ impl CameraController {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let position = DVec2::new(position.x, position.y);
-                if self.dragging && let Some(last) = self.cursor {
+                if self.dragging
+                    && let Some(last) = self.cursor
+                {
                     let delta = position - last;
                     if delta != DVec2::ZERO {
                         self.active = true;
@@ -157,9 +159,8 @@ impl CameraController {
             }
         }
 
-        let rotation = self.frame
-            * DQuat::from_rotation_y(self.yaw)
-            * DQuat::from_rotation_x(self.pitch);
+        let rotation =
+            self.frame * DQuat::from_rotation_y(self.yaw) * DQuat::from_rotation_x(self.pitch);
         let mut wish = DVec3::ZERO;
         let held = |code| f64::from(u8::from(self.held.contains(&code)));
         wish += (rotation * DVec3::NEG_Z) * (held(KeyCode::KeyW) - held(KeyCode::KeyS));
@@ -191,6 +192,10 @@ pub fn debug_camera_roundtrip(scene: &Scene) {
     eprintln!("up axis:  {:?}", scene.up);
     eprintln!("authored: {authored:.6}");
     eprintln!("rebuilt:  {rebuilt:.6}");
-    let drift = (rebuilt - authored).abs().to_cols_array().into_iter().fold(0.0, f64::max);
+    let drift = (rebuilt - authored)
+        .abs()
+        .to_cols_array()
+        .into_iter()
+        .fold(0.0, f64::max);
     eprintln!("max abs drift: {drift:.2e}");
 }

@@ -87,6 +87,8 @@ impl Renderer {
                 config.passes_per_frame,
                 config.render_scale,
                 config.pixel_stride,
+                spectral_scene.light_count,
+                spectral_scene.spectrum_len,
             ) {
                 Ok(tracer) => {
                     return Ok(Self::PathTraced {
@@ -118,8 +120,8 @@ impl Renderer {
 }
 
 impl Example for App {
-    fn depth_format() -> Option<Format> {
-        Some(Format::D32Float)
+    fn depth_format(&self) -> Option<Format> {
+        matches!(&self.renderer, Renderer::Raster(_)).then_some(Format::D32Float)
     }
 
     fn new(device: &Device, color_format: Format) -> Self {

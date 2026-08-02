@@ -1,9 +1,6 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-
 use ash::vk;
 
-use super::device::{SharedPendingRetirements, VulkanRetiredResource, format_to_vk};
+use super::device::format_to_vk;
 use crate::error::{RhiError, RhiResult};
 use crate::pipeline::{BlendAttachment, BlendState, ColorTarget};
 use crate::types::{BlendFactor, BlendOp, ColorWriteMask, Cull, SampleCount, Topology};
@@ -15,8 +12,6 @@ pub struct VulkanGraphicsPso {
     pub(crate) device: ash::Device,
     pub(crate) pipeline_cache: vk::PipelineCache,
     pub(crate) desc: VulkanGraphicsPsoDesc,
-    pub(crate) blend_pipelines: RefCell<HashMap<BlendState, vk::Pipeline>>,
-    pub(crate) pending_retired_resources: SharedPendingRetirements,
 }
 
 /// Vulkan compute pipeline state.
@@ -25,18 +20,17 @@ pub struct VulkanComputePso {
     pub(crate) pipeline_layout: vk::PipelineLayout,
     #[allow(dead_code)]
     pub(crate) threads_per_threadgroup: [u32; 3],
-    pub(crate) pending_retired_resources: SharedPendingRetirements,
+    pub(crate) device: ash::Device,
 }
 
 impl Drop for VulkanComputePso {
+    /// Destroys immediately; the caller guarantees no in-flight submission still references it.
     fn drop(&mut self) {
-        self.pending_retired_resources
-            .lock()
-            .expect("pending retired resource lock poisoned")
-            .push(VulkanRetiredResource::Pipeline {
-                pipelines: vec![self.pipeline],
-                layout: self.pipeline_layout,
-            });
+        unsafe {
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+        }
     }
 }
 
@@ -55,20 +49,6 @@ pub struct VulkanGraphicsPsoDesc {
 }
 
 impl VulkanGraphicsPso {
-    /// Return the cached blend variant, creating it when needed.
-    pub(crate) fn pipeline_for_blend(&self, blend: &BlendState) -> vk::Pipeline {
-        if let Some(p) = self.blend_pipelines.borrow().get(blend) {
-            return *p;
-        }
-        let pipeline = self
-            .create_pipeline(blend)
-            .expect("Vulkan graphics PSO creation failed for dynamic blend variant");
-        self.blend_pipelines
-            .borrow_mut()
-            .insert(blend.clone(), pipeline);
-        pipeline
-    }
-
     pub(crate) fn create_pipeline(&self, blend: &BlendState) -> RhiResult<vk::Pipeline> {
         let shader_stages = [
             vk::PipelineShaderStageCreateInfo::default()
@@ -194,20 +174,13 @@ impl VulkanGraphicsPso {
 }
 
 impl Drop for VulkanGraphicsPso {
+    /// Destroys immediately; the caller guarantees no in-flight submission still references it.
     fn drop(&mut self) {
-        let mut pipelines = vec![self.pipeline];
-        for (_, pipeline) in self.blend_pipelines.borrow_mut().drain() {
-            if pipeline != self.pipeline {
-                pipelines.push(pipeline);
-            }
+        unsafe {
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
         }
-        self.pending_retired_resources
-            .lock()
-            .expect("pending retired resource lock poisoned")
-            .push(VulkanRetiredResource::Pipeline {
-                pipelines,
-                layout: self.pipeline_layout,
-            });
     }
 }
 
@@ -283,19 +256,14 @@ fn blend_op_to_vk(op: BlendOp) -> vk::BlendOp {
     }
 }
 
-/// Vulkan meshlet (mesh shader) pipeline state.
-///
-/// Requires `VK_EXT_mesh_shader`.  The pipeline is built without a vertex or
-/// geometry stage; the mesh stage replaces both.
+/// Vulkan meshlet (mesh shader) pipeline state. Requires `VK_EXT_mesh_shader`; built without a
+/// vertex or geometry stage, since the mesh stage replaces both.
 pub struct VulkanMeshletPso {
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) pipeline_layout: vk::PipelineLayout,
     pub(crate) device: ash::Device,
     pub(crate) pipeline_cache: vk::PipelineCache,
-    /// Blend variants (same per-draw flyweight mechanism as graphics PSOs).
     pub(crate) desc: VulkanMeshletPsoDesc,
-    pub(crate) blend_pipelines: RefCell<HashMap<BlendState, vk::Pipeline>>,
-    pub(crate) pending_retired_resources: SharedPendingRetirements,
 }
 
 pub struct VulkanMeshletPsoDesc {
@@ -312,20 +280,6 @@ pub struct VulkanMeshletPsoDesc {
 }
 
 impl VulkanMeshletPso {
-    /// Return the cached blend variant, creating it when needed.
-    pub(crate) fn pipeline_for_blend(&self, blend: &BlendState) -> vk::Pipeline {
-        if let Some(p) = self.blend_pipelines.borrow().get(blend) {
-            return *p;
-        }
-        let pipeline = self
-            .create_pipeline(blend)
-            .expect("Vulkan meshlet PSO creation failed for dynamic blend variant");
-        self.blend_pipelines
-            .borrow_mut()
-            .insert(blend.clone(), pipeline);
-        pipeline
-    }
-
     pub(crate) fn create_pipeline(&self, blend: &BlendState) -> RhiResult<vk::Pipeline> {
         let mesh_stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::MESH_EXT)
@@ -434,19 +388,12 @@ impl VulkanMeshletPso {
 }
 
 impl Drop for VulkanMeshletPso {
+    /// Destroys immediately; the caller guarantees no in-flight submission still references it.
     fn drop(&mut self) {
-        let mut pipelines = vec![self.pipeline];
-        for (_, pipeline) in self.blend_pipelines.borrow_mut().drain() {
-            if pipeline != self.pipeline {
-                pipelines.push(pipeline);
-            }
+        unsafe {
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
         }
-        self.pending_retired_resources
-            .lock()
-            .expect("pending retired resource lock poisoned")
-            .push(VulkanRetiredResource::Pipeline {
-                pipelines,
-                layout: self.pipeline_layout,
-            });
     }
 }

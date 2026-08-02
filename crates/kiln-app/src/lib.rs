@@ -345,6 +345,7 @@ impl<E: Example> App<E> {
                 clear_stencil: 0,
             }),
             render_area: [0, 0, extent.x, extent.y],
+            label: Some("example"),
         });
         cmd.set_viewport(0.0, 0.0, extent.x as f32, extent.y as f32, 0.0, 1.0);
         cmd.set_scissor(0, 0, extent.x, extent.y);
@@ -366,6 +367,7 @@ impl<E: Example> App<E> {
                 }],
                 depth_attachment: None,
                 render_area: [0, 0, extent.x, extent.y],
+                label: Some("egui overlay"),
             });
             egui.renderer
                 .paint(

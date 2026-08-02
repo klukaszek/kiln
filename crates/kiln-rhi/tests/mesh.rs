@@ -125,6 +125,7 @@ fn mesh_fullscreen_color() {
             }],
             depth_attachment: None,
             render_area: [0, 0, SIZE, SIZE],
+            label: Some("mesh test"),
         });
         cmd.set_meshlet_pipeline(&pso);
         cmd.set_viewport(0.0, 0.0, SIZE as f32, SIZE as f32, 0.0, 1.0);
@@ -241,6 +242,7 @@ fn render_meshlets(
         }],
         depth_attachment: None,
         render_area: [0, 0, size, size],
+        label: Some("meshlet grid"),
     });
     cmd.set_meshlet_pipeline(pso);
     cmd.set_viewport(0.0, 0.0, size as f32, size as f32, 0.0, 1.0);

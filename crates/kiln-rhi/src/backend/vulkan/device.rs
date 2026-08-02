@@ -1,10 +1,7 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+use std::sync::{Arc, Mutex};
 
 use ash::{
     Device, Entry, Instance,
@@ -14,9 +11,7 @@ use ash::{
 };
 use smallvec::SmallVec;
 
-use crate::command::{
-    CommandBuffer, CommandBufferInner, SignalOp, SignalValueDesc, WaitOp, WaitValueDesc,
-};
+use crate::command::{CommandBuffer, CommandBufferInner};
 use crate::device::{BindlessMode, DeviceDesc};
 use crate::error::{RhiError, RhiResult};
 use crate::memory::{BufferDesc, GpuBuffer, GpuBufferInner, MemoryType};
@@ -67,11 +62,8 @@ pub(crate) struct BufferAllocation {
     pub memory_type_index: u32,
 }
 
-/// Reverse index for CPU-mapped allocations.
-///
-/// GPU command encoding uses the allocation's GPU base address, while the public pointer bridge
-/// starts from a CPU address. Keeping a second index lets both directions use predecessor lookup
-/// without scanning unrelated allocations.
+/// Reverse index for CPU-mapped allocations: encoding looks up by GPU address, the public
+/// pointer bridge by CPU address, and a second index keeps both a predecessor lookup.
 struct MappedAllocation {
     gpu_base: GpuAddress,
     size: u64,
@@ -112,9 +104,6 @@ pub(crate) struct DescriptorBufferHeap {
 pub(crate) type SharedAllocations = Arc<Mutex<BTreeMap<u64, BufferAllocation>>>;
 type SharedMappedAllocations = Arc<Mutex<BTreeMap<usize, MappedAllocation>>>;
 pub(crate) type SharedTextures = Arc<Mutex<Vec<Option<VulkanTexture>>>>;
-pub(crate) type SharedPendingRetirements = Arc<Mutex<Vec<VulkanRetiredResource>>>;
-type SharedPendingRetirementWork = Arc<AtomicBool>;
-pub(crate) type SharedActiveRecordings = Arc<AtomicUsize>;
 type SharedTextureFreeIds = Arc<Mutex<Vec<TextureId>>>;
 type SharedSamplerFreeIds = Arc<Mutex<Vec<SamplerId>>>;
 
@@ -150,8 +139,6 @@ pub struct VulkanDevice {
     pub(crate) physical_device: vk::PhysicalDevice,
     pub(crate) queue_family_index: u32,
     pub(crate) queue: Queue,
-    pending_retired_resources: SharedPendingRetirements,
-    active_recordings: SharedActiveRecordings,
     pub(crate) present_queue: vk::Queue,
     pub(crate) command_pool: vk::CommandPool,
     pub(crate) pipeline_cache: vk::PipelineCache,
@@ -159,7 +146,6 @@ pub struct VulkanDevice {
     buffer_pool: SharedBufferPool,
     pub(crate) device_memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub(crate) bindless_mode: BindlessMode,
-    pub(crate) max_draw_indirect_count: u32,
     /// Nanoseconds per timestamp tick (`VkPhysicalDeviceLimits::timestampPeriod`).
     pub(crate) timestamp_period: f32,
 
@@ -169,6 +155,8 @@ pub struct VulkanDevice {
 
     pub(crate) debug_utils_loader: Option<debug_utils::Instance>,
     pub(crate) debug_callback: vk::DebugUtilsMessengerEXT,
+    /// Device-level `VK_EXT_debug_utils`: object names and pass label regions.
+    pub(crate) debug_labels: Option<debug_utils::Device>,
 
     pub(crate) texture_descriptor_set_layout: vk::DescriptorSetLayout,
     pub(crate) descriptor_buffer_heap: Option<DescriptorBufferHeap>,
@@ -206,20 +194,14 @@ pub struct VulkanQueue {
     pub(crate) device: Device,
     pub(crate) swapchain_loader: swapchain::Device,
     pub(crate) command_pool: vk::CommandPool,
-    value_sync: Mutex<HashMap<u64, VulkanValueSyncState>>,
     buffer_pool: SharedBufferPool,
     /// Generic command buffers are returned to the pool once their queue timeline value is
     /// complete. Swapchain command buffers have their own frame fences and are intentionally not
     /// placed in this list.
     pending_commands: Mutex<VecDeque<(vk::CommandBuffer, u64)>>,
     available_commands: Mutex<Vec<vk::CommandBuffer>>,
-    active_recordings: SharedActiveRecordings,
     completion_semaphore: vk::Semaphore,
     next_completion_value: Mutex<u64>,
-    last_submission_value: Mutex<Option<u64>>,
-    retired_resources: Mutex<VecDeque<VulkanRetiredResourceWithValue>>,
-    pending_retired_resources: SharedPendingRetirements,
-    pending_retirement_work: SharedPendingRetirementWork,
     free_texture_ids: SharedTextureFreeIds,
     free_sampler_ids: SharedSamplerFreeIds,
 }
@@ -234,29 +216,6 @@ pub(crate) enum VulkanRetiredResource {
         id: SamplerId,
         sampler: vk::Sampler,
     },
-    Pipeline {
-        pipelines: Vec<vk::Pipeline>,
-        layout: vk::PipelineLayout,
-    },
-    AccelerationStructure {
-        acceleration_structure: vk::AccelerationStructureKHR,
-        buffer: vk::Buffer,
-        buffer_memory: vk::DeviceMemory,
-        scratch_buffer: vk::Buffer,
-        scratch_memory: vk::DeviceMemory,
-        accel_loader: vk_accel_structure::Device,
-    },
-}
-
-struct VulkanRetiredResourceWithValue {
-    value: u64,
-    resource: VulkanRetiredResource,
-}
-
-#[derive(Clone, Copy)]
-struct VulkanValueSyncState {
-    semaphore: vk::Semaphore,
-    scheduled_value: u64,
 }
 
 impl VulkanQueue {
@@ -298,51 +257,12 @@ impl VulkanQueue {
         self.submit_with_desc(cmd, &SubmitDesc::default())
     }
 
-    pub(crate) fn retire_resource(&self, resource: VulkanRetiredResource) {
-        self.pending_retired_resources
-            .lock()
-            .expect("pending retired resource lock poisoned")
-            .push(resource);
-        self.pending_retirement_work.store(true, Ordering::Release);
-    }
-
-    fn schedule_pending_retirements(&self) {
-        if !self.pending_retirement_work.load(Ordering::Acquire)
-            || self.active_recordings.load(Ordering::Acquire) != 0
-            || !self.pending_retirement_work.swap(false, Ordering::AcqRel)
-        {
-            return;
-        }
-        let pending = std::mem::take(
-            &mut *self
-                .pending_retired_resources
-                .lock()
-                .expect("pending retired resource lock poisoned"),
-        );
-        if pending.is_empty() {
-            return;
-        }
-        let value = *self
-            .last_submission_value
-            .lock()
-            .expect("last submission value lock poisoned");
-        if let Some(value) = value {
-            self.retired_resources
-                .lock()
-                .expect("retired resource lock poisoned")
-                .extend(
-                    pending
-                        .into_iter()
-                        .map(|resource| VulkanRetiredResourceWithValue { value, resource }),
-                );
-        } else {
-            for resource in pending {
-                self.release_retired_resource(resource);
-            }
-        }
-    }
-
-    fn release_retired_resource(&self, resource: VulkanRetiredResource) {
+    /// Release a destroyed resource's storage immediately: destroy the native handles, hand any
+    /// bindless ID back to the free list, and return the buffer range to the pool.
+    ///
+    /// There is no deferral. The caller guarantees the GPU is done with the resource (see the
+    /// contract on `Device::destroy_buffer` and friends).
+    pub(crate) fn release_resource(&self, resource: VulkanRetiredResource) {
         unsafe {
             match &resource {
                 // The block owns the mapping and the memory; the buffer only returns its range.
@@ -362,26 +282,6 @@ impl VulkanQueue {
                 VulkanRetiredResource::Sampler { sampler, .. } => {
                     self.device.destroy_sampler(*sampler, None);
                 }
-                VulkanRetiredResource::Pipeline { pipelines, layout } => {
-                    for pipeline in pipelines {
-                        self.device.destroy_pipeline(*pipeline, None);
-                    }
-                    self.device.destroy_pipeline_layout(*layout, None);
-                }
-                VulkanRetiredResource::AccelerationStructure {
-                    acceleration_structure,
-                    buffer,
-                    buffer_memory,
-                    scratch_buffer,
-                    scratch_memory,
-                    accel_loader,
-                } => {
-                    accel_loader.destroy_acceleration_structure(*acceleration_structure, None);
-                    self.device.destroy_buffer(*buffer, None);
-                    self.device.free_memory(*buffer_memory, None);
-                    self.device.destroy_buffer(*scratch_buffer, None);
-                    self.device.free_memory(*scratch_memory, None);
-                }
             }
         }
         match resource {
@@ -397,9 +297,7 @@ impl VulkanQueue {
                     .expect("free sampler ID lock poisoned")
                     .push(id);
             }
-            VulkanRetiredResource::Buffer(_)
-            | VulkanRetiredResource::Pipeline { .. }
-            | VulkanRetiredResource::AccelerationStructure { .. } => {}
+            VulkanRetiredResource::Buffer(_) => {}
         }
     }
 
@@ -408,37 +306,6 @@ impl VulkanQueue {
             self.device
                 .get_semaphore_counter_value(self.completion_semaphore)
                 .unwrap_or(0)
-        }
-    }
-
-    fn reclaim_retired_resources(&self, completed: u64) {
-        let mut ready = SmallVec::<[VulkanRetiredResource; 4]>::new();
-        {
-            let mut retired = self
-                .retired_resources
-                .lock()
-                .expect("retired resource lock poisoned");
-            while retired
-                .front()
-                .is_some_and(|entry| entry.value <= completed)
-            {
-                ready.push(
-                    retired
-                        .pop_front()
-                        .expect("retired resource queue front disappeared")
-                        .resource,
-                );
-            }
-        }
-        for resource in ready {
-            self.release_retired_resource(resource);
-        }
-        let mut last = self
-            .last_submission_value
-            .lock()
-            .expect("last submission value lock poisoned");
-        if last.is_some_and(|value| value <= completed) {
-            *last = None;
         }
     }
 
@@ -451,111 +318,6 @@ impl VulkanQueue {
             .checked_add(1)
             .ok_or_else(|| RhiError::QueueSubmit("Vulkan completion timeline exhausted".into()))?;
         Ok(*next)
-    }
-
-    fn ensure_value_sync_state<'a>(
-        &self,
-        value_ptr: GpuAddress,
-        map: &'a mut HashMap<u64, VulkanValueSyncState>,
-    ) -> RhiResult<&'a mut VulkanValueSyncState> {
-        let key = value_ptr.0;
-        match map.entry(key) {
-            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let mut type_info = vk::SemaphoreTypeCreateInfo::default()
-                    .semaphore_type(vk::SemaphoreType::TIMELINE)
-                    .initial_value(0);
-                let semaphore_info = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
-                let semaphore = unsafe {
-                    self.device
-                        .create_semaphore(&semaphore_info, None)
-                        .map_err(|e| {
-                            RhiError::SyncError(format!(
-                                "Failed to create Vulkan value semaphore for {:#x}: {e}",
-                                key
-                            ))
-                        })?
-                };
-                Ok(entry.insert(VulkanValueSyncState {
-                    semaphore,
-                    scheduled_value: 0,
-                }))
-            }
-        }
-    }
-
-    fn collect_value_waits(&self, waits: &[WaitValueDesc]) -> RhiResult<ValuePairs> {
-        if waits.is_empty() {
-            return Ok(ValuePairs::new());
-        }
-        let mut map = self.value_sync.lock().expect("value sync lock poisoned");
-        let mut merged = ValuePairs::new();
-        for wait in waits {
-            let state = self.ensure_value_sync_state(wait.value_ptr, &mut map)?;
-            let required = match wait.wait_op {
-                WaitOp::GreaterOrEqual => wait.value,
-                WaitOp::Equal => {
-                    if wait.value < state.scheduled_value {
-                        return Err(RhiError::SyncError(format!(
-                            "Vulkan wait_before_value(Equal) on {:#x} requested {}, but value already advanced to {}",
-                            wait.value_ptr.0, wait.value, state.scheduled_value
-                        )));
-                    }
-                    wait.value
-                }
-                WaitOp::MaskedEqual => {
-                    if wait.mask == u64::MAX {
-                        if wait.value < state.scheduled_value {
-                            return Err(RhiError::SyncError(format!(
-                                "Vulkan wait_before_value(MaskedEqual full-mask) on {:#x} requested {}, but value already advanced to {}",
-                                wait.value_ptr.0, wait.value, state.scheduled_value
-                            )));
-                        }
-                        wait.value
-                    } else {
-                        let masked_current = state.scheduled_value & wait.mask;
-                        let masked_target = wait.value & wait.mask;
-                        if masked_current != masked_target {
-                            return Err(RhiError::SyncError(format!(
-                                "Vulkan wait_before_value(MaskedEqual) for {:#x} cannot be represented with timeline wait: current masked value {:#x} != target {:#x}",
-                                wait.value_ptr.0, masked_current, masked_target
-                            )));
-                        }
-                        state.scheduled_value
-                    }
-                }
-            };
-            state.scheduled_value = state.scheduled_value.max(required);
-            let semaphore = state.semaphore;
-            merge_value_pair(&mut merged, semaphore, required, u64::max);
-        }
-        Ok(merged)
-    }
-
-    fn collect_value_signals(&self, signals: &[SignalValueDesc]) -> RhiResult<ValuePairs> {
-        if signals.is_empty() {
-            return Ok(ValuePairs::new());
-        }
-        let mut map = self.value_sync.lock().expect("value sync lock poisoned");
-        let mut merged = ValuePairs::new();
-        for signal in signals {
-            let state = self.ensure_value_sync_state(signal.value_ptr, &mut map)?;
-            let target = match signal.signal_op {
-                SignalOp::AtomicSet => signal.value,
-                SignalOp::AtomicMax => signal.value.max(state.scheduled_value),
-                SignalOp::AtomicOr => state.scheduled_value | signal.value,
-            };
-            if target < state.scheduled_value {
-                return Err(RhiError::SyncError(format!(
-                    "Vulkan signal_after_value would decrease {:#x} from {} to {}",
-                    signal.value_ptr.0, state.scheduled_value, target
-                )));
-            }
-            state.scheduled_value = target;
-            let semaphore = state.semaphore;
-            merge_value_pair(&mut merged, semaphore, target, |_, latest| latest);
-        }
-        Ok(merged)
     }
 
     pub fn submit_with_desc(
@@ -571,12 +333,10 @@ impl VulkanQueue {
             }
             return Err(error);
         }
-        let mut waits: SmallVec<[(vk::Semaphore, u64); 4]> =
+        let waits: SmallVec<[(vk::Semaphore, u64); 4]> =
             timeline_pairs(desc.wait_semaphores, "wait")?;
-        waits.extend(self.collect_value_waits(&cmd.pending_value_waits)?);
         let mut signals: SmallVec<[(vk::Semaphore, u64); 4]> =
             timeline_pairs(desc.signal_semaphores, "signal")?;
-        signals.extend(self.collect_value_signals(&cmd.pending_value_signals)?);
         let wait_stages: SmallVec<[vk::PipelineStageFlags; 4]> =
             SmallVec::from_elem(vk::PipelineStageFlags::ALL_COMMANDS, waits.len());
         let completion_value = self.next_completion_value()?;
@@ -598,12 +358,6 @@ impl VulkanQueue {
             .lock()
             .expect("pending command lock poisoned")
             .push_back((cmd.command_buffer, completion_value));
-        cmd.resolve_recording();
-        *self
-            .last_submission_value
-            .lock()
-            .expect("last submission value lock poisoned") = Some(completion_value);
-        self.schedule_pending_retirements();
         Ok(())
     }
 
@@ -611,7 +365,6 @@ impl VulkanQueue {
     /// the next submission pays one timeline-counter query and then reclaims a prefix of work.
     fn reclaim_completed_commands(&self) {
         let completed = self.completed_submission_value();
-        self.reclaim_retired_resources(completed);
         let mut pending = self
             .pending_commands
             .lock()
@@ -685,7 +438,6 @@ impl VulkanQueue {
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .map_err(|e| RhiError::SyncError(e.to_string()))?;
             self.reclaim_completed_commands();
-            self.reclaim_retired_resources(self.completed_submission_value());
             self.device
                 .reset_fences(&[fence])
                 .map_err(|e| RhiError::SyncError(e.to_string()))?;
@@ -773,28 +525,17 @@ impl VulkanQueue {
         waits.push((sc.present_complete_semaphores[frame_index], 0));
         let mut wait_stages: SmallVec<[vk::PipelineStageFlags; 4]> = SmallVec::new();
         wait_stages.push(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT);
-        for (sem, val) in self.collect_value_waits(&cmd.pending_value_waits)? {
-            waits.push((sem, val));
-            wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
-        }
         let mut signals: SmallVec<[(vk::Semaphore, u64); 4]> = SmallVec::new();
         signals.push((sc.rendering_complete_semaphores[image_index], 0));
-        signals.extend(self.collect_value_signals(&cmd.pending_value_signals)?);
         let completion_value = self.next_completion_value()?;
         signals.push((self.completion_semaphore, completion_value));
         let fence = sc.in_flight_fences[frame_index];
         let raw_cmd = cmd.command_buffer;
         self.submit_timeline(raw_cmd, &waits, &wait_stages, &signals, fence)?;
-        cmd.resolve_recording();
-        *self
-            .last_submission_value
-            .lock()
-            .expect("last submission value lock poisoned") = Some(completion_value);
 
         if let Some(slot) = sc.in_flight_cmd_buffers.borrow_mut().get_mut(frame_index) {
             *slot = raw_cmd;
         }
-        self.schedule_pending_retirements();
 
         // `submit_frame` owns presentation on both backends. A stale swapchain is rebuilt on the
         // next acquire.
@@ -808,10 +549,8 @@ impl VulkanQueue {
         unsafe {
             let _ = self.device.queue_wait_idle(self.queue);
         }
-        self.schedule_pending_retirements();
         self.reclaim_completed_commands();
-        self.reclaim_retired_resources(self.completed_submission_value());
-        // Blocks are only freed here, never on the retire path, so this cannot land mid-frame.
+        // Blocks are only freed here, never on the destroy path, so this cannot land mid-frame.
         self.buffer_pool
             .lock()
             .expect("buffer pool lock poisoned")
@@ -819,26 +558,8 @@ impl VulkanQueue {
     }
 }
 
-/// Semaphore/value pairs for one submission. Merged with a linear scan: a submission carries one
-/// or two entries, so a `HashMap` would allocate and hash for nothing.
+/// Semaphore/value pairs for one submission.
 type ValuePairs = SmallVec<[(vk::Semaphore, u64); 4]>;
-
-/// Record `value` under `semaphore`, folding into any existing entry with `combine`.
-fn merge_value_pair(
-    pairs: &mut ValuePairs,
-    semaphore: vk::Semaphore,
-    value: u64,
-    combine: fn(u64, u64) -> u64,
-) {
-    if let Some((_, existing)) = pairs
-        .iter_mut()
-        .find(|(candidate, _)| *candidate == semaphore)
-    {
-        *existing = combine(*existing, value);
-    } else {
-        pairs.push((semaphore, value));
-    }
-}
 
 /// Unwrap a slice of `(TimelineSemaphore, u64)` into `(vk::Semaphore, u64)` pairs,
 /// erroring out if any handle is from a non-Vulkan backend.
@@ -971,241 +692,446 @@ pub(crate) fn geometry_flags_to_vk(flags: GeometryFlags) -> vk::GeometryFlagsKHR
     out
 }
 
+/// Pick the best physical device satisfying every feature the RHI requires, plus the queue family
+/// to use with it. Filtering on the full feature set before scoring keeps adapter choice from
+/// depending on enumeration order.
+fn select_physical_device(
+    instance: &ash::Instance,
+) -> RhiResult<(vk::PhysicalDevice, u32, VulkanCapabilities)> {
+    let physical_devices = unsafe {
+        instance
+            .enumerate_physical_devices()
+            .map_err(|e| RhiError::DeviceCreation(format!("Enumerate devices: {e}")))?
+    };
+
+    // Filter on the complete required feature set before scoring devices. Selecting the
+    // first Vulkan 1.3 queue and discovering missing descriptor-buffer features later makes
+    // adapter choice depend on enumeration order and can fail on perfectly usable systems.
+    let selected = physical_devices
+        .iter()
+        .filter_map(|pdevice| {
+            let props = unsafe { instance.get_physical_device_properties(*pdevice) };
+            let api_version = props.api_version;
+            let supports_vulkan_13 = vk::api_version_major(api_version) > 1
+                || (vk::api_version_major(api_version) == 1
+                    && vk::api_version_minor(api_version) >= 3);
+            if !supports_vulkan_13 {
+                return None;
+            }
+
+            let extensions =
+                unsafe { instance.enumerate_device_extension_properties(*pdevice) }.ok()?;
+            let has_ext = |needle: &[u8]| {
+                extensions.iter().any(|ext| {
+                    let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
+                    name.to_bytes() == needle
+                })
+            };
+            if !has_ext(b"VK_KHR_swapchain")
+                || !has_ext(b"VK_EXT_descriptor_buffer")
+                || !has_ext(b"VK_EXT_mutable_descriptor_type")
+            {
+                return None;
+            }
+
+            let mut vulkan11 = vk::PhysicalDeviceVulkan11Features::default();
+            let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
+            let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default();
+            let mut descriptor_buffer = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
+            let mut mutable_descriptor =
+                vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT::default();
+            let has_mesh_ext = has_ext(b"VK_EXT_mesh_shader");
+            let has_accel_ext = has_ext(b"VK_KHR_acceleration_structure")
+                && has_ext(b"VK_KHR_deferred_host_operations");
+            let has_ray_query_ext = has_accel_ext && has_ext(b"VK_KHR_ray_query");
+            let has_rt_maintenance1_ext =
+                has_ray_query_ext && has_ext(b"VK_KHR_ray_tracing_maintenance1");
+            let has_rt_pipeline_ext = has_ray_query_ext && has_ext(b"VK_KHR_ray_tracing_pipeline");
+            let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+            let mut accel = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
+            let mut ray_query = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
+            let mut rt_maintenance1 =
+                vk::PhysicalDeviceRayTracingMaintenance1FeaturesKHR::default();
+            let mut rt_pipeline = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default();
+
+            let mut features2 = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut vulkan11)
+                .push_next(&mut vulkan12)
+                .push_next(&mut vulkan13)
+                .push_next(&mut descriptor_buffer)
+                .push_next(&mut mutable_descriptor);
+            if has_mesh_ext {
+                features2 = features2.push_next(&mut mesh);
+            }
+            if has_accel_ext {
+                features2 = features2.push_next(&mut accel);
+            }
+            if has_ray_query_ext {
+                features2 = features2.push_next(&mut ray_query);
+            }
+            if has_rt_maintenance1_ext {
+                features2 = features2.push_next(&mut rt_maintenance1);
+            }
+            if has_rt_pipeline_ext {
+                features2 = features2.push_next(&mut rt_pipeline);
+            }
+            unsafe { instance.get_physical_device_features2(*pdevice, &mut features2) };
+
+            let base = features2.features;
+            let required = base.shader_clip_distance != 0
+                && base.fill_mode_non_solid != 0
+                && base.multi_draw_indirect != 0
+                && base.shader_int64 != 0
+                && vulkan11.shader_draw_parameters != 0
+                && vulkan12.buffer_device_address != 0
+                && vulkan12.timeline_semaphore != 0
+                && vulkan12.draw_indirect_count != 0
+                && vulkan12.descriptor_binding_partially_bound != 0
+                && vulkan12.runtime_descriptor_array != 0
+                && vulkan12.host_query_reset != 0
+                && vulkan13.dynamic_rendering != 0
+                && vulkan13.synchronization2 != 0
+                && descriptor_buffer.descriptor_buffer != 0
+                && mutable_descriptor.mutable_descriptor_type != 0;
+            if !required {
+                return None;
+            }
+
+            let queue_family =
+                unsafe { instance.get_physical_device_queue_family_properties(*pdevice) }
+                    .iter()
+                    .enumerate()
+                    .find(|(_, info)| {
+                        info.queue_flags
+                            .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+                    })
+                    .map(|(index, _)| index as u32)?;
+
+            let capabilities = VulkanCapabilities {
+                mesh_shader: has_mesh_ext && mesh.mesh_shader != 0,
+                acceleration_structure: has_accel_ext && accel.acceleration_structure != 0,
+                ray_query: has_ray_query_ext && ray_query.ray_query != 0,
+                ray_tracing_maintenance1: has_rt_maintenance1_ext
+                    && rt_maintenance1.ray_tracing_maintenance1 != 0,
+                ray_tracing_pipeline: has_rt_pipeline_ext && rt_pipeline.ray_tracing_pipeline != 0,
+            };
+            let type_score = match props.device_type {
+                vk::PhysicalDeviceType::DISCRETE_GPU => 4u64,
+                vk::PhysicalDeviceType::INTEGRATED_GPU => 3,
+                vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+                vk::PhysicalDeviceType::CPU => 1,
+                _ => 0,
+            };
+            let memory_score = unsafe { instance.get_physical_device_memory_properties(*pdevice) }
+                .memory_heaps[..]
+                .iter()
+                .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                .map(|heap| heap.size / (1024 * 1024))
+                .max()
+                .unwrap_or(0);
+            Some((
+                *pdevice,
+                queue_family,
+                capabilities,
+                (type_score << 48) | memory_score.min((1 << 48) - 1),
+            ))
+        })
+        .max_by_key(|candidate| candidate.3)
+        .map(|(pdevice, family, capabilities, _)| (pdevice, family, capabilities))
+        .ok_or(RhiError::NoSuitableGpu)?;
+    Ok(selected)
+}
+
+/// Create the Vulkan instance and, under validation, its debug messenger.
+///
+/// The returned flag reports whether `VK_EXT_debug_utils` was enabled at all: the device-level
+/// half (object names, pass labels) rides on the same instance extension.
+fn create_instance(
+    entry: &Entry,
+    desc: &DeviceDesc,
+) -> RhiResult<(
+    ash::Instance,
+    Option<debug_utils::Instance>,
+    vk::DebugUtilsMessengerEXT,
+    bool,
+)> {
+    let app_name = c"kiln-rhi";
+
+    let mut layer_names_raw: Vec<*const c_char> = Vec::new();
+    let layer_name_validation = c"VK_LAYER_KHRONOS_validation";
+    if desc.validation {
+        layer_names_raw.push(layer_name_validation.as_ptr());
+    }
+
+    // Enabled outside validation too: it carries the object-name and command-label entry
+    // points, which a release-build capture still wants.
+    let debug_utils_available = unsafe { entry.enumerate_instance_extension_properties(None) }
+        .map(|properties| {
+            properties
+                .iter()
+                .any(|property| property.extension_name_as_c_str() == Ok(debug_utils::NAME))
+        })
+        .unwrap_or(false);
+
+    let mut extension_names: Vec<*const c_char> = Vec::new();
+    if debug_utils_available {
+        extension_names.push(debug_utils::NAME.as_ptr());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        extension_names.push(ash::khr::portability_enumeration::NAME.as_ptr());
+        extension_names.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
+    }
+
+    extension_names.push(ash::khr::surface::NAME.as_ptr());
+
+    #[cfg(target_os = "macos")]
+    {
+        extension_names.push(ash::ext::metal_surface::NAME.as_ptr());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        extension_names.push(ash::khr::xcb_surface::NAME.as_ptr());
+        extension_names.push(ash::khr::xlib_surface::NAME.as_ptr());
+        extension_names.push(ash::khr::wayland_surface::NAME.as_ptr());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        extension_names.push(ash::khr::win32_surface::NAME.as_ptr());
+    }
+
+    let app_info = vk::ApplicationInfo::default()
+        .application_name(app_name)
+        .application_version(vk::make_api_version(0, 1, 0, 0))
+        .engine_name(app_name)
+        .engine_version(vk::make_api_version(0, 1, 0, 0))
+        .api_version(vk::make_api_version(0, 1, 3, 0));
+
+    let create_flags = if cfg!(any(target_os = "macos", target_os = "ios")) {
+        vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+    } else {
+        vk::InstanceCreateFlags::default()
+    };
+
+    let create_info = vk::InstanceCreateInfo::default()
+        .application_info(&app_info)
+        .enabled_layer_names(&layer_names_raw)
+        .enabled_extension_names(&extension_names)
+        .flags(create_flags);
+
+    let instance = unsafe {
+        entry
+            .create_instance(&create_info, None)
+            .map_err(|e| RhiError::DeviceCreation(format!("Failed to create instance: {e}")))?
+    };
+
+    let (debug_utils_loader, debug_callback) = if desc.validation && debug_utils_available {
+        let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+            .message_severity(
+                vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING,
+            )
+            .message_type(
+                vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+            )
+            .pfn_user_callback(Some(vulkan_debug_callback));
+
+        let loader = debug_utils::Instance::new(entry, &instance);
+        let callback = unsafe {
+            loader
+                .create_debug_utils_messenger(&debug_info, None)
+                .map_err(|e| RhiError::DeviceCreation(format!("Debug callback: {e}")))?
+        };
+        (Some(loader), callback)
+    } else {
+        (None, vk::DebugUtilsMessengerEXT::null())
+    };
+    Ok((
+        instance,
+        debug_utils_loader,
+        debug_callback,
+        debug_utils_available,
+    ))
+}
+
+/// Negotiate optional device extensions against `capabilities`, enable the feature set the RHI
+/// depends on, and create the logical device. Bindless requires descriptor buffers and mutable
+/// descriptor types; both are hard requirements, so their absence fails here.
+fn create_logical_device(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue_family_index: u32,
+    capabilities: &VulkanCapabilities,
+    desc: &DeviceDesc,
+) -> RhiResult<ash::Device> {
+    let device_extension_props = unsafe {
+        instance
+            .enumerate_device_extension_properties(physical_device)
+            .map_err(|e| RhiError::DeviceCreation(format!("Enumerate device extensions: {e}")))?
+    };
+    let has_ext = |needle: &[u8]| {
+        device_extension_props.iter().any(|ext| {
+            let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
+            name.to_bytes() == needle
+        })
+    };
+    let supports_descriptor_buffer = has_ext(b"VK_EXT_descriptor_buffer");
+    let supports_mutable_descriptor_type = has_ext(b"VK_EXT_mutable_descriptor_type");
+    let supports_mesh_shader = capabilities.mesh_shader;
+    // BLAS/TLAS builds require acceleration structure and deferred-host-operation support.
+    let supports_accel = capabilities.acceleration_structure;
+    // Inline ray queries add VK_KHR_ray_query.
+    let supports_ray_query = capabilities.ray_query;
+    // The bindless TLAS lowering uses the address conversion provided by maintenance1.
+    let supports_rt_maintenance1 = capabilities.ray_tracing_maintenance1;
+    // Slang's bindless-TLAS lowering also requires the ray-tracing-pipeline extension, even
+    // though the RHI only uses inline ray queries.
+    let supports_ray_tracing_pipeline = capabilities.ray_tracing_pipeline;
+    log::info!(
+        "RHI: Optional extensions — mesh_shader={supports_mesh_shader} mutable_descriptors={supports_mutable_descriptor_type} acceleration_structure={supports_accel} ray_query={supports_ray_query} rt_maintenance1={supports_rt_maintenance1} rt_pipeline={supports_ray_tracing_pipeline}"
+    );
+
+    if desc.bindless_mode == Some(BindlessMode::ArgumentTable) {
+        return Err(RhiError::Unsupported(
+            "Vulkan does not support Metal argument tables".into(),
+        ));
+    }
+    if !supports_descriptor_buffer {
+        return Err(RhiError::Unsupported(
+            "Vulkan descriptor buffer is required but not supported".into(),
+        ));
+    }
+    if !supports_mutable_descriptor_type {
+        return Err(RhiError::Unsupported(
+            "Vulkan bindless storage textures require VK_EXT_mutable_descriptor_type".into(),
+        ));
+    }
+    let mut device_extension_names: Vec<*const c_char> = vec![swapchain::NAME.as_ptr()];
+
+    device_extension_names.push(descriptor_buffer::NAME.as_ptr());
+    device_extension_names.push(ash::ext::mutable_descriptor_type::NAME.as_ptr());
+    if supports_mesh_shader {
+        device_extension_names.push(vk_mesh_shader::NAME.as_ptr());
+    }
+    if supports_accel {
+        device_extension_names.push(vk_accel_structure::NAME.as_ptr());
+        device_extension_names.push(ash::khr::deferred_host_operations::NAME.as_ptr());
+    }
+    if supports_ray_query {
+        device_extension_names.push(ash::khr::ray_query::NAME.as_ptr());
+    }
+    if supports_rt_maintenance1 {
+        device_extension_names.push(ash::khr::ray_tracing_maintenance1::NAME.as_ptr());
+    }
+    if supports_ray_tracing_pipeline {
+        device_extension_names.push(ash::khr::ray_tracing_pipeline::NAME.as_ptr());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        if has_ext(b"VK_KHR_portability_subset") {
+            device_extension_names.push(ash::khr::portability_subset::NAME.as_ptr());
+        }
+    }
+
+    // Vulkan 1.2/1.3 features use the consolidated core feature structs.
+    let mut vulkan11_features =
+        vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
+    let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default()
+        .buffer_device_address(true)
+        .timeline_semaphore(true)
+        .draw_indirect_count(true)
+        .descriptor_binding_partially_bound(true)
+        // Slang lowers bindless handles to an unbounded runtime descriptor array.
+        .runtime_descriptor_array(true)
+        .host_query_reset(true);
+    let mut vulkan13_features = vk::PhysicalDeviceVulkan13Features::default()
+        .dynamic_rendering(true)
+        .synchronization2(true);
+
+    let mut descriptor_buffer_features =
+        vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
+    let mut mutable_descriptor_type_features =
+        vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT::default().mutable_descriptor_type(true);
+
+    // Mesh only: task/amplification shaders are not exposed (see `pipeline.rs`), and asking
+    // for one would exclude mesh-only devices. The adapter filter must agree.
+    let mut mesh_shader_features =
+        vk::PhysicalDeviceMeshShaderFeaturesEXT::default().mesh_shader(true);
+    let mut accel_structure_features =
+        vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default().acceleration_structure(true);
+    let mut ray_query_features = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
+    let mut rt_maintenance1_features =
+        vk::PhysicalDeviceRayTracingMaintenance1FeaturesKHR::default()
+            .ray_tracing_maintenance1(true);
+    let mut rt_pipeline_features =
+        vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
+
+    let features = vk::PhysicalDeviceFeatures {
+        shader_clip_distance: 1,
+        fill_mode_non_solid: 1,
+        multi_draw_indirect: 1,
+        shader_int64: 1,
+        ..Default::default()
+    };
+
+    let mut features2 = vk::PhysicalDeviceFeatures2::default()
+        .features(features)
+        .push_next(&mut vulkan11_features)
+        .push_next(&mut vulkan12_features)
+        .push_next(&mut vulkan13_features)
+        .push_next(&mut descriptor_buffer_features);
+
+    // Reassign each `push_next` result so the feature chain remains attached.
+    if supports_mesh_shader {
+        features2 = features2.push_next(&mut mesh_shader_features);
+    }
+    features2 = features2.push_next(&mut mutable_descriptor_type_features);
+    if supports_accel {
+        features2 = features2.push_next(&mut accel_structure_features);
+    }
+    if supports_ray_query {
+        features2 = features2.push_next(&mut ray_query_features);
+    }
+    if supports_rt_maintenance1 {
+        features2 = features2.push_next(&mut rt_maintenance1_features);
+    }
+    if supports_ray_tracing_pipeline {
+        features2 = features2.push_next(&mut rt_pipeline_features);
+    }
+
+    let priorities = [1.0f32];
+    let queue_info = vk::DeviceQueueCreateInfo::default()
+        .queue_family_index(queue_family_index)
+        .queue_priorities(&priorities);
+
+    let device_create_info = vk::DeviceCreateInfo::default()
+        .queue_create_infos(std::slice::from_ref(&queue_info))
+        .enabled_extension_names(&device_extension_names)
+        .push_next(&mut features2);
+
+    let device = unsafe {
+        instance
+            .create_device(physical_device, &device_create_info, None)
+            .map_err(|e| RhiError::DeviceCreation(format!("Failed to create device: {e}")))?
+    };
+
+    Ok(device)
+}
+
 impl VulkanDevice {
     pub fn new(desc: &DeviceDesc) -> RhiResult<Self> {
         let entry = unsafe { Entry::load() }
             .map_err(|e| RhiError::DeviceCreation(format!("Failed to load Vulkan: {e}")))?;
 
-        let app_name = c"kiln-rhi";
+        let (instance, debug_utils_loader, debug_callback, debug_utils_available) =
+            create_instance(&entry, desc)?;
 
-        let mut layer_names_raw: Vec<*const c_char> = Vec::new();
-        let layer_name_validation = c"VK_LAYER_KHRONOS_validation";
-        if desc.validation {
-            layer_names_raw.push(layer_name_validation.as_ptr());
-        }
-
-        let mut extension_names: Vec<*const c_char> = Vec::new();
-        if desc.validation {
-            extension_names.push(debug_utils::NAME.as_ptr());
-        }
-
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            extension_names.push(ash::khr::portability_enumeration::NAME.as_ptr());
-            extension_names.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
-        }
-
-        extension_names.push(ash::khr::surface::NAME.as_ptr());
-
-        #[cfg(target_os = "macos")]
-        {
-            extension_names.push(ash::ext::metal_surface::NAME.as_ptr());
-        }
-        #[cfg(target_os = "linux")]
-        {
-            extension_names.push(ash::khr::xcb_surface::NAME.as_ptr());
-            extension_names.push(ash::khr::xlib_surface::NAME.as_ptr());
-            extension_names.push(ash::khr::wayland_surface::NAME.as_ptr());
-        }
-        #[cfg(target_os = "windows")]
-        {
-            extension_names.push(ash::khr::win32_surface::NAME.as_ptr());
-        }
-
-        let app_info = vk::ApplicationInfo::default()
-            .application_name(app_name)
-            .application_version(vk::make_api_version(0, 1, 0, 0))
-            .engine_name(app_name)
-            .engine_version(vk::make_api_version(0, 1, 0, 0))
-            .api_version(vk::make_api_version(0, 1, 3, 0));
-
-        let create_flags = if cfg!(any(target_os = "macos", target_os = "ios")) {
-            vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
-        } else {
-            vk::InstanceCreateFlags::default()
-        };
-
-        let create_info = vk::InstanceCreateInfo::default()
-            .application_info(&app_info)
-            .enabled_layer_names(&layer_names_raw)
-            .enabled_extension_names(&extension_names)
-            .flags(create_flags);
-
-        let instance = unsafe {
-            entry
-                .create_instance(&create_info, None)
-                .map_err(|e| RhiError::DeviceCreation(format!("Failed to create instance: {e}")))?
-        };
-
-        let (debug_utils_loader, debug_callback) = if desc.validation {
-            let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
-                .message_severity(
-                    vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
-                        | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING,
-                )
-                .message_type(
-                    vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                        | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
-                        | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
-                )
-                .pfn_user_callback(Some(vulkan_debug_callback));
-
-            let loader = debug_utils::Instance::new(&entry, &instance);
-            let callback = unsafe {
-                loader
-                    .create_debug_utils_messenger(&debug_info, None)
-                    .map_err(|e| RhiError::DeviceCreation(format!("Debug callback: {e}")))?
-            };
-            (Some(loader), callback)
-        } else {
-            (None, vk::DebugUtilsMessengerEXT::null())
-        };
-
-        let physical_devices = unsafe {
-            instance
-                .enumerate_physical_devices()
-                .map_err(|e| RhiError::DeviceCreation(format!("Enumerate devices: {e}")))?
-        };
-
-        // Filter on the complete required feature set before scoring devices. Selecting the
-        // first Vulkan 1.3 queue and discovering missing descriptor-buffer features later makes
-        // adapter choice depend on enumeration order and can fail on perfectly usable systems.
-        let (physical_device, queue_family_index, capabilities) = physical_devices
-            .iter()
-            .filter_map(|pdevice| {
-                let props = unsafe { instance.get_physical_device_properties(*pdevice) };
-                let api_version = props.api_version;
-                let supports_vulkan_13 = vk::api_version_major(api_version) > 1
-                    || (vk::api_version_major(api_version) == 1
-                        && vk::api_version_minor(api_version) >= 3);
-                if !supports_vulkan_13 {
-                    return None;
-                }
-
-                let extensions =
-                    unsafe { instance.enumerate_device_extension_properties(*pdevice) }.ok()?;
-                let has_ext = |needle: &[u8]| {
-                    extensions.iter().any(|ext| {
-                        let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
-                        name.to_bytes() == needle
-                    })
-                };
-                if !has_ext(b"VK_KHR_swapchain")
-                    || !has_ext(b"VK_EXT_descriptor_buffer")
-                    || !has_ext(b"VK_EXT_mutable_descriptor_type")
-                {
-                    return None;
-                }
-
-                let mut vulkan11 = vk::PhysicalDeviceVulkan11Features::default();
-                let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
-                let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default();
-                let mut descriptor_buffer =
-                    vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
-                let mut mutable_descriptor =
-                    vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT::default();
-                let has_mesh_ext = has_ext(b"VK_EXT_mesh_shader");
-                let has_accel_ext = has_ext(b"VK_KHR_acceleration_structure")
-                    && has_ext(b"VK_KHR_deferred_host_operations");
-                let has_ray_query_ext = has_accel_ext && has_ext(b"VK_KHR_ray_query");
-                let has_rt_maintenance1_ext =
-                    has_ray_query_ext && has_ext(b"VK_KHR_ray_tracing_maintenance1");
-                let has_rt_pipeline_ext =
-                    has_ray_query_ext && has_ext(b"VK_KHR_ray_tracing_pipeline");
-                let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
-                let mut accel = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
-                let mut ray_query = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
-                let mut rt_maintenance1 =
-                    vk::PhysicalDeviceRayTracingMaintenance1FeaturesKHR::default();
-                let mut rt_pipeline = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default();
-
-                let mut features2 = vk::PhysicalDeviceFeatures2::default()
-                    .push_next(&mut vulkan11)
-                    .push_next(&mut vulkan12)
-                    .push_next(&mut vulkan13)
-                    .push_next(&mut descriptor_buffer)
-                    .push_next(&mut mutable_descriptor);
-                if has_mesh_ext {
-                    features2 = features2.push_next(&mut mesh);
-                }
-                if has_accel_ext {
-                    features2 = features2.push_next(&mut accel);
-                }
-                if has_ray_query_ext {
-                    features2 = features2.push_next(&mut ray_query);
-                }
-                if has_rt_maintenance1_ext {
-                    features2 = features2.push_next(&mut rt_maintenance1);
-                }
-                if has_rt_pipeline_ext {
-                    features2 = features2.push_next(&mut rt_pipeline);
-                }
-                unsafe { instance.get_physical_device_features2(*pdevice, &mut features2) };
-
-                let base = features2.features;
-                let required = base.shader_clip_distance != 0
-                    && base.fill_mode_non_solid != 0
-                    && base.multi_draw_indirect != 0
-                    && base.shader_int64 != 0
-                    && vulkan11.shader_draw_parameters != 0
-                    && vulkan12.buffer_device_address != 0
-                    && vulkan12.timeline_semaphore != 0
-                    && vulkan12.draw_indirect_count != 0
-                    && vulkan12.descriptor_binding_partially_bound != 0
-                    && vulkan12.runtime_descriptor_array != 0
-                    && vulkan12.host_query_reset != 0
-                    && vulkan13.dynamic_rendering != 0
-                    && vulkan13.synchronization2 != 0
-                    && descriptor_buffer.descriptor_buffer != 0
-                    && mutable_descriptor.mutable_descriptor_type != 0;
-                if !required {
-                    return None;
-                }
-
-                let queue_family =
-                    unsafe { instance.get_physical_device_queue_family_properties(*pdevice) }
-                        .iter()
-                        .enumerate()
-                        .find(|(_, info)| {
-                            info.queue_flags
-                                .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
-                        })
-                        .map(|(index, _)| index as u32)?;
-
-                let capabilities = VulkanCapabilities {
-                    mesh_shader: has_mesh_ext && mesh.mesh_shader != 0,
-                    acceleration_structure: has_accel_ext && accel.acceleration_structure != 0,
-                    ray_query: has_ray_query_ext && ray_query.ray_query != 0,
-                    ray_tracing_maintenance1: has_rt_maintenance1_ext
-                        && rt_maintenance1.ray_tracing_maintenance1 != 0,
-                    ray_tracing_pipeline: has_rt_pipeline_ext
-                        && rt_pipeline.ray_tracing_pipeline != 0,
-                };
-                let type_score = match props.device_type {
-                    vk::PhysicalDeviceType::DISCRETE_GPU => 4u64,
-                    vk::PhysicalDeviceType::INTEGRATED_GPU => 3,
-                    vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
-                    vk::PhysicalDeviceType::CPU => 1,
-                    _ => 0,
-                };
-                let memory_score =
-                    unsafe { instance.get_physical_device_memory_properties(*pdevice) }
-                        .memory_heaps[..]
-                        .iter()
-                        .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
-                        .map(|heap| heap.size / (1024 * 1024))
-                        .max()
-                        .unwrap_or(0);
-                Some((
-                    *pdevice,
-                    queue_family,
-                    capabilities,
-                    (type_score << 48) | memory_score.min((1 << 48) - 1),
-                ))
-            })
-            .max_by_key(|candidate| candidate.3)
-            .map(|(pdevice, family, capabilities, _)| (pdevice, family, capabilities))
-            .ok_or(RhiError::NoSuitableGpu)?;
+        let (physical_device, queue_family_index, capabilities) =
+            select_physical_device(&instance)?;
 
         let device_props = unsafe { instance.get_physical_device_properties(physical_device) };
         let device_name = unsafe {
@@ -1215,166 +1141,21 @@ impl VulkanDevice {
         };
         log::info!("RHI: Selected GPU: {}", device_name);
 
-        let device_extension_props = unsafe {
-            instance
-                .enumerate_device_extension_properties(physical_device)
-                .map_err(|e| {
-                    RhiError::DeviceCreation(format!("Enumerate device extensions: {e}"))
-                })?
-        };
-        let has_ext = |needle: &[u8]| {
-            device_extension_props.iter().any(|ext| {
-                let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
-                name.to_bytes() == needle
-            })
-        };
-        let supports_descriptor_buffer = has_ext(b"VK_EXT_descriptor_buffer");
-        let supports_mutable_descriptor_type = has_ext(b"VK_EXT_mutable_descriptor_type");
-        let supports_mesh_shader = capabilities.mesh_shader;
-        // BLAS/TLAS builds require acceleration structure and deferred-host-operation support.
-        let supports_accel = capabilities.acceleration_structure;
-        // Inline ray queries add VK_KHR_ray_query.
-        let supports_ray_query = capabilities.ray_query;
-        // The bindless TLAS lowering uses the address conversion provided by maintenance1.
-        let supports_rt_maintenance1 = capabilities.ray_tracing_maintenance1;
-        // Slang's bindless-TLAS lowering also requires the ray-tracing-pipeline extension, even
-        // though the RHI only uses inline ray queries.
-        let supports_ray_tracing_pipeline = capabilities.ray_tracing_pipeline;
-        log::info!(
-            "RHI: Optional extensions — mesh_shader={supports_mesh_shader} mutable_descriptors={supports_mutable_descriptor_type} acceleration_structure={supports_accel} ray_query={supports_ray_query} rt_maintenance1={supports_rt_maintenance1} rt_pipeline={supports_ray_tracing_pipeline}"
-        );
-
-        if desc.bindless_mode == Some(BindlessMode::ArgumentTable) {
-            return Err(RhiError::Unsupported(
-                "Vulkan does not support Metal argument tables".into(),
-            ));
-        }
-        if !supports_descriptor_buffer {
-            return Err(RhiError::Unsupported(
-                "Vulkan descriptor buffer is required but not supported".into(),
-            ));
-        }
-        if !supports_mutable_descriptor_type {
-            return Err(RhiError::Unsupported(
-                "Vulkan bindless storage textures require VK_EXT_mutable_descriptor_type".into(),
-            ));
-        }
+        let device = create_logical_device(
+            &instance,
+            physical_device,
+            queue_family_index,
+            &capabilities,
+            desc,
+        )?;
         let bindless_mode = BindlessMode::DescriptorBuffer;
 
-        let mut device_extension_names: Vec<*const c_char> = vec![swapchain::NAME.as_ptr()];
-
-        device_extension_names.push(descriptor_buffer::NAME.as_ptr());
-        device_extension_names.push(ash::ext::mutable_descriptor_type::NAME.as_ptr());
-        if supports_mesh_shader {
-            device_extension_names.push(vk_mesh_shader::NAME.as_ptr());
-        }
-        if supports_accel {
-            device_extension_names.push(vk_accel_structure::NAME.as_ptr());
-            device_extension_names.push(ash::khr::deferred_host_operations::NAME.as_ptr());
-        }
-        if supports_ray_query {
-            device_extension_names.push(ash::khr::ray_query::NAME.as_ptr());
-        }
-        if supports_rt_maintenance1 {
-            device_extension_names.push(ash::khr::ray_tracing_maintenance1::NAME.as_ptr());
-        }
-        if supports_ray_tracing_pipeline {
-            device_extension_names.push(ash::khr::ray_tracing_pipeline::NAME.as_ptr());
-        }
-
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            if has_ext(b"VK_KHR_portability_subset") {
-                device_extension_names.push(ash::khr::portability_subset::NAME.as_ptr());
-            }
-        }
-
-        // Vulkan 1.2/1.3 features use the consolidated core feature structs.
-        let mut vulkan11_features =
-            vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
-        let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default()
-            .buffer_device_address(true)
-            .timeline_semaphore(true)
-            .draw_indirect_count(true)
-            .descriptor_binding_partially_bound(true)
-            // Slang lowers bindless handles to an unbounded runtime descriptor array.
-            .runtime_descriptor_array(true)
-            .host_query_reset(true);
-        let mut vulkan13_features = vk::PhysicalDeviceVulkan13Features::default()
-            .dynamic_rendering(true)
-            .synchronization2(true);
-
-        let mut descriptor_buffer_features =
-            vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
-        let mut mutable_descriptor_type_features =
-            vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT::default()
-                .mutable_descriptor_type(true);
-
-        // Mesh only: task/amplification shaders are not exposed (see `pipeline.rs`), and asking
-        // for one would exclude mesh-only devices. The adapter filter must agree.
-        let mut mesh_shader_features =
-            vk::PhysicalDeviceMeshShaderFeaturesEXT::default().mesh_shader(true);
-        let mut accel_structure_features =
-            vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
-                .acceleration_structure(true);
-        let mut ray_query_features =
-            vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
-        let mut rt_maintenance1_features =
-            vk::PhysicalDeviceRayTracingMaintenance1FeaturesKHR::default()
-                .ray_tracing_maintenance1(true);
-        let mut rt_pipeline_features =
-            vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
-
-        let features = vk::PhysicalDeviceFeatures {
-            shader_clip_distance: 1,
-            fill_mode_non_solid: 1,
-            multi_draw_indirect: 1,
-            shader_int64: 1,
-            ..Default::default()
-        };
-
-        let mut features2 = vk::PhysicalDeviceFeatures2::default()
-            .features(features)
-            .push_next(&mut vulkan11_features)
-            .push_next(&mut vulkan12_features)
-            .push_next(&mut vulkan13_features)
-            .push_next(&mut descriptor_buffer_features);
-
-        // Reassign each `push_next` result so the feature chain remains attached.
-        if supports_mesh_shader {
-            features2 = features2.push_next(&mut mesh_shader_features);
-        }
-        features2 = features2.push_next(&mut mutable_descriptor_type_features);
-        if supports_accel {
-            features2 = features2.push_next(&mut accel_structure_features);
-        }
-        if supports_ray_query {
-            features2 = features2.push_next(&mut ray_query_features);
-        }
-        if supports_rt_maintenance1 {
-            features2 = features2.push_next(&mut rt_maintenance1_features);
-        }
-        if supports_ray_tracing_pipeline {
-            features2 = features2.push_next(&mut rt_pipeline_features);
-        }
-
-        let priorities = [1.0f32];
-        let queue_info = vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family_index)
-            .queue_priorities(&priorities);
-
-        let device_create_info = vk::DeviceCreateInfo::default()
-            .queue_create_infos(std::slice::from_ref(&queue_info))
-            .enabled_extension_names(&device_extension_names)
-            .push_next(&mut features2);
-
-        let device = unsafe {
-            instance
-                .create_device(physical_device, &device_create_info, None)
-                .map_err(|e| RhiError::DeviceCreation(format!("Failed to create device: {e}")))?
-        };
-
         let present_queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+
+        // Device-level half: object names and label regions. `debug_utils_loader` is the
+        // instance-level messenger and only exists under validation.
+        let debug_labels =
+            debug_utils_available.then(|| debug_utils::Device::new(&instance, &device));
 
         let surface_loader = surface::Instance::new(&entry, &instance);
         let swapchain_loader = swapchain::Device::new(&instance, &device);
@@ -1408,12 +1189,12 @@ impl VulkanDevice {
 
         let descriptor_buffer_loader = Some(descriptor_buffer::Device::new(&instance, &device));
 
-        let acceleration_structure_opt = if supports_accel {
+        let acceleration_structure_opt = if capabilities.acceleration_structure {
             Some(vk_accel_structure::Device::new(&instance, &device))
         } else {
             None
         };
-        let mesh_shader_loader = if supports_mesh_shader {
+        let mesh_shader_loader = if capabilities.mesh_shader {
             Some(vk_mesh_shader::Device::new(&instance, &device))
         } else {
             None
@@ -1433,9 +1214,6 @@ impl VulkanDevice {
         };
         let free_texture_ids = Arc::new(Mutex::new(Vec::new()));
         let free_sampler_ids = Arc::new(Mutex::new(Vec::new()));
-        let pending_retired_resources = Arc::new(Mutex::new(Vec::new()));
-        let pending_retirement_work = Arc::new(AtomicBool::new(false));
-        let active_recordings = Arc::new(AtomicUsize::new(0));
         let mut completion_type_info = vk::SemaphoreTypeCreateInfo::default()
             .semaphore_type(vk::SemaphoreType::TIMELINE)
             .initial_value(0);
@@ -1459,17 +1237,11 @@ impl VulkanDevice {
                 device: device.clone(),
                 swapchain_loader: swapchain::Device::new(&instance, &device),
                 command_pool,
-                value_sync: Mutex::new(HashMap::new()),
                 buffer_pool: buffer_pool.clone(),
                 pending_commands: Mutex::new(VecDeque::new()),
                 available_commands: Mutex::new(Vec::new()),
-                active_recordings: active_recordings.clone(),
                 completion_semaphore,
                 next_completion_value: Mutex::new(0),
-                last_submission_value: Mutex::new(None),
-                retired_resources: Mutex::new(VecDeque::new()),
-                pending_retired_resources: pending_retired_resources.clone(),
-                pending_retirement_work,
                 free_texture_ids: free_texture_ids.clone(),
                 free_sampler_ids: free_sampler_ids.clone(),
             })),
@@ -1482,20 +1254,18 @@ impl VulkanDevice {
             physical_device,
             queue_family_index,
             queue,
-            pending_retired_resources,
-            active_recordings,
             present_queue,
             command_pool,
             pipeline_cache,
             buffer_pool,
             device_memory_properties,
             bindless_mode,
-            max_draw_indirect_count: device_props.limits.max_draw_indirect_count,
             timestamp_period: device_props.limits.timestamp_period,
             surface_loader,
             swapchain_loader,
             descriptor_buffer_loader,
             debug_utils_loader,
+            debug_labels,
             debug_callback,
             texture_descriptor_set_layout,
             descriptor_buffer_heap,
@@ -1510,7 +1280,7 @@ impl VulkanDevice {
             free_sampler_ids,
             setup_command_buffer,
             setup_recording: Cell::new(false),
-            mesh_shader_supported: supports_mesh_shader,
+            mesh_shader_supported: capabilities.mesh_shader,
             mesh_shader_loader,
             acceleration_structure: acceleration_structure_opt,
             accel_counter: RefCell::new(0),
@@ -1525,11 +1295,8 @@ impl VulkanDevice {
         self.bindless_mode
     }
 
-    #[allow(irrefutable_let_patterns)]
     pub fn wait_idle(&self) {
-        if let QueueInner::Vulkan(queue) = &self.queue.inner {
-            queue.wait_idle();
-        }
+        backend_expect!(&self.queue.inner, QueueInner::Vulkan).wait_idle();
     }
 
     pub fn wait_for_frame(&self, _frame_index: usize) {}
@@ -1571,11 +1338,7 @@ impl VulkanDevice {
         surface: &Surface,
         desc: &SwapchainDesc,
     ) -> RhiResult<Swapchain> {
-        let vk_surface = match &surface.inner {
-            SurfaceInner::Vulkan(s) => s.surface,
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
-        };
+        let vk_surface = backend_expect!(&surface.inner, SurfaceInner::Vulkan).surface;
 
         let surface_formats = unsafe {
             self.surface_loader
@@ -1641,11 +1404,7 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::Backend(e.to_string()))?
         };
 
-        let sc = match &mut swapchain.inner {
-            SwapchainInner::Vulkan(sc) => sc,
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
-        };
+        let sc = backend_expect!(&mut swapchain.inner, SwapchainInner::Vulkan);
 
         let old_swapchain = sc.swapchain;
         let surface = sc.surface;
@@ -1824,6 +1583,18 @@ impl VulkanDevice {
         })
     }
 
+    /// Name a Vulkan object for captures. No-op without `VK_EXT_debug_utils`.
+    pub(crate) fn set_object_name<H: vk::Handle>(&self, handle: H, name: &str) {
+        let Some(loader) = self.debug_labels.as_ref() else {
+            return;
+        };
+        let name = std::ffi::CString::new(name).expect("debug label contains a NUL");
+        let info = vk::DebugUtilsObjectNameInfoEXT::default()
+            .object_handle(handle)
+            .object_name(&name);
+        unsafe { loader.set_debug_utils_object_name(&info) }.expect("set_debug_utils_object_name");
+    }
+
     pub fn create_buffer(&self, desc: &BufferDesc) -> RhiResult<GpuBuffer> {
         let mut usage_flags = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::INDEX_BUFFER
@@ -1913,6 +1684,10 @@ impl VulkanDevice {
             MemoryType::Default | MemoryType::Readback => suballocation.mapped_ptr,
             MemoryType::GpuOnly => None,
         };
+
+        if let Some(label) = desc.label.as_deref() {
+            self.set_object_name(buffer, label);
+        }
 
         let vk_buffer = VulkanBuffer {
             buffer,
@@ -2212,6 +1987,11 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::TextureCreation(e.to_string()))?
         };
 
+        if let Some(label) = desc.label.as_deref() {
+            self.set_object_name(image, label);
+            self.set_object_name(image_view, label);
+        }
+
         let texture_id = self.allocate_texture_id()?;
 
         let initial_layout = initial_image_layout(desc);
@@ -2431,17 +2211,12 @@ impl VulkanDevice {
             device: self.device.clone(),
             pipeline_cache: self.pipeline_cache,
             desc: pso_desc,
-            blend_pipelines: RefCell::new(std::collections::HashMap::new()),
-            pending_retired_resources: self.pending_retired_resources.clone(),
         };
-        // Bake the initial blend variant; later variants are cached on demand.
-        let initial_blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
-        let pipeline = vk_pso.create_pipeline(&initial_blend)?;
-        vk_pso.pipeline = pipeline;
-        vk_pso
-            .blend_pipelines
-            .borrow_mut()
-            .insert(initial_blend, pipeline);
+        let blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
+        vk_pso.pipeline = vk_pso.create_pipeline(&blend)?;
+        if let Some(label) = desc.label.as_deref() {
+            self.set_object_name(vk_pso.pipeline, label);
+        }
 
         Ok(GraphicsPso {
             inner: GraphicsPsoInner::Vulkan(Box::new(vk_pso)),
@@ -2486,12 +2261,16 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::PipelineCreation(format!("{e:?}")))?
         };
 
+        if let Some(label) = desc.label.as_deref() {
+            self.set_object_name(pipelines[0], label);
+        }
+
         Ok(ComputePso {
             inner: ComputePsoInner::Vulkan(Box::new(VulkanComputePso {
                 pipeline: pipelines[0],
                 pipeline_layout,
                 threads_per_threadgroup: desc.threads_per_threadgroup,
-                pending_retired_resources: self.pending_retired_resources.clone(),
+                device: self.device.clone(),
             })),
         })
     }
@@ -2546,16 +2325,12 @@ impl VulkanDevice {
             device: self.device.clone(),
             pipeline_cache: self.pipeline_cache,
             desc: pso_desc,
-            blend_pipelines: RefCell::new(std::collections::HashMap::new()),
-            pending_retired_resources: self.pending_retired_resources.clone(),
         };
-        let initial_blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
-        let pipeline = vk_pso.create_pipeline(&initial_blend)?;
-        vk_pso.pipeline = pipeline;
-        vk_pso
-            .blend_pipelines
-            .borrow_mut()
-            .insert(initial_blend, pipeline);
+        let blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
+        vk_pso.pipeline = vk_pso.create_pipeline(&blend)?;
+        if let Some(label) = desc.label.as_deref() {
+            self.set_object_name(vk_pso.pipeline, label);
+        }
 
         Ok(MeshletPso {
             inner: MeshletPsoInner::Vulkan(Box::new(vk_pso)),
@@ -2756,7 +2531,7 @@ impl VulkanDevice {
                 scratch_memory,
                 scratch_address,
                 accel_loader: accel_loader.clone(),
-                pending_retired_resources: self.pending_retired_resources.clone(),
+                device: self.device.clone(),
             })),
         })
     }
@@ -2863,19 +2638,12 @@ impl VulkanDevice {
     }
 
     fn acquire_command_buffer(&self) -> RhiResult<vk::CommandBuffer> {
-        match &self.queue.inner {
-            QueueInner::Vulkan(queue) => queue.acquire_command_buffer(),
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
-        }
+        backend_expect!(&self.queue.inner, QueueInner::Vulkan).acquire_command_buffer()
     }
 
     fn recycle_command_buffer(&self, command_buffer: vk::CommandBuffer) {
-        match &self.queue.inner {
-            QueueInner::Vulkan(queue) => queue.recycle_command_buffer(command_buffer),
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
-        }
+        backend_expect!(&self.queue.inner, QueueInner::Vulkan)
+            .recycle_command_buffer(command_buffer)
     }
 
     pub fn create_command_buffer(&self) -> RhiResult<CommandBuffer> {
@@ -2908,7 +2676,6 @@ impl VulkanDevice {
         let descriptor_buffer_binding = Some(descriptor_buffer_binding);
         let mesh_shader = self.mesh_shader_loader.clone();
         let accel_loader_cmd = self.acceleration_structure.clone();
-        self.active_recordings.fetch_add(1, Ordering::AcqRel);
 
         Ok(CommandBuffer {
             inner: CommandBufferInner::Vulkan(Box::new(VulkanCommandBuffer {
@@ -2921,20 +2688,16 @@ impl VulkanDevice {
                 descriptor_buffer_loader,
                 descriptor_buffer_binding,
                 push_constant_stages: vk::ShaderStageFlags::empty(),
-                current_blend_state: BlendState::default(),
+                debug_labels: self.debug_labels.clone(),
+                in_labelled_pass: false,
                 current_depth_stencil: None,
                 pending_split_barrier: None,
-                pending_value_waits: SmallVec::new(),
-                pending_value_signals: SmallVec::new(),
                 allocations: self.allocations.clone(),
                 textures: self.textures.clone(),
                 mesh_shader,
                 acceleration_structure: accel_loader_cmd,
-                max_draw_indirect_count: self.max_draw_indirect_count,
                 rendered_swapchain_images: SmallVec::new(),
                 ended: false,
-                active_recordings: self.active_recordings.clone(),
-                recording_active: true,
             })),
         })
     }
@@ -2945,11 +2708,7 @@ impl VulkanDevice {
         swapchain: &Swapchain,
         frame_index: usize,
     ) -> RhiResult<CommandBuffer> {
-        let sc = match &swapchain.inner {
-            SwapchainInner::Vulkan(s) => s,
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
-        };
+        let sc = backend_expect!(&swapchain.inner, SwapchainInner::Vulkan);
         if frame_index >= sc.in_flight_fences.len() {
             return Err(RhiError::CommandBuffer("invalid Vulkan frame index".into()));
         }
@@ -2980,7 +2739,6 @@ impl VulkanDevice {
         let descriptor_buffer_binding = Some(descriptor_buffer_binding);
         let mesh_shader = self.mesh_shader_loader.clone();
         let accel_loader_cmd = self.acceleration_structure.clone();
-        self.active_recordings.fetch_add(1, Ordering::AcqRel);
 
         Ok(CommandBuffer {
             inner: CommandBufferInner::Vulkan(Box::new(VulkanCommandBuffer {
@@ -2993,20 +2751,16 @@ impl VulkanDevice {
                 descriptor_buffer_loader,
                 descriptor_buffer_binding,
                 push_constant_stages: vk::ShaderStageFlags::empty(),
-                current_blend_state: BlendState::default(),
+                debug_labels: self.debug_labels.clone(),
+                in_labelled_pass: false,
                 current_depth_stencil: None,
                 pending_split_barrier: None,
-                pending_value_waits: SmallVec::new(),
-                pending_value_signals: SmallVec::new(),
                 allocations: self.allocations.clone(),
                 textures: self.textures.clone(),
                 mesh_shader,
                 acceleration_structure: accel_loader_cmd,
-                max_draw_indirect_count: self.max_draw_indirect_count,
                 rendered_swapchain_images: SmallVec::new(),
                 ended: false,
-                active_recordings: self.active_recordings.clone(),
-                recording_active: true,
             })),
         })
     }
@@ -3032,7 +2786,6 @@ impl VulkanDevice {
         })
     }
 
-    #[allow(irrefutable_let_patterns)]
     pub fn destroy_buffer(&self, buffer: GpuBuffer) {
         match buffer.inner {
             GpuBufferInner::Vulkan(b) => {
@@ -3047,16 +2800,14 @@ impl VulkanDevice {
                         .expect("mapped allocations lock poisoned")
                         .remove(&(mapped_ptr as usize));
                 }
-                if let QueueInner::Vulkan(queue) = &self.queue.inner {
-                    queue.retire_resource(VulkanRetiredResource::Buffer(b));
-                }
+                backend_expect!(&self.queue.inner, QueueInner::Vulkan)
+                    .release_resource(VulkanRetiredResource::Buffer(b));
             }
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
         }
     }
 
-    #[allow(irrefutable_let_patterns)]
     pub fn destroy_texture(&self, texture: Texture) {
         let texture_id = texture.id;
         let idx = texture_id.0 as usize;
@@ -3075,16 +2826,15 @@ impl VulkanDevice {
             {
                 *is_view = false;
             }
-            if let QueueInner::Vulkan(queue) = &self.queue.inner {
-                queue.retire_resource(VulkanRetiredResource::Texture {
+            backend_expect!(&self.queue.inner, QueueInner::Vulkan).release_resource(
+                VulkanRetiredResource::Texture {
                     id: texture_id,
                     texture,
-                });
-            }
+                },
+            );
         }
     }
 
-    #[allow(irrefutable_let_patterns)]
     pub fn destroy_texture_view(&self, id: TextureId) {
         let idx = id.0 as usize;
         // Claim the view in one critical section. Splitting the test and the clear lets two
@@ -3104,14 +2854,12 @@ impl VulkanDevice {
             .expect("textures lock poisoned")
             .get_mut(idx)
             .and_then(Option::take);
-        if let Some(texture) = retired
-            && let QueueInner::Vulkan(queue) = &self.queue.inner
-        {
-            queue.retire_resource(VulkanRetiredResource::Texture { id, texture });
+        if let Some(texture) = retired {
+            backend_expect!(&self.queue.inner, QueueInner::Vulkan)
+                .release_resource(VulkanRetiredResource::Texture { id, texture });
         }
     }
 
-    #[allow(irrefutable_let_patterns)]
     pub fn destroy_sampler(&self, sampler: Sampler) {
         let sampler_id = sampler.id();
         let retired = self
@@ -3119,13 +2867,13 @@ impl VulkanDevice {
             .borrow_mut()
             .get_mut(sampler_id.0 as usize)
             .and_then(Option::take);
-        if let Some(sampler) = retired
-            && let QueueInner::Vulkan(queue) = &self.queue.inner
-        {
-            queue.retire_resource(VulkanRetiredResource::Sampler {
-                id: sampler_id,
-                sampler,
-            });
+        if let Some(sampler) = retired {
+            backend_expect!(&self.queue.inner, QueueInner::Vulkan).release_resource(
+                VulkanRetiredResource::Sampler {
+                    id: sampler_id,
+                    sampler,
+                },
+            );
         }
     }
 
@@ -3185,11 +2933,7 @@ impl VulkanDevice {
     }
 
     pub fn read_timestamps(&self, pool: &QueryPool) -> RhiResult<Vec<u64>> {
-        let vk_pool = match &pool.inner {
-            QueryPoolInner::Vulkan(p) => p.pool,
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("query pool backend does not match device backend"),
-        };
+        let vk_pool = backend_expect!(&pool.inner, QueryPoolInner::Vulkan).pool;
         let mut data = vec![0u64; pool.count as usize];
         // The frame fence has already completed; unwritten slots remain zero.
         let result = unsafe {
@@ -3627,17 +3371,9 @@ impl VulkanDevice {
 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
-        let q = match &self.queue.inner {
-            QueueInner::Vulkan(q) => q,
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
-        };
+        let q = backend_expect!(&self.queue.inner, QueueInner::Vulkan);
         q.wait_idle();
         unsafe {
-            let mut value_sync = q.value_sync.lock().expect("value sync lock poisoned");
-            for (_ptr, state) in value_sync.drain() {
-                self.device.destroy_semaphore(state.semaphore, None);
-            }
             self.device.destroy_semaphore(q.completion_semaphore, None);
 
             for t in self
@@ -3670,9 +3406,9 @@ impl Drop for VulkanDevice {
 
             // Buffers the application never destroyed are still bound into pool blocks, and
             // freeing block memory underneath a live buffer is invalid usage.
-            for (_, allocation) in std::mem::take(
-                &mut *self.allocations.lock().expect("allocations lock poisoned"),
-            ) {
+            for (_, allocation) in
+                std::mem::take(&mut *self.allocations.lock().expect("allocations lock poisoned"))
+            {
                 self.device.destroy_buffer(allocation.buffer, None);
             }
             self.buffer_pool

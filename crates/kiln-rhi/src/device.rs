@@ -189,10 +189,7 @@ impl Device {
     ) -> RhiResult<GpuAllocation> {
         let align = align.max(1);
 
-        let backing_size = size
-            .max(1)
-            .checked_add(align - 1)
-            .ok_or_else(|| RhiError::AllocationFailed("allocation size overflow".into()))?;
+        let backing_size = size.max(1) + align - 1;
         let buffer = self.create_buffer(&BufferDesc {
             size: backing_size,
             memory,
@@ -217,7 +214,7 @@ impl Device {
         Ok(alloc)
     }
 
-    /// Free a pointer-first allocation.
+    /// Free a pointer-first allocation. Same contract as [`destroy_buffer`](Self::destroy_buffer).
     pub fn free(&self, allocation: GpuAllocation) {
         self.destroy_buffer(allocation.into_buffer());
     }
@@ -375,31 +372,16 @@ impl Device {
         instance: &TlasInstance,
     ) -> RhiResult<()> {
         let stride = self.tlas_instance_stride();
-        let offset = index.checked_mul(stride).ok_or_else(|| {
-            RhiError::AllocationFailed(format!(
-                "TLAS instance {index} offset overflows host address space"
-            ))
-        })?;
-        let end = offset.checked_add(stride).ok_or_else(|| {
-            RhiError::AllocationFailed(format!(
-                "TLAS instance {index} range overflows host address space"
-            ))
-        })?;
-        let capacity = usize::try_from(dst.size()).map_err(|_| {
-            RhiError::AllocationFailed(
-                "instance buffer size does not fit in host address space".into(),
-            )
-        })?;
-        if end > capacity {
+        let offset = index * stride;
+        if offset + stride > dst.size() as usize {
             return Err(RhiError::AllocationFailed(format!(
-                "TLAS instance {index} (stride {stride}) exceeds instance buffer ({capacity} bytes)"
+                "TLAS instance {index} (stride {stride}) exceeds the instance buffer"
             )));
         }
         let base = dst.cpu().ok_or_else(|| {
             RhiError::AllocationFailed("instance buffer is not CPU-mapped".into())
         })?;
-        // SAFETY: `end <= capacity`, and `base` is valid for `capacity` mapped
-        // bytes, so `ptr` points to `stride` writable bytes for the backend to fill.
+        // SAFETY: bounds-checked above, and `base` is valid for `dst.size()` mapped bytes.
         let ptr = unsafe { base.add(offset) };
         backend_dispatch!(&self.inner, DeviceInner, d => d.write_tlas_instance(ptr, instance));
         Ok(())
@@ -470,22 +452,29 @@ impl Device {
         backend_dispatch!(&self.inner, DeviceInner, d => d.wait_idle())
     }
 
-    /// Destroy a buffer. Native storage is released after current recordings and GPU work finish.
+    /// Destroy a buffer, releasing its storage immediately.
+    ///
+    /// The RHI tracks no lifetimes: the caller guarantees the GPU is done, via
+    /// [`wait_idle`](Self::wait_idle), [`wait_for_frame`](Self::wait_for_frame), or the
+    /// swapchain's frames-in-flight fence. Destroying a resource an in-flight submission still
+    /// references is a use-after-free.
     pub fn destroy_buffer(&self, buffer: GpuBuffer) {
         backend_dispatch!(&self.inner, DeviceInner, d => d.destroy_buffer(buffer))
     }
 
-    /// Destroy a texture. Native storage is released after current recordings and GPU work finish.
+    /// Destroy a texture. Same contract as [`destroy_buffer`](Self::destroy_buffer); the
+    /// `TextureId` is recycled at once, so a still-in-flight draw may read the next texture
+    /// to take the slot.
     pub fn destroy_texture(&self, texture: Texture) {
         backend_dispatch!(&self.inner, DeviceInner, d => d.destroy_texture(texture))
     }
 
-    /// Destroy a sampled or storage view after current recordings and GPU work finish.
+    /// Destroy a sampled or storage view. Same contract as [`destroy_buffer`](Self::destroy_buffer).
     pub fn destroy_texture_view(&self, id: crate::types::TextureId) {
         backend_dispatch!(&self.inner, DeviceInner, d => d.destroy_texture_view(id))
     }
 
-    /// Destroy a sampler after current recordings and GPU work finish.
+    /// Destroy a sampler. Same contract as [`destroy_buffer`](Self::destroy_buffer).
     pub fn destroy_sampler(&self, sampler: Sampler) {
         backend_dispatch!(&self.inner, DeviceInner, d => d.destroy_sampler(sampler))
     }
@@ -499,11 +488,7 @@ impl Device {
     /// Only available with the vulkan feature.
     #[cfg(feature = "vulkan")]
     pub fn vulkan_handles(&self) -> crate::backend::vulkan::device::VulkanHandles {
-        match &self.inner {
-            DeviceInner::Vulkan(d) => d.vulkan_handles(),
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
-        }
+        backend_expect!(&self.inner, DeviceInner::Vulkan).vulkan_handles()
     }
 }
 
@@ -565,11 +550,7 @@ impl CommandBuffer {
     /// Get the raw Vulkan command buffer handle for escape-hatch scenarios.
     #[cfg(feature = "vulkan")]
     pub fn vulkan_command_buffer(&self) -> ash::vk::CommandBuffer {
-        match &self.inner {
-            crate::command::CommandBufferInner::Vulkan(cmd) => cmd.command_buffer,
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
-        }
+        backend_expect!(&self.inner, crate::command::CommandBufferInner::Vulkan).command_buffer
     }
 }
 

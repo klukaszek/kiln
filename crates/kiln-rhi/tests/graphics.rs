@@ -122,6 +122,7 @@ fn graphics_fullscreen_color() {
             }],
             depth_attachment: None,
             render_area: [0, 0, SIZE, SIZE],
+            label: Some("graphics test"),
         });
         cmd.set_graphics_pipeline(&pso);
         cmd.set_viewport(0.0, 0.0, SIZE as f32, SIZE as f32, 0.0, 1.0);
@@ -280,6 +281,7 @@ fn render_draw(
         }],
         depth_attachment: None,
         render_area: [0, 0, size, size],
+        label: Some("graphics test"),
     });
     cmd.set_graphics_pipeline(pso);
     cmd.set_viewport(0.0, 0.0, size as f32, size as f32, 0.0, 1.0);

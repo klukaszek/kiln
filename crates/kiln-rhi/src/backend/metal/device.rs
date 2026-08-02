@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -11,20 +11,16 @@ use objc2_metal::{
     MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandQueue, MTL4Compiler,
     MTL4CompilerDescriptor, MTL4ComputePipelineDescriptor, MTL4CounterHeap,
     MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTL4LibraryFunctionDescriptor,
-    MTL4PipelineDescriptor, MTL4PipelineOptions, MTL4ShaderReflection, MTLAllocation, MTLBinding,
-    MTLBindingType, MTLBuffer, MTLCompileOptions, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLCullMode, MTLDevice, MTLDrawable, MTLEvent, MTLHeap,
-    MTLLanguageVersion, MTLLibrary, MTLPixelFormat, MTLRenderPipelineState, MTLResidencySet,
-    MTLResidencySetDescriptor, MTLSamplerDescriptor, MTLSamplerState, MTLSharedEvent,
-    MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
-    MTLTextureUsage as MtlTextureUsage, MTLWinding,
+    MTL4PipelineDescriptor, MTLBuffer, MTLCreateSystemDefaultDevice, MTLCullMode, MTLDevice,
+    MTLDrawable, MTLEvent, MTLHeap, MTLPixelFormat, MTLResidencySet, MTLResidencySetDescriptor,
+    MTLSamplerDescriptor, MTLSamplerState, MTLSharedEvent, MTLStorageMode, MTLTexture,
+    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage as MtlTextureUsage, MTLWinding,
 };
 use objc2_quartz_core::CAMetalLayer;
 use raw_window_handle::RawWindowHandle;
-use smallvec::SmallVec;
 
 use crate::accel::{AccelInner, AccelerationStructure};
-use crate::command::{CommandBuffer, SignalOp, SignalValueDesc, WaitOp, WaitValueDesc};
+use crate::command::CommandBuffer;
 use crate::device::{BindlessMode, DeviceDesc};
 use crate::error::{RhiError, RhiResult};
 use crate::memory::{BufferDesc, GpuBuffer, GpuBufferInner};
@@ -39,9 +35,10 @@ use crate::sync::{TimelineSemaphore, TimelineSemaphoreInner};
 use crate::texture::{Texture, TextureDesc, TextureSizeAlign, TextureUsage};
 use crate::types::*;
 
+use super::as_allocation;
 use super::command::{
-    MetalCommandBuffer, MetalFrameTableSlot, MetalTableState, SharedFrameTableSlots,
-    SharedTableSlotPool,
+    MetalCommandBuffer, MetalFrameTableSlot, SharedFrameTableSlots, SharedTableSlotPool,
+    create_root_table_buffer,
 };
 use super::memory::{MetalBuffer, MetalBufferPool, SharedMetalBufferPool};
 use super::pipeline::{MetalComputePso, MetalGraphicsPso};
@@ -55,48 +52,37 @@ use super::texture::{format_to_mtl, mtl_to_format};
 type FrameFenceValues = Rc<RefCell<[u64; MAX_FRAMES_IN_FLIGHT]>>;
 type InFlightFrameCommands = Rc<RefCell<Vec<Option<MetalCommandBuffer>>>>;
 type PendingSubmissions = Rc<RefCell<VecDeque<(u64, MetalCommandBuffer)>>>;
-pub(crate) type SharedTextures = Rc<RefCell<Vec<Option<Retained<ProtocolObject<dyn MTLTexture>>>>>>;
-pub(crate) type SharedSamplers =
-    Rc<RefCell<Vec<Option<Retained<ProtocolObject<dyn MTLSamplerState>>>>>>;
-type SharedTextureFreeIds = Rc<RefCell<Vec<TextureId>>>;
-type SharedSamplerFreeIds = Rc<RefCell<Vec<SamplerId>>>;
-/// Buffer allocations keyed by GPU base address, enabling O(log n) address->buffer
-/// resolution for blit copies and indirect draws instead of a linear scan.
-pub(crate) type SharedAllocations = Rc<RefCell<BTreeMap<u64, BufferAllocation>>>;
+
+/// Fixed capacities of the bindless descriptor heaps; one `gpuResourceID` per entry.
+const METAL_BINDLESS_TEXTURE_CAPACITY: usize = MAX_BINDLESS_TEXTURES as usize;
+const METAL_BINDLESS_SAMPLER_CAPACITY: usize = 256;
+/// Bindless slot tables, indexed by `TextureId`/`SamplerId`. A slot is `None` once its resource
+/// is destroyed and before the ID is handed out again.
+type TextureSlots = RefCell<Vec<Option<Retained<ProtocolObject<dyn MTLTexture>>>>>;
+type SamplerSlots = RefCell<Vec<Option<Retained<ProtocolObject<dyn MTLSamplerState>>>>>;
+
 /// Reverse index for CPU-mapped allocations, used by the public pointer bridge.
 type SharedMappedAllocations = Rc<RefCell<BTreeMap<usize, MappedAllocation>>>;
-pub(crate) type SharedBindlessGeneration = Rc<Cell<u64>>;
-type ValueSyncMap = RefCell<HashMap<u64, MetalValueSyncState>>;
-type MetalEventWaits = SmallVec<[(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64); 4]>;
-/// Events being merged, tagged with the value pointer they sync on. Linear merge: a submission
-/// carries one or two entries, so a `HashMap` would allocate and hash for nothing.
-type MergedEvents = SmallVec<[(u64, Retained<ProtocolObject<dyn MTLSharedEvent>>, u64); 4]>;
 
-/// Record `value` under `key`, folding into any existing entry with `combine`.
-fn merge_event(
-    merged: &mut MergedEvents,
-    key: u64,
-    event: &Retained<ProtocolObject<dyn MTLSharedEvent>>,
-    value: u64,
-    combine: fn(u64, u64) -> u64,
-) {
-    if let Some((_, _, existing)) = merged.iter_mut().find(|(candidate, ..)| *candidate == key) {
-        *existing = combine(*existing, value);
-    } else {
-        merged.push((key, event.clone(), value));
-    }
+/// Device state the queue and every command buffer also need. Held behind one `Rc` so creating a
+/// command buffer threads a single handle instead of a dozen.
+pub(crate) struct MetalShared {
+    pub(crate) device: Retained<ProtocolObject<dyn MTLDevice>>,
+    pub(crate) residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    /// Set when the residency set gains or loses an allocation; committed at the next submit.
+    pub(crate) residency_dirty: Cell<bool>,
+    /// Texture views live here alongside textures; both consume `TextureId`s.
+    pub(crate) textures: TextureSlots,
+    pub(crate) samplers: SamplerSlots,
+    pub(crate) free_texture_ids: RefCell<Vec<TextureId>>,
+    pub(crate) free_sampler_ids: RefCell<Vec<SamplerId>>,
+    /// Buffer allocations keyed by GPU base address, so blit copies and indirect draws resolve an
+    /// address to its `MTLBuffer` in O(log n) rather than by scanning.
+    pub(crate) allocations: RefCell<BTreeMap<u64, BufferAllocation>>,
+    /// `gpuResourceID`s indexed by TextureId/SamplerId, bound at argument-table slots 1 and 2.
+    pub(crate) texture_heap: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) sampler_heap: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
-
-fn finish_merged_events(merged: MergedEvents) -> MetalEventWaits {
-    merged
-        .into_iter()
-        .map(|(_, event, value)| (event, value))
-        .collect()
-}
-type RetiredResources = Rc<RefCell<VecDeque<(u64, MetalRetiredResource)>>>;
-type PendingRetiredResources = Rc<RefCell<Vec<MetalRetiredResource>>>;
-type SharedPendingRetirementWork = Rc<Cell<bool>>;
-pub(crate) type SharedActiveRecordings = Rc<Cell<usize>>;
 
 pub(crate) enum MetalRetiredResource {
     Buffer(MetalBuffer),
@@ -144,21 +130,13 @@ fn resolve_mapped_pointer(
 }
 
 pub struct MetalDevice {
-    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    shared: Rc<MetalShared>,
+    /// `MTL4Compiler` owns a compilation context, so it is built once rather than per PSO.
+    compiler: Retained<ProtocolObject<dyn MTL4Compiler>>,
     buffer_pool: SharedMetalBufferPool,
     rhi_queue: Queue,
-    residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
-    residency_dirty: Rc<Cell<bool>>,
-    textures: SharedTextures,
     texture_view_flags: RefCell<Vec<bool>>,
-    free_texture_ids: SharedTextureFreeIds,
-    samplers: SharedSamplers,
-    free_sampler_ids: SharedSamplerFreeIds,
-    texture_generation: SharedBindlessGeneration,
-    sampler_generation: SharedBindlessGeneration,
-    allocations: SharedAllocations,
     mapped_allocations: SharedMappedAllocations,
-    active_recordings: SharedActiveRecordings,
     /// Per-frame fence values for swapchain acquisition.
     frame_fence_values: FrameFenceValues,
     /// Shared event for per-frame synchronization.
@@ -169,34 +147,16 @@ pub struct MetalDevice {
     bindless_mode: BindlessMode,
     /// Monotonic counter for AccelerationStructureId assignment.
     accel_counter: RefCell<u32>,
-    mdi_icb_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 pub struct MetalQueue {
     queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
-    #[allow(dead_code)]
-    device: Retained<ProtocolObject<dyn MTLDevice>>,
-    residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
-    residency_dirty: Rc<Cell<bool>>,
+    shared: Rc<MetalShared>,
     frame_fence_values: FrameFenceValues,
     frame_fence_next: Rc<Cell<u64>>,
     frame_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     in_flight_frame_commands: InFlightFrameCommands,
     pending_submissions: PendingSubmissions,
-    retired_resources: RetiredResources,
-    pending_retired_resources: PendingRetiredResources,
-    pending_retirement_work: SharedPendingRetirementWork,
-    active_recordings: SharedActiveRecordings,
-    last_submission_value: Cell<Option<u64>>,
-    free_texture_ids: SharedTextureFreeIds,
-    free_sampler_ids: SharedSamplerFreeIds,
-    value_sync: ValueSyncMap,
-}
-
-#[derive(Clone)]
-struct MetalValueSyncState {
-    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
-    scheduled_value: u64,
 }
 
 impl MetalQueue {
@@ -204,198 +164,36 @@ impl MetalQueue {
         self.submit_with_desc(cmd, &SubmitDesc::default())
     }
 
-    pub(crate) fn retire_resource(&self, resource: MetalRetiredResource) {
-        self.pending_retired_resources.borrow_mut().push(resource);
-        self.pending_retirement_work.set(true);
-    }
-
-    fn schedule_pending_retirements(&self) {
-        if !self.pending_retirement_work.get() || self.active_recordings.get() != 0 {
-            return;
-        }
-        let pending = std::mem::take(&mut *self.pending_retired_resources.borrow_mut());
-        self.pending_retirement_work.set(false);
-        if let Some(retire_value) = self.last_submission_value.get() {
-            self.retired_resources
-                .borrow_mut()
-                .extend(pending.into_iter().map(|resource| (retire_value, resource)));
-        } else {
-            for resource in pending {
-                self.release_retired_resource(resource);
-            }
-        }
-    }
-
-    fn release_retired_resource(&self, resource: MetalRetiredResource) {
+    /// Release a resource's storage immediately. The caller guarantees the GPU is done with it
+    /// (see `Device::destroy_buffer`); the freed slot is reusable by the next create.
+    pub(crate) fn release_resource(&self, resource: MetalRetiredResource) {
         match &resource {
             MetalRetiredResource::Buffer(buffer) => {
-                let allocation = unsafe {
-                    &*(buffer.buffer.as_ref() as *const ProtocolObject<dyn MTLBuffer>
-                        as *const ProtocolObject<dyn MTLAllocation>)
-                };
-                self.residency_set.removeAllocation(allocation);
-                self.residency_dirty.set(true);
+                self.shared
+                    .residency_set
+                    .removeAllocation(as_allocation(&buffer.buffer));
+                self.shared.residency_dirty.set(true);
             }
             MetalRetiredResource::Texture { texture, .. } => {
-                let allocation = unsafe {
-                    &*(texture.as_ref() as *const ProtocolObject<dyn MTLTexture>
-                        as *const ProtocolObject<dyn MTLAllocation>)
-                };
-                self.residency_set.removeAllocation(allocation);
-                self.residency_dirty.set(true);
+                self.shared
+                    .residency_set
+                    .removeAllocation(as_allocation(texture));
+                self.shared.residency_dirty.set(true);
             }
-            // Sampler states are not MTLResource/MTLAllocation objects and do not belong in the
-            // residency set. Retain them until the fence completes, then ARC releases them.
+            // Samplers aren't MTLAllocations, so they never entered the residency set.
             MetalRetiredResource::Sampler { sampler, .. } => {
                 let _ = sampler;
             }
         }
         match resource {
             MetalRetiredResource::Texture { id, .. } => {
-                self.free_texture_ids.borrow_mut().push(id);
+                self.shared.free_texture_ids.borrow_mut().push(id);
             }
             MetalRetiredResource::Sampler { id, .. } => {
-                self.free_sampler_ids.borrow_mut().push(id);
+                self.shared.free_sampler_ids.borrow_mut().push(id);
             }
             MetalRetiredResource::Buffer(buffer) => buffer.release_to_pool(),
         }
-    }
-
-    fn reclaim_retired_resources(&self) {
-        let completed = self.frame_event.signaledValue();
-        let mut ready = SmallVec::<[MetalRetiredResource; 4]>::new();
-        {
-            let mut retired = self.retired_resources.borrow_mut();
-            while retired
-                .front()
-                .is_some_and(|(value, _)| *value <= completed)
-            {
-                ready.push(
-                    retired
-                        .pop_front()
-                        .expect("retired resource queue front disappeared")
-                        .1,
-                );
-            }
-        }
-        for resource in ready {
-            self.release_retired_resource(resource);
-        }
-        if self
-            .last_submission_value
-            .get()
-            .is_some_and(|value| value <= completed)
-        {
-            self.last_submission_value.set(None);
-        }
-    }
-
-    fn ensure_value_sync_state<'a>(
-        &self,
-        value_ptr: GpuAddress,
-        map: &'a mut HashMap<u64, MetalValueSyncState>,
-    ) -> RhiResult<&'a mut MetalValueSyncState> {
-        let key = value_ptr.0;
-        match map.entry(key) {
-            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let event = self.device.newSharedEvent().ok_or_else(|| {
-                    RhiError::SyncError(format!(
-                        "Failed to create Metal value event for {:#x}",
-                        key
-                    ))
-                })?;
-                event.setSignaledValue(0);
-                Ok(entry.insert(MetalValueSyncState {
-                    event,
-                    scheduled_value: 0,
-                }))
-            }
-        }
-    }
-
-    fn collect_value_waits(&self, waits: &[WaitValueDesc]) -> RhiResult<MetalEventWaits> {
-        if waits.is_empty() {
-            return Ok(SmallVec::new());
-        }
-        let mut map = self.value_sync.borrow_mut();
-        let mut merged = MergedEvents::new();
-        for wait in waits {
-            let state = self.ensure_value_sync_state(wait.value_ptr, &mut map)?;
-            let required = match wait.wait_op {
-                WaitOp::GreaterOrEqual => wait.value,
-                WaitOp::Equal => {
-                    if wait.value < state.scheduled_value {
-                        return Err(RhiError::SyncError(format!(
-                            "Metal wait_before_value(Equal) on {:#x} requested {}, but value already advanced to {}",
-                            wait.value_ptr.0, wait.value, state.scheduled_value
-                        )));
-                    }
-                    wait.value
-                }
-                WaitOp::MaskedEqual => {
-                    if wait.mask == u64::MAX {
-                        if wait.value < state.scheduled_value {
-                            return Err(RhiError::SyncError(format!(
-                                "Metal wait_before_value(MaskedEqual full-mask) on {:#x} requested {}, but value already advanced to {}",
-                                wait.value_ptr.0, wait.value, state.scheduled_value
-                            )));
-                        }
-                        wait.value
-                    } else {
-                        let masked_current = state.scheduled_value & wait.mask;
-                        let masked_target = wait.value & wait.mask;
-                        if masked_current != masked_target {
-                            return Err(RhiError::SyncError(format!(
-                                "Metal wait_before_value(MaskedEqual) for {:#x} cannot be represented with queue event wait: current masked value {:#x} != target {:#x}",
-                                wait.value_ptr.0, masked_current, masked_target
-                            )));
-                        }
-                        state.scheduled_value
-                    }
-                }
-            };
-            state.scheduled_value = state.scheduled_value.max(required);
-            merge_event(
-                &mut merged,
-                wait.value_ptr.0,
-                &state.event,
-                required,
-                u64::max,
-            );
-        }
-        Ok(finish_merged_events(merged))
-    }
-
-    fn collect_value_signals(&self, signals: &[SignalValueDesc]) -> RhiResult<MetalEventWaits> {
-        if signals.is_empty() {
-            return Ok(SmallVec::new());
-        }
-        let mut map = self.value_sync.borrow_mut();
-        let mut merged = MergedEvents::new();
-        for signal in signals {
-            let state = self.ensure_value_sync_state(signal.value_ptr, &mut map)?;
-            let target = match signal.signal_op {
-                SignalOp::AtomicSet => signal.value,
-                SignalOp::AtomicMax => signal.value.max(state.scheduled_value),
-                SignalOp::AtomicOr => state.scheduled_value | signal.value,
-            };
-            if target < state.scheduled_value {
-                return Err(RhiError::SyncError(format!(
-                    "Metal signal_after_value would decrease {:#x} from {} to {}",
-                    signal.value_ptr.0, state.scheduled_value, target
-                )));
-            }
-            state.scheduled_value = target;
-            merge_event(
-                &mut merged,
-                signal.value_ptr.0,
-                &state.event,
-                target,
-                |_, latest| latest,
-            );
-        }
-        Ok(finish_merged_events(merged))
     }
 
     pub fn submit_with_desc(
@@ -410,10 +208,8 @@ impl MetalQueue {
                 ));
             }
         }
-        let value_waits = self.collect_value_waits(&cmd.pending_value_waits)?;
-        let value_signals = self.collect_value_signals(&cmd.pending_value_signals)?;
-        if self.residency_dirty.replace(false) {
-            self.residency_set.commit();
+        if self.shared.residency_dirty.replace(false) {
+            self.shared.residency_set.commit();
         }
         self.reclaim_completed_submissions();
 
@@ -430,10 +226,6 @@ impl MetalQueue {
                     ));
                 }
             }
-        }
-        for (event, value) in value_waits {
-            self.queue
-                .waitForEvent_value(shared_event_as_event(&event), value);
         }
 
         let mut cmd = cmd;
@@ -454,20 +246,13 @@ impl MetalQueue {
                 }
             }
         }
-        for (event, value) in value_signals {
-            self.queue
-                .signalEvent_value(shared_event_as_event(&event), value);
-        }
 
         let value = self.next_fence_value();
         self.queue
             .signalEvent_value(shared_event_as_event(&self.frame_event), value);
-        cmd.resolve_recording();
         self.pending_submissions
             .borrow_mut()
             .push_back((value, cmd));
-        self.last_submission_value.set(Some(value));
-        self.schedule_pending_retirements();
         Ok(())
     }
 
@@ -485,17 +270,10 @@ impl MetalQueue {
                 "invalid frame index for Metal queue submission".into(),
             ));
         }
-        let value_waits = self.collect_value_waits(&cmd.pending_value_waits)?;
-        let value_signals = self.collect_value_signals(&cmd.pending_value_signals)?;
-        if self.residency_dirty.replace(false) {
-            self.residency_set.commit();
+        if self.shared.residency_dirty.replace(false) {
+            self.shared.residency_set.commit();
         }
         self.reclaim_completed_submissions();
-
-        for (event, value) in value_waits {
-            self.queue
-                .waitForEvent_value(shared_event_as_event(&event), value);
-        }
 
         // Taken during recording, so the queue-side wait is enqueued here — still before the
         // commit that renders into it. A frame that never touched the swapchain skips this.
@@ -508,16 +286,10 @@ impl MetalQueue {
         cmd.finish();
         self.commit_single(&cmd.command_buffer);
 
-        for (event, value) in value_signals {
-            self.queue
-                .signalEvent_value(shared_event_as_event(&event), value);
-        }
-
         let value = self.next_fence_value();
         self.frame_fence_values.borrow_mut()[frame_index] = value;
         self.queue
             .signalEvent_value(shared_event_as_event(&self.frame_event), value);
-        cmd.resolve_recording();
 
         if let Some(drawable) = drawable {
             self.queue.signalDrawable(&drawable);
@@ -530,8 +302,6 @@ impl MetalQueue {
             log::warn!("Overwriting in-flight Metal frame command before completion");
         }
         frame_cmds[frame_index] = Some(cmd);
-        self.last_submission_value.set(Some(value));
-        self.schedule_pending_retirements();
 
         Ok(())
     }
@@ -572,8 +342,6 @@ impl MetalQueue {
         let value = self.next_fence_value();
         self.queue
             .signalEvent_value(shared_event_as_event(&self.frame_event), value);
-        self.last_submission_value.set(Some(value));
-        self.schedule_pending_retirements();
         let _ = self
             .frame_event
             .waitUntilSignaledValue_timeoutMS(value, u64::MAX);
@@ -581,7 +349,6 @@ impl MetalQueue {
         for slot in self.in_flight_frame_commands.borrow_mut().iter_mut() {
             *slot = None;
         }
-        self.reclaim_retired_resources();
     }
 
     fn next_fence_value(&self) -> u64 {
@@ -601,7 +368,6 @@ impl MetalQueue {
                 .pop_front()
                 .expect("pending submission queue front disappeared");
         }
-        self.reclaim_retired_resources();
     }
 
     fn commit_single(&self, cmd: &Retained<ProtocolObject<dyn MTL4CommandBuffer>>) {
@@ -615,68 +381,6 @@ impl MetalQueue {
     }
 }
 
-const METAL_MDI_ICB_SOURCE: &str = r#"
-#include <metal_stdlib>
-#include <metal_command_buffer>
-using namespace metal;
-
-struct RhiDrawIndirectMultiArgs {
-    uint vertex_count;
-    uint instance_count;
-    uint first_vertex;
-    uint first_instance;
-};
-
-struct RhiIcbRange {
-    uint location;
-    uint length;
-};
-
-// MSL exposes `command_buffer` through an argument buffer; slot 3 carries its resource ID.
-struct RhiIcbContainer {
-    command_buffer cmd [[id(0)]];
-};
-
-static inline primitive_type rhi_primitive_type(uint id) {
-    switch (id) {
-        case 0: return primitive_type::point;
-        case 1: return primitive_type::line;
-        case 2: return primitive_type::line_strip;
-        case 4: return primitive_type::triangle_strip;
-        default: return primitive_type::triangle;
-    }
-}
-
-kernel void rhi_encode_mdi_icb(
-    device const RhiDrawIndirectMultiArgs* draws [[buffer(0)]],
-    device atomic_uint* drawCount [[buffer(1)]],
-    device RhiIcbRange* range [[buffer(2)]],
-    device const RhiIcbContainer& icb_container [[buffer(3)]],
-    constant uint& maxDrawCount [[buffer(4)]],
-    constant uint& primitiveType [[buffer(5)]],
-    uint tid [[thread_position_in_grid]])
-{
-    uint count = min(atomic_load_explicit(drawCount, memory_order_relaxed), maxDrawCount);
-    if (tid == 0) {
-        range->location = 0;
-        range->length = count;
-    }
-    if (tid >= count) {
-        return;
-    }
-
-    RhiDrawIndirectMultiArgs draw = draws[tid];
-
-    render_command cmd(icb_container.cmd, tid);
-    cmd.draw_primitives(
-        rhi_primitive_type(primitiveType),
-        draw.first_vertex,
-        draw.vertex_count,
-        draw.instance_count,
-        draw.first_instance);
-}
-"#;
-
 /// Translate the unified `Cull` value into Metal's `(cull_mode, front-face winding)` pair.
 /// All variants imply CCW as the front-face convention. `Cull::All` is approximated as
 /// Back + CW since Metal has no FRONT_AND_BACK cull mode.
@@ -687,32 +391,6 @@ fn cull_to_mtl(cull: Cull) -> (MTLCullMode, MTLWinding) {
         Cull::Ccw => (MTLCullMode::Front, MTLWinding::CounterClockwise),
         Cull::All => (MTLCullMode::Back, MTLWinding::Clockwise),
     }
-}
-
-fn create_mdi_icb_pipeline(
-    device: &ProtocolObject<dyn MTLDevice>,
-) -> RhiResult<Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
-    let options = MTLCompileOptions::new();
-    options.setLanguageVersion(MTLLanguageVersion::Version4_0);
-    let source = NSString::from_str(METAL_MDI_ICB_SOURCE);
-    let library = device
-        .newLibraryWithSource_options_error(&source, Some(&options))
-        .map_err(|e| {
-            RhiError::PipelineCreation(format!(
-                "Metal MDI ICB encoder library compilation failed: {e}"
-            ))
-        })?;
-    let function_name = NSString::from_str("rhi_encode_mdi_icb");
-    let function = library.newFunctionWithName(&function_name).ok_or_else(|| {
-        RhiError::PipelineCreation("Metal MDI ICB encoder function was not found".into())
-    })?;
-    device
-        .newComputePipelineStateWithFunction_error(&function)
-        .map_err(|e| {
-            RhiError::PipelineCreation(format!(
-                "Metal MDI ICB encoder pipeline creation failed: {e}"
-            ))
-        })
 }
 
 impl MetalDevice {
@@ -749,35 +427,7 @@ impl MetalDevice {
                 .collect(),
         ));
         let pending_submissions: PendingSubmissions = Rc::new(RefCell::new(VecDeque::new()));
-        let free_texture_ids = Rc::new(RefCell::new(Vec::new()));
-        let free_sampler_ids = Rc::new(RefCell::new(Vec::new()));
-        let active_recordings = Rc::new(Cell::new(0));
-
-        let residency_dirty = Rc::new(Cell::new(false));
         let frame_table_slots = Rc::new(RefCell::new(vec![None; MAX_FRAMES_IN_FLIGHT]));
-        let metal_queue = MetalQueue {
-            queue: queue.clone(),
-            device: device.clone(),
-            residency_set: residency_set.clone(),
-            residency_dirty: residency_dirty.clone(),
-            frame_fence_values: frame_fence_values.clone(),
-            frame_fence_next,
-            frame_event: frame_event.clone(),
-            in_flight_frame_commands,
-            pending_submissions,
-            retired_resources: Rc::new(RefCell::new(VecDeque::new())),
-            pending_retired_resources: Rc::new(RefCell::new(Vec::new())),
-            pending_retirement_work: Rc::new(Cell::new(false)),
-            active_recordings: active_recordings.clone(),
-            last_submission_value: Cell::new(None),
-            free_texture_ids: free_texture_ids.clone(),
-            free_sampler_ids: free_sampler_ids.clone(),
-            value_sync: RefCell::new(HashMap::new()),
-        };
-
-        let rhi_queue = Queue {
-            inner: QueueInner::Metal(Box::new(metal_queue)),
-        };
 
         log::info!("Metal device created: {}", device.name());
 
@@ -787,31 +437,71 @@ impl MetalDevice {
             ));
         }
         let bindless_mode = BindlessMode::ArgumentTable;
-        let mdi_icb = create_mdi_icb_pipeline(device.as_ref())?;
+
+        let create_heap = |len: usize, label: &str| {
+            let heap = device
+                .newBufferWithLength_options(
+                    len * std::mem::size_of::<u64>(),
+                    objc2_metal::MTLResourceOptions::StorageModeShared,
+                )
+                .ok_or_else(|| {
+                    RhiError::DeviceCreation(format!("Failed to allocate Metal {label} heap"))
+                })?;
+            {
+                use objc2_metal::MTLResource;
+                heap.setLabel(Some(&NSString::from_str(label)));
+            }
+            residency_set.addAllocation(as_allocation(&heap));
+            Ok::<_, RhiError>(heap)
+        };
+        let texture_heap = create_heap(METAL_BINDLESS_TEXTURE_CAPACITY, "bindless-texture-heap")?;
+        let sampler_heap = create_heap(METAL_BINDLESS_SAMPLER_CAPACITY, "bindless-sampler-heap")?;
+
+        let shared = Rc::new(MetalShared {
+            device: device.clone(),
+            residency_set,
+            residency_dirty: Cell::new(true),
+            textures: RefCell::new(Vec::new()),
+            samplers: RefCell::new(Vec::new()),
+            free_texture_ids: RefCell::new(Vec::new()),
+            free_sampler_ids: RefCell::new(Vec::new()),
+            allocations: RefCell::new(BTreeMap::new()),
+            texture_heap,
+            sampler_heap,
+        });
+
+        let rhi_queue = Queue {
+            inner: QueueInner::Metal(Box::new(MetalQueue {
+                queue: queue.clone(),
+                shared: shared.clone(),
+                frame_fence_values: frame_fence_values.clone(),
+                frame_fence_next,
+                frame_event: frame_event.clone(),
+                in_flight_frame_commands,
+                pending_submissions,
+            })),
+        };
+
+        let compiler_desc = MTL4CompilerDescriptor::new();
+        let compiler = device
+            .newCompilerWithDescriptor_error(&compiler_desc)
+            .map_err(|e| {
+                RhiError::DeviceCreation(format!("Metal MTL4 compiler creation failed: {e}"))
+            })?;
 
         let device = Self {
-            device,
+            shared,
+            compiler,
             buffer_pool,
             rhi_queue,
-            residency_set,
-            residency_dirty,
-            textures: Rc::new(RefCell::new(Vec::new())),
             texture_view_flags: RefCell::new(Vec::new()),
-            free_texture_ids,
-            samplers: Rc::new(RefCell::new(Vec::new())),
-            free_sampler_ids,
-            texture_generation: Rc::new(Cell::new(1)),
-            sampler_generation: Rc::new(Cell::new(1)),
-            allocations: Rc::new(RefCell::new(BTreeMap::new())),
             mapped_allocations: Rc::new(RefCell::new(BTreeMap::new())),
-            active_recordings,
             frame_fence_values,
             frame_event,
             frame_table_slots,
             table_slot_pool: Rc::new(RefCell::new(Vec::new())),
             bindless_mode,
             accel_counter: RefCell::new(0),
-            mdi_icb_pipeline: mdi_icb,
         };
 
         Ok(device)
@@ -826,12 +516,8 @@ impl MetalDevice {
     }
 
     pub fn wait_idle(&self) {
-        match &self.rhi_queue.inner {
-            QueueInner::Metal(q) => q.wait_idle(),
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
-        }
-        // Heaps are only handed back here, never on the retire path, so this cannot land
+        backend_expect!(&self.rhi_queue.inner, QueueInner::Metal).wait_idle();
+        // Heaps are only handed back here, never on the destroy path, so this cannot land
         // mid-frame. The queue is idle already.
         self.buffer_pool.borrow_mut().trim();
     }
@@ -868,9 +554,10 @@ impl MetalDevice {
                 let ns_view = handle.ns_view.as_ptr() as *mut AnyObject;
 
                 let layer = CAMetalLayer::new();
-                layer.setDevice(Some(&self.device));
+                layer.setDevice(Some(&self.shared.device));
                 layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm_sRGB);
                 layer.setFramebufferOnly(true);
+                layer.setOpaque(true);
 
                 let _: () = msg_send![ns_view, setWantsLayer: Bool::YES];
                 let layer_ptr: *mut AnyObject = objc2::rc::Retained::as_ptr(&layer) as *mut _;
@@ -900,6 +587,12 @@ impl MetalDevice {
             #[allow(unreachable_patterns)]
             _ => unreachable!("wrong backend"),
         };
+
+        // Drawables live in the layer's own residency set; adding it to the queue is what makes
+        // them resident. The layer outlives every swapchain built from it, so this happens once.
+        backend_expect!(&self.rhi_queue.inner, QueueInner::Metal)
+            .queue
+            .addResidencySet(&layer.residencySet());
 
         let mtl_format = format_to_mtl(desc.format);
         layer.setPixelFormat(mtl_format);
@@ -955,12 +648,10 @@ impl MetalDevice {
             MetalBufferPool::allocate_shared(&self.buffer_pool, length, desc.memory)?;
 
         // Track the texture for Metal 4 residency.
-        let allocation = unsafe {
-            &*(metal_buffer.buffer.as_ref() as *const ProtocolObject<dyn MTLBuffer>
-                as *const ProtocolObject<dyn MTLAllocation>)
-        };
-        self.residency_set.addAllocation(allocation);
-        self.residency_dirty.set(true);
+        self.shared
+            .residency_set
+            .addAllocation(as_allocation(&metal_buffer.buffer));
+        self.shared.residency_dirty.set(true);
 
         if let Some(label) = &desc.label {
             use objc2_metal::MTLResource;
@@ -969,7 +660,7 @@ impl MetalDevice {
         }
 
         {
-            let mut allocations = self.allocations.borrow_mut();
+            let mut allocations = self.shared.allocations.borrow_mut();
             allocations.insert(
                 metal_buffer.gpu_address().0,
                 BufferAllocation {
@@ -1058,7 +749,10 @@ impl MetalDevice {
 
     pub fn texture_size_align(&self, desc: &TextureDesc) -> RhiResult<TextureSizeAlign> {
         let mtl_desc = self.build_texture_descriptor(desc);
-        let size_align = self.device.heapTextureSizeAndAlignWithDescriptor(&mtl_desc);
+        let size_align = self
+            .shared
+            .device
+            .heapTextureSizeAndAlignWithDescriptor(&mtl_desc);
         Ok(TextureSizeAlign {
             size: size_align.size as u64,
             align: size_align.align as u64,
@@ -1066,27 +760,38 @@ impl MetalDevice {
     }
 
     fn allocate_texture_id(&self) -> RhiResult<TextureId> {
-        if let Some(id) = self.free_texture_ids.borrow_mut().pop() {
+        if let Some(id) = self.shared.free_texture_ids.borrow_mut().pop() {
             return Ok(id);
         }
-        let next = self.textures.borrow().len();
-        if next > u32::MAX as usize {
+        let next = self.shared.textures.borrow().len();
+        if next >= METAL_BINDLESS_TEXTURE_CAPACITY {
             return Err(RhiError::TextureCreation(
-                "Metal texture ID space exhausted".into(),
+                "Metal bindless texture heap exhausted".into(),
             ));
         }
         Ok(TextureId(next as u32))
     }
 
     fn allocate_sampler_id(&self) -> RhiResult<SamplerId> {
-        if let Some(id) = self.free_sampler_ids.borrow_mut().pop() {
+        if let Some(id) = self.shared.free_sampler_ids.borrow_mut().pop() {
             return Ok(id);
         }
-        let next = self.samplers.borrow().len();
-        if next > u32::MAX as usize {
-            return Err(RhiError::Backend("Metal sampler ID space exhausted".into()));
+        let next = self.shared.samplers.borrow().len();
+        if next >= METAL_BINDLESS_SAMPLER_CAPACITY {
+            return Err(RhiError::Backend(
+                "Metal bindless sampler heap exhausted".into(),
+            ));
         }
         Ok(SamplerId(next as u32))
+    }
+
+    /// Write `resource_id` into a bindless heap slot. Destroyed resources leave their slot stale
+    /// rather than zeroed; an in-flight frame may still legitimately read it.
+    fn write_heap_slot(heap: &ProtocolObject<dyn MTLBuffer>, index: usize, resource_id: u64) {
+        unsafe {
+            let base = heap.contents().as_ptr() as *mut u64;
+            base.add(index).write(resource_id);
+        }
     }
 
     pub fn create_texture(
@@ -1101,9 +806,12 @@ impl MetalDevice {
         }
 
         let mtl_desc = self.build_texture_descriptor(desc);
-        let size_align = self.device.heapTextureSizeAndAlignWithDescriptor(&mtl_desc);
+        let size_align = self
+            .shared
+            .device
+            .heapTextureSizeAndAlignWithDescriptor(&mtl_desc);
         let (heap, heap_offset) = {
-            let allocations = self.allocations.borrow();
+            let allocations = self.shared.allocations.borrow();
             let alloc = allocations
                 .range(..=texture_gpu.0)
                 .next_back()
@@ -1141,12 +849,10 @@ impl MetalDevice {
                 })?;
 
         // Track the buffer for Metal 4 residency.
-        let allocation = unsafe {
-            &*(texture.as_ref() as *const ProtocolObject<dyn MTLTexture>
-                as *const ProtocolObject<dyn MTLAllocation>)
-        };
-        self.residency_set.addAllocation(allocation);
-        self.residency_dirty.set(true);
+        self.shared
+            .residency_set
+            .addAllocation(as_allocation(&texture));
+        self.shared.residency_dirty.set(true);
 
         if let Some(label) = &desc.label {
             use objc2_metal::MTLResource;
@@ -1156,7 +862,7 @@ impl MetalDevice {
 
         let id = self.allocate_texture_id()?;
         let idx = id.0 as usize;
-        let mut textures = self.textures.borrow_mut();
+        let mut textures = self.shared.textures.borrow_mut();
         if textures.len() <= idx {
             textures.resize_with(idx + 1, || None);
         }
@@ -1167,8 +873,11 @@ impl MetalDevice {
             view_flags.resize(idx + 1, false);
         }
         view_flags[idx] = false;
-        self.texture_generation
-            .set(self.texture_generation.get().wrapping_add(1));
+        Self::write_heap_slot(
+            &self.shared.texture_heap,
+            idx,
+            texture.gpuResourceID().to_raw(),
+        );
 
         Ok(Texture {
             id,
@@ -1199,20 +908,24 @@ impl MetalDevice {
         mtl_desc.setSupportArgumentBuffers(true);
 
         let sampler = self
+            .shared
             .device
             .newSamplerStateWithDescriptor(&mtl_desc)
             .ok_or_else(|| RhiError::Backend("Failed to create Metal sampler".into()))?;
 
         let id = self.allocate_sampler_id()?;
         let idx = id.0 as usize;
-        let mut samplers = self.samplers.borrow_mut();
+        let mut samplers = self.shared.samplers.borrow_mut();
         if samplers.len() <= idx {
             samplers.resize_with(idx + 1, || None);
         }
         samplers[idx] = Some(sampler.clone());
         drop(samplers);
-        self.sampler_generation
-            .set(self.sampler_generation.get().wrapping_add(1));
+        Self::write_heap_slot(
+            &self.shared.sampler_heap,
+            idx,
+            sampler.gpuResourceID().to_raw(),
+        );
 
         Ok(Sampler { id })
     }
@@ -1226,6 +939,7 @@ impl MetalDevice {
         };
 
         let library = self
+            .shared
             .device
             .newLibraryWithData_error(&dispatch_data)
             .map_err(|e| {
@@ -1247,14 +961,6 @@ impl MetalDevice {
         vert_module: &MetalShaderModule,
         frag_module: &MetalShaderModule,
     ) -> RhiResult<GraphicsPso> {
-        let compiler_desc = MTL4CompilerDescriptor::new();
-        let compiler = self
-            .device
-            .newCompilerWithDescriptor_error(&compiler_desc)
-            .map_err(|e| {
-                RhiError::PipelineCreation(format!("Metal MTL4 compiler creation failed: {e}"))
-            })?;
-
         let mut color_formats = Vec::with_capacity(desc.color_targets.len());
         let mut color_write_masks = Vec::with_capacity(desc.color_targets.len());
         for target in &desc.color_targets {
@@ -1270,9 +976,9 @@ impl MetalDevice {
             SampleCount::S16 => 16,
         };
 
-        let initial_blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
+        let blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
         let pipeline_state = MetalGraphicsPso::compile_pipeline_state(
-            compiler.as_ref(),
+            self.compiler.as_ref(),
             vert_module.library.as_ref(),
             &vert_module.entry_point,
             frag_module.library.as_ref(),
@@ -1281,30 +987,9 @@ impl MetalDevice {
             &color_write_masks,
             sample_count,
             desc.alpha_to_coverage,
-            &initial_blend,
+            &blend,
+            desc.label.as_deref(),
         )?;
-
-        let graphics_argument_buffer_slots = pipeline_state
-            .reflection()
-            .map(|r| {
-                let mut slots = Vec::new();
-                let collect_slots =
-                    |bindings: &objc2_foundation::NSArray<ProtocolObject<dyn MTLBinding>>,
-                     slots: &mut Vec<usize>| {
-                        for i in 0..bindings.count() {
-                            let binding = bindings.objectAtIndexedSubscript(i);
-                            if binding.r#type() == MTLBindingType::Buffer && binding.isArgument() {
-                                slots.push(binding.index());
-                            }
-                        }
-                    };
-                collect_slots(r.vertexBindings().as_ref(), &mut slots);
-                collect_slots(r.fragmentBindings().as_ref(), &mut slots);
-                slots.sort_unstable();
-                slots.dedup();
-                slots
-            })
-            .unwrap_or_default();
 
         let (cull_mode, winding) = cull_to_mtl(desc.cull);
 
@@ -1318,25 +1003,12 @@ impl MetalDevice {
             ),
         };
 
-        let mut blend_pipelines = HashMap::new();
-        blend_pipelines.insert(initial_blend, pipeline_state.clone());
-
         Ok(GraphicsPso {
             inner: GraphicsPsoInner::Metal(Box::new(MetalGraphicsPso {
+                pipeline: pipeline_state,
                 cull_mode,
                 winding,
                 topology,
-                compiler,
-                vertex_library: vert_module.library.clone(),
-                vertex_entry_point: vert_module.entry_point.clone(),
-                fragment_library: frag_module.library.clone(),
-                fragment_entry_point: frag_module.entry_point.clone(),
-                color_formats,
-                color_write_masks,
-                sample_count,
-                alpha_to_coverage: desc.alpha_to_coverage,
-                graphics_argument_buffer_slots,
-                blend_pipelines: RefCell::new(blend_pipelines),
             })),
         })
     }
@@ -1347,25 +1019,16 @@ impl MetalDevice {
         compute_module: &MetalShaderModule,
     ) -> RhiResult<ComputePso> {
         let fn_name = NSString::from_str(&compute_module.entry_point);
-        let compiler_desc = MTL4CompilerDescriptor::new();
-        let compiler = self
-            .device
-            .newCompilerWithDescriptor_error(&compiler_desc)
-            .map_err(|e| {
-                RhiError::PipelineCreation(format!("Metal MTL4 compiler creation failed: {e}"))
-            })?;
-
         let func_desc = MTL4LibraryFunctionDescriptor::new();
         func_desc.setName(Some(&fn_name));
         func_desc.setLibrary(Some(&compute_module.library));
 
         let pipeline_desc = MTL4ComputePipelineDescriptor::new();
         pipeline_desc.setComputeFunctionDescriptor(Some(&func_desc));
-        let pipeline_options = MTL4PipelineOptions::new();
-        pipeline_options.setShaderReflection(
-            MTL4ShaderReflection::BindingInfo | MTL4ShaderReflection::BufferTypeInfo,
-        );
-        pipeline_desc.setOptions(Some(&pipeline_options));
+        if let Some(label) = desc.label.as_deref() {
+            let base: &MTL4PipelineDescriptor = pipeline_desc.as_ref();
+            base.setLabel(Some(&NSString::from_str(label)));
+        }
         if desc.threads_per_threadgroup.contains(&0) {
             return Err(RhiError::PipelineCreation(
                 "Metal compute PSO requires non-zero threads_per_threadgroup".into(),
@@ -1378,33 +1041,18 @@ impl MetalDevice {
         };
         pipeline_desc.setRequiredThreadsPerThreadgroup(tg);
 
-        let pipeline_state = compiler
+        let pipeline_state = self
+            .compiler
             .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&pipeline_desc, None)
             .map_err(|e| {
                 RhiError::PipelineCreation(format!("Metal compute PSO creation failed: {e}"))
             })?;
-        let compute_argument_buffer_slots = pipeline_state
-            .reflection()
-            .map(|r| {
-                let bindings = r.bindings();
-                let mut slots = Vec::new();
-                for i in 0..bindings.count() {
-                    let binding = bindings.objectAtIndexedSubscript(i);
-                    if binding.r#type() == MTLBindingType::Buffer && binding.isArgument() {
-                        slots.push(binding.index());
-                    }
-                }
-                slots.sort_unstable();
-                slots.dedup();
-                slots
-            })
-            .unwrap_or_default();
 
         Ok(ComputePso {
             inner: ComputePsoInner::Metal(Box::new(MetalComputePso {
                 pipeline: pipeline_state,
                 threads_per_threadgroup: desc.threads_per_threadgroup,
-                compute_argument_buffer_slots,
+                label: desc.label.clone(),
             })),
         })
     }
@@ -1417,12 +1065,6 @@ impl MetalDevice {
     ) -> RhiResult<MeshletPso> {
         use super::pipeline::MetalMeshletPso;
         use objc2_metal::MTL4MeshRenderPipelineDescriptor;
-
-        let compiler_desc = MTL4CompilerDescriptor::new();
-        let compiler = self
-            .device
-            .newCompilerWithDescriptor_error(&compiler_desc)
-            .map_err(|e| RhiError::PipelineCreation(format!("MTL4 compiler: {e}")))?;
 
         let mesh_fn_name = NSString::from_str(&mesh_module.entry_point);
         let mesh_func_desc = MTL4LibraryFunctionDescriptor::new();
@@ -1437,6 +1079,10 @@ impl MetalDevice {
         let pipeline_desc = MTL4MeshRenderPipelineDescriptor::new();
         pipeline_desc.setMeshFunctionDescriptor(Some(&mesh_func_desc));
         pipeline_desc.setFragmentFunctionDescriptor(Some(&frag_func_desc));
+        if let Some(label) = desc.label.as_deref() {
+            let base: &MTL4PipelineDescriptor = pipeline_desc.as_ref();
+            base.setLabel(Some(&NSString::from_str(label)));
+        }
 
         let sample_count = match desc.sample_count {
             SampleCount::S1 => 1,
@@ -1453,49 +1099,20 @@ impl MetalDevice {
             }
         }
 
-        let mut color_formats = Vec::with_capacity(desc.color_targets.len());
-        for target in &desc.color_targets {
-            color_formats.push(super::texture::format_to_mtl(target.format));
-        }
-
-        for (i, &fmt) in color_formats.iter().enumerate() {
+        let blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
+        for (i, target) in desc.color_targets.iter().enumerate() {
             let att = unsafe { pipeline_desc.colorAttachments().objectAtIndexedSubscript(i) };
-            att.setPixelFormat(fmt);
+            att.setPixelFormat(super::texture::format_to_mtl(target.format));
+            let mut blend_att = blend.attachments.get(i).cloned().unwrap_or_default();
+            blend_att.write_mask &= target.write_mask;
+            super::pipeline::apply_blend_to_attachment(att.as_ref(), blend_att);
         }
 
-        let pipeline_options = MTL4PipelineOptions::new();
-        pipeline_options.setShaderReflection(
-            MTL4ShaderReflection::BindingInfo | MTL4ShaderReflection::BufferTypeInfo,
-        );
-        pipeline_desc.setOptions(Some(&pipeline_options));
-
-        // Reflection supplies the bindless argument-buffer slots.
         let base_desc: &MTL4PipelineDescriptor = pipeline_desc.as_ref();
-        let default_pipeline = compiler
+        let default_pipeline = self
+            .compiler
             .newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(base_desc, None)
             .map_err(|e| RhiError::PipelineCreation(format!("Mesh PSO: {e}")))?;
-
-        let argument_buffer_slots = default_pipeline
-            .reflection()
-            .map(|r| {
-                let mut slots = Vec::new();
-                let collect_slots =
-                    |bindings: &objc2_foundation::NSArray<ProtocolObject<dyn MTLBinding>>,
-                     slots: &mut Vec<usize>| {
-                        for i in 0..bindings.count() {
-                            let binding = bindings.objectAtIndexedSubscript(i);
-                            if binding.r#type() == MTLBindingType::Buffer && binding.isArgument() {
-                                slots.push(binding.index());
-                            }
-                        }
-                    };
-                collect_slots(&r.meshBindings(), &mut slots);
-                collect_slots(&r.fragmentBindings(), &mut slots);
-                slots.sort_unstable();
-                slots.dedup();
-                slots
-            })
-            .unwrap_or_default();
 
         let (cull_mode, winding) = cull_to_mtl(desc.cull);
 
@@ -1503,7 +1120,6 @@ impl MetalDevice {
             inner: crate::pipeline::MeshletPsoInner::Metal(Box::new(MetalMeshletPso {
                 cull_mode,
                 winding,
-                argument_buffer_slots,
                 default_pipeline,
             })),
         })
@@ -1523,6 +1139,7 @@ impl MetalDevice {
         super::accel::set_accel_usage(primitive_base, desc.flags);
 
         let sizes = self
+            .shared
             .device
             .accelerationStructureSizesWithDescriptor(primitive_base);
         self.finalize_accel_structure(sizes, "BLAS")
@@ -1548,6 +1165,7 @@ impl MetalDevice {
         super::accel::set_accel_usage(instance_base, desc.flags);
 
         let sizes = self
+            .shared
             .device
             .accelerationStructureSizesWithDescriptor(instance_base);
         self.finalize_accel_structure(sizes, "TLAS")
@@ -1628,12 +1246,14 @@ impl MetalDevice {
         use objc2_metal::{MTLAccelerationStructure as _, MTLDevice, MTLResourceOptions};
 
         let accel = self
+            .shared
             .device
             .newAccelerationStructureWithSize(sizes.accelerationStructureSize)
             .ok_or_else(|| {
                 RhiError::AllocationFailed(format!("Failed to allocate Metal {label}"))
             })?;
         let scratch = self
+            .shared
             .device
             .newBufferWithLength_options(
                 sizes.buildScratchBufferSize,
@@ -1643,16 +1263,13 @@ impl MetalDevice {
                 RhiError::AllocationFailed(format!("Failed to allocate {label} scratch buffer"))
             })?;
 
-        unsafe {
-            let accel_alloc = &*(accel.as_ref()
-                as *const ProtocolObject<dyn objc2_metal::MTLAccelerationStructure>
-                as *const ProtocolObject<dyn MTLAllocation>);
-            self.residency_set.addAllocation(accel_alloc);
-            let scratch_alloc = &*(scratch.as_ref() as *const ProtocolObject<dyn MTLBuffer>
-                as *const ProtocolObject<dyn MTLAllocation>);
-            self.residency_set.addAllocation(scratch_alloc);
-        }
-        self.residency_dirty.set(true);
+        self.shared
+            .residency_set
+            .addAllocation(as_allocation(&accel));
+        self.shared
+            .residency_set
+            .addAllocation(as_allocation(&scratch));
+        self.shared.residency_dirty.set(true);
 
         let gpu_resource_id = accel.gpuResourceID().to_raw();
 
@@ -1669,8 +1286,7 @@ impl MetalDevice {
                 acceleration_structure: accel,
                 gpu_resource_id,
                 scratch_buffer: scratch,
-                residency_set: self.residency_set.clone(),
-                residency_dirty: self.residency_dirty.clone(),
+                shared: self.shared.clone(),
             })),
         })
     }
@@ -1682,19 +1298,19 @@ impl MetalDevice {
         pool: Option<SharedTableSlotPool>,
         what: &str,
     ) -> RhiResult<Rc<MetalFrameTableSlot>> {
-        let state = MetalTableState::new(
-            self.device.as_ref(),
-            self.residency_set.as_ref(),
-            &self.residency_dirty,
+        let root_table_buffer = create_root_table_buffer(
+            self.shared.device.as_ref(),
+            self.shared.residency_set.as_ref(),
+            &self.shared.residency_dirty,
         )?;
-        let command_allocator = self.device.newCommandAllocator().ok_or_else(|| {
+        let command_allocator = self.shared.device.newCommandAllocator().ok_or_else(|| {
             RhiError::CommandBuffer(format!("Failed to create {what} MTL4CommandAllocator"))
         })?;
-        let command_buffer = self.device.newCommandBuffer().ok_or_else(|| {
+        let command_buffer = self.shared.device.newCommandBuffer().ok_or_else(|| {
             RhiError::CommandBuffer(format!("Failed to create {what} MTL4CommandBuffer"))
         })?;
         Ok(Rc::new(MetalFrameTableSlot {
-            state: Rc::new(RefCell::new(state)),
+            root_table_buffer,
             command_allocator,
             command_buffer,
             argument_table: RefCell::new(None),
@@ -1748,17 +1364,8 @@ impl MetalDevice {
         let mtl_cmd = MetalCommandBuffer::new(
             slot.command_buffer.clone(),
             slot.command_allocator.clone(),
-            self.device.clone(),
-            self.residency_set.clone(),
-            self.residency_dirty.clone(),
-            self.textures.clone(),
-            self.samplers.clone(),
-            self.texture_generation.clone(),
-            self.sampler_generation.clone(),
-            self.allocations.clone(),
-            self.active_recordings.clone(),
-            Some(slot.clone()),
-            self.mdi_icb_pipeline.clone(),
+            self.shared.clone(),
+            slot.clone(),
         );
         let mtl_cmd = match mtl_cmd {
             Ok(cmd) => cmd,
@@ -1802,6 +1409,7 @@ impl MetalDevice {
 
     pub fn create_timeline_semaphore(&self, initial_value: u64) -> RhiResult<TimelineSemaphore> {
         let event = self
+            .shared
             .device
             .newSharedEvent()
             .ok_or_else(|| RhiError::SyncError("Failed to create MTLSharedEvent".into()))?;
@@ -1814,13 +1422,12 @@ impl MetalDevice {
         })
     }
 
-    #[allow(irrefutable_let_patterns)]
     pub fn destroy_buffer(&self, buffer: GpuBuffer) {
         match buffer.inner {
             #[cfg(feature = "metal")]
             GpuBufferInner::Metal(mtl) => {
                 {
-                    let mut allocations = self.allocations.borrow_mut();
+                    let mut allocations = self.shared.allocations.borrow_mut();
                     allocations.remove(&mtl.gpu_address().0);
                 }
                 if let Some(mapped_ptr) = mtl.mapped_ptr() {
@@ -1828,19 +1435,17 @@ impl MetalDevice {
                         .borrow_mut()
                         .remove(&(mapped_ptr as usize));
                 }
-                if let QueueInner::Metal(queue) = &self.rhi_queue.inner {
-                    queue.retire_resource(MetalRetiredResource::Buffer(mtl));
-                }
+                backend_expect!(&self.rhi_queue.inner, QueueInner::Metal)
+                    .release_resource(MetalRetiredResource::Buffer(mtl));
             }
             #[cfg(feature = "vulkan")]
             GpuBufferInner::Vulkan(_) => {}
         }
     }
 
-    #[allow(irrefutable_let_patterns)]
     pub fn destroy_texture(&self, texture: Texture) {
         let retired = {
-            let mut textures = self.textures.borrow_mut();
+            let mut textures = self.shared.textures.borrow_mut();
             let idx = texture.id.0 as usize;
             if idx < textures.len() {
                 textures[idx].take()
@@ -1856,18 +1461,15 @@ impl MetalDevice {
             {
                 *is_view = false;
             }
-            self.texture_generation
-                .set(self.texture_generation.get().wrapping_add(1));
-            if let QueueInner::Metal(queue) = &self.rhi_queue.inner {
-                queue.retire_resource(MetalRetiredResource::Texture {
+            backend_expect!(&self.rhi_queue.inner, QueueInner::Metal).release_resource(
+                MetalRetiredResource::Texture {
                     id: texture.id,
                     texture: tex,
-                });
-            }
+                },
+            );
         }
     }
 
-    #[allow(irrefutable_let_patterns)]
     pub fn destroy_texture_view(&self, id: TextureId) {
         // Claim the view in one borrow, mirroring the Vulkan path.
         let was_view = self
@@ -1879,24 +1481,21 @@ impl MetalDevice {
             return;
         }
         let retired = self
+            .shared
             .textures
             .borrow_mut()
             .get_mut(id.0 as usize)
             .and_then(Option::take);
         if let Some(texture) = retired {
-            self.texture_generation
-                .set(self.texture_generation.get().wrapping_add(1));
-            if let QueueInner::Metal(queue) = &self.rhi_queue.inner {
-                queue.retire_resource(MetalRetiredResource::Texture { id, texture });
-            }
+            backend_expect!(&self.rhi_queue.inner, QueueInner::Metal)
+                .release_resource(MetalRetiredResource::Texture { id, texture });
         }
     }
 
-    #[allow(irrefutable_let_patterns)]
     pub fn destroy_sampler(&self, sampler: Sampler) {
         let sampler_id = sampler.id();
         let retired = {
-            let mut samplers = self.samplers.borrow_mut();
+            let mut samplers = self.shared.samplers.borrow_mut();
             let idx = sampler_id.0 as usize;
             if idx < samplers.len() {
                 samplers[idx].take()
@@ -1905,14 +1504,12 @@ impl MetalDevice {
             }
         };
         if let Some(sampler) = retired {
-            self.sampler_generation
-                .set(self.sampler_generation.get().wrapping_add(1));
-            if let QueueInner::Metal(queue) = &self.rhi_queue.inner {
-                queue.retire_resource(MetalRetiredResource::Sampler {
+            backend_expect!(&self.rhi_queue.inner, QueueInner::Metal).release_resource(
+                MetalRetiredResource::Sampler {
                     id: sampler_id,
                     sampler,
-                });
-            }
+                },
+            );
         }
     }
 
@@ -1936,24 +1533,22 @@ impl MetalDevice {
     /// `id`. On Metal a `DescriptorHandle<Texture2D>` is the texture's `gpuResourceID`, which the
     /// shader uses directly.
     pub fn bindless_texture_handle(&self, id: TextureId) -> GpuAddress {
-        let textures = self.textures.borrow();
-        let raw = textures
+        let textures = self.shared.textures.borrow();
+        let texture = textures
             .get(id.0 as usize)
             .and_then(|t| t.as_ref())
-            .map(|t| t.gpuResourceID().to_raw())
-            .unwrap_or(0);
-        GpuAddress(raw)
+            .expect("invalid TextureId");
+        GpuAddress(texture.gpuResourceID().to_raw())
     }
 
     /// Value to store in a [`SamplerHandle`](crate::SamplerHandle) root field for sampler `id`.
     pub fn bindless_sampler_handle(&self, id: crate::types::SamplerId) -> GpuAddress {
-        let samplers = self.samplers.borrow();
-        let raw = samplers
+        let samplers = self.shared.samplers.borrow();
+        let sampler = samplers
             .get(id.0 as usize)
             .and_then(|s| s.as_ref())
-            .map(|s| s.gpuResourceID().to_raw())
-            .unwrap_or(0);
-        GpuAddress(raw)
+            .expect("invalid SamplerId");
+        GpuAddress(sampler.gpuResourceID().to_raw())
     }
 
     pub fn create_query_pool(&self, count: u32) -> RhiResult<QueryPool> {
@@ -1964,6 +1559,7 @@ impl MetalDevice {
         // SAFETY: count is the heap entry count; not bounds-checked by the API.
         unsafe { desc.setCount(count as usize) };
         let heap = self
+            .shared
             .device
             .newCounterHeapWithDescriptor_error(&desc)
             .map_err(|e| RhiError::Backend(format!("newCounterHeapWithDescriptor: {e}")))?;
@@ -1983,7 +1579,7 @@ impl MetalDevice {
     pub fn destroy_query_pool(&self, _pool: QueryPool) {}
 
     pub fn timestamp_period_ns(&self) -> f64 {
-        let freq = self.device.queryTimestampFrequency();
+        let freq = self.shared.device.queryTimestampFrequency();
         if freq == 0 { 0.0 } else { 1.0e9 / freq as f64 }
     }
 
@@ -2030,7 +1626,7 @@ impl MetalDevice {
         use crate::texture::{ALL_LAYERS, ALL_MIPS};
         use objc2_foundation::NSRange;
 
-        let textures_borrow = self.textures.borrow();
+        let textures_borrow = self.shared.textures.borrow();
         let src_texture = textures_borrow
             .get(source.id.0 as usize)
             .and_then(|t| t.as_ref())
@@ -2089,23 +1685,24 @@ impl MetalDevice {
         };
 
         // Views share the source allocation but still need residency tracking.
-        let allocation = unsafe {
-            &*(view_texture.as_ref() as *const ProtocolObject<dyn MTLTexture>
-                as *const ProtocolObject<dyn MTLAllocation>)
-        };
-        self.residency_set.addAllocation(allocation);
-        self.residency_dirty.set(true);
+        self.shared
+            .residency_set
+            .addAllocation(as_allocation(&view_texture));
+        self.shared.residency_dirty.set(true);
 
         let id = match self.allocate_texture_id() {
             Ok(id) => id,
             Err(err) => {
-                self.residency_set.removeAllocation(allocation);
-                self.residency_dirty.set(true);
+                self.shared
+                    .residency_set
+                    .removeAllocation(as_allocation(&view_texture));
+                self.shared.residency_dirty.set(true);
                 return Err(err);
             }
         };
         let idx = id.0 as usize;
-        let mut textures = self.textures.borrow_mut();
+        let resource_id = view_texture.gpuResourceID().to_raw();
+        let mut textures = self.shared.textures.borrow_mut();
         if textures.len() <= idx {
             textures.resize_with(idx + 1, || None);
         }
@@ -2116,8 +1713,7 @@ impl MetalDevice {
             view_flags.resize(idx + 1, false);
         }
         view_flags[idx] = true;
-        self.texture_generation
-            .set(self.texture_generation.get().wrapping_add(1));
+        Self::write_heap_slot(&self.shared.texture_heap, idx, resource_id);
 
         Ok(id)
     }

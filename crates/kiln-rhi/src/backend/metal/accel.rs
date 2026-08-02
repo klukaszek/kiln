@@ -1,15 +1,17 @@
-use std::cell::Cell;
 use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSArray;
+
+use super::as_allocation;
+use super::device::MetalShared;
 use objc2_metal::{
     MTL4AccelerationStructureBoundingBoxGeometryDescriptor,
     MTL4AccelerationStructureGeometryDescriptor,
     MTL4AccelerationStructureTriangleGeometryDescriptor, MTL4BufferRange, MTLAccelerationStructure,
-    MTLAccelerationStructureDescriptor, MTLAccelerationStructureUsage, MTLAllocation, MTLBuffer,
-    MTLIndexType, MTLResidencySet,
+    MTLAccelerationStructureDescriptor, MTLAccelerationStructureUsage, MTLBuffer, MTLIndexType,
+    MTLResidencySet,
 };
 
 use crate::types::{BlasDesc, BuildAccelFlags, GeometryFlags, GeometryType};
@@ -38,24 +40,18 @@ pub struct MetalAccelerationStructure {
     pub(crate) acceleration_structure: Retained<ProtocolObject<dyn MTLAccelerationStructure>>,
     pub(crate) gpu_resource_id: u64,
     pub(crate) scratch_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub(crate) residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
-    pub(crate) residency_dirty: Rc<Cell<bool>>,
+    pub(crate) shared: Rc<MetalShared>,
 }
 
 impl Drop for MetalAccelerationStructure {
     fn drop(&mut self) {
-        let accel = unsafe {
-            &*(self.acceleration_structure.as_ref()
-                as *const ProtocolObject<dyn MTLAccelerationStructure>
-                as *const ProtocolObject<dyn MTLAllocation>)
-        };
-        self.residency_set.removeAllocation(accel);
-        let scratch = unsafe {
-            &*(self.scratch_buffer.as_ref() as *const ProtocolObject<dyn MTLBuffer>
-                as *const ProtocolObject<dyn MTLAllocation>)
-        };
-        self.residency_set.removeAllocation(scratch);
-        self.residency_dirty.set(true);
+        self.shared
+            .residency_set
+            .removeAllocation(as_allocation(&self.acceleration_structure));
+        self.shared
+            .residency_set
+            .removeAllocation(as_allocation(&self.scratch_buffer));
+        self.shared.residency_dirty.set(true);
     }
 }
 

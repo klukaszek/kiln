@@ -65,11 +65,7 @@ impl Swapchain {
     /// Get the Vulkan swapchain extent for escape-hatch scenarios.
     #[cfg(feature = "vulkan")]
     pub fn vulkan_extent(&self) -> ash::vk::Extent2D {
-        match &self.inner {
-            SwapchainInner::Vulkan(sc) => sc.extent,
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
-        }
+        backend_expect!(&self.inner, SwapchainInner::Vulkan).extent
     }
 }
 

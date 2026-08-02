@@ -176,6 +176,7 @@ fn bindless_texture_sample() {
             }],
             depth_attachment: None,
             render_area: [0, 0, SIZE, SIZE],
+            label: Some("bindless texture test"),
         });
         cmd.set_graphics_pipeline(&pso);
         cmd.set_viewport(0.0, 0.0, SIZE as f32, SIZE as f32, 0.0, 1.0);

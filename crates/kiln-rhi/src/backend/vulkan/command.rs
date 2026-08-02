@@ -1,21 +1,18 @@
 use super::barrier::{to_vk_access_flags, to_vk_stage_flags};
 use super::device::{
-    SharedActiveRecordings, SharedAllocations, SharedTextures, build_accel_flags_to_vk,
-    geometry_flags_to_vk,
+    SharedAllocations, SharedTextures, build_accel_flags_to_vk, geometry_flags_to_vk,
 };
 use crate::barrier::{HazardFlags, StageFlags};
 use crate::command::{
-    DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectMultiArgs, LoadOp, RenderPassDesc,
-    RenderTarget, SignalValueDesc, StoreOp, WaitValueDesc,
+    DispatchIndirectArgs, DrawIndexedIndirectArgs, LoadOp, RenderPassDesc, RenderTarget, StoreOp,
 };
 use crate::pipeline::{
-    BlendState, ComputePso, ComputePsoInner, DepthStencilState, GraphicsPso, GraphicsPsoInner,
-    MeshletPso,
+    ComputePso, ComputePsoInner, DepthStencilState, GraphicsPso, GraphicsPsoInner, MeshletPso,
 };
 use crate::texture::{Texture, bytes_per_pixel};
 use crate::types::*;
 use ash::{
-    ext::{descriptor_buffer, mesh_shader as vk_mesh_shader},
+    ext::{debug_utils, descriptor_buffer, mesh_shader as vk_mesh_shader},
     khr::acceleration_structure as vk_accel_structure,
     vk,
 };
@@ -33,36 +30,23 @@ pub struct VulkanCommandBuffer {
     pub(crate) descriptor_buffer_loader: Option<descriptor_buffer::Device>,
     pub(crate) descriptor_buffer_binding: Option<vk::DescriptorBufferBindingInfoEXT<'static>>,
     pub(crate) push_constant_stages: vk::ShaderStageFlags,
-    pub(crate) current_blend_state: BlendState,
+    pub(crate) debug_labels: Option<debug_utils::Device>,
+    /// Set when the open pass pushed a label region for `end_render_pass` to pop.
+    pub(crate) in_labelled_pass: bool,
     pub(crate) current_depth_stencil: Option<DepthStencilState>,
     pub(crate) pending_split_barrier: Option<(StageFlags, HazardFlags)>,
-    pub(crate) pending_value_waits: SmallVec<[WaitValueDesc; 2]>,
-    pub(crate) pending_value_signals: SmallVec<[SignalValueDesc; 2]>,
     pub(crate) allocations: SharedAllocations,
     pub(crate) textures: SharedTextures,
     pub(crate) mesh_shader: Option<vk_mesh_shader::Device>,
     pub(crate) acceleration_structure: Option<vk_accel_structure::Device>,
-    pub(crate) max_draw_indirect_count: u32,
     pub(crate) rendered_swapchain_images: SmallVec<[u32; 4]>,
     pub(crate) ended: bool,
-    pub(crate) active_recordings: SharedActiveRecordings,
-    pub(crate) recording_active: bool,
 }
 
 // SAFETY: VulkanCommandBuffer is only used from one thread at a time.
 unsafe impl Send for VulkanCommandBuffer {}
 
 impl VulkanCommandBuffer {
-    pub(crate) fn resolve_recording(&mut self) {
-        if self.recording_active {
-            self.recording_active = false;
-            let previous = self
-                .active_recordings
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            debug_assert!(previous > 0);
-        }
-    }
-
     pub(crate) fn finish(&mut self) -> crate::error::RhiResult<()> {
         if self.ended {
             return Ok(());
@@ -125,21 +109,6 @@ impl VulkanCommandBuffer {
         (buffer, offset)
     }
 
-    fn resolve_buffer_with_remaining(
-        &self,
-        addr: GpuAddress,
-        min_size: u64,
-    ) -> (vk::Buffer, u64, u64) {
-        let (buffer, offset, remaining) = self.resolve_buffer_bounds(addr);
-        if min_size > remaining {
-            panic!(
-                "GPU address {:#x} size {} exceeds allocation bounds (remaining {})",
-                addr.0, min_size, remaining
-            );
-        }
-        (buffer, offset, remaining)
-    }
-
     fn resolve_texture_info(&self, id: TextureId) -> (vk::Image, vk::ImageView, vk::ImageLayout) {
         let textures = self.textures.lock().expect("textures lock poisoned");
         let tex = textures
@@ -152,6 +121,16 @@ impl VulkanCommandBuffer {
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc) {
         let cmd = self.command_buffer;
         self.current_depth_stencil = None;
+
+        // Opened before the attachment transitions so the capture attributes them to this pass.
+        self.in_labelled_pass = false;
+        if let (Some(loader), Some(label)) = (self.debug_labels.as_ref(), desc.label)
+            && let Ok(label) = std::ffi::CString::new(label)
+        {
+            let info = vk::DebugUtilsLabelEXT::default().label_name(&label);
+            unsafe { loader.cmd_begin_debug_utils_label(cmd, &info) };
+            self.in_labelled_pass = true;
+        }
 
         for ca in &desc.color_attachments {
             if let RenderTarget::SwapchainImage(idx) = ca.target {
@@ -317,29 +296,26 @@ impl VulkanCommandBuffer {
         unsafe {
             self.device.cmd_end_rendering(self.command_buffer);
         }
+        if self.in_labelled_pass
+            && let Some(loader) = self.debug_labels.as_ref()
+        {
+            unsafe { loader.cmd_end_debug_utils_label(self.command_buffer) };
+            self.in_labelled_pass = false;
+        }
     }
 
     pub fn set_graphics_pipeline(&mut self, pso: &GraphicsPso) {
-        let vk_pso = match &pso.inner {
-            GraphicsPsoInner::Vulkan(p) => p,
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
-        };
-        let pipeline = vk_pso.pipeline_for_blend(&self.current_blend_state);
+        let vk_pso = backend_expect!(&pso.inner, GraphicsPsoInner::Vulkan);
         self.bind_pipeline(
             vk::PipelineBindPoint::GRAPHICS,
-            pipeline,
+            vk_pso.pipeline,
             vk_pso.pipeline_layout,
             vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
         );
     }
 
     pub fn set_compute_pipeline(&mut self, pso: &ComputePso) {
-        let vk_pso = match &pso.inner {
-            ComputePsoInner::Vulkan(p) => p,
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
-        };
+        let vk_pso = backend_expect!(&pso.inner, ComputePsoInner::Vulkan);
         self.bind_pipeline(
             vk::PipelineBindPoint::COMPUTE,
             vk_pso.pipeline,
@@ -433,13 +409,6 @@ impl VulkanCommandBuffer {
         self.current_depth_stencil = Some(state.clone());
     }
 
-    pub fn set_blend_state(&mut self, state: &BlendState) {
-        if self.current_blend_state == *state {
-            return;
-        }
-        self.current_blend_state = state.clone();
-    }
-
     pub fn set_root_data(&mut self, root: GpuAddress) {
         let bytes = root.0.to_ne_bytes();
         unsafe {
@@ -530,37 +499,6 @@ impl VulkanCommandBuffer {
                 arg_offset,
                 1,
                 std::mem::size_of::<DrawIndexedIndirectArgs>() as u32,
-            );
-        }
-    }
-
-    pub fn draw_indirect_multi(
-        &mut self,
-        root: GpuAddress,
-        args: GpuAddress,
-        draw_count: GpuAddress,
-    ) {
-        self.set_root_data(root);
-        let stride = std::mem::size_of::<DrawIndirectMultiArgs>() as u32;
-        let (arg_buffer, arg_offset, arg_remaining) =
-            self.resolve_buffer_with_remaining(args, stride as u64);
-        let (count_buffer, count_offset) =
-            self.resolve_buffer(draw_count, std::mem::size_of::<u32>() as u64);
-        let max_draw_count =
-            (arg_remaining / stride as u64).min(self.max_draw_indirect_count as u64) as u32;
-        assert!(
-            max_draw_count > 0,
-            "draw_indirect_multi args allocation has no complete draw records"
-        );
-        unsafe {
-            self.device.cmd_draw_indirect_count(
-                self.command_buffer,
-                arg_buffer,
-                arg_offset,
-                count_buffer,
-                count_offset,
-                max_draw_count,
-                stride,
             );
         }
     }
@@ -824,16 +762,6 @@ impl VulkanCommandBuffer {
         self.barrier_with_hazard(src, dst, pending_hazard | hazard);
     }
 
-    pub fn signal_after_value(&mut self, desc: &SignalValueDesc) {
-        self.signal_after(desc.src_stage, HazardFlags::empty());
-        self.pending_value_signals.push(*desc);
-    }
-
-    pub fn wait_before_value(&mut self, desc: &WaitValueDesc) {
-        self.wait_before(desc.dst_stage, desc.hazard);
-        self.pending_value_waits.push(*desc);
-    }
-
     pub fn set_viewport(
         &mut self,
         x: f32,
@@ -918,15 +846,10 @@ impl VulkanCommandBuffer {
     }
 
     pub fn set_meshlet_pipeline(&mut self, pso: &MeshletPso) {
-        let vk_pso = match &pso.inner {
-            crate::pipeline::MeshletPsoInner::Vulkan(p) => p,
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
-        };
-        let pipeline = vk_pso.pipeline_for_blend(&self.current_blend_state);
+        let vk_pso = backend_expect!(&pso.inner, crate::pipeline::MeshletPsoInner::Vulkan);
         self.bind_pipeline(
             vk::PipelineBindPoint::GRAPHICS,
-            pipeline,
+            vk_pso.pipeline,
             vk_pso.pipeline_layout,
             vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::FRAGMENT,
         );
@@ -1105,12 +1028,6 @@ impl VulkanCommandBuffer {
             #[allow(unreachable_patterns)]
             _ => None,
         }
-    }
-}
-
-impl Drop for VulkanCommandBuffer {
-    fn drop(&mut self) {
-        self.resolve_recording();
     }
 }
 

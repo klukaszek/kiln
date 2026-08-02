@@ -13,6 +13,19 @@ macro_rules! backend_dispatch {
     };
 }
 
+/// Unwrap a backend-tagged handle to the variant the calling backend owns:
+/// `backend_expect!(&pso.inner, ComputePsoInner::Metal)`. The fallback arm exists only in
+/// multi-backend builds, where reaching it means a handle from the other backend crossed over.
+macro_rules! backend_expect {
+    ($value:expr, $variant:path) => {
+        match $value {
+            $variant(inner) => inner,
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("handle belongs to a different backend"),
+        }
+    };
+}
+
 /// Define a GPU-facing struct once, generating the `#[repr(C)]` [`GpuPod`](crate::GpuPod) Rust
 /// type and a matching Slang declaration string `Name::SLANG` to prepend to a shader — keeping
 /// the host/device layout in lockstep. Must be padding-free (add explicit tail padding where

@@ -64,6 +64,9 @@ impl Film {
             Some(existing) if self.extent == extent => existing,
             stale => {
                 if let Some(stale) = stale {
+                    // A stride change reaches here without the resize path's wait_idle, and a
+                    // previous frame may still be accumulating into the old buffer.
+                    device.wait_idle();
                     device.free(stale);
                 }
                 device.malloc(bytes, MemoryType::GpuOnly)?

@@ -7,7 +7,7 @@
 //! - Single root data pointer per draw/dispatch (no descriptor sets, no bind groups)
 //! - Global texture heap indexed by TextureId(u32)
 //! - Stage-only barriers (no per-resource state tracking)
-//! - Minimal PSO (topology + formats + MSAA baked; separate DepthStencil/Blend)
+//! - Minimal PSO (topology + formats + MSAA + blend baked; separate DepthStencil)
 //! - Transient command buffers (create, record, submit, auto-reclaim)
 //! - Timeline semaphores for frame sync
 //! - Enum dispatch for zero-cost backend selection
@@ -135,8 +135,7 @@ pub use accel::AccelerationStructure;
 pub use barrier::{HazardFlags, StageFlags};
 pub use command::{
     ColorAttachment, CommandBuffer, DepthAttachment, DispatchIndirectArgs, DrawIndexedIndirectArgs,
-    DrawIndirectArgs, DrawIndirectMultiArgs, LoadOp, RenderPassDesc, RenderTarget, SignalOp,
-    SignalValueDesc, StoreOp, WaitOp, WaitValueDesc,
+    DrawIndirectArgs, LoadOp, RenderPassDesc, RenderTarget, StoreOp,
 };
 pub use device::{Backend, BindlessMode, Device, DeviceDesc};
 pub use error::{RhiError, RhiResult};

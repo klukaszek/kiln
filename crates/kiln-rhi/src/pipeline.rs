@@ -21,9 +21,9 @@ impl ColorTarget {
 
 /// Description for creating a graphics pipeline state object.
 ///
-/// Minimal PSO — only topology, formats, MSAA, cull, and write masks baked. DepthStencil and
-/// Blend are separate flyweights (`set_depth_stencil_state` / `set_blend_state`) to minimise
-/// permutations. Shaders are passed as `&ShaderModule` args to `create_graphics_pso`, not here.
+/// Minimal PSO — topology, formats, MSAA, cull, write masks and blend baked. DepthStencil stays
+/// dynamic (`set_depth_stencil_state`); blend cannot, since both backends bake it into the
+/// hardware pipeline. Shaders are passed to `create_graphics_pso`, not here.
 #[derive(Clone, Debug)]
 pub struct GraphicsPsoDesc {
     /// Primitive topology.
@@ -42,7 +42,7 @@ pub struct GraphicsPsoDesc {
     pub stencil_format: Option<Format>,
     /// Enable dual-source blending (requires `blendstate` with two outputs).
     pub support_dual_source_blending: bool,
-    /// Pre-baked default blend state. `None` = supply per-draw via `cmd.set_blend_state(...)`.
+    /// Blend state baked into the pipeline. `None` = opaque (blending disabled).
     pub blendstate: Option<BlendState>,
     pub label: Option<String>,
 }
@@ -208,7 +208,7 @@ impl Default for BlendAttachment {
     }
 }
 
-/// Separate blend state (flyweight object).
+/// Blend state, baked into a PSO via `GraphicsPsoDesc::blendstate`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlendState {
     pub attachments: Vec<BlendAttachment>,
@@ -236,7 +236,7 @@ pub struct MeshletPsoDesc {
     pub alpha_to_coverage: bool,
     pub cull: Cull,
     pub support_dual_source_blending: bool,
-    /// Optional pre-baked blend state.
+    /// Blend state baked into the pipeline. `None` = opaque (blending disabled).
     pub blendstate: Option<BlendState>,
     pub label: Option<String>,
 }

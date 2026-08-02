@@ -1,15 +1,12 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTL4AlphaToCoverageState, MTL4BlendState, MTL4Compiler, MTL4IndirectCommandBufferSupportState,
-    MTL4LibraryFunctionDescriptor, MTL4PipelineDescriptor, MTL4PipelineOptions,
-    MTL4RenderPipelineColorAttachmentDescriptor, MTL4RenderPipelineDescriptor,
-    MTL4ShaderReflection, MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode,
-    MTLLibrary, MTLPrimitiveType, MTLRenderPipelineState, MTLWinding,
+    MTL4LibraryFunctionDescriptor, MTL4PipelineDescriptor,
+    MTL4RenderPipelineColorAttachmentDescriptor, MTL4RenderPipelineDescriptor, MTLBlendFactor,
+    MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLLibrary, MTLPrimitiveType,
+    MTLRenderPipelineState, MTLWinding,
 };
 
 use crate::error::{RhiError, RhiResult};
@@ -17,65 +14,19 @@ use crate::pipeline::{BlendAttachment, BlendState};
 use crate::types::{BlendFactor, BlendOp, ColorWriteMask};
 
 pub struct MetalGraphicsPso {
+    pub(crate) pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     pub(crate) cull_mode: MTLCullMode,
     pub(crate) winding: MTLWinding,
     pub(crate) topology: MTLPrimitiveType,
-    pub(crate) compiler: Retained<ProtocolObject<dyn MTL4Compiler>>,
-    pub(crate) vertex_library: Retained<ProtocolObject<dyn MTLLibrary>>,
-    pub(crate) vertex_entry_point: String,
-    pub(crate) fragment_library: Retained<ProtocolObject<dyn MTLLibrary>>,
-    pub(crate) fragment_entry_point: String,
-    pub(crate) color_formats: Vec<objc2_metal::MTLPixelFormat>,
-    pub(crate) color_write_masks: Vec<ColorWriteMask>,
-    pub(crate) sample_count: usize,
-    pub(crate) alpha_to_coverage: bool,
-    pub(crate) graphics_argument_buffer_slots: Vec<usize>,
-    pub(crate) blend_pipelines:
-        RefCell<HashMap<BlendState, Retained<ProtocolObject<dyn MTLRenderPipelineState>>>>,
 }
 
 pub struct MetalComputePso {
     pub(crate) pipeline: Retained<ProtocolObject<dyn objc2_metal::MTLComputePipelineState>>,
     pub(crate) threads_per_threadgroup: [u32; 3],
-    pub(crate) compute_argument_buffer_slots: Vec<usize>,
+    pub(crate) label: Option<String>,
 }
 
 impl MetalGraphicsPso {
-    /// Return the cached blend variant, compiling it when needed.
-    pub(crate) fn pipeline_for_blend(
-        &self,
-        blend: &BlendState,
-    ) -> Retained<ProtocolObject<dyn MTLRenderPipelineState>> {
-        if let Some(pso) = self.blend_pipelines.borrow().get(blend) {
-            return pso.clone();
-        }
-        let pso = self
-            .create_pipeline(blend)
-            .expect("Metal 4 graphics PSO creation failed for dynamic blend variant");
-        self.blend_pipelines
-            .borrow_mut()
-            .insert(blend.clone(), pso.clone());
-        pso
-    }
-
-    fn create_pipeline(
-        &self,
-        blend: &BlendState,
-    ) -> RhiResult<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
-        Self::compile_pipeline_state(
-            self.compiler.as_ref(),
-            self.vertex_library.as_ref(),
-            &self.vertex_entry_point,
-            self.fragment_library.as_ref(),
-            &self.fragment_entry_point,
-            &self.color_formats,
-            &self.color_write_masks,
-            self.sample_count,
-            self.alpha_to_coverage,
-            blend,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn compile_pipeline_state(
         compiler: &ProtocolObject<dyn MTL4Compiler>,
@@ -88,6 +39,7 @@ impl MetalGraphicsPso {
         sample_count: usize,
         alpha_to_coverage: bool,
         blend: &BlendState,
+        label: Option<&str>,
     ) -> RhiResult<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
         let vertex_name = NSString::from_str(vertex_entry_point);
         let fragment_name = NSString::from_str(fragment_entry_point);
@@ -103,6 +55,10 @@ impl MetalGraphicsPso {
         let pso_desc = MTL4RenderPipelineDescriptor::new();
         pso_desc.setVertexFunctionDescriptor(Some(vertex_desc.as_ref()));
         pso_desc.setFragmentFunctionDescriptor(Some(fragment_desc.as_ref()));
+        if let Some(label) = label {
+            let base: &MTL4PipelineDescriptor = pso_desc.as_ref();
+            base.setLabel(Some(&NSString::from_str(label)));
+        }
 
         let color_attachments = pso_desc.colorAttachments();
         for (i, fmt) in color_formats.iter().enumerate() {
@@ -128,12 +84,6 @@ impl MetalGraphicsPso {
         });
         pso_desc.setSupportIndirectCommandBuffers(MTL4IndirectCommandBufferSupportState::Enabled);
 
-        let options = MTL4PipelineOptions::new();
-        options.setShaderReflection(
-            MTL4ShaderReflection::BindingInfo | MTL4ShaderReflection::BufferTypeInfo,
-        );
-        pso_desc.setOptions(Some(&options));
-
         let base_desc: &MTL4PipelineDescriptor = pso_desc.as_ref();
         compiler
             .newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(base_desc, None)
@@ -143,7 +93,7 @@ impl MetalGraphicsPso {
     }
 }
 
-fn apply_blend_to_attachment(
+pub(crate) fn apply_blend_to_attachment(
     att: &MTL4RenderPipelineColorAttachmentDescriptor,
     blend: BlendAttachment,
 ) {
@@ -205,15 +155,10 @@ fn blend_op_to_mtl(op: BlendOp) -> MTLBlendOperation {
     }
 }
 
-/// Metal meshlet (mesh shader) pipeline state.
-///
-/// Requires the Metal 4 mesh render pipeline path.
-/// On unsupported hardware `create_meshlet_pso` returns `RhiError::Unsupported`.
+/// Metal meshlet (mesh shader) pipeline state. Mesh shaders need an Apple GPU family that
+/// supports them; `create_meshlet_pso` fails at PSO compilation otherwise.
 pub struct MetalMeshletPso {
     pub(crate) cull_mode: MTLCullMode,
     pub(crate) winding: MTLWinding,
-    /// Buffer-index slots the mesh+fragment shader declares for bindless heap pointers.
-    /// Used to drive selective heap refresh (texture=1, sampler=2).
-    pub(crate) argument_buffer_slots: Vec<usize>,
     pub(crate) default_pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
 }

@@ -142,10 +142,6 @@ struct FrameBuffers {
 /// drive it each frame with [`update_textures`](Self::update_textures) + [`paint`](Self::paint).
 pub struct EguiRenderer {
     pso: GraphicsPso,
-    /// The premultiplied-alpha blend baked into `pso`. Re-applied each `paint` so the draw hits
-    /// the pipeline variant cached at creation (the RHI keeps shader modules only that long, so a
-    /// mismatched blend state would force an invalid recreate).
-    blend: BlendState,
     _sampler: Sampler,
     sampler_handle: SamplerHandle,
     textures: HashMap<egui::TextureId, ManagedTexture>,
@@ -186,7 +182,7 @@ impl EguiRenderer {
                 // Two root pointers (vertex + pixel share one EguiRoot): 2 * 8 bytes.
                 // egui is not consistent about winding; never cull.
                 cull: Cull::None,
-                blendstate: Some(blend.clone()),
+                blendstate: Some(blend),
                 label: Some("egui".into()),
                 ..Default::default()
             },
@@ -209,7 +205,6 @@ impl EguiRenderer {
 
         Ok(Self {
             pso,
-            blend,
             sampler_handle,
             _sampler: sampler,
             textures: HashMap::new(),
@@ -232,12 +227,19 @@ impl EguiRenderer {
         Ok(())
     }
 
-    /// Free textures egui dropped (call after the render pass / after the frame's GPU work).
+    /// Free textures egui dropped. Drains the GPU first: destruction is immediate and the frame
+    /// just submitted may still be sampling them. `free` is empty on almost every frame.
     pub fn free_textures(&mut self, device: &Device, free: &[egui::TextureId]) {
-        for id in free {
-            if let Some(m) = self.textures.remove(id) {
-                m.destroy(device);
-            }
+        let doomed: Vec<_> = free
+            .iter()
+            .filter_map(|id| self.textures.remove(id))
+            .collect();
+        if doomed.is_empty() {
+            return;
+        }
+        device.wait_idle();
+        for m in doomed {
+            m.destroy(device);
         }
     }
 
@@ -308,9 +310,6 @@ impl EguiRenderer {
         ];
         let flags = self.srgb_target as u32;
 
-        // Match the blend baked into the PSO so `set_graphics_pipeline` hits the cached pipeline
-        // variant (see `blend` field).
-        cmd.set_blend_state(&self.blend);
         cmd.set_graphics_pipeline(&self.pso);
         cmd.set_viewport(0.0, 0.0, fb_w as f32, fb_h as f32, 0.0, 1.0);
 
@@ -432,6 +431,8 @@ impl EguiRenderer {
                 .is_none_or(|m| m.width as usize != pw || m.height as usize != ph);
             if recreate {
                 if let Some(old) = self.textures.remove(&id) {
+                    // An in-flight frame may still be sampling the old atlas.
+                    device.wait_idle();
                     old.destroy(device);
                 }
                 let m = create_texture(device, pw as u32, ph as u32, patch.to_vec())?;

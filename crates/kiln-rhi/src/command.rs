@@ -2,7 +2,7 @@
 
 use crate::accel::AccelerationStructure;
 use crate::barrier::{HazardFlags, StageFlags};
-use crate::pipeline::{BlendState, ComputePso, DepthStencilState, GraphicsPso, MeshletPso};
+use crate::pipeline::{ComputePso, DepthStencilState, GraphicsPso, MeshletPso};
 use crate::query::{QueryPool, QueryPoolInner};
 use crate::types::*;
 use crate::types::{BlasDesc, TlasDesc};
@@ -52,11 +52,19 @@ pub enum StoreOp {
 }
 
 /// Description for beginning dynamic rendering.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RenderPassDesc {
     pub color_attachments: Vec<ColorAttachment>,
     pub depth_attachment: Option<DepthAttachment>,
     pub render_area: [u32; 4], // x, y, width, height
+    /// Debug name for the pass, shown against the encoder in a GPU capture. A `&'static str`
+    /// rather than the `String` the creation-time descriptors use: this struct is rebuilt every
+    /// frame, so the name is expected to be a literal.
+    ///
+    /// Applied on Metal today. Vulkan needs a device-level `VK_EXT_debug_utils` loader that the
+    /// backend does not create yet (it only builds the instance-level messenger), so the name is
+    /// ignored there for now.
+    pub label: Option<&'static str>,
 }
 
 /// Arguments for non-indexed indirect draws.
@@ -80,19 +88,6 @@ pub struct DrawIndexedIndirectArgs {
     pub first_instance: u32,
 }
 
-/// Arguments for multi-draw indirect (layout matches `VkDrawIndirectCommand`).
-///
-/// The hardware draw is non-indexed: the vertex shader reads `draw_id`, finds its per-draw
-/// root, and does programmable index fetch from a pointer in that root.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::Immutable)]
-pub struct DrawIndirectMultiArgs {
-    pub vertex_count: u32,
-    pub instance_count: u32,
-    pub first_vertex: u32,
-    pub first_instance: u32,
-}
-
 /// Arguments for indirect dispatch (matches VkDispatchIndirectCommand layout).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::Immutable)]
@@ -100,45 +95,6 @@ pub struct DispatchIndirectArgs {
     pub x: u32,
     pub y: u32,
     pub z: u32,
-}
-
-/// Atomic signal operation for split synchronization.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SignalOp {
-    /// Write the value unconditionally.
-    AtomicSet,
-    /// Atomically update the counter to max(current, value). Used for timeline semaphores.
-    AtomicMax,
-    /// Atomically OR the value into the counter. Used for bitmask completion patterns.
-    AtomicOr,
-}
-
-/// Value comparison operation for split synchronization waits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WaitOp {
-    Equal,
-    GreaterOrEqual,
-    MaskedEqual,
-}
-
-/// Producer-side value signal descriptor.
-#[derive(Clone, Copy, Debug)]
-pub struct SignalValueDesc {
-    pub src_stage: StageFlags,
-    pub value_ptr: GpuAddress,
-    pub value: u64,
-    pub signal_op: SignalOp,
-}
-
-/// Consumer-side value wait descriptor.
-#[derive(Clone, Copy, Debug)]
-pub struct WaitValueDesc {
-    pub dst_stage: StageFlags,
-    pub value_ptr: GpuAddress,
-    pub value: u64,
-    pub wait_op: WaitOp,
-    pub hazard: HazardFlags,
-    pub mask: u64,
 }
 
 /// Transient command buffer. Created, recorded, submitted, auto-reclaimed.
@@ -182,11 +138,6 @@ impl CommandBuffer {
     /// Set depth-stencil state.
     pub fn set_depth_stencil_state(&mut self, state: &DepthStencilState) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_depth_stencil_state(state))
-    }
-
-    /// Set blend state.
-    pub fn set_blend_state(&mut self, state: &BlendState) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_blend_state(state))
     }
 
     fn set_root_data(&mut self, root: GpuAddress) {
@@ -247,21 +198,6 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indexed_indirect(indices, args))
     }
 
-    /// Multi-draw indirect. `args` is an array of `DrawIndirectMultiArgs`; the shader indexes
-    /// per-draw roots from `root` using its draw ID. Non-indexed; the shader does its own index fetch.
-    pub fn draw_indirect_multi(
-        &mut self,
-        root: GpuAddress,
-        args: GpuAddress,
-        draw_count: GpuAddress,
-    ) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indirect_multi(
-            root,
-            args,
-            draw_count,
-        ))
-    }
-
     /// Copy bytes between two GPU pointers.
     pub fn memcpy(&mut self, dst: GpuAddress, src: GpuAddress, size: u64) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.memcpy(dst, src, size))
@@ -297,14 +233,17 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.barrier_with_hazard(src, dst, hazard))
     }
 
-    /// Signal a GPU value after the producer stage completes.
-    pub fn signal_after(&mut self, desc: &SignalValueDesc) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.signal_after_value(desc))
+    /// Open a split barrier: record that work up to here in `src` must complete before the
+    /// matching [`wait_before`](Self::wait_before). Nothing is encoded until that call, so
+    /// unrelated work recorded in between overlaps freely.
+    pub fn signal_after(&mut self, src: StageFlags, hazard: HazardFlags) {
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.signal_after(src, hazard))
     }
 
-    /// Wait on a GPU value before the consumer stage begins.
-    pub fn wait_before(&mut self, desc: &WaitValueDesc) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.wait_before_value(desc))
+    /// Close a split barrier opened by [`signal_after`](Self::signal_after), making `dst` wait on
+    /// it. Panics if no split barrier is open.
+    pub fn wait_before(&mut self, dst: StageFlags, hazard: HazardFlags) {
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.wait_before(dst, hazard))
     }
 
     /// Set viewport.

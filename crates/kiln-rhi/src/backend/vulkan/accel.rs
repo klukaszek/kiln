@@ -1,7 +1,5 @@
 use ash::vk;
 
-use super::device::{SharedPendingRetirements, VulkanRetiredResource};
-
 /// Vulkan acceleration structure entry (BLAS or TLAS).
 ///
 /// `acceleration_structure` is an opaque `VkAccelerationStructureKHR`.
@@ -23,21 +21,19 @@ pub struct VulkanAccelerationStructure {
     pub(crate) scratch_address: u64,
     /// Extension loader for `VK_KHR_acceleration_structure`.
     pub(crate) accel_loader: ash::khr::acceleration_structure::Device,
-    pub(crate) pending_retired_resources: SharedPendingRetirements,
+    pub(crate) device: ash::Device,
 }
 
 impl Drop for VulkanAccelerationStructure {
+    /// Destroys immediately; the caller guarantees the GPU is done with it.
     fn drop(&mut self) {
-        self.pending_retired_resources
-            .lock()
-            .expect("pending retired resource lock poisoned")
-            .push(VulkanRetiredResource::AccelerationStructure {
-                acceleration_structure: self.acceleration_structure,
-                buffer: self.buffer,
-                buffer_memory: self.buffer_memory,
-                scratch_buffer: self.scratch_buffer,
-                scratch_memory: self.scratch_memory,
-                accel_loader: self.accel_loader.clone(),
-            });
+        unsafe {
+            self.accel_loader
+                .destroy_acceleration_structure(self.acceleration_structure, None);
+            self.device.destroy_buffer(self.buffer, None);
+            self.device.free_memory(self.buffer_memory, None);
+            self.device.destroy_buffer(self.scratch_buffer, None);
+            self.device.free_memory(self.scratch_memory, None);
+        }
     }
 }

@@ -3,13 +3,13 @@ use kiln_rhi::{
     GraphicsPsoDesc, SampleCount, ShaderStage, Topology,
 };
 
-use crate::render;
+use crate::render::{self, GpuTextureBinding};
 
 use super::display;
 use super::integrator;
 use super::sampler;
 use super::shader_types::{CLEAR_SOURCE, CLEAR_THREADS, ClearRoot, DisplayRoot, TraceRoot};
-use super::trace_scene::{GpuBsdf, GpuLight, GpuTriangle};
+use super::trace_scene::{GpuBsdf, GpuLight, GpuMaterialTexture, GpuTriangle};
 
 pub(super) struct Pipelines {
     pub(super) trace: ComputePso,
@@ -26,8 +26,10 @@ impl Pipelines {
         spectrum_len: u32,
     ) -> render::Result<Self> {
         let trace_source = format!(
-            "{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}",
             GpuBsdf::SLANG,
+            GpuMaterialTexture::SLANG,
+            GpuTextureBinding::SLANG,
             GpuLight::SLANG,
             GpuTriangle::SLANG,
             TraceRoot::SLANG,
@@ -101,8 +103,10 @@ mod shader_source_tests {
         }
 
         let trace_source = format!(
-            "{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}",
             GpuBsdf::SLANG,
+            GpuMaterialTexture::SLANG,
+            GpuTextureBinding::SLANG,
             GpuLight::SLANG,
             GpuTriangle::SLANG,
             TraceRoot::SLANG,

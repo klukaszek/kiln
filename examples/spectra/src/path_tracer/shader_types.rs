@@ -41,11 +41,15 @@ gpu_struct! {
         spectrum: GpuAddress as "Ptr<float4, Access.Read>", // CDF table: (phase, wavelength, flux_shape, p_light)
         lambda: GpuAddress as "Ptr<float4, Access.Read>", // uniform-λ MIS table, same texel layout
         reflectance: GpuAddress as "Ptr<float, Access.Read>", // [material][light/uniform table][wavelength entry]
+        material_textures: GpuAddress as "Ptr<GpuMaterialTexture, Access.Read>",
+        texture_bindings: GpuAddress as "Ptr<GpuTextureBinding, Access.Read>",
+        texture_basis: GpuAddress as "Ptr<float, Access.Read>",
         tlas: AccelHandle,
         film_width: u32,
         film_height: u32,
         pass_start: u32,
         pass_count: u32,
+        _pad: UVec2,
     }
 }
 

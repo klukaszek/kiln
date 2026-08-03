@@ -6,8 +6,8 @@ use kiln_rhi::{
     GpuAddress, MeshletPso, MeshletPsoDesc, SampleCount, ShaderStage, Topology, gpu_struct,
 };
 
-use super::mesh::RasterVertex;
-use crate::render;
+use super::scene::{GpuPreviewMaterial, RasterVertex};
+use crate::render::{self, GpuTextureBinding};
 
 const TRIANGLES_PER_MESHLET: u32 = 64;
 
@@ -18,19 +18,24 @@ gpu_struct! {
         vp2: Vec4,
         vp3: Vec4,
         cam_pos: Vec4,
-        verts: GpuAddress as "RasterVertex*",
         tri_count: u32,
         _pad: u32,
+        verts: GpuAddress as "RasterVertex*",
+        materials: GpuAddress as "GpuPreviewMaterial*",
+        texture_bindings: GpuAddress as "GpuTextureBinding*",
     }
 }
 
 const SHADER_BODY: &str = /*slang*/
     r#"
+static const uint NO_TEXTURE = 0xffffffffu;
+
 struct VOut {
     float4 pos : SV_Position;
     float3 world : WORLD;
     float3 nrm : NORMAL;
-    float3 color : COLOR;
+    float2 uv : TEXCOORD0;
+    nointerpolation uint material_id : MATERIAL;
 };
 
 [shader("mesh")]
@@ -48,7 +53,8 @@ void msMain(uint3 gid : SV_GroupID, out vertices VOut verts[192], out indices ui
             o.pos = v.pos.x * r.vp0 + v.pos.y * r.vp1 + v.pos.z * r.vp2 + v.pos.w * r.vp3;
             o.world = v.pos.xyz;
             o.nrm = v.normal.xyz;
-            o.color = v.color.xyz;
+            o.uv = v.uv.xy;
+            o.material_id = v.material_id;
             verts[t * 3u + k] = o;
         }
         tris[t] = uint3(t * 3u, t * 3u + 1u, t * 3u + 2u);
@@ -60,7 +66,15 @@ float4 fsMain(VOut i, uniform Root* r) : SV_Target
 {
     float3 n = normalize(i.nrm);
     float3 l = normalize(r.cam_pos.xyz - i.world);
-    return float4(i.color * (0.2 + 0.8 * abs(dot(n, l))), 1.0);
+    GpuPreviewMaterial material = r.materials[i.material_id];
+    float3 color = material.color.rgb;
+    if (material.texture_id != NO_TEXTURE) {
+        GpuTextureBinding binding = r.texture_bindings[material.texture_id];
+        Texture2D texture = binding.image;
+        SamplerState sampler = binding.sampler;
+        color *= texture.Sample(sampler, float2(i.uv.x, 1.0 - i.uv.y)).rgb;
+    }
+    return float4(color * (0.2 + 0.8 * abs(dot(n, l))), 1.0);
 }
 "#;
 
@@ -68,7 +82,14 @@ pub(super) struct Pipeline(MeshletPso);
 
 impl Pipeline {
     pub(super) fn new(device: &Device, color_format: Format) -> render::Result<Self> {
-        let source = format!("{}{}{}", RasterVertex::SLANG, Root::SLANG, SHADER_BODY);
+        let source = format!(
+            "{}{}{}{}{}",
+            RasterVertex::SLANG,
+            GpuPreviewMaterial::SLANG,
+            GpuTextureBinding::SLANG,
+            Root::SLANG,
+            SHADER_BODY
+        );
         let mesh_shader = kiln_rhi::compiler::compile(device, &source, "msMain", ShaderStage::Mesh);
         let fragment_shader =
             kiln_rhi::compiler::compile(device, &source, "fsMain", ShaderStage::Pixel);

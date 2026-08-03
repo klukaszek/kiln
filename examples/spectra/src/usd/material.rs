@@ -1,46 +1,45 @@
-use std::collections::HashMap;
-
 use glam::Vec3;
 use openusd::sdf::{self, Value};
 use openusd::usd::Stage;
+use std::collections::HashMap;
 
-use crate::scene::{Material, MaterialId, PrincipledBsdf, Surface};
+use crate::scene::{Image, Material, MaterialId, PrincipledBsdf, Surface, Texture};
 
+use super::texture::TextureLibrary;
 use super::{Error, Result};
 
 pub(super) struct MaterialLibrary {
     by_path: HashMap<String, MaterialId>,
     materials: Vec<Material>,
+    textures: TextureLibrary,
 }
 
 impl MaterialLibrary {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(textures: TextureLibrary) -> Self {
         Self {
             by_path: HashMap::new(),
             materials: vec![Material::default()],
+            textures,
         }
     }
 
     pub(super) fn id_for_prim(&mut self, stage: &Stage, prim_path: &str) -> Result<MaterialId> {
         let Some(material_path) = material_binding(stage, prim_path)? else {
-            return Ok(self.default_id());
+            return Ok(MaterialId::DEFAULT);
         };
         if let Some(&id) = self.by_path.get(&material_path) {
             return Ok(id);
         }
-        let material = read_material(stage, &material_path)?;
+        let material = read_material(stage, &material_path, &mut self.textures)?;
         let id = MaterialId(self.materials.len());
         self.materials.push(material);
         self.by_path.insert(material_path, id);
         Ok(id)
     }
 
-    pub(super) fn into_materials(self) -> Vec<Material> {
-        self.materials
-    }
-
-    fn default_id(&self) -> MaterialId {
-        MaterialId::DEFAULT
+    pub(super) fn into_parts(self) -> (Vec<Material>, Vec<Image>, Vec<Texture>) {
+        let (images, textures) = self.textures.into_parts();
+        (self.materials, images, textures)
     }
 }
 
@@ -54,7 +53,11 @@ fn material_binding(stage: &Stage, prim_path: &str) -> Result<Option<String>> {
     Ok(paths.first().map(|path| path.as_str().to_owned()))
 }
 
-fn read_material(stage: &Stage, material_path: &str) -> Result<Material> {
+fn read_material(
+    stage: &Stage,
+    material_path: &str,
+    textures: &mut TextureLibrary,
+) -> Result<Material> {
     let material = sdf::path(material_path)?;
     let mut rejected_outputs = Vec::new();
     let mut shader_path = None;
@@ -89,12 +92,20 @@ fn read_material(stage: &Stage, material_path: &str) -> Result<Material> {
 
     let mut result = Material::default();
     let mut surface = PrincipledBsdf::default();
-    if let Some(color) = read_vec3(stage, &shader_path, "inputs:diffuseColor")? {
-        surface.base_color = color;
-    }
-    if let Some(color) = read_vec3(stage, &shader_path, "inputs:baseColor")? {
-        surface.base_color = color;
-    }
+    read_base_color(
+        stage,
+        &shader_path,
+        "inputs:diffuseColor",
+        &mut surface,
+        textures,
+    )?;
+    read_base_color(
+        stage,
+        &shader_path,
+        "inputs:baseColor",
+        &mut surface,
+        textures,
+    )?;
     if let Some(color) = read_vec3(stage, &shader_path, "inputs:emissiveColor")? {
         result.emission.color = color;
     }
@@ -112,8 +123,6 @@ fn read_material(stage: &Stage, material_path: &str) -> Result<Material> {
     }
     result.surface = Surface::Principled(surface);
     for input in [
-        "inputs:diffuseColor",
-        "inputs:baseColor",
         "inputs:emissiveColor",
         "inputs:emissionColor",
         "inputs:roughness",
@@ -123,6 +132,24 @@ fn read_material(stage: &Stage, material_path: &str) -> Result<Material> {
         reject_connected_input(stage, &shader_path, input)?;
     }
     Ok(result)
+}
+
+fn read_base_color(
+    stage: &Stage,
+    shader: &sdf::Path,
+    input: &str,
+    surface: &mut PrincipledBsdf,
+    textures: &mut TextureLibrary,
+) -> Result<()> {
+    let property = shader.append_property(input)?;
+    if let Some(source) = connected_path(stage, property)? {
+        surface.base_color = Vec3::ONE;
+        surface.base_color_texture = Some(textures.read(stage, input, &source)?);
+    } else if let Some(color) = read_vec3(stage, shader, input)? {
+        surface.base_color = color;
+        surface.base_color_texture = None;
+    }
+    Ok(())
 }
 
 fn shader_id(stage: &Stage, shader_path: &sdf::Path) -> Result<Option<String>> {
@@ -176,4 +203,65 @@ fn read_f32(stage: &Stage, shader: &sdf::Path, name: &str) -> Result<Option<f32>
         Some(Value::Int64(value)) => Some(value as f32),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+    use crate::scene::TextureId;
+
+    #[test]
+    fn loads_preview_surface_uv_texture() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("spectra-texture-{nonce}"));
+        std::fs::create_dir(&directory).unwrap();
+        let texture_path = directory.join("wood.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([128, 64, 32, 255]))
+            .save(&texture_path)
+            .unwrap();
+        let stage_path = directory.join("material.usda");
+        std::fs::write(
+            &stage_path,
+            r#"#usda 1.0
+def Xform "Mesh" {
+    rel material:binding = </Mat>
+}
+def Material "Mat" {
+    token outputs:surface.connect = </Mat/Preview.outputs:surface>
+    def Shader "Preview" {
+        uniform token info:id = "UsdPreviewSurface"
+        color3f inputs:diffuseColor.connect = </Mat/Image.outputs:rgb>
+        token outputs:surface
+    }
+    def Shader "Image" {
+        uniform token info:id = "UsdUVTexture"
+        asset inputs:file = @wood.png@
+        token inputs:sourceColorSpace = "sRGB"
+        float3 outputs:rgb
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let stage = Stage::open(stage_path.to_str().unwrap()).unwrap();
+        let textures = TextureLibrary::new(&stage_path, &stage);
+        let mut library = MaterialLibrary::new(textures);
+        let material_id = library.id_for_prim(&stage, "/Mesh").unwrap();
+        let (materials, images, textures) = library.into_parts();
+        let Surface::Principled(surface) = materials[material_id.0].surface else {
+            panic!("expected principled material");
+        };
+        assert_eq!(surface.base_color_texture, Some(TextureId(0)));
+        assert_eq!(images.len(), 1);
+        assert_eq!(textures.len(), 1);
+        assert_eq!((images[0].width, images[0].height), (2, 2));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

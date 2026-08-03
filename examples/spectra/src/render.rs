@@ -1,9 +1,11 @@
 //! Renderer lifecycle traits and per-frame context.
 
 mod arena;
+mod texture;
 mod upload;
 
 pub(crate) use arena::FrameArenas;
+pub(crate) use texture::{GpuTextureBinding, TextureResources};
 pub(crate) use upload::{GpuArray, GpuUploadBatch};
 
 use glam::UVec2;

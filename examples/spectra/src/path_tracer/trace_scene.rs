@@ -3,11 +3,11 @@
 //! Nothing in this module is part of the shared scene model: the ray geometry, acceleration
 //! structure, BSDF parameters, light list, and spectral tables exist only for this backend.
 
-use glam::Vec4;
+use glam::{Vec2, Vec3, Vec4};
 use kiln_rhi::{Device, gpu_struct};
 
-use crate::render::{self, Error, GpuArray, GpuUploadBatch};
-use crate::scene::Scene;
+use crate::render::{self, Error, GpuArray, GpuTextureBinding, GpuUploadBatch, TextureResources};
+use crate::scene::{Scene, Surface};
 use crate::spectrum::{self, Spd};
 
 use super::acceleration::SceneAccel;
@@ -20,6 +20,15 @@ gpu_struct! {
         metallic: f32,
         f0_dielectric: f32,
         spec_prob: f32,
+        texture_id: u32,
+        _pad: [f32; 2],
+    }
+}
+
+gpu_struct! {
+    pub(super) struct GpuMaterialTexture {
+        factor: Vec4,
+        binding_id: u32,
         _pad: [f32; 3],
     }
 }
@@ -36,9 +45,10 @@ gpu_struct! {
 gpu_struct! {
     pub(super) struct GpuTriangle {
         normal_area: Vec4,
+        uv01: Vec4,
+        uv2: Vec2,
         material_id: u32,
         emission: f32,
-        _pad: [f32; 2],
     }
 }
 
@@ -50,6 +60,10 @@ pub(super) struct TraceScene {
     pub(super) spectrum: GpuArray<Vec4>,
     pub(super) lambda: GpuArray<Vec4>,
     pub(super) reflectance: GpuArray<f32>,
+    pub(super) material_textures: GpuArray<GpuMaterialTexture>,
+    pub(super) texture_bindings: GpuArray<GpuTextureBinding>,
+    pub(super) texture_basis: GpuArray<f32>,
+    textures: TextureResources,
 }
 
 impl TraceScene {
@@ -62,11 +76,18 @@ impl TraceScene {
             return Err(Error::Capacity("trace geometry exceeds u32 indexing"));
         }
         let spectrum = light_spectrum.bake(spectrum::DEFAULT_RESOLUTION);
+        let image_averages = scene
+            .images
+            .iter()
+            .map(|image| image.average_color())
+            .collect::<Vec<_>>();
         let mut fits = Vec::with_capacity(scene.materials.len());
-        let mut bsdfs = Vec::with_capacity(scene.materials.len());
+        let mut lowered_bsdfs = Vec::with_capacity(scene.materials.len());
         let mut emission = Vec::with_capacity(scene.materials.len());
         for material in &scene.materials {
-            let lowered = bsdf::lower(material)?;
+            let representative =
+                representative_base_color(material.surface, scene, &image_averages);
+            let lowered = bsdf::lower(material, representative)?;
             let fit = spectrum::fit_reflectance(lowered.base_color);
             if fit.fit_error > 0.01 {
                 eprintln!(
@@ -77,7 +98,7 @@ impl TraceScene {
                 );
             }
             fits.push(fit);
-            bsdfs.push(bsdf_to_gpu(lowered));
+            lowered_bsdfs.push(lowered);
             emission.push(if material.is_emissive() {
                 spectrum.emission_scale(material.emission.color)
             } else {
@@ -91,11 +112,15 @@ impl TraceScene {
             let material = triangle.material;
             let (normal, area) = triangle.geometric_normal_and_area();
             let emission = emission[material.0];
+            let uv0 = triangle.vertices[0].uv.unwrap_or_default();
+            let uv1 = triangle.vertices[1].uv.unwrap_or_default();
+            let uv2 = triangle.vertices[2].uv.unwrap_or_default();
             triangles.push(GpuTriangle {
                 normal_area: normal.extend(area),
+                uv01: Vec4::new(uv0.x, uv0.y, uv1.x, uv1.y),
+                uv2,
                 material_id: material.0 as u32,
                 emission,
-                _pad: [0.0; 2],
             });
             if scene.materials[material.0].is_emissive() {
                 let vertices = &triangle.vertices;
@@ -111,6 +136,36 @@ impl TraceScene {
             }
         }
         let accel = SceneAccel::build(device, scene)?;
+        let textures = match TextureResources::upload(device, &scene.images, &scene.textures) {
+            Ok(textures) => textures,
+            Err(error) => {
+                accel.destroy(device);
+                return Err(error);
+            }
+        };
+        let texture_bindings = textures.bindings();
+        let mut material_textures = Vec::new();
+        let mut bsdfs = Vec::with_capacity(lowered_bsdfs.len());
+        for params in lowered_bsdfs {
+            let texture_id = match params.base_color_texture {
+                Some(binding) => {
+                    let id = material_textures.len() as u32;
+                    material_textures.push(GpuMaterialTexture {
+                        factor: params.texture_factor.extend(1.0),
+                        binding_id: binding.0 as u32,
+                        _pad: [0.0; 3],
+                    });
+                    id
+                }
+                None => u32::MAX,
+            };
+            bsdfs.push(bsdf_to_gpu(params, texture_id));
+        }
+        let texture_basis = if material_textures.is_empty() {
+            Vec::new()
+        } else {
+            build_texture_basis(&spectrum)
+        };
 
         let uploaded = (|| {
             let mut uploads = GpuUploadBatch::new(device);
@@ -120,6 +175,9 @@ impl TraceScene {
             uploads.upload(&reflectance)?;
             uploads.upload(&triangles)?;
             uploads.upload(&lights)?;
+            uploads.upload(&material_textures)?;
+            uploads.upload(texture_bindings)?;
+            uploads.upload(&texture_basis)?;
             uploads.finish()
         })();
         let [
@@ -129,10 +187,14 @@ impl TraceScene {
             reflectance_gpu,
             triangle_gpu,
             light_gpu,
+            material_texture_gpu,
+            texture_binding_gpu,
+            texture_basis_gpu,
         ] = match uploaded {
             Ok(value) => value,
             Err(error) => {
                 accel.destroy(device);
+                textures.destroy(device);
                 return Err(error);
             }
         };
@@ -153,6 +215,10 @@ impl TraceScene {
             spectrum: GpuArray::new(spectrum_gpu, spectrum.texels.len()),
             lambda: GpuArray::new(lambda_gpu, spectrum.lambda_texels.len()),
             reflectance: GpuArray::new(reflectance_gpu, reflectance.len()),
+            material_textures: GpuArray::new(material_texture_gpu, material_textures.len()),
+            texture_bindings: GpuArray::new(texture_binding_gpu, texture_bindings.len()),
+            texture_basis: GpuArray::new(texture_basis_gpu, texture_basis.len()),
+            textures,
         })
     }
 
@@ -164,18 +230,53 @@ impl TraceScene {
         self.spectrum.destroy(device);
         self.lambda.destroy(device);
         self.reflectance.destroy(device);
+        self.material_textures.destroy(device);
+        self.texture_bindings.destroy(device);
+        self.texture_basis.destroy(device);
+        self.textures.destroy(device);
     }
 }
 
-fn bsdf_to_gpu(params: PrincipledGgxParams) -> GpuBsdf {
+fn bsdf_to_gpu(params: PrincipledGgxParams, texture_id: u32) -> GpuBsdf {
     GpuBsdf {
         alpha: params.alpha,
         alpha2: params.alpha_squared,
         metallic: params.metallic,
         f0_dielectric: params.dielectric_f0,
         spec_prob: params.specular_probability,
-        _pad: [0.0; 3],
+        texture_id,
+        _pad: [0.0; 2],
     }
+}
+
+fn representative_base_color(surface: Surface, scene: &Scene, image_averages: &[Vec3]) -> Vec3 {
+    let Surface::Principled(surface) = surface else {
+        return surface.preview_color();
+    };
+    match surface.base_color_texture {
+        Some(texture) => {
+            let image = scene.textures[texture.0].image;
+            surface.base_color * image_averages[image.0]
+        }
+        None => surface.base_color,
+    }
+}
+
+fn build_texture_basis(light: &spectrum::EmissionSpectrum) -> Vec<f32> {
+    let fits = texture_basis_colors().map(spectrum::fit_reflectance);
+    build_reflectance_lut(&fits, light)
+}
+
+fn texture_basis_colors() -> [Vec3; 7] {
+    [
+        Vec3::ONE,
+        Vec3::new(0.0, 1.0, 1.0),
+        Vec3::new(1.0, 0.0, 1.0),
+        Vec3::new(1.0, 1.0, 0.0),
+        Vec3::X,
+        Vec3::Y,
+        Vec3::Z,
+    ]
 }
 
 fn build_reflectance_lut(
@@ -195,4 +296,24 @@ fn build_reflectance_lut(
         }
     }
     lut
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hot_path_records_stay_compact() {
+        assert_eq!(size_of::<GpuBsdf>(), 32);
+        assert_eq!(size_of::<GpuTriangle>(), 48);
+        assert_eq!(size_of::<GpuMaterialTexture>(), 32);
+    }
+
+    #[test]
+    fn texture_basis_fits_rgb_cube_corners() {
+        for color in texture_basis_colors() {
+            let fit = spectrum::fit_reflectance(color);
+            assert!(fit.fit_error < 0.035, "{color:?}: {}", fit.fit_error);
+        }
+    }
 }

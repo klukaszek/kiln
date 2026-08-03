@@ -53,6 +53,7 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
         for (uint bounce = 0u; bounce < 4u; bounce++) {
             uint prim;
             float hitT;
+            float2 barycentrics;
             {
                 // Keep the traversal object and RayDesc out of the shading
                 // portion of the bounce. This limits the state that must
@@ -77,6 +78,7 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
                 }
                 prim = q.CommittedPrimitiveIndex();
                 hitT = q.CommittedRayT();
+                barycentrics = q.CommittedTriangleBarycentrics();
             }
 
             // Read only the primitive fields needed before branching. The
@@ -109,6 +111,21 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
             GpuBsdf surf = r.bsdfs[matId];
             float3 wo = -rayDirection;
             float4 rho = lookup_reflectance(r, matId, spectralIndices);
+            if (surf.texture_id != 0xffffffffu) {
+                GpuTriangle triangle = r.triangles[prim];
+                float bary0 = 1.0 - barycentrics.x - barycentrics.y;
+                float2 texcoord = bary0 * triangle.uv01.xy
+                    + barycentrics.x * triangle.uv01.zw
+                    + barycentrics.y * triangle.uv2.xy;
+                GpuMaterialTexture materialTexture = r.material_textures[surf.texture_id];
+                GpuTextureBinding binding = r.texture_bindings[materialTexture.binding_id];
+                Texture2D texture = binding.image;
+                SamplerState sampler = binding.sampler;
+                float3 texel = texture.SampleLevel(
+                    sampler, float2(texcoord.x, 1.0 - texcoord.y), 0.0).rgb;
+                rho = texture_reflectance(
+                    r, texel * materialTexture.factor.rgb, spectralIndices);
+            }
 
             // A very sharp, highly specular lobe is effectively delta-like:
             // random-point NEE almost never lands inside it, but still pays for

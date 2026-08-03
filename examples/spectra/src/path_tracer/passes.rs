@@ -135,11 +135,15 @@ impl PathTracer {
                 spectrum: resources.spectrum.gpu(),
                 lambda: resources.lambda.gpu(),
                 reflectance: resources.reflectance.gpu(),
+                material_textures: resources.material_textures.gpu(),
+                texture_bindings: resources.texture_bindings.gpu(),
+                texture_basis: resources.texture_basis.gpu(),
                 tlas: resources.accel.tlas.gpu(),
                 film_width: extent.x,
                 film_height: extent.y,
                 pass_start: batch.start,
                 pass_count: batch.count,
+                _pad: UVec2::ZERO,
             },
         );
 

@@ -2,9 +2,10 @@
 
 mod material;
 mod mesh;
+mod texture;
 mod transform;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use openusd::schemas::geom::{find_geom_prims, read_camera};
 use openusd::sdf;
@@ -26,6 +27,19 @@ pub enum Error {
     NonUtf8Path(String),
     #[error("connected Preview Surface input {input} is unsupported (source {connection})")]
     ConnectedInput { input: String, connection: String },
+    #[error("unsupported texture source for {input}: {connection} ({reason})")]
+    UnsupportedTexture {
+        input: String,
+        connection: String,
+        reason: String,
+    },
+    #[error("texture asset not found: {0}")]
+    MissingTexture(String),
+    #[error("failed to decode texture {path}: {source}")]
+    Texture {
+        path: PathBuf,
+        source: image::ImageError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -37,22 +51,26 @@ impl From<anyhow::Error> for Error {
 }
 
 pub fn load(path: &Path) -> Result<Scene> {
-    let path = path
+    let path_str = path
         .to_str()
         .ok_or_else(|| Error::NonUtf8Path(path.display().to_string()))?;
-    let stage = Stage::open(path)?;
+    let stage = Stage::open(path_str)?;
     let prims = find_geom_prims(&stage)?;
 
     // Material discovery is importer orchestration. Mesh decoding only receives material IDs and
     // can therefore be reused by another importer without constructing a material cache.
-    let mut materials = material::MaterialLibrary::new();
+    let textures = texture::TextureLibrary::new(path, &stage);
+    let mut materials = material::MaterialLibrary::new(textures);
     let geometry = mesh::load(&stage, &prims.meshes, &mut materials)?;
     let camera = load_camera(&stage, &prims.cameras)?;
     let up = transform::stage_up_axis(&stage)?;
 
+    let (materials, images, textures) = materials.into_parts();
     Ok(Scene {
         geometry,
-        materials: materials.into_materials(),
+        materials,
+        images,
+        textures,
         camera,
         up,
     })

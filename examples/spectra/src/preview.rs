@@ -1,7 +1,7 @@
 //! Simple raster preview fallback backend.
 
-mod mesh;
 mod pipeline;
+mod scene;
 
 use glam::Vec4;
 use kiln_rhi::{CommandBuffer, Device, Format};
@@ -9,11 +9,11 @@ use kiln_rhi::{CommandBuffer, Device, Format};
 use crate::render::{self, FrameArenas, PresentRenderer, RenderFrame, Renderer};
 use crate::scene::{Camera, Scene};
 
-use mesh::PreviewMesh;
 use pipeline::{Pipeline, Root};
+use scene::PreviewScene;
 
 pub struct PreviewRenderer {
-    mesh: PreviewMesh,
+    scene: PreviewScene,
     pipeline: Pipeline,
     frame_arenas: FrameArenas,
     vp: [Vec4; 4],
@@ -23,16 +23,16 @@ pub struct PreviewRenderer {
 impl PreviewRenderer {
     pub fn new(device: &Device, color_format: Format, scene: &Scene) -> render::Result<Self> {
         let pipeline = Pipeline::new(device, color_format)?;
-        let mesh = PreviewMesh::build(device, scene)?;
+        let scene = PreviewScene::build(device, scene)?;
         let frame_arenas = match FrameArenas::new(device, 4096, "spectra-raster-arena") {
             Ok(value) => value,
             Err(error) => {
-                mesh.destroy(device);
+                scene.destroy(device);
                 return Err(error);
             }
         };
         Ok(Self {
-            mesh,
+            scene,
             pipeline,
             frame_arenas,
             vp: [Vec4::ZERO; 4],
@@ -55,10 +55,12 @@ impl Renderer for PreviewRenderer {
 
     fn destroy(self: Box<Self>, device: &Device) {
         let Self {
-            mesh, frame_arenas, ..
+            scene,
+            frame_arenas,
+            ..
         } = *self;
         frame_arenas.destroy(device);
-        mesh.destroy(device);
+        scene.destroy(device);
     }
 }
 
@@ -77,12 +79,14 @@ impl PresentRenderer for PreviewRenderer {
                 vp2: self.vp[2],
                 vp3: self.vp[3],
                 cam_pos: self.cam_pos,
-                verts: self.mesh.vertices.gpu(),
-                tri_count: self.mesh.triangle_count,
+                verts: self.scene.vertices.gpu(),
+                materials: self.scene.materials.gpu(),
+                texture_bindings: self.scene.texture_bindings.gpu(),
+                tri_count: self.scene.triangle_count,
                 _pad: 0,
             },
         );
-        self.pipeline.record(cmd, root, self.mesh.triangle_count);
+        self.pipeline.record(cmd, root, self.scene.triangle_count);
     }
 }
 

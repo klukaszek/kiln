@@ -8,7 +8,10 @@ mod material;
 mod mesh;
 
 pub use geometry::{Geometry, Triangle};
-pub use material::{Emission, Material, PrincipledBsdf, Surface};
+pub use material::{
+    ColorSpace, Emission, Image, ImageId, Material, PrincipledBsdf, Surface, Texture, TextureId,
+    WrapMode,
+};
 pub use mesh::{Instance, Mesh, MeshId, Primitive, Vertex};
 
 use glam::{DMat4, DVec3, Vec3};
@@ -45,6 +48,8 @@ impl MaterialId {
 pub struct Scene {
     pub geometry: Geometry,
     pub materials: Vec<Material>,
+    pub images: Vec<Image>,
+    pub textures: Vec<Texture>,
     pub camera: Camera,
     /// World up axis from stage metadata. Geometry and cameras are already in world space.
     pub up: DVec3,
@@ -104,6 +109,8 @@ mod tests {
         let scene = Scene {
             geometry,
             materials: vec![Material::default()],
+            images: Vec::new(),
+            textures: Vec::new(),
             camera: Camera {
                 world: glam::DMat4::IDENTITY,
                 projection: Projection {

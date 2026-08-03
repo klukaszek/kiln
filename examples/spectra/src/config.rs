@@ -1,22 +1,26 @@
+//! Command-line configuration and asset resolution.
+
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use glam::UVec2;
 
-use crate::{pathtracer, scene::spectral};
+use spectra::{path_tracer, spectrum};
+
+use super::Error;
 
 const ASSETS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
 
 #[derive(Parser, Clone, Debug)]
 pub struct Config {
     /// Target samples per pixel for the progressive render
-    #[arg(long, default_value_t = pathtracer::DEFAULT_TARGET_SPP)]
+    #[arg(long, default_value_t = path_tracer::DEFAULT_TARGET_SPP)]
     pub spp: u32,
     /// Spatial tracing passes recorded per frame
     #[arg(
         long,
         visible_aliases = ["samples-per-frame", "spf"],
-        default_value_t = pathtracer::DEFAULT_PASSES_PER_FRAME
+        default_value_t = path_tracer::DEFAULT_PASSES_PER_FRAME
     )]
     pub passes_per_frame: u32,
     /// Render offscreen at WxH and write a PNG under target/test-images
@@ -55,14 +59,14 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn light_spectrum(&self) -> anyhow::Result<spectral::Spd> {
-        if let Some(spd) = spectral::named(&self.light_spectrum) {
+    pub fn light_spectrum(&self) -> super::Result<spectrum::Spd> {
+        if let Some(spd) = spectrum::named(&self.light_spectrum) {
             return Ok(spd);
         }
 
         let literal = PathBuf::from(&self.light_spectrum);
         if literal.is_file() {
-            return spectral::from_lspdd_csv(&literal);
+            return Ok(spectrum::from_lspdd_csv(&literal)?);
         }
 
         let dropped = Path::new(ASSETS_DIR)
@@ -70,17 +74,17 @@ impl Config {
             .join(&self.light_spectrum)
             .with_extension("csv");
         if dropped.is_file() {
-            return spectral::from_lspdd_csv(&dropped);
+            return Ok(spectrum::from_lspdd_csv(&dropped)?);
         }
 
-        anyhow::bail!(
-            "no spectrum named {:?}: not a built-in, not a CSV path, and {} does not exist",
+        Err(Error::Config(format!(
+            "no spectrum named {:?}; {} does not exist",
             self.light_spectrum,
             dropped.display()
-        )
+        )))
     }
 
-    pub fn scene_path(&self) -> anyhow::Result<PathBuf> {
+    pub fn scene_path(&self) -> super::Result<PathBuf> {
         let literal = PathBuf::from(&self.scene);
         if literal.is_file() {
             return Ok(literal);
@@ -93,11 +97,11 @@ impl Config {
             return Ok(bundled);
         }
 
-        anyhow::bail!(
-            "no scene named {:?}: not a file, and not one of the bundled scenes ({})",
+        Err(Error::Config(format!(
+            "no scene named {:?}; bundled scenes: {}",
             self.scene,
             bundled_scenes().join(", ")
-        )
+        )))
     }
 
     pub fn scene_name(&self) -> String {

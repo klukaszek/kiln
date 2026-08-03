@@ -13,7 +13,7 @@ compiled per backend.
 ![Path-traced Cornell box](public/cornell_box.png)
 
 *Cornell box path-traced headless at 1024x1024, 64 spp, through the ray-tracing path. Reproduce
-with `cargo run --release --example spectral -- --spp 64 --headless 1024x1024`.*
+with `cargo run --release -p spectra -- --spp 64 --headless 1024x1024`.*
 
 ## Philosophy
 

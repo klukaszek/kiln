@@ -1,21 +1,23 @@
+//! Windowed application mode.
+
 use std::sync::OnceLock;
 
-use anyhow::Context;
 use kiln_app::{Example, FrameCtx};
 use kiln_rhi::{CommandBuffer, Device, Format};
 use winit::event::WindowEvent;
 
-use crate::config::Config;
-use crate::controls::CameraController;
-use crate::pathtracer::PathTracer;
-use crate::raster::RasterPreview;
-use crate::scene::Scene;
-use crate::scene::gpu::{GpuGeometry, SpectralGpuScene};
-use crate::scene::spectral::Spd;
+use spectra::path_tracer::{PathTracer, Settings};
+use spectra::preview::PreviewRenderer;
+use spectra::render::{PresentRenderer, RenderFrame};
+use spectra::scene::Scene;
+
+use super::Result;
+use super::config::Config;
+use super::controls::CameraController;
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
-pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(config: Config) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let title = format!("Kiln · Spectral — {}", config.scene_name());
     let harness = config.harness.clone();
     CONFIG
@@ -26,102 +28,43 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
 struct App {
     scene: Scene,
-    geometry: GpuGeometry,
-    renderer: Renderer,
+    renderer: Box<dyn PresentRenderer>,
     controls: CameraController,
 }
 
-enum Renderer {
-    PathTraced {
-        scene: SpectralGpuScene,
-        tracer: Box<PathTracer>,
-    },
-    Raster(RasterPreview),
-}
-
 impl App {
-    fn try_new(device: &Device, color_format: Format) -> anyhow::Result<Self> {
+    fn try_new(device: &Device, color_format: Format) -> Result<Self> {
         let config = CONFIG.get().expect("viewer config not installed");
-        let asset = config.scene_path().context("invalid --scene")?;
-        let scene =
-            crate::scene::load(&asset).with_context(|| format!("loading {}", asset.display()))?;
-        let light_spectrum = config
-            .light_spectrum()
-            .context("invalid --light-spectrum")?;
-        let geometry = GpuGeometry::build(device, &scene).context("uploading geometry")?;
-        let renderer = Renderer::build(
-            device,
-            color_format,
-            &scene,
-            &geometry,
-            config,
-            &light_spectrum,
-        )?;
+        let asset = config.scene_path()?;
+        let scene = spectra::usd::load(&asset)?;
+        let light_spectrum = config.light_spectrum()?;
+        let settings = Settings {
+            target_spp: config.spp,
+            passes_per_frame: config.passes_per_frame,
+            render_scale: config.render_scale,
+            pixel_stride: config.pixel_stride,
+        };
+        let renderer: Box<dyn PresentRenderer> =
+            match PathTracer::new(device, color_format, &scene, &light_spectrum, settings) {
+                Ok(renderer) => Box::new(renderer),
+                Err(error) => {
+                    eprintln!("spectral path tracer unavailable; using raster preview: {error:#}");
+                    Box::new(PreviewRenderer::new(device, color_format, &scene)?)
+                }
+            };
 
-        let controls = CameraController::new(&scene.camera.world, scene.up);
+        let controls = CameraController::new(scene.camera.world, scene.up);
         Ok(Self {
             scene,
-            geometry,
             renderer,
             controls,
         })
     }
 }
 
-impl Renderer {
-    fn build(
-        device: &Device,
-        color_format: Format,
-        scene: &Scene,
-        geometry: &GpuGeometry,
-        config: &Config,
-        light_spectrum: &Spd,
-    ) -> anyhow::Result<Self> {
-        if geometry.accel.is_some() {
-            let spectral_scene = SpectralGpuScene::build(device, scene, light_spectrum)
-                .context("uploading spectral scene")?;
-            match PathTracer::new(
-                device,
-                color_format,
-                config.spp,
-                config.passes_per_frame,
-                config.render_scale,
-                config.pixel_stride,
-                spectral_scene.light_count,
-                spectral_scene.spectrum_len,
-            ) {
-                Ok(tracer) => {
-                    return Ok(Self::PathTraced {
-                        scene: spectral_scene,
-                        tracer: Box::new(tracer),
-                    });
-                }
-                Err(error) => {
-                    eprintln!("spectral path tracer disabled: {error}");
-                    spectral_scene.destroy(device);
-                }
-            }
-        }
-
-        RasterPreview::build(device, color_format, geometry)
-            .map(Self::Raster)
-            .context("building raster preview")
-    }
-
-    fn destroy(self, device: &Device) {
-        match self {
-            Self::PathTraced { scene, tracer } => {
-                (*tracer).destroy(device);
-                scene.destroy(device);
-            }
-            Self::Raster(raster) => raster.destroy(device),
-        }
-    }
-}
-
 impl Example for App {
     fn depth_format(&self) -> Option<Format> {
-        matches!(&self.renderer, Renderer::Raster(_)).then_some(Format::D32Float)
+        self.renderer.depth_format()
     }
 
     fn new(device: &Device, color_format: Format) -> Self {
@@ -136,21 +79,30 @@ impl Example for App {
     }
 
     fn pre_render(&mut self, ctx: &FrameCtx, cmd: &mut CommandBuffer) {
-        self.controls.update(&mut self.scene.camera.world);
-        if let Renderer::PathTraced { scene, tracer } = &mut self.renderer {
-            tracer.pre_render(ctx, cmd, &self.scene, &self.geometry, scene);
+        if let Some(world) = self.controls.update() {
+            self.scene.camera.world = world;
+        }
+        let frame = RenderFrame {
+            device: ctx.device,
+            extent: ctx.extent,
+            slot: ctx.slot,
+        };
+        if let Err(error) = self.renderer.encode(&frame, cmd, &self.scene.camera) {
+            eprintln!("renderer pre-render failed: {error:#}");
+            std::process::exit(1);
         }
     }
 
     fn render(&mut self, ctx: &FrameCtx, cmd: &mut CommandBuffer) {
-        match &mut self.renderer {
-            Renderer::PathTraced { tracer, .. } => tracer.render(ctx, cmd),
-            Renderer::Raster(raster) => raster.render(ctx, cmd, &self.scene, &self.geometry),
-        }
+        let frame = RenderFrame {
+            device: ctx.device,
+            extent: ctx.extent,
+            slot: ctx.slot,
+        };
+        self.renderer.encode_present(&frame, cmd);
     }
 
     fn destroy(self, device: &Device) {
         self.renderer.destroy(device);
-        self.geometry.destroy(device);
     }
 }

@@ -1,93 +1,59 @@
-//! USD scene loading.
+//! Renderer-independent scene data.
 //!
-//! This module is the render-facing facade. It owns the GPU vertex layout the loaders
-//! produce ([`Vertex`]), while the implementation is split into the parts of a stage the
-//! renderer consumes: camera, geometry, materials, transforms, and small math helpers.
-//!
-//! All matrix math follows openusd's convention: `[f64; 16]` row-major, **row-vector**
-//! (`p' = p · M`, translation in indices 12..14).
+//! This module deliberately contains no GPU representation and no USD reader types. Importers
+//! produce this model; renderers prepare the representation their own pipelines require.
 
-mod camera;
 mod geometry;
 mod material;
-mod transform;
+mod mesh;
 
-pub mod gpu;
-pub mod spectral;
+pub use geometry::{Geometry, Triangle};
+pub use material::{Emission, Material, PrincipledBsdf, Surface};
+pub use mesh::{Instance, Mesh, MeshId, Primitive, Vertex};
 
-pub use camera::Camera;
-pub use material::Material;
+use glam::{DMat4, DVec3, Vec3};
 
-use glam::{DVec3, Vec3, Vec4};
-use kiln_rhi::gpu_struct;
-use openusd::schemas::geom::find_geom_prims;
-use openusd::sdf::{self, Value};
-use openusd::usd::Stage;
+/// Importer-independent perspective projection parameters.
+#[derive(Clone, Copy, Debug)]
+pub struct Projection {
+    pub vertical_fov_rad: f32,
+    pub clipping_range: [f32; 2],
+}
 
-gpu_struct! {
-    /// Per-vertex render data. Declared ahead of any root struct whose Slang source
-    /// dereferences a `Vertex*`.
-    pub struct Vertex {
-        pos: Vec4,    // world position, w = 1
-        normal: Vec4, // world normal,   w = 0
-        color: Vec4,  // linear RGB,      w = 1
+/// Camera transform and projection in the scene IR.
+#[derive(Clone, Copy, Debug)]
+pub struct Camera {
+    pub world: DMat4,
+    pub projection: Projection,
+}
+
+impl Camera {
+    pub fn position(&self) -> Vec3 {
+        self.world.w_axis.truncate().as_vec3()
     }
 }
 
-/// Everything the renderer currently needs from the scene.
+/// Stable identifier for a material referenced by scene geometry.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaterialId(pub usize);
+
+impl MaterialId {
+    pub const DEFAULT: Self = Self(0);
+}
+
+/// CPU scene IR shared by all renderer backends.
 pub struct Scene {
-    pub vertices: Vec<Vertex>,
-    pub triangle_materials: Vec<u32>,
+    pub geometry: Geometry,
     pub materials: Vec<Material>,
     pub camera: Camera,
-    /// World up axis from the stage's `upAxis` metadata (Y when unauthored).
-    /// Geometry and cameras arrive in world space, so a Z-up stage stays Z-up;
-    /// interactive camera controls must level against this axis, not Y.
+    /// World up axis from stage metadata. Geometry and cameras are already in world space.
     pub up: DVec3,
 }
 
 impl Scene {
-    /// Number of triangles in the soup (three vertices each).
     pub fn triangle_count(&self) -> usize {
-        self.vertices.len() / 3
+        self.geometry.triangles.len()
     }
-
-    /// Camera world-space position (translation row of the world transform).
-    pub fn camera_pos(&self) -> Vec3 {
-        self.camera.position()
-    }
-
-    /// Build the row-vector `view_proj = view · proj` for the given viewport aspect.
-    pub fn view_proj_rows(&self, aspect: f32) -> [Vec4; 4] {
-        self.camera.view_proj_rows(aspect)
-    }
-}
-
-/// Load `path` (a `.usda`/`.usdc`/`.usdz`) into a [`Scene`].
-pub fn load(path: &std::path::Path) -> anyhow::Result<Scene> {
-    let path = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 scene path {}", path.display()))?;
-    let stage = Stage::open(path)?;
-    let prims = find_geom_prims(&stage)?;
-    let geometry = geometry::load_geometry(&stage, &prims.meshes)?;
-
-    Ok(Scene {
-        vertices: geometry.vertices,
-        triangle_materials: geometry.triangle_materials,
-        materials: geometry.materials,
-        camera: camera::load_first(&stage, &prims.cameras)?,
-        up: stage_up_axis(&stage)?,
-    })
-}
-
-/// The stage's `upAxis` layer metadata, read off the pseudo-root.
-fn stage_up_axis(stage: &Stage) -> anyhow::Result<DVec3> {
-    let axis = stage.field::<Value>(sdf::path("/")?, "upAxis")?;
-    Ok(match axis {
-        Some(Value::Token(axis) | Value::String(axis)) if axis == "Z" => DVec3::Z,
-        _ => DVec3::Y,
-    })
 }
 
 #[cfg(test)]
@@ -99,11 +65,54 @@ mod tests {
     #[test]
     fn loads_bundled_cornell_box() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/cornell-box.usda");
-        let scene = load(&path).unwrap();
+        let scene = crate::usd::load(&path).unwrap();
 
-        assert!(!scene.vertices.is_empty());
-        assert_eq!(scene.vertices.len() % 3, 0);
-        assert_eq!(scene.triangle_materials.len(), scene.triangle_count());
+        assert!(scene.triangle_count() > 0);
         assert!(!scene.materials.is_empty());
+        assert!(!scene.geometry.meshes.is_empty());
+        assert!(!scene.geometry.meshes[0].indices.is_empty());
+    }
+
+    #[test]
+    fn scene_can_be_built_without_an_importer() {
+        let material_id = MaterialId::DEFAULT;
+        let vertices = vec![
+            Vertex {
+                position: glam::Vec3::new(0.0, 0.0, 0.0),
+                normal: Some(glam::Vec3::Z),
+                uv: Some(glam::Vec2::new(0.0, 0.0)),
+            },
+            Vertex {
+                position: glam::Vec3::new(1.0, 0.0, 0.0),
+                normal: Some(glam::Vec3::Z),
+                uv: Some(glam::Vec2::new(1.0, 0.0)),
+            },
+            Vertex {
+                position: glam::Vec3::new(0.0, 1.0, 0.0),
+                normal: Some(glam::Vec3::Z),
+                uv: Some(glam::Vec2::new(0.0, 1.0)),
+            },
+        ];
+        let mesh = Mesh::with_material(vertices, vec![0, 1, 2], material_id);
+        let geometry = Geometry::new(
+            vec![mesh],
+            vec![Instance {
+                mesh: MeshId(0),
+                transform: glam::DMat4::IDENTITY,
+            }],
+        );
+        let scene = Scene {
+            geometry,
+            materials: vec![Material::default()],
+            camera: Camera {
+                world: glam::DMat4::IDENTITY,
+                projection: Projection {
+                    vertical_fov_rad: 1.0,
+                    clipping_range: [0.1, 100.0],
+                },
+            },
+            up: glam::DVec3::Y,
+        };
+        assert_eq!(scene.triangle_count(), 1);
     }
 }

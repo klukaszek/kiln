@@ -1,107 +1,83 @@
+//! Headless path-tracing application mode.
+
 use std::time::Instant;
 
 use glam::UVec2;
-use kiln_app::FrameCtx;
 use kiln_rhi::{Device, DeviceDesc, Format};
 
-use crate::config::Config;
-use crate::controls::debug_camera_roundtrip;
-use crate::pathtracer::PathTracer;
-use crate::scene::gpu::{GpuGeometry, SpectralGpuScene};
+use spectra::path_tracer::{PathTracer, Settings};
+use spectra::render::{RenderFrame, Renderer};
 
-pub fn run(config: &Config, resolution: UVec2) -> anyhow::Result<()> {
+use super::Result;
+use super::config::Config;
+use super::controls::debug_camera_roundtrip;
+
+pub fn run(config: &Config, resolution: UVec2) -> Result<()> {
     let device = Device::new(&DeviceDesc {
         validation: false,
         label: Some("spectral-headless".into()),
         ..Default::default()
     })?;
-    let scene = crate::scene::load(&config.scene_path()?)?;
+    let scene = spectra::usd::load(&config.scene_path()?)?;
     if std::env::var_os("SPECTRAL_DEBUG_CAMERA").is_some() {
         debug_camera_roundtrip(&scene);
     }
 
     let light = config.light_spectrum()?;
-    let geometry = GpuGeometry::build(&device, &scene)?;
-    anyhow::ensure!(
-        geometry.accel.is_some(),
-        "headless render needs ray tracing support"
-    );
-    let spectral_scene = SpectralGpuScene::build(&device, &scene, &light)?;
-    let mut tracer = PathTracer::new(
-        &device,
-        Format::B8G8R8A8Srgb,
-        config.spp,
-        config.passes_per_frame,
-        1,
-        config.headless_pixel_stride,
-        spectral_scene.light_count,
-        spectral_scene.spectrum_len,
-    )?;
+    let settings = Settings {
+        target_spp: config.spp,
+        passes_per_frame: config.passes_per_frame,
+        render_scale: 1,
+        pixel_stride: config.headless_pixel_stride,
+    };
+    let mut renderer = PathTracer::new(&device, Format::B8G8R8A8Srgb, &scene, &light, settings)?;
 
     let result = (|| {
         eprintln!(
             "spectral headless: {}x{}, target spp={}, passes/frame={}, light spectrum {}",
             resolution.x,
             resolution.y,
-            tracer.target_spp(),
-            tracer.passes_per_frame(),
+            renderer.target_spp(),
+            renderer.passes_per_frame(),
             light.name,
         );
 
-        let ctx = FrameCtx {
+        let frame = RenderFrame {
             device: &device,
             extent: resolution,
             slot: 0,
         };
         let start = Instant::now();
-        while !tracer.is_complete() {
-            // Same reason the windowed harness wraps its frame: each pass creates autoreleased
-            // encoders that would otherwise accumulate for the whole trace.
-            kiln_rhi::frame_scope(|| -> anyhow::Result<()> {
-                let previous_passes = tracer.pass_count();
-                let mut cmd = device.create_command_buffer()?;
-                tracer.pre_render(&ctx, &mut cmd, &scene, &geometry, &spectral_scene);
-                cmd.end();
-                let queue = device.queue();
-                queue.submit(cmd)?;
-                queue.wait_idle();
-                anyhow::ensure!(
-                    tracer.pass_count() > previous_passes,
-                    "path tracer made no progress; lights={}",
-                    spectral_scene.light_count
-                );
-                Ok(())
-            })?;
-        }
+        render_to_completion(&mut renderer, &frame, &scene.camera)?;
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
-        let samples = f64::from(tracer.sample_count().max(1));
-        let passes = f64::from(tracer.pass_count().max(1));
+        let samples = f64::from(renderer.sample_count().max(1));
+        let passes = f64::from(renderer.pass_count().max(1));
         let paths = f64::from(resolution.x) * f64::from(resolution.y) * samples;
         eprintln!(
             "spectral trace: {:.1} ms for {} spp over {} spatial passes = {:.2} ms/spp, {:.2} ms/pass ({:.2} Mpath/s)",
             elapsed_ms,
-            tracer.sample_count(),
-            tracer.pass_count(),
+            renderer.sample_count(),
+            renderer.pass_count(),
             elapsed_ms / samples,
             elapsed_ms / passes,
             paths / (elapsed_ms * 1e3),
         );
 
-        let extent = tracer.extent();
-        let rgba = tracer.tonemapped_rgba8(&device)?;
+        let extent = renderer.extent();
+        let rgba = renderer.tonemapped_rgba8(&device)?;
         let name = format!(
             "{}_{}x{}_{}spp",
             config.scene_name(),
             extent.x,
             extent.y,
-            tracer.sample_count()
+            renderer.sample_count()
         );
-        let path = crate::png::save_rgba_png(&name, extent.x, extent.y, &rgba)?;
+        let path = super::output::save_rgba_png(&name, extent.x, extent.y, &rgba)?;
         eprintln!("spectral headless wrote {}", path.display());
 
-        crate::export::emit(
-            &tracer,
+        super::output::emit_spectral(
+            &renderer,
             &device,
             extent,
             config.spectral_probe,
@@ -109,8 +85,28 @@ pub fn run(config: &Config, resolution: UVec2) -> anyhow::Result<()> {
         )
     })();
 
-    tracer.destroy(&device);
-    spectral_scene.destroy(&device);
-    geometry.destroy(&device);
+    renderer.destroy(&device);
     result
+}
+
+/// Drive any finite progressive renderer without coupling the loop to its implementation.
+fn render_to_completion(
+    renderer: &mut PathTracer,
+    frame: &RenderFrame<'_>,
+    camera: &spectra::scene::Camera,
+) -> Result<()> {
+    while !renderer.is_complete() {
+        // Each pass creates autoreleased encoders; the frame scope keeps a long headless trace
+        // from retaining every encoder until process exit.
+        kiln_rhi::frame_scope(|| -> Result<()> {
+            let mut cmd = frame.device.create_command_buffer()?;
+            renderer.encode(frame, &mut cmd, camera)?;
+            cmd.end();
+            let queue = frame.device.queue();
+            queue.submit(cmd)?;
+            queue.wait_idle();
+            Ok(())
+        })?;
+    }
+    Ok(())
 }

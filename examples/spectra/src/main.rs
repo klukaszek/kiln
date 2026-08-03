@@ -6,20 +6,37 @@
 
 mod config;
 mod controls;
-mod export;
-mod frame_arena;
 mod headless;
-mod pathtracer;
-mod png;
-mod raster;
-mod scene;
+mod output;
 mod viewer;
 
 use clap::Parser;
 
 use config::Config;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error(transparent)]
+    Rhi(#[from] kiln_rhi::RhiError),
+    #[error(transparent)]
+    Render(#[from] spectra::render::Error),
+    #[error(transparent)]
+    Usd(#[from] spectra::usd::Error),
+    #[error(transparent)]
+    Spectrum(#[from] spectra::spectrum::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Png(#[from] png::EncodingError),
+    #[error("invalid configuration: {0}")]
+    Config(String),
+    #[error("invalid output: {0}")]
+    Output(String),
+}
+
+type Result<T> = std::result::Result<T, Error>;
+
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse();
     if let Some(resolution) = config.headless {
         headless::run(&config, resolution)?;

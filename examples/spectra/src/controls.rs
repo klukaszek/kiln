@@ -6,7 +6,7 @@
 //! restarts progressive accumulation by itself.
 //!
 //! Yaw/pitch live in a "levelled" local frame whose Y is the *stage's* up axis
-//! ([`crate::scene::Scene::up`]) — a Z-up stage steered with Y-up controls yaws
+//! ([`spectra::scene::Scene::up`]) — a Z-up stage steered with Y-up controls yaws
 //! around the view axis (i.e. rolls) and starts at the gimbal pole, where
 //! decomposing the authored matrix turns numerical noise into a finite roll.
 //! The controller also never writes the camera until the first actual input, so
@@ -20,7 +20,7 @@ use glam::{DMat4, DQuat, DVec2, DVec3};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
-use crate::scene::Scene;
+use spectra::scene::Scene;
 
 /// Base fly speed in scene units/second (the Cornell box is ~5.5 units tall).
 const FLY_SPEED: f64 = 2.5;
@@ -56,11 +56,11 @@ pub struct CameraController {
 }
 
 impl CameraController {
-    pub fn new(world: &DMat4, up: DVec3) -> Self {
+    pub fn new(world: DMat4, up: DVec3) -> Self {
         let frame = DQuat::from_rotation_arc(DVec3::Y, up.normalize_or(DVec3::Y));
-        let (position, yaw, pitch) = Self::decompose(world, frame);
+        let (position, yaw, pitch) = Self::decompose(&world, frame);
         Self {
-            home: *world,
+            home: world,
             frame,
             position,
             yaw,
@@ -136,18 +136,16 @@ impl CameraController {
         }
     }
 
-    /// Integrate held keys over the elapsed frame time and write the camera's
-    /// world transform (once the user has taken over).
-    pub fn update(&mut self, world: &mut DMat4) {
+    /// Integrate held keys and return a new camera transform after user input.
+    pub fn update(&mut self) -> Option<DMat4> {
         let dt = self.last_tick.elapsed().as_secs_f64().min(0.1);
         self.last_tick = Instant::now();
 
         if self.reset_requested {
             self.reset_requested = false;
             self.active = false;
-            *world = self.home;
-            (self.position, self.yaw, self.pitch) = Self::decompose(world, self.frame);
-            return;
+            (self.position, self.yaw, self.pitch) = Self::decompose(&self.home, self.frame);
+            return Some(self.home);
         }
         if !self.active {
             // Key takeover is derived from held state here (not from the press
@@ -155,7 +153,7 @@ impl CameraController {
             // flying immediately instead of waiting for an OS key repeat.
             self.active = MOVEMENT_KEYS.iter().any(|key| self.held.contains(key));
             if !self.active {
-                return;
+                return None;
             }
         }
 
@@ -177,7 +175,7 @@ impl CameraController {
             self.position += wish.normalize() * (FLY_SPEED * boost * dt);
         }
 
-        *world = DMat4::from_rotation_translation(rotation, self.position);
+        Some(DMat4::from_rotation_translation(rotation, self.position))
     }
 }
 
@@ -185,10 +183,9 @@ impl CameraController {
 /// the controller's takeover rebuild, to validate the decompose math per scene.
 pub fn debug_camera_roundtrip(scene: &Scene) {
     let authored = scene.camera.world;
-    let mut controls = CameraController::new(&authored, scene.up);
+    let mut controls = CameraController::new(authored, scene.up);
     controls.active = true;
-    let mut rebuilt = authored;
-    controls.update(&mut rebuilt);
+    let rebuilt = controls.update().unwrap_or(authored);
     eprintln!("up axis:  {:?}", scene.up);
     eprintln!("authored: {authored:.6}");
     eprintln!("rebuilt:  {rebuilt:.6}");

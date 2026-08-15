@@ -3,7 +3,7 @@ use kiln_rhi::{Device, gpu_struct};
 
 use crate::base::gpu::{GpuArray, GpuTextureBinding, GpuUploadBatch, TextureResources};
 use crate::base::renderer::{self, Error};
-use crate::base::scene::{CpuStorage, Material, Scene, SceneStorage, Surface};
+use crate::base::scene::{Material, Scene, SceneStorage, Surface};
 
 pub(super) const NO_TEXTURE: u32 = u32::MAX;
 
@@ -37,11 +37,7 @@ impl SceneStorage for Storage {
     type Config = ();
     type Error = renderer::Error;
 
-    fn build(
-        device: &Device,
-        scene: &Scene<CpuStorage>,
-        _config: &Self::Config,
-    ) -> renderer::Result<Self> {
+    fn build(device: &Device, scene: &Scene, _config: &Self::Config) -> renderer::Result<Self> {
         if scene.triangle_count() > (u32::MAX as usize) / 3 {
             return Err(Error::Capacity("raster geometry exceeds u32 indexing"));
         }

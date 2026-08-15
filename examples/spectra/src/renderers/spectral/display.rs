@@ -32,7 +32,7 @@ float4 displayFs(VOut i, uniform DisplayRoot* r) : SV_Target
     bool targetIsSrgb = r.target_is_srgb != 0u;
     uint filmW = r.film_width;
     uint filmH = r.film_height;
-    uint pixelStride = DISPLAY_PIXEL_STRIDE;
+    uint pixelStride = r.pixel_stride;
     uint x = min((uint)i.pos.x, width - 1u);
     uint y = min((uint)i.pos.y, height - 1u);
     // Nearest-neighbour upscale when the film renders below display resolution.
@@ -73,7 +73,7 @@ float4 displayFs(VOut i, uniform DisplayRoot* r) : SV_Target
 }
 "#;
 
-pub(super) fn source(pixel_stride: u32) -> String {
+pub(super) fn source() -> String {
     assert!(
         spectrum::SPECTRAL_BINS.is_multiple_of(4),
         "spectral display requires a multiple of four bins"
@@ -95,7 +95,7 @@ pub(super) fn source(pixel_stride: u32) -> String {
     format!(
         "static const uint DISPLAY_BINS = {}u;\n\
          static const uint DISPLAY_BIN_VECS = {}u;\n\
-         static const uint DISPLAY_PIXEL_STRIDE = {pixel_stride}u;\n\n\
+         \n\
          {cmf_source}\n{BODY}",
         spectrum::SPECTRAL_BINS,
         spectrum::SPECTRAL_BINS / 4,

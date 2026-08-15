@@ -8,13 +8,13 @@ use kiln_rhi::{CommandBuffer, Device, Format};
 
 use crate::base::gpu::FrameArenas;
 use crate::base::renderer::{self as render, PresentRenderer, RenderFrame, Renderer};
-use crate::base::scene::{Camera, CpuStorage, Scene};
+use crate::base::scene::{Camera, Scene, SceneStorage};
 
 use pipeline::{Pipeline, Root};
 use scene::Storage;
 
 pub struct RasterRenderer {
-    scene: Scene<Storage>,
+    storage: Storage,
     pipeline: Pipeline,
     frame_arenas: FrameArenas,
     vp: [Vec4; 4],
@@ -22,27 +22,30 @@ pub struct RasterRenderer {
 }
 
 impl RasterRenderer {
-    pub fn new(
-        device: &Device,
-        color_format: Format,
-        source: &Scene<CpuStorage>,
-    ) -> render::Result<Self> {
+    pub fn new(device: &Device, color_format: Format, source: &Scene) -> render::Result<Self> {
         let pipeline = Pipeline::new(device, color_format)?;
-        let scene = source.prepare::<Storage>(device, &())?;
+        let storage = source.prepare::<Storage>(device, &())?;
         let frame_arenas = match FrameArenas::new(device, 4096, "spectra-raster-arena") {
             Ok(value) => value,
             Err(error) => {
-                scene.destroy(device);
+                storage.destroy(device);
                 return Err(error);
             }
         };
         Ok(Self {
-            scene,
+            storage,
             pipeline,
             frame_arenas,
             vp: [Vec4::ZERO; 4],
             cam_pos: Vec4::ZERO,
         })
+    }
+
+    pub fn update_scene(&mut self, device: &Device, source: &Scene) -> render::Result<()> {
+        let new_storage = source.prepare::<Storage>(device, &())?;
+        let old_storage = std::mem::replace(&mut self.storage, new_storage);
+        old_storage.destroy(device);
+        Ok(())
     }
 }
 
@@ -60,12 +63,12 @@ impl Renderer for RasterRenderer {
 
     fn destroy(self: Box<Self>, device: &Device) {
         let Self {
-            scene,
+            storage,
             frame_arenas,
             ..
         } = *self;
         frame_arenas.destroy(device);
-        scene.destroy(device);
+        storage.destroy(device);
     }
 }
 
@@ -84,15 +87,14 @@ impl PresentRenderer for RasterRenderer {
                 vp2: self.vp[2],
                 vp3: self.vp[3],
                 cam_pos: self.cam_pos,
-                verts: self.scene.storage.vertices.gpu(),
-                materials: self.scene.storage.materials.gpu(),
-                texture_bindings: self.scene.storage.texture_bindings.gpu(),
-                tri_count: self.scene.storage.triangle_count,
+                verts: self.storage.vertices.gpu(),
+                materials: self.storage.materials.gpu(),
+                texture_bindings: self.storage.texture_bindings.gpu(),
+                tri_count: self.storage.triangle_count,
                 _pad: 0,
             },
         );
-        self.pipeline
-            .record(cmd, root, self.scene.storage.triangle_count);
+        self.pipeline.record(cmd, root, self.storage.triangle_count);
     }
 }
 

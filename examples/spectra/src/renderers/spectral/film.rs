@@ -89,6 +89,12 @@ impl Film {
         }
     }
 
+    /// Keep the allocation, but force the next frame to clear it and restart accumulation.
+    pub(super) fn invalidate(&mut self) {
+        self.pass_count = 0;
+        self.signature = None;
+    }
+
     pub(super) fn accum(&self) -> &GpuAllocation {
         self.accum
             .as_ref()

@@ -4,7 +4,9 @@ use openusd::sdf;
 use openusd::usd::Stage;
 use std::collections::HashMap;
 
-use crate::base::scene::{Geometry, Instance, MaterialId, Mesh, MeshId, Primitive, Vertex};
+use crate::base::scene::{
+    EmissiveComponent, Geometry, Instance, MaterialId, Mesh, MeshId, Primitive, Vertex,
+};
 
 use super::material::MaterialLibrary;
 use super::transform::world_xform;
@@ -29,6 +31,7 @@ pub(super) fn load(
         meshes.push(asset);
         instances.push(Instance {
             mesh: mesh_id,
+            path: mesh_path.clone(),
             transform: world_xform(stage, &path)?,
         });
     }
@@ -85,6 +88,7 @@ fn decode_mesh(
                         let index = u32::try_from(vertices.len())?;
                         vertices.push(Vertex {
                             position: Vec3::from_array(position),
+                            source_index: Some(u32::try_from(point_index)?),
                             normal,
                             uv,
                         });
@@ -107,10 +111,13 @@ fn decode_mesh(
             "faceVertexIndices has trailing entries".into(),
         ));
     }
+    let emissive_components =
+        connected_emissive_components(&vertices, &indices, &primitives, materials);
     Ok(Mesh {
         vertices,
         indices,
         primitives,
+        emissive_components,
     })
 }
 
@@ -119,6 +126,110 @@ struct ImportVertexKey {
     point_index: usize,
     normal: Option<[u32; 3]>,
     uv: Option<[u32; 2]>,
+}
+
+#[derive(Clone, Copy)]
+struct EmissiveTriangle {
+    material: MaterialId,
+    topology: [u32; 3],
+    indices: [u32; 3],
+}
+
+fn connected_emissive_components(
+    vertices: &[Vertex],
+    indices: &[u32],
+    primitives: &[Primitive],
+    materials: &MaterialLibrary,
+) -> Vec<EmissiveComponent> {
+    let mut triangles = Vec::new();
+    for primitive in primitives {
+        let Some(material) = materials.materials().get(primitive.material.0) else {
+            continue;
+        };
+        if !material.is_emissive() {
+            continue;
+        }
+        let range = primitive.index_start..primitive.index_start + primitive.index_count;
+        for corners in indices[range].chunks_exact(3) {
+            let triangle = [corners[0], corners[1], corners[2]];
+            triangles.push(EmissiveTriangle {
+                material: primitive.material,
+                topology: triangle
+                    .map(|index| vertices[index as usize].source_index.unwrap_or(index)),
+                indices: triangle,
+            });
+        }
+    }
+
+    let mut sets = DisjointSet::new(triangles.len());
+    let mut edges = HashMap::<(MaterialId, u32, u32), usize>::new();
+    for (triangle_index, triangle) in triangles.iter().enumerate() {
+        for edge in [
+            [triangle.topology[0], triangle.topology[1]],
+            [triangle.topology[1], triangle.topology[2]],
+            [triangle.topology[2], triangle.topology[0]],
+        ] {
+            let (a, b) = if edge[0] < edge[1] {
+                (edge[0], edge[1])
+            } else {
+                (edge[1], edge[0])
+            };
+            if let Some(other) = edges.insert((triangle.material, a, b), triangle_index) {
+                sets.union(triangle_index, other);
+            }
+        }
+    }
+
+    let mut grouped = HashMap::<(usize, MaterialId), Vec<[u32; 3]>>::new();
+    for (triangle_index, triangle) in triangles.into_iter().enumerate() {
+        grouped
+            .entry((sets.find(triangle_index), triangle.material))
+            .or_default()
+            .push(triangle.indices);
+    }
+    let mut components = grouped.into_iter().collect::<Vec<_>>();
+    components.sort_by_key(|((root, _), _)| *root);
+    components
+        .into_iter()
+        .map(|((_, material), triangles)| EmissiveComponent {
+            material,
+            triangles,
+        })
+        .collect()
+}
+
+struct DisjointSet {
+    parent: Vec<usize>,
+    size: Vec<usize>,
+}
+
+impl DisjointSet {
+    fn new(count: usize) -> Self {
+        Self {
+            parent: (0..count).collect(),
+            size: vec![1; count],
+        }
+    }
+
+    fn find(&mut self, value: usize) -> usize {
+        if self.parent[value] != value {
+            self.parent[value] = self.find(self.parent[value]);
+        }
+        self.parent[value]
+    }
+
+    fn union(&mut self, left: usize, right: usize) {
+        let mut left = self.find(left);
+        let mut right = self.find(right);
+        if left == right {
+            return;
+        }
+        if self.size[left] < self.size[right] {
+            std::mem::swap(&mut left, &mut right);
+        }
+        self.parent[right] = left;
+        self.size[left] += self.size[right];
+    }
 }
 
 fn subset_material(

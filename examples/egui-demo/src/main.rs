@@ -8,7 +8,7 @@
 //!
 //! Run with: `cargo run -p egui-demo` (needs `slangc` on PATH).
 
-use kiln_app::{Example, FrameCtx};
+use kiln_app::{Example, FrameCtx, PerformanceStats};
 use kiln_rhi::{CommandBuffer, Device, Format};
 
 struct Demo {
@@ -30,9 +30,9 @@ impl Example for Demo {
     // whenever the crate is built with the default `egui` feature) draws the UI on top.
     fn render(&mut self, _ctx: &FrameCtx, _cmd: &mut CommandBuffer) {}
 
-    fn ui(&mut self, ui: &mut egui::Ui) {
+    fn ui(&mut self, ui: &mut egui::Ui, _stats: PerformanceStats) {
         // `show_inside(ui)` (rather than `show(ctx)`) nests the panel inside the harness's pass
-        // root, below its stats bar; it restores the central panel's background fill and margins.
+        // root; it restores the central panel's background fill and margins.
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.heading("Kiln RHI · egui");
             ui.separator();

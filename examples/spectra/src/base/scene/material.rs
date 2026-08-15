@@ -116,14 +116,32 @@ impl Default for Emission {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Material {
+    pub name: String,
     pub surface: Surface,
     pub emission: Emission,
 }
 
 impl Material {
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ..Self::default()
+        }
+    }
+
     pub fn is_emissive(&self) -> bool {
         self.emission.color.max_element() > 0.0
+    }
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            name: "Material".into(),
+            surface: Surface::default(),
+            emission: Emission::default(),
+        }
     }
 }

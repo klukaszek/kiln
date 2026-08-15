@@ -9,7 +9,9 @@ use crate::base::renderer;
 use super::display;
 use super::integrator;
 use super::sampler;
-use super::scene::{GpuBsdf, GpuLight, GpuMaterialTexture, GpuTriangle};
+use super::scene::{
+    GpuBsdf, GpuInstance, GpuLight, GpuMaterialTexture, GpuMeshLightTriangle, GpuTriangle,
+};
 use super::shader_types::{CLEAR_SOURCE, CLEAR_THREADS, ClearRoot, DisplayRoot, TraceRoot};
 
 pub(super) struct Pipelines {
@@ -22,20 +24,20 @@ impl Pipelines {
     pub(super) fn new(
         device: &Device,
         color_format: Format,
-        pixel_stride: u32,
-        light_count: u32,
         spectrum_len: u32,
     ) -> renderer::Result<Self> {
         let trace_source = format!(
-            "{}{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}{}{}",
             GpuBsdf::SLANG,
             GpuMaterialTexture::SLANG,
             GpuTextureBinding::SLANG,
             GpuLight::SLANG,
+            GpuMeshLightTriangle::SLANG,
             GpuTriangle::SLANG,
+            GpuInstance::SLANG,
             TraceRoot::SLANG,
             sampler::source(),
-            integrator::source(pixel_stride, light_count, spectrum_len)
+            integrator::source(spectrum_len)
         );
         let trace_shader = kiln_rhi::compiler::compile_with_caps(
             device,
@@ -63,7 +65,7 @@ impl Pipelines {
             &clear_shader,
         )?;
 
-        let display_source = format!("{}{}", DisplayRoot::SLANG, display::source(pixel_stride));
+        let display_source = format!("{}{}", DisplayRoot::SLANG, display::source());
         let display_vs =
             kiln_rhi::compiler::compile(device, &display_source, "displayVs", ShaderStage::Vertex);
         let display_fs =
@@ -104,19 +106,21 @@ mod shader_source_tests {
         }
 
         let trace_source = format!(
-            "{}{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}{}{}",
             GpuBsdf::SLANG,
             GpuMaterialTexture::SLANG,
             GpuTextureBinding::SLANG,
             GpuLight::SLANG,
+            GpuMeshLightTriangle::SLANG,
             GpuTriangle::SLANG,
+            GpuInstance::SLANG,
             TraceRoot::SLANG,
             sampler::source(),
-            integrator::source(2, 1, 64)
+            integrator::source(64)
         );
         compile(&trace_source, "traceMain", "compute", &["spvRayQueryKHR"]);
 
-        let display_source = format!("{}{}", DisplayRoot::SLANG, display::source(2));
+        let display_source = format!("{}{}", DisplayRoot::SLANG, display::source());
         compile(&display_source, "displayVs", "vertex", &[]);
         compile(&display_source, "displayFs", "fragment", &[]);
     }

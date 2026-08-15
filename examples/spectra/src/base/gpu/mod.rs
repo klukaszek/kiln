@@ -6,4 +6,4 @@ pub(crate) mod upload;
 
 pub(crate) use frame::FrameArenas;
 pub(crate) use texture::{GpuTextureBinding, TextureResources};
-pub(crate) use upload::{GpuArray, GpuUploadBatch};
+pub(crate) use upload::{GpuArray, GpuPatchBatch, GpuUploadBatch};

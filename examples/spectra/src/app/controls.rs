@@ -136,6 +136,31 @@ impl CameraController {
         }
     }
 
+    /// Current position in world space, for the debug/editor UI.
+    pub fn position(&self) -> DVec3 {
+        self.position
+    }
+
+    /// Request the authored USD camera on the next update.
+    pub fn request_reset(&mut self) {
+        self.reset_requested = true;
+    }
+
+    /// Move the camera from an editor while keeping the controller active.
+    pub fn set_position(&mut self, position: DVec3) {
+        self.position = position;
+        self.active = true;
+        self.reset_requested = false;
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
+    pub fn needs_continuous_update(&self) -> bool {
+        self.dragging || MOVEMENT_KEYS.iter().any(|key| self.held.contains(key))
+    }
+
     /// Integrate held keys and return a new camera transform after user input.
     pub fn update(&mut self) -> Option<DMat4> {
         let dt = self.last_tick.elapsed().as_secs_f64().min(0.1);

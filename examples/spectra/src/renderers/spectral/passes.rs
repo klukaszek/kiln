@@ -34,7 +34,7 @@ impl PathTracer {
             extent,
             FilmSignature::new(camera, self.schedule.pixel_stride),
         )?;
-        let batch = if self.scene.storage.lights.len() > 0 {
+        let batch = if self.storage.lights.len() > 0 {
             self.schedule.next_batch(self.film.pass_count)
         } else {
             None
@@ -62,8 +62,8 @@ impl PathTracer {
                     ctx.extent.y,
                     self.schedule.target_spp,
                     self.schedule.passes_per_frame,
-                    self.scene.storage.bsdfs.len(),
-                    self.scene.storage.lights.len()
+                    self.storage.bsdfs.len(),
+                    self.storage.lights.len()
                 );
             }
         }
@@ -98,7 +98,8 @@ impl PathTracer {
                 completed_samples: progress.completed_samples,
                 remaining_phases: progress.remaining_phases,
                 target_is_srgb: u32::from(self.display_target_is_srgb),
-                _pad: UVec2::ZERO,
+                pixel_stride: self.schedule.pixel_stride,
+                _pad: 0,
             },
         );
 
@@ -118,7 +119,7 @@ impl PathTracer {
             batch,
             ..
         } = dispatch;
-        let resources = &self.scene.storage;
+        let resources = &self.storage;
         let accum = self.film.accum();
         let root = self.frame_arenas.upload(
             ctx.slot,
@@ -130,8 +131,12 @@ impl PathTracer {
                 lens: camera.lens,
                 film: accum.gpu(),
                 triangles: resources.triangles.gpu(),
+                instances: resources.instances.gpu(),
                 bsdfs: resources.bsdfs.gpu(),
                 lights: resources.lights.gpu(),
+                mesh_light_triangles: resources.mesh_light_triangles.gpu(),
+                mesh_light_cdf: resources.mesh_light_cdf.gpu(),
+                light_spectrum: resources.light_spectrum.gpu(),
                 spectrum: resources.spectrum.gpu(),
                 lambda: resources.lambda.gpu(),
                 reflectance: resources.reflectance.gpu(),
@@ -143,7 +148,13 @@ impl PathTracer {
                 film_height: extent.y,
                 pass_start: batch.start,
                 pass_count: batch.count,
-                _pad: UVec2::ZERO,
+                settings: glam::UVec4::new(
+                    self.storage.lights.len(),
+                    self.schedule.pixel_stride,
+                    self.schedule.pixel_stride * self.schedule.pixel_stride,
+                    0,
+                ),
+                _pad: glam::UVec2::ZERO,
             },
         );
 

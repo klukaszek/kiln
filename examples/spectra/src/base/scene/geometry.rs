@@ -51,6 +51,13 @@ impl Geometry {
         flatten_triangles(&self.meshes, &self.instances)
     }
 
+    /// Return only the triangles belonging to one instance. Renderer update paths use this to
+    /// patch an edited instance without flattening every occurrence in the scene.
+    pub fn instance_triangles(&self, instance_index: usize) -> Vec<Triangle> {
+        let instance = &self.instances[instance_index];
+        flatten_instance_triangles(&self.meshes, instance)
+    }
+
     pub fn from_triangles(triangles: Vec<Triangle>) -> Self {
         let capacity = triangles.len() * 3;
         let mut vertices = Vec::with_capacity(capacity);
@@ -71,11 +78,13 @@ impl Geometry {
             vertices,
             indices,
             primitives,
+            emissive_components: Vec::new(),
         };
         Self::new(
             vec![mesh],
             vec![Instance {
                 mesh: MeshId(0),
+                path: "/Geometry".into(),
                 transform: DMat4::IDENTITY,
             }],
         )
@@ -85,40 +94,47 @@ impl Geometry {
 fn flatten_triangles(meshes: &[Mesh], instances: &[Instance]) -> Vec<Triangle> {
     let mut triangles = Vec::new();
     for instance in instances {
-        let mesh = &meshes[instance.mesh.0];
-        let transform = instance.transform;
-        let normal_transform = transform.inverse().transpose();
-        for primitive in &mesh.primitives {
-            let start = primitive.index_start;
-            let indices = &mesh.indices[start..start + primitive.index_count];
-            for corners in indices.chunks_exact(3) {
-                let mut vertices = [Vertex::default(); 3];
-                for (dst, index) in vertices.iter_mut().zip(corners) {
-                    let source = mesh.vertices[*index as usize];
-                    dst.position = transform
-                        .transform_point3(source.position.as_dvec3())
-                        .as_vec3();
-                    dst.normal = source.normal.map(|normal| {
-                        normal_transform
-                            .transform_vector3(normal.as_dvec3())
-                            .normalize()
-                            .as_vec3()
-                    });
-                    dst.uv = source.uv;
-                }
-                let geometric = (vertices[1].position - vertices[0].position)
-                    .cross(vertices[2].position - vertices[0].position)
-                    .normalize();
-                for vertex in &mut vertices {
-                    if vertex.normal.is_none() {
-                        vertex.normal = Some(geometric);
-                    }
-                }
-                triangles.push(Triangle {
-                    vertices,
-                    material: primitive.material,
+        triangles.extend(flatten_instance_triangles(meshes, instance));
+    }
+    triangles
+}
+
+fn flatten_instance_triangles(meshes: &[Mesh], instance: &Instance) -> Vec<Triangle> {
+    let mesh = &meshes[instance.mesh.0];
+    let transform = instance.transform;
+    let normal_transform = transform.inverse().transpose();
+    let mut triangles = Vec::new();
+    for primitive in &mesh.primitives {
+        let start = primitive.index_start;
+        let indices = &mesh.indices[start..start + primitive.index_count];
+        for corners in indices.chunks_exact(3) {
+            let mut vertices = [Vertex::default(); 3];
+            for (dst, index) in vertices.iter_mut().zip(corners) {
+                let source = mesh.vertices[*index as usize];
+                dst.position = transform
+                    .transform_point3(source.position.as_dvec3())
+                    .as_vec3();
+                dst.source_index = source.source_index;
+                dst.normal = source.normal.map(|normal| {
+                    normal_transform
+                        .transform_vector3(normal.as_dvec3())
+                        .normalize()
+                        .as_vec3()
                 });
+                dst.uv = source.uv;
             }
+            let geometric = (vertices[1].position - vertices[0].position)
+                .cross(vertices[2].position - vertices[0].position)
+                .normalize();
+            for vertex in &mut vertices {
+                if vertex.normal.is_none() {
+                    vertex.normal = Some(geometric);
+                }
+            }
+            triangles.push(Triangle {
+                vertices,
+                material: primitive.material,
+            });
         }
     }
     triangles
@@ -132,16 +148,19 @@ mod tests {
         vec![
             Vertex {
                 position: Vec3::ZERO,
+                source_index: None,
                 normal: None,
                 uv: None,
             },
             Vertex {
                 position: Vec3::X,
+                source_index: None,
                 normal: None,
                 uv: None,
             },
             Vertex {
                 position: Vec3::Y,
+                source_index: None,
                 normal: None,
                 uv: None,
             },
@@ -155,6 +174,7 @@ mod tests {
             vec![mesh],
             vec![Instance {
                 mesh: MeshId(0),
+                path: "/Geometry".into(),
                 transform: DMat4::from_translation(glam::DVec3::Z),
             }],
         );

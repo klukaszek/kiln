@@ -59,6 +59,10 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn light_spectrum_name(&self) -> &str {
+        &self.light_spectrum
+    }
+
     pub fn light_spectrum(&self) -> super::Result<spectrum::Spd> {
         if let Some(spd) = spectrum::named(&self.light_spectrum) {
             return Ok(spd);

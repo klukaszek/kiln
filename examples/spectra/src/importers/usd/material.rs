@@ -18,7 +18,7 @@ impl MaterialLibrary {
     pub(super) fn new(textures: TextureLibrary) -> Self {
         Self {
             by_path: HashMap::new(),
-            materials: vec![Material::default()],
+            materials: vec![Material::named("Default Material")],
             textures,
         }
     }
@@ -30,7 +30,13 @@ impl MaterialLibrary {
         if let Some(&id) = self.by_path.get(&material_path) {
             return Ok(id);
         }
-        let material = read_material(stage, &material_path, &mut self.textures)?;
+        let mut material = read_material(stage, &material_path, &mut self.textures)?;
+        material.name = material_path
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Material")
+            .to_owned();
         let id = MaterialId(self.materials.len());
         self.materials.push(material);
         self.by_path.insert(material_path, id);
@@ -40,6 +46,10 @@ impl MaterialLibrary {
     pub(super) fn into_parts(self) -> (Vec<Material>, Vec<Image>, Vec<Texture>) {
         let (images, textures) = self.textures.into_parts();
         (self.materials, images, textures)
+    }
+
+    pub(super) fn materials(&self) -> &[Material] {
+        &self.materials
     }
 }
 

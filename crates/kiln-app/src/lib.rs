@@ -10,9 +10,9 @@
 //! The overlay is gated entirely by the `egui` build feature (on by default), not a runtime flag:
 //! build with it and every demo gets an egui overlay on top of its render; build
 //! `--no-default-features` and the harness is plain egui-free windowing (the RHI core never depends
-//! on egui either way). When active, the overlay draws a CPU/GPU frame-time bar plus whatever the
-//! example injects by overriding [`Example::ui`], painted in a second color-load pass so it
-//! composites over depth-using examples without a dynamic-rendering format mismatch.
+//! on egui either way). When active, the overlay paints whatever the example injects by overriding
+//! [`Example::ui`], in a second color-load pass so it composites over depth-using examples without
+//! a dynamic-rendering format mismatch.
 
 #![allow(dead_code)]
 
@@ -54,6 +54,21 @@ pub struct FrameCtx<'a> {
     pub slot: usize,
 }
 
+/// Harness data available while an example builds its egui overlay.
+#[cfg(feature = "egui")]
+#[derive(Clone, Copy)]
+pub struct PerformanceStats {
+    /// CPU time spent recording and submitting the current frame, excluding egui construction and
+    /// the frame-slot acquisition wait.
+    pub cpu_ms: f64,
+    /// GPU queue time bracketed by the frame timestamps, including pre-render compute and present.
+    pub gpu_ms: f64,
+    /// Time spent acquiring the next frame slot/image. This is commonly compositor/vsync or a
+    /// frames-in-flight fence wait, not renderer CPU work.
+    pub wait_ms: f64,
+    pub backend: &'static str,
+}
+
 /// What each windowed example implements: build its pipelines once, then record draw commands into
 /// the per-frame render pass.
 pub trait Example {
@@ -84,12 +99,17 @@ pub trait Example {
     /// `Some`, a cleared depth attachment is bound too.
     fn render(&mut self, ctx: &FrameCtx, cmd: &mut CommandBuffer);
 
+    /// Whether the harness should keep requesting redraws without an external event. Progressive
+    /// examples return false once they have converged; input events still request a redraw.
+    fn wants_continuous_redraw(&self) -> bool {
+        true
+    }
+
     /// Emit the example's egui overlay UI for this frame. Only present when the crate is built with
-    /// the `egui` feature; with it the overlay is always active and the harness has already drawn
-    /// its frame-time bar above this. Override to inject UI; the default emits nothing (so a plain
-    /// example still gets the frame-time HUD for free).
+    /// the `egui` feature; with it the overlay is always active. Override to inject UI; the default
+    /// emits nothing. Per-frame timing and backend information are supplied to the example UI.
     #[cfg(feature = "egui")]
-    fn ui(&mut self, _ui: &mut egui::Ui) {}
+    fn ui(&mut self, _ui: &mut egui::Ui, _stats: PerformanceStats) {}
 
     /// Release resources whose RHI ownership is explicit rather than RAII.
     fn destroy(self, _device: &Device)
@@ -274,8 +294,6 @@ impl<E: Example> App<E> {
     }
 
     fn render_frame_inner(&mut self) {
-        let _cpu_start = Instant::now();
-
         // Build the overlay UI first: its texture deltas must upload before the render pass.
         #[cfg(feature = "egui")]
         let egui_frame = self.build_egui_frame();
@@ -290,6 +308,7 @@ impl<E: Example> App<E> {
         let queue = self.device.queue();
 
         // `acquire_image` waits on this slot's fence, so the slot's resources are free.
+        let acquire_start = Instant::now();
         let image = match queue.acquire_image(swapchain, frame_index) {
             Ok(image) => image,
             Err(e) => {
@@ -300,12 +319,17 @@ impl<E: Example> App<E> {
                 return;
             }
         };
+        #[cfg(feature = "egui")]
+        if let Some(egui) = self.egui.as_mut() {
+            egui.wait_ms = ema(egui.wait_ms, acquire_start.elapsed().as_secs_f64() * 1.0e3);
+        }
         let extent = UVec2::new(image.width, image.height);
         let ctx = FrameCtx {
             device: &self.device,
             extent,
             slot: frame_index,
         };
+        let cpu_start = Instant::now();
 
         // Read this slot's prior timestamps (its fence was waited at acquire) before recording over them.
         #[cfg(feature = "egui")]
@@ -400,13 +424,13 @@ impl<E: Example> App<E> {
             if let Some(frame) = egui_frame {
                 egui.renderer.free_textures(&self.device, &frame.free);
             }
-            egui.cpu_ms = ema(egui.cpu_ms, _cpu_start.elapsed().as_secs_f64() * 1.0e3);
+            egui.cpu_ms = ema(egui.cpu_ms, cpu_start.elapsed().as_secs_f64() * 1.0e3);
             if *FRAME_BENCH {
                 egui.debug_frame_count += 1;
                 if egui.debug_frame_count.is_multiple_of(20) {
                     eprintln!(
-                        "kiln frame benchmark: cpu={:.3}ms gpu={:.3}ms",
-                        egui.cpu_ms, egui.gpu_ms
+                        "kiln frame benchmark: cpu_record={:.3}ms acquire_wait={:.3}ms gpu={:.3}ms",
+                        egui.cpu_ms, egui.wait_ms, egui.gpu_ms
                     );
                 }
             }
@@ -418,13 +442,13 @@ impl<E: Example> App<E> {
                 eprintln!(
                     "kiln frame benchmark: frame={} cpu={:.3}ms",
                     self.benchmark_frame_count,
-                    _cpu_start.elapsed().as_secs_f64() * 1.0e3
+                    cpu_start.elapsed().as_secs_f64() * 1.0e3
                 );
             }
         }
     }
 
-    /// Build this frame's egui UI (stats bar + the example's overlay), apply its texture deltas,
+    /// Build this frame's egui UI (the example's overlay), apply its texture deltas,
     /// and return the tessellated geometry to paint. `None` when the overlay is inactive.
     #[cfg(feature = "egui")]
     fn build_egui_frame(&mut self) -> Option<EguiFrame> {
@@ -438,19 +462,14 @@ impl<E: Example> App<E> {
         // text-selection plugin's `on_end_pass` is what releases drag state on pointer-up. Bare
         // `run` skips it, so selection sticks to the cursor after release.
         let ctx = egui.ctx.clone();
-        let (cpu_ms, gpu_ms, backend) = (egui.cpu_ms, egui.gpu_ms, device.backend_name());
+        let stats = PerformanceStats {
+            cpu_ms: egui.cpu_ms,
+            gpu_ms: egui.gpu_ms,
+            wait_ms: egui.wait_ms,
+            backend: device.backend_name(),
+        };
         let out = ctx.run_ui(raw_input, |ui| {
-            // Top stats bar, added before the example's panels (egui panel ordering).
-            egui::Panel::top("kiln_stats").show_inside(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(format!("Kiln · {backend}"));
-                    ui.separator();
-                    ui.label(format!("CPU {cpu_ms:5.2} ms"));
-                    ui.separator();
-                    ui.label(format!("GPU {gpu_ms:5.2} ms"));
-                });
-            });
-            example.ui(ui);
+            example.ui(ui, stats);
         });
         egui.state
             .handle_platform_output(window, out.platform_output);
@@ -567,14 +586,32 @@ impl<E: Example> ApplicationHandler for App<E> {
                 if (w, h) != self.surface_size {
                     self.recreate_surface_sized(w, h);
                 }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
             WindowEvent::RedrawRequested => self.render_frame(),
-            _ => {}
+            _ => {
+                // When the example is idle, ControlFlow::Wait prevents a redraw storm. Every
+                // user event still gets one frame so egui edits and camera input remain responsive.
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let continuous = self
+            .example
+            .as_ref()
+            .is_some_and(|example| example.wants_continuous_redraw());
+        event_loop.set_control_flow(if continuous {
+            ControlFlow::Poll
+        } else {
+            ControlFlow::Wait
+        });
+        if continuous && let Some(window) = &self.window {
             window.request_redraw();
         }
     }
@@ -595,7 +632,7 @@ struct EguiFrame {
 }
 
 /// Overlay resources: egui context + winit input glue, the Kiln painter, per-slot timestamp pools,
-/// and the smoothed frame times shown in the stats bar.
+/// and the smoothed frame times supplied to the example UI.
 #[cfg(feature = "egui")]
 struct Egui {
     ctx: egui::Context,
@@ -605,6 +642,7 @@ struct Egui {
     query_pools: Vec<kiln_rhi::QueryPool>,
     cpu_ms: f64,
     gpu_ms: f64,
+    wait_ms: f64,
     debug_frame_count: u32,
 }
 
@@ -632,6 +670,7 @@ impl Egui {
             query_pools,
             cpu_ms: 0.0,
             gpu_ms: 0.0,
+            wait_ms: 0.0,
             debug_frame_count: 0,
         }
     }

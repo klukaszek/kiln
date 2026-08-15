@@ -1,6 +1,6 @@
 //! Host and shader argument layouts for spectral tracing.
 
-use glam::{UVec2, Vec4};
+use glam::{UVec2, UVec4, Vec4};
 use kiln_rhi::{AccelHandle, GpuAddress, gpu_struct};
 
 use crate::base::scene::Camera;
@@ -36,8 +36,12 @@ gpu_struct! {
         lens: Vec4,
         film: GpuAddress as "float*", // spectral film: per pixel [bin_0..bin_N]
         triangles: GpuAddress as "Ptr<GpuTriangle, Access.Read>",
+        instances: GpuAddress as "Ptr<GpuInstance, Access.Read>",
         bsdfs: GpuAddress as "Ptr<GpuBsdf, Access.Read>",
         lights: GpuAddress as "Ptr<GpuLight, Access.Read>",
+        mesh_light_triangles: GpuAddress as "Ptr<GpuMeshLightTriangle, Access.Read>",
+        mesh_light_cdf: GpuAddress as "Ptr<float, Access.Read>",
+        light_spectrum: GpuAddress as "Ptr<float, Access.Read>",
         spectrum: GpuAddress as "Ptr<float4, Access.Read>", // CDF table: (phase, wavelength, flux_shape, p_light)
         lambda: GpuAddress as "Ptr<float4, Access.Read>", // uniform-λ MIS table, same texel layout
         reflectance: GpuAddress as "Ptr<float, Access.Read>", // [material][light/uniform table][wavelength entry]
@@ -49,6 +53,7 @@ gpu_struct! {
         film_height: u32,
         pass_start: u32,
         pass_count: u32,
+        settings: UVec4,
         _pad: UVec2,
     }
 }
@@ -64,7 +69,8 @@ gpu_struct! {
         completed_samples: u32,
         remaining_phases: u32,
         target_is_srgb: u32,
-        _pad: UVec2,
+        pixel_stride: u32,
+        _pad: u32,
     }
 }
 

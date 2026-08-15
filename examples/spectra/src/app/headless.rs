@@ -20,7 +20,11 @@ pub fn run(config: &Config, resolution: UVec2) -> Result<()> {
         label: Some("spectral-headless".into()),
         ..Default::default()
     })?;
-    let scene = usd::load(&config.scene_path()?)?;
+    let mut scene = usd::load(&config.scene_path()?)?;
+    let default_light_spectrum = config.light_spectrum_name().to_owned();
+    for light in &mut scene.lights {
+        light.spectrum = default_light_spectrum.clone();
+    }
     if std::env::var_os("SPECTRAL_DEBUG_CAMERA").is_some() {
         debug_camera_roundtrip(&scene);
     }

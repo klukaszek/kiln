@@ -9,18 +9,20 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
     uint height = r.film_height;
     uint passStart = r.pass_start;
     uint sampleBatch = r.pass_count;
-    uint tileWidth = (width + PIXEL_STRIDE - 1u) / PIXEL_STRIDE;
-    uint tileHeight = (height + PIXEL_STRIDE - 1u) / PIXEL_STRIDE;
+    uint pixelStride = r.settings.y;
+    uint phaseCount = r.settings.z;
+    uint tileWidth = (width + pixelStride - 1u) / pixelStride;
+    uint tileHeight = (height + pixelStride - 1u) / pixelStride;
     if (tid.x >= tileWidth || tid.y >= tileHeight) {
         return;
     }
 
     for (uint passOffset = 0u; passOffset < sampleBatch; passOffset++) {
         uint passIndex = passStart + passOffset;
-        uint sampleIndex = passIndex / PHASE_COUNT;
-        uint phase = passIndex - sampleIndex * PHASE_COUNT;
-        uint2 phaseOffset = uint2(phase % PIXEL_STRIDE, phase / PIXEL_STRIDE);
-        uint2 pixelCoord = tid.xy * PIXEL_STRIDE + phaseOffset;
+        uint sampleIndex = passIndex / phaseCount;
+        uint phase = passIndex - sampleIndex * phaseCount;
+        uint2 phaseOffset = uint2(phase % pixelStride, phase / pixelStride);
+        uint2 pixelCoord = tid.xy * pixelStride + phaseOffset;
         if (pixelCoord.x >= width || pixelCoord.y >= height) {
             continue;
         }
@@ -52,6 +54,7 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
 
         for (uint bounce = 0u; bounce < 4u; bounce++) {
             uint prim;
+            uint instanceId;
             float hitT;
             float2 barycentrics;
             {
@@ -76,7 +79,8 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
                     // Nothing outside the box; escaped rays carry no energy.
                     break;
                 }
-                prim = q.CommittedPrimitiveIndex();
+                instanceId = q.CommittedInstanceID();
+                prim = r.instances[instanceId].triangle_base + q.CommittedPrimitiveIndex();
                 hitT = q.CommittedRayT();
                 barycentrics = q.CommittedTriangleBarycentrics();
             }
@@ -85,7 +89,15 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
             // material ID is deferred until after the emissive-hit case, so
             // emissive triangles do not carry or fetch material state.
             float4 normalArea = r.triangles[prim].normal_area;
-            float3 n = normalArea.xyz;
+            GpuInstance instance = r.instances[instanceId];
+            float3 localNormal = normalArea.xyz;
+            float3 transformedNormal =
+                instance.normal_x.xyz * localNormal.x +
+                instance.normal_y.xyz * localNormal.y +
+                instance.normal_z_determinant.xyz * localNormal.z;
+            float3 n = normalize(transformedNormal);
+            float worldArea = normalArea.w * abs(instance.normal_z_determinant.w) *
+                length(transformedNormal);
             float emission = r.triangles[prim].emission;
             float3 p = rayOrigin + rayDirection * hitT;
             if (dot(n, -rayDirection) < 0.0) {
@@ -98,9 +110,9 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
                 float misWeight = 1.0;
                 if (bounce > 0u) {
                     float cosLight = abs(dot(n, rayDirection));
-                    float area = normalArea.w;
+                    float area = worldArea;
                     float lightPdf = (hitT * hitT) / max(
-                            cosLight * area * (float)LIGHT_COUNT, 1e-8);
+                            cosLight * area * (float)max(r.settings.x, 1u), 1e-8);
                     misWeight = power_heuristic(prevBsdfPdf, lightPdf);
                 }
                 radiance += throughput * (emission * misWeight);
@@ -132,8 +144,9 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
             // a full shadow traversal. Keep NEE for every diffuse/glossy case.
             bool near_delta = surf.alpha2 <= 1e-5 && surf.spec_prob >= 0.9;
             if (!near_delta) {
-                float3 lightU = sample_3d(pixelSeed, sampleIndex, 1u + bounce * 2u);
-                radiance += throughput * sample_direct_light(r, tlas, p, n, wo, surf, rho, lightU);
+                float4 lightU = sample_4d(pixelSeed, sampleIndex, 1u + bounce * 2u);
+                radiance += throughput * sample_direct_light(
+                    r, tlas, p, n, wo, surf, rho, lightU, spectralIndices);
             }
 
             float4 bsdfU = sample_4d(pixelSeed, sampleIndex, 2u + bounce * 2u);

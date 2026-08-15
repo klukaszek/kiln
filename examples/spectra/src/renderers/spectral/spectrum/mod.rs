@@ -47,6 +47,9 @@ const CMF_STEP: f32 = 5.0;
 /// Default width of a baked emission-spectrum table, matching the reference.
 pub const DEFAULT_RESOLUTION: usize = 1024;
 
+/// Built-in spectrum names exposed by the light inspector.
+pub const BUILTIN_NAMES: &[&str] = &["A", "D50", "D65", "E", "FL2", "FL7", "FL11"];
+
 /// Number of wavelength bins in the spectral film. The film stores this many
 /// per-band radiance estimates per pixel, so it is the spectral-resolution /
 /// GPU-memory knob: cost is `width*height*BINS*4` bytes. Bins span

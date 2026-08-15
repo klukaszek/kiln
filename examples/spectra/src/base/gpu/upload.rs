@@ -2,7 +2,7 @@
 
 use std::marker::PhantomData;
 
-use kiln_rhi::{Device, GpuAddress, GpuAllocation, GpuPod, MemoryType};
+use kiln_rhi::{CommandBuffer, Device, GpuAddress, GpuAllocation, GpuPod, MemoryType};
 
 use crate::base::renderer::Result;
 
@@ -39,6 +39,78 @@ pub(crate) struct GpuUploadBatch<'a> {
     staging: Vec<GpuAllocation>,
 }
 
+/// Batch range updates into existing device-local arrays. All patches are submitted together so
+/// one editor transaction does not wait on the GPU once per field or mesh-light component.
+pub(crate) struct GpuPatchBatch<'a> {
+    device: &'a Device,
+    command: Option<CommandBuffer>,
+    staging: Vec<GpuAllocation>,
+}
+
+impl<'a> GpuPatchBatch<'a> {
+    pub(crate) fn new(device: &'a Device) -> Result<Self> {
+        Ok(Self {
+            device,
+            command: Some(device.create_command_buffer()?),
+            staging: Vec::new(),
+        })
+    }
+
+    pub(crate) fn patch<T: GpuPod>(
+        &mut self,
+        array: &GpuArray<T>,
+        start: usize,
+        values: &[T],
+    ) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        let byte_offset = start.checked_mul(std::mem::size_of::<T>()).ok_or(
+            crate::base::renderer::Error::Capacity("GPU array patch offset exceeds usize capacity"),
+        )?;
+        let byte_size = std::mem::size_of_val(values);
+        let byte_end =
+            byte_offset
+                .checked_add(byte_size)
+                .ok_or(crate::base::renderer::Error::Capacity(
+                    "GPU array patch exceeds usize capacity",
+                ))?;
+        if byte_end as u64 > array.allocation.size() {
+            return Err(crate::base::renderer::Error::Capacity(
+                "GPU array patch exceeds allocation bounds",
+            ));
+        }
+        let staging = self.device.upload_slice(values)?;
+        self.command
+            .as_mut()
+            .expect("patch batch already finished")
+            .memcpy(
+                array.allocation.gpu().offset(byte_offset as u64),
+                staging.gpu(),
+                byte_size as u64,
+            );
+        self.staging.push(staging);
+        Ok(())
+    }
+
+    /// Submit the patch copies and return their staging allocations. The caller must retain them
+    /// until the frame fence covering this submission signals.
+    pub(crate) fn finish(mut self) -> Result<Vec<GpuAllocation>> {
+        let mut command = self.command.take().expect("patch batch already finished");
+        command.end();
+        self.device.queue().submit(command)?;
+        Ok(std::mem::take(&mut self.staging))
+    }
+}
+
+impl Drop for GpuPatchBatch<'_> {
+    fn drop(&mut self) {
+        for staging in self.staging.drain(..) {
+            self.device.free(staging);
+        }
+    }
+}
+
 impl<'a> GpuUploadBatch<'a> {
     pub(crate) fn new(device: &'a Device) -> Self {
         Self {
@@ -65,7 +137,15 @@ impl<'a> GpuUploadBatch<'a> {
         Ok(())
     }
 
-    pub(crate) fn finish<const N: usize>(mut self) -> Result<[GpuAllocation; N]> {
+    pub(crate) fn finish<const N: usize>(self) -> Result<[GpuAllocation; N]> {
+        let allocations = self.finish_vec()?;
+        match allocations.try_into() {
+            Ok(allocations) => Ok(allocations),
+            Err(_) => unreachable!("upload count is fixed at the call site"),
+        }
+    }
+
+    pub(crate) fn finish_vec(mut self) -> Result<Vec<GpuAllocation>> {
         let mut cmd = self.device.create_command_buffer()?;
         for (destination, staging) in self.allocations.iter().zip(&self.staging) {
             cmd.memcpy(destination.gpu(), staging.gpu(), destination.size());
@@ -76,11 +156,7 @@ impl<'a> GpuUploadBatch<'a> {
         for staging in self.staging.drain(..) {
             self.device.free(staging);
         }
-        let allocations = std::mem::take(&mut self.allocations);
-        match allocations.try_into() {
-            Ok(allocations) => Ok(allocations),
-            Err(_) => unreachable!("upload count is fixed at the call site"),
-        }
+        Ok(std::mem::take(&mut self.allocations))
     }
 }
 

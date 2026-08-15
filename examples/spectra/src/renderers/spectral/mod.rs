@@ -19,7 +19,7 @@ use kiln_rhi::{CommandBuffer, Device, Format};
 use self::spectrum::Spd;
 use crate::base::gpu::FrameArenas;
 use crate::base::renderer::{self as render, Error, PresentRenderer, RenderFrame, Renderer};
-use crate::base::scene::{Camera, CpuStorage, Scene};
+use crate::base::scene::{Camera, Scene, SceneStorage};
 
 use film::Film;
 use pipelines::Pipelines;
@@ -42,6 +42,65 @@ pub struct Settings {
     pub pixel_stride: u32,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SceneUpdate {
+    instance_transforms: Vec<usize>,
+    lights: Vec<usize>,
+    materials: Vec<usize>,
+    topology_changed: bool,
+}
+
+impl SceneUpdate {
+    /// Mark an edit that changes the geometry/instance topology and therefore requires the
+    /// backend's full scene-resource fallback.
+    pub fn topology() -> Self {
+        Self {
+            topology_changed: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn instance_transform(index: usize) -> Self {
+        Self {
+            instance_transforms: vec![index],
+            ..Self::default()
+        }
+    }
+
+    pub fn light(index: usize) -> Self {
+        Self {
+            lights: vec![index],
+            ..Self::default()
+        }
+    }
+
+    pub fn material(index: usize) -> Self {
+        Self {
+            materials: vec![index],
+            ..Self::default()
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        for index in other.instance_transforms {
+            if !self.instance_transforms.contains(&index) {
+                self.instance_transforms.push(index);
+            }
+        }
+        for index in other.lights {
+            if !self.lights.contains(&index) {
+                self.lights.push(index);
+            }
+        }
+        for index in other.materials {
+            if !self.materials.contains(&index) {
+                self.materials.push(index);
+            }
+        }
+        self.topology_changed |= other.topology_changed;
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -55,7 +114,7 @@ impl Default for Settings {
 
 /// Progressive spectral path tracer and all resources required to render its scene.
 pub struct PathTracer {
-    scene: Scene<Storage>,
+    storage: Storage,
     pipelines: Pipelines,
     frame_arenas: FrameArenas,
     film: Film,
@@ -69,7 +128,7 @@ impl PathTracer {
     pub fn new(
         device: &Device,
         color_format: Format,
-        scene: &Scene<CpuStorage>,
+        scene: &Scene,
         light_spectrum: &Spd,
         settings: Settings,
     ) -> render::Result<Self> {
@@ -81,17 +140,11 @@ impl PathTracer {
             settings.passes_per_frame,
             settings.pixel_stride,
         )?;
-        let trace_scene = scene.prepare::<Storage>(device, light_spectrum)?;
-        let pipelines = match Pipelines::new(
-            device,
-            color_format,
-            schedule.pixel_stride,
-            trace_scene.storage.lights.len(),
-            trace_scene.storage.spectrum.len(),
-        ) {
+        let storage = scene.prepare::<Storage>(device, light_spectrum)?;
+        let pipelines = match Pipelines::new(device, color_format, storage.spectrum.len()) {
             Ok(pipelines) => pipelines,
             Err(error) => {
-                trace_scene.destroy(device);
+                storage.destroy(device);
                 return Err(error);
             }
         };
@@ -99,13 +152,13 @@ impl PathTracer {
         {
             Ok(frame_arenas) => frame_arenas,
             Err(error) => {
-                trace_scene.destroy(device);
+                storage.destroy(device);
                 return Err(error);
             }
         };
 
         Ok(Self {
-            scene: trace_scene,
+            storage,
             pipelines,
             frame_arenas,
             film: Film::new(FILM_STRIDE),
@@ -124,7 +177,7 @@ impl PathTracer {
     }
 
     pub fn is_complete(&self) -> bool {
-        if self.scene.storage.lights.len() == 0 {
+        if self.storage.lights.len() == 0 {
             self.film.extent != UVec2::ZERO
         } else {
             self.schedule.is_complete(self.film.pass_count)
@@ -149,6 +202,65 @@ impl PathTracer {
 
     pub fn extent(&self) -> UVec2 {
         self.film.extent
+    }
+
+    pub fn update_scene(
+        &mut self,
+        device: &Device,
+        scene: &Scene,
+        light_spectrum: &Spd,
+        update: &SceneUpdate,
+        frame_slot: usize,
+    ) -> render::Result<()> {
+        if !update.materials.is_empty() {
+            // Material edits affect the lowered BSDF, reflectance LUT, texture factors, and
+            // emissive mesh-light records. Rebuild those coupled arrays as one storage snapshot so
+            // a partially patched material can never be observed by a trace dispatch.
+            let new_storage = scene.prepare::<Storage>(device, light_spectrum)?;
+            let old_storage = std::mem::replace(&mut self.storage, new_storage);
+            old_storage.destroy(device);
+        } else {
+            self.storage.begin_frame_update(device, frame_slot);
+        }
+        if update.materials.is_empty() && update.topology_changed {
+            self.storage
+                .update_geometry(device, scene, light_spectrum)?;
+        } else if update.materials.is_empty() {
+            if !update.instance_transforms.is_empty() {
+                self.storage.update_instances(
+                    device,
+                    scene,
+                    light_spectrum,
+                    &update.instance_transforms,
+                    frame_slot,
+                )?;
+            }
+            if !update.lights.is_empty() {
+                self.storage.update_lights(
+                    device,
+                    scene,
+                    light_spectrum,
+                    &update.lights,
+                    frame_slot,
+                )?;
+            }
+        }
+        self.film.invalidate();
+        Ok(())
+    }
+
+    pub fn update_settings(&mut self, settings: Settings) -> render::Result<()> {
+        if settings.render_scale == 0 {
+            return Err(Error::Settings("render scale must be non-zero"));
+        }
+        self.schedule = SpatialSchedule::new(
+            settings.target_spp,
+            settings.passes_per_frame,
+            settings.pixel_stride,
+        )?;
+        self.render_scale = settings.render_scale;
+        self.film.invalidate();
+        Ok(())
     }
 
     pub fn tonemapped_rgba8(&self, device: &Device) -> render::Result<Vec<u8>> {
@@ -184,14 +296,14 @@ impl PathTracer {
 
     pub fn destroy(self, device: &Device) {
         let Self {
-            scene,
+            storage,
             frame_arenas,
             film,
             ..
         } = self;
         film.destroy(device);
         frame_arenas.destroy(device);
-        scene.destroy(device);
+        storage.destroy(device);
     }
 
     fn log_progress(&self) {
@@ -217,6 +329,10 @@ impl Renderer for PathTracer {
         self.record_iteration(frame, commands, camera)
     }
 
+    fn samples_drawn(&self) -> Option<u32> {
+        Some(self.sample_count())
+    }
+
     fn destroy(self: Box<Self>, device: &Device) {
         (*self).destroy(device);
     }
@@ -225,5 +341,24 @@ impl Renderer for PathTracer {
 impl PresentRenderer for PathTracer {
     fn encode_present(&mut self, frame: &RenderFrame<'_>, commands: &mut CommandBuffer) {
         self.record_display(frame, commands)
+    }
+}
+
+#[cfg(test)]
+mod scene_update_tests {
+    use super::SceneUpdate;
+
+    #[test]
+    fn merges_dirty_ranges_without_duplicates() {
+        let mut update = SceneUpdate::instance_transform(4);
+        update.merge(SceneUpdate::instance_transform(4));
+        update.merge(SceneUpdate::light(2));
+        update.merge(SceneUpdate::material(7));
+        update.merge(SceneUpdate::topology());
+
+        assert_eq!(update.instance_transforms, vec![4]);
+        assert_eq!(update.lights, vec![2]);
+        assert_eq!(update.materials, vec![7]);
+        assert!(update.topology_changed);
     }
 }

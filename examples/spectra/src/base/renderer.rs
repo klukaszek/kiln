@@ -35,6 +35,10 @@ pub trait Renderer {
         camera: &Camera,
     ) -> Result<()>;
 
+    fn samples_drawn(&self) -> Option<u32> {
+        None
+    }
+
     fn destroy(self: Box<Self>, device: &Device);
 }
 

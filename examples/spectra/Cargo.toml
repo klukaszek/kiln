@@ -6,9 +6,10 @@ description = "GPU rendering engine over USD scenes, with a progressive spectral
 
 [dependencies]
 kiln-rhi = { path = "../../crates/kiln-rhi" }
-# No egui overlay here, so drop kiln-app's default `egui` feature; it is still pulled for
-# `HarnessOpts` (a plain clap struct) and the windowing harness.
-kiln-app = { path = "../../crates/kiln-app", default-features = false }
+# Spectra owns the renderer but uses kiln-app's egui context and RHI painter for its inspector.
+kiln-app = { path = "../../crates/kiln-app", default-features = false, features = ["egui"] }
+# Direct because the Example::ui implementation is compiled in this crate.
+egui = { version = "0.34", default-features = false, features = ["default_fonts"] }
 # `gpu_struct!` (shader interfaces and backend GPU scenes) expands to zerocopy derives that reference the
 # crate directly, so it must be a direct dependency (same 0.8 line as kiln-rhi, so cargo unifies).
 zerocopy = { version = "0.8", features = ["derive"] }
@@ -16,7 +17,7 @@ glam = { version = "0.33.1", features = ["zerocopy"] }
 # Camera controls read winit event types directly (via the harness's `window_event` hook).
 winit = "0.30"
 # Pure-Rust USD reader for the scene loader; `geom` pulls the mesh/camera/xform schema readers.
-openusd = { version = "0.4", default-features = false, features = ["geom"] }
+openusd = { version = "0.4", default-features = false, features = ["geom", "lux"] }
 # openusd surfaces `anyhow::Result`; the USD adapter converts it to `usd::Error`.
 anyhow = "1"
 thiserror = "2"

@@ -100,7 +100,7 @@ fn graphics_fullscreen_color() {
         .expect("create_texture");
 
     // Root color and readback buffer.
-    let root = device
+    let mut root = device
         .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
     root.upload(&Root {
@@ -131,7 +131,7 @@ fn graphics_fullscreen_color() {
         cmd.end_render_pass();
 
         cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
-        cmd.copy_from_texture(readback.gpu(), tex_mem.gpu(), &texture);
+        cmd.copy_texture_to_buffer(&texture, readback.gpu());
         cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
         cmd.end();
         let queue = device.queue();
@@ -192,7 +192,7 @@ fn graphics_static_color_write_mask() {
             &fs,
         )
         .expect("create masked graphics pso");
-    let root = device
+    let mut root = device
         .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
     root.upload(&Root {
@@ -290,7 +290,7 @@ fn render_draw(
     cmd.end_render_pass();
 
     cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
-    cmd.copy_from_texture(readback.gpu(), tex_mem.gpu(), &texture);
+    cmd.copy_texture_to_buffer(&texture, readback.gpu());
     cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
     cmd.end();
     let queue = device.queue();

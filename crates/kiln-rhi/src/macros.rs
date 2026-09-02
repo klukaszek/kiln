@@ -31,7 +31,7 @@ macro_rules! backend_expect {
 /// the host/device layout in lockstep. Must be padding-free (add explicit tail padding where
 /// alignment would insert it).
 ///
-/// The Slang type of a field is inferred from its Rust type (see [`gpu_slang_ty!`] for the
+/// The Slang type of a field is inferred from its Rust type (see [`crate::gpu_slang_ty!`] for the
 /// table: `Vec4` → `float4`, `u32` → `uint`, …). Pointers are the exception — `GpuAddress`
 /// erases its pointee, so device pointers spell out the Slang type with `as "T*"`. The same
 /// `as "..."` override works for any field whose mapping isn't built in.

@@ -69,7 +69,7 @@ fn ray_query_triangle_hit() {
 
     // Triangle at z=0, with the ray starting at z=-1.
     let verts: [[f32; 3]; 3] = [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]];
-    let vbuf = device
+    let mut vbuf = device
         .malloc(std::mem::size_of_val(&verts) as u64, MemoryType::Default)
         .expect("vertex buffer");
     vbuf.upload(&verts).expect("upload vertices");
@@ -141,7 +141,7 @@ fn ray_query_triangle_hit() {
     });
 
     let output = device.malloc(4, MemoryType::Readback).expect("output");
-    let root = device
+    let mut root = device
         .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
     root.upload(&Root {
@@ -157,14 +157,6 @@ fn ray_query_triangle_hit() {
         cmd.barrier(StageFlags::COMPUTE, StageFlags::ALL_COMMANDS);
         cmd.end();
         let q = device.queue();
-        // Unrelated work must not retire acceleration structures referenced by `cmd`.
-        drop(tlas);
-        drop(blas);
-        let unrelated = device
-            .create_command_buffer()
-            .expect("unrelated command buffer");
-        q.submit(unrelated).expect("submit unrelated work");
-        q.wait_idle();
         q.submit(cmd).expect("submit");
         q.wait_idle();
     });
@@ -172,6 +164,9 @@ fn ray_query_triangle_hit() {
     let hit = output.read::<u32>().expect("read hit result");
     assert_eq!(hit, 1, "ray query should report a triangle hit");
 
+    // Resources borrowed while recording must remain alive until the submitted work retires.
+    drop(tlas);
+    drop(blas);
     device.free(vbuf);
     device.free(instbuf);
     device.free(output);

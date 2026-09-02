@@ -23,7 +23,7 @@ pub type TextureHandle = GpuAddress;
 /// Read-write texture handle field type for [`gpu_struct!`].
 ///
 /// This maps to `DescriptorHandle<RWTexture2D<float>>`; assign the value from
-/// [`Device::bindless_texture_handle`] for a view created with `create_storage_view`.
+/// [`crate::Device::storage_texture_handle`] for a view created with `create_storage_view`.
 pub type StorageTextureHandle = GpuAddress;
 
 /// Sampler handle field type for [`gpu_struct!`].

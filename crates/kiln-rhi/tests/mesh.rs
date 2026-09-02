@@ -103,7 +103,7 @@ fn mesh_fullscreen_color() {
         .expect("create_texture");
 
     // Root data is allocated directly; the other mesh tests use the bump allocator.
-    let root = device
+    let mut root = device
         .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
     root.upload(&Root {
@@ -134,7 +134,7 @@ fn mesh_fullscreen_color() {
         cmd.end_render_pass();
 
         cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
-        cmd.copy_from_texture(readback.gpu(), tex_mem.gpu(), &texture);
+        cmd.copy_texture_to_buffer(&texture, readback.gpu());
         cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
         cmd.end();
         let queue = device.queue();
@@ -251,7 +251,7 @@ fn render_meshlets(
     cmd.end_render_pass();
 
     cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
-    cmd.copy_from_texture(readback.gpu(), tex_mem.gpu(), &texture);
+    cmd.copy_texture_to_buffer(&texture, readback.gpu());
     cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
     cmd.end();
     let queue = device.queue();

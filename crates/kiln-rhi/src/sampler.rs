@@ -41,6 +41,7 @@ impl Default for SamplerDesc {
 /// Opaque sampler object.
 pub struct Sampler {
     pub(crate) id: SamplerId,
+    pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 impl Sampler {

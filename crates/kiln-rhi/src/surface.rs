@@ -11,6 +11,7 @@ pub struct SurfaceDesc {
 /// Platform surface for presentation.
 pub struct Surface {
     pub(crate) inner: SurfaceInner,
+    pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 pub(crate) enum SurfaceInner {

@@ -125,7 +125,7 @@ fn bindless_texture_sample() {
         .create_sampled_view(&texture, &Default::default())
         .expect("create_sampled_view");
 
-    let root = device
+    let mut root = device
         .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
     root.upload(&Root {
@@ -160,7 +160,7 @@ fn bindless_texture_sample() {
     common::timed("sample bindless texture · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
         // Make the upload and descriptor visible before sampling.
-        cmd.copy_to_texture(tex_mem.gpu(), staging.gpu(), &texture);
+        cmd.copy_buffer_to_texture(staging.gpu(), &texture);
         cmd.barrier_with_hazard(
             StageFlags::TRANSFER,
             StageFlags::PIXEL_SHADER,
@@ -185,7 +185,7 @@ fn bindless_texture_sample() {
         cmd.end_render_pass();
 
         cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
-        cmd.copy_from_texture(readback.gpu(), rt_mem.gpu(), &rt);
+        cmd.copy_texture_to_buffer(&rt, readback.gpu());
         cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
         cmd.end();
         let queue = device.queue();

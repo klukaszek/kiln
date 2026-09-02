@@ -27,6 +27,7 @@ impl Default for SwapchainDesc {
 /// Swapchain for presenting rendered frames.
 pub struct Swapchain {
     pub(crate) inner: SwapchainInner,
+    pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 pub(crate) enum SwapchainInner {

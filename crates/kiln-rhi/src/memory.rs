@@ -95,12 +95,12 @@ impl GpuAllocation {
 
     /// Upload a value into CPU-mapped memory (bounds-checked). Caller orders the write before
     /// the dependent submit.
-    pub fn upload<T: GpuPod>(&self, value: &T) -> RhiResult<()> {
+    pub fn upload<T: GpuPod>(&mut self, value: &T) -> RhiResult<()> {
         mapped_write(self.cpu(), self.size, value.as_bytes())
     }
 
     /// Upload a slice into this allocation's CPU-mapped memory (bounds-checked).
-    pub fn upload_slice<T: GpuPod>(&self, data: &[T]) -> RhiResult<()> {
+    pub fn upload_slice<T: GpuPod>(&mut self, data: &[T]) -> RhiResult<()> {
         mapped_write(self.cpu(), self.size, data.as_bytes())
     }
 
@@ -149,6 +149,7 @@ impl GpuAllocation {
 /// A persistent GPU buffer.
 pub struct GpuBuffer {
     pub(crate) inner: GpuBufferInner,
+    pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 pub(crate) enum GpuBufferInner {
@@ -261,7 +262,9 @@ impl BumpAllocator {
 }
 
 fn aligned_bump_range(offset: u64, size: u64, align: u64, capacity: u64) -> Option<(u64, u64)> {
-    let align = align.max(1);
+    if !align.is_power_of_two() {
+        return None;
+    }
     let remainder = offset % align;
     let padding = if remainder == 0 { 0 } else { align - remainder };
     let aligned_offset = offset.checked_add(padding)?;
@@ -277,6 +280,8 @@ mod tests {
     fn bump_range_rejects_overflow() {
         assert_eq!(aligned_bump_range(u64::MAX - 7, 16, 16, u64::MAX), None);
         assert_eq!(aligned_bump_range(8, u64::MAX, 1, u64::MAX), None);
+        assert_eq!(aligned_bump_range(0, 8, 0, 64), None);
+        assert_eq!(aligned_bump_range(0, 8, 3, 64), None);
     }
 
     #[test]

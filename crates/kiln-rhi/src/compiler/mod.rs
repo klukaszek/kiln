@@ -144,11 +144,18 @@ impl SlangCompiler {
             SLANG_OPTIMIZATION_LEVEL,
         );
         let path = self.cache_dir.join(format!("{key:016x}.{ext}"));
-        if let Ok(cached) = std::fs::read(&path) {
+        if let Ok(cached) = std::fs::read(&path)
+            && valid_artifact(&cached, target)
+        {
             return Ok(cached);
         }
         let code = invoke_slangc(src, entry, stage, target, ext, capabilities)?;
-        let _ = std::fs::write(&path, &code);
+        if !valid_artifact(&code, target) {
+            return Err(RhiError::ShaderCompilation(format!(
+                "slangc produced an invalid {target} artifact for `{entry}`"
+            )));
+        }
+        write_cache_atomically(&path, &code);
         Ok(code)
     }
 }
@@ -245,6 +252,30 @@ fn cache_key(
     h.finish()
 }
 
+fn valid_artifact(code: &[u8], target: &str) -> bool {
+    if target == "spirv" {
+        code.len() >= 4 && code.len().is_multiple_of(4) && code[..4] == [0x03, 0x02, 0x23, 0x07]
+    } else {
+        !code.is_empty()
+    }
+}
+
+fn write_cache_atomically(path: &std::path::Path, code: &[u8]) {
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), seq));
+    if std::fs::write(&temp, code).is_err() {
+        return;
+    }
+
+    // `rename` cannot replace an existing file on Windows. At this point an existing entry was
+    // already found to be malformed, so remove only that cache entry before installing the fully
+    // written replacement. If power is lost between these operations, the next run recompiles.
+    let _ = std::fs::remove_file(path);
+    if std::fs::rename(&temp, path).is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+}
+
 fn invoke_slangc(
     src: &str,
     entry: &str,
@@ -332,5 +363,18 @@ fn stage_str(stage: ShaderStage) -> &'static str {
         ShaderStage::Vertex => "vertex",
         ShaderStage::Pixel => "fragment",
         ShaderStage::Mesh => "mesh",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_artifact;
+
+    #[test]
+    fn rejects_truncated_or_corrupt_spirv_cache_entries() {
+        assert!(!valid_artifact(&[], "spirv"));
+        assert!(!valid_artifact(&[0, 0, 0, 0], "spirv"));
+        assert!(!valid_artifact(&[0x03, 0x02, 0x23, 0x07, 0], "spirv"));
+        assert!(valid_artifact(&[0x03, 0x02, 0x23, 0x07], "spirv"));
     }
 }

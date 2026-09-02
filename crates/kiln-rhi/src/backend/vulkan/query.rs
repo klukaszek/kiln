@@ -2,8 +2,7 @@
 
 use ash::vk;
 
-/// Backing for a [`crate::QueryPool`] on Vulkan. Freed explicitly via
-/// `Device::destroy_query_pool` (RHI resources are not RAII for device-owned storage).
+/// Backing for a [`crate::QueryPool`] on Vulkan. The device registry owns the native lifetime.
 pub struct VulkanQueryPool {
     pub(crate) pool: vk::QueryPool,
 }

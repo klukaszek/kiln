@@ -67,6 +67,7 @@ impl Default for GraphicsPsoDesc {
 /// Opaque graphics pipeline state object handle.
 pub struct GraphicsPso {
     pub(crate) inner: GraphicsPsoInner,
+    pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 pub(crate) enum GraphicsPsoInner {
@@ -98,6 +99,7 @@ impl Default for ComputePsoDesc {
 /// Opaque compute pipeline state object handle.
 pub struct ComputePso {
     pub(crate) inner: ComputePsoInner,
+    pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 pub(crate) enum ComputePsoInner {
@@ -165,8 +167,10 @@ impl Default for DepthStencilState {
             depth_bias: 0.0,
             depth_bias_slope_factor: 0.0,
             depth_bias_clamp: 0.0,
-            stencil_read_mask: 0xff,
-            stencil_write_mask: 0xff,
+            // A default state must not silently enable stencil. Applications opt in by
+            // setting either mask to a non-zero value.
+            stencil_read_mask: 0,
+            stencil_write_mask: 0,
             stencil_front: StencilDesc::default(),
             stencil_back: StencilDesc::default(),
         }
@@ -177,6 +181,16 @@ impl DepthStencilState {
     /// Returns true if stencil testing/writing is active (either mask is non-zero).
     pub fn stencil_enabled(&self) -> bool {
         self.stencil_read_mask != 0 || self.stencil_write_mask != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DepthStencilState;
+
+    #[test]
+    fn default_depth_stencil_state_disables_stencil() {
+        assert!(!DepthStencilState::default().stencil_enabled());
     }
 }
 
@@ -261,6 +275,7 @@ impl Default for MeshletPsoDesc {
 /// Opaque meshlet pipeline state object handle.
 pub struct MeshletPso {
     pub(crate) inner: MeshletPsoInner,
+    pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 pub(crate) enum MeshletPsoInner {

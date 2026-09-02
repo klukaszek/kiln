@@ -100,6 +100,7 @@ pub struct DispatchIndirectArgs {
 /// Transient command buffer. Created, recorded, submitted, auto-reclaimed.
 pub struct CommandBuffer {
     pub(crate) inner: CommandBufferInner,
+    pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 pub(crate) enum CommandBufferInner {
@@ -110,6 +111,19 @@ pub(crate) enum CommandBufferInner {
 }
 
 impl CommandBuffer {
+    fn assert_same_device(
+        &self,
+        other: &Option<std::rc::Rc<crate::device::DeviceInner>>,
+        resource: &str,
+    ) {
+        let same = self
+            ._owner
+            .as_ref()
+            .zip(other.as_ref())
+            .is_some_and(|(command, resource)| std::rc::Rc::ptr_eq(command, resource));
+        assert!(same, "{resource} belongs to a different device");
+    }
+
     /// Begin a render pass.
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.begin_render_pass(desc))
@@ -122,16 +136,19 @@ impl CommandBuffer {
 
     /// Set the active graphics pipeline.
     pub fn set_graphics_pipeline(&mut self, pso: &GraphicsPso) {
+        self.assert_same_device(&pso._owner, "graphics pipeline");
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_graphics_pipeline(pso))
     }
 
     /// Set the active compute pipeline.
     pub fn set_compute_pipeline(&mut self, pso: &ComputePso) {
+        self.assert_same_device(&pso._owner, "compute pipeline");
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_compute_pipeline(pso))
     }
 
     /// Set the active mesh pipeline.
     pub fn set_meshlet_pipeline(&mut self, pso: &MeshletPso) {
+        self.assert_same_device(&pso._owner, "meshlet pipeline");
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_meshlet_pipeline(pso))
     }
 
@@ -203,24 +220,43 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.memcpy(dst, src, size))
     }
 
-    /// Copy a buffer into a texture.
+    /// Compatibility spelling for [`copy_buffer_to_texture`](Self::copy_buffer_to_texture).
+    #[doc(hidden)]
     pub fn copy_to_texture(
         &mut self,
         texture_gpu: GpuAddress,
         src: GpuAddress,
         texture: &crate::texture::Texture,
     ) {
+        self.assert_same_device(&texture._owner, "texture");
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_to_texture(texture_gpu, src, texture))
     }
 
-    /// Copy a texture into a buffer.
+    /// Copy a tightly-packed buffer into the base mip and first layer of a texture.
+    ///
+    /// This is the common-case spelling. Unlike [`copy_to_texture`](Self::copy_to_texture),
+    /// the texture's placement address cannot accidentally disagree with the texture object.
+    pub fn copy_buffer_to_texture(&mut self, src: GpuAddress, texture: &crate::texture::Texture) {
+        self.copy_to_texture(texture.gpu(), src, texture);
+    }
+
+    /// Compatibility spelling for [`copy_texture_to_buffer`](Self::copy_texture_to_buffer).
+    #[doc(hidden)]
     pub fn copy_from_texture(
         &mut self,
         dst: GpuAddress,
         texture_gpu: GpuAddress,
         texture: &crate::texture::Texture,
     ) {
+        self.assert_same_device(&texture._owner, "texture");
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_from_texture(dst, texture_gpu, texture))
+    }
+
+    /// Copy the base mip and first layer of a texture into a tightly-packed buffer.
+    ///
+    /// This is the common-case spelling and derives the placement address from `texture`.
+    pub fn copy_texture_to_buffer(&mut self, texture: &crate::texture::Texture, dst: GpuAddress) {
+        self.copy_from_texture(dst, texture.gpu(), texture);
     }
 
     /// Stage-only global barrier.
@@ -267,6 +303,7 @@ impl CommandBuffer {
 
     /// Reset a timestamp pool outside a render pass.
     pub fn reset_queries(&mut self, pool: &QueryPool) {
+        self.assert_same_device(&pool._owner, "query pool");
         match (&mut self.inner, &pool.inner) {
             #[cfg(feature = "vulkan")]
             (CommandBufferInner::Vulkan(cmd), QueryPoolInner::Vulkan(p)) => {
@@ -281,6 +318,7 @@ impl CommandBuffer {
 
     /// Write a timestamp outside a render pass.
     pub fn write_timestamp(&mut self, pool: &QueryPool, query: u32) {
+        self.assert_same_device(&pool._owner, "query pool");
         match (&mut self.inner, &pool.inner) {
             #[cfg(feature = "vulkan")]
             (CommandBufferInner::Vulkan(cmd), QueryPoolInner::Vulkan(p)) => {
@@ -336,11 +374,13 @@ impl CommandBuffer {
 
     /// Build a BLAS. `accel` must come from `device.create_blas(desc)` with the same `desc`.
     pub fn build_blas(&mut self, accel: &AccelerationStructure, desc: &BlasDesc) {
+        self.assert_same_device(&accel._owner, "acceleration structure");
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.build_blas(accel, desc))
     }
 
     /// Build a TLAS.
     pub fn build_tlas(&mut self, accel: &AccelerationStructure, desc: &TlasDesc) {
+        self.assert_same_device(&accel._owner, "acceleration structure");
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.build_tlas(accel, desc))
     }
 }

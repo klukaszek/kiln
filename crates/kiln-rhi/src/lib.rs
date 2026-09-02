@@ -91,7 +91,7 @@
 mod macros;
 
 pub mod accel;
-pub mod backend;
+pub(crate) mod backend;
 pub mod barrier;
 pub mod command;
 pub mod compiler;
@@ -108,6 +108,12 @@ pub mod swapchain;
 pub mod sync;
 pub mod texture;
 pub mod types;
+
+/// Native handles for narrowly-scoped backend interop.
+pub mod raw {
+    #[cfg(feature = "vulkan")]
+    pub use crate::backend::vulkan::device::VulkanHandles;
+}
 
 // The RHI is built around zerocopy for its GPU data contract (`GpuPod`, `gpu_struct!`,
 // the indirect-args structs). Re-export it so the `gpu_struct!` macro and downstream

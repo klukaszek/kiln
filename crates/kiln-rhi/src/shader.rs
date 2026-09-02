@@ -17,6 +17,7 @@ pub enum ShaderStage {
 pub struct ShaderModule {
     pub(crate) inner: ShaderModuleInner,
     pub(crate) stage: ShaderStage,
+    pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 pub(crate) enum ShaderModuleInner {

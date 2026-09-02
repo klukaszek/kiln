@@ -171,6 +171,11 @@ pub struct VulkanDevice {
     pub(crate) next_sampler_id: RefCell<u32>,
     free_sampler_ids: SharedSamplerFreeIds,
 
+    /// User timeline semaphores stay alive until device teardown. This permits callers to use a
+    /// temporary `SubmitDesc` without destroying a semaphore still referenced by queued work.
+    timeline_semaphores: RefCell<Vec<vk::Semaphore>>,
+    query_pools: RefCell<Vec<vk::QueryPool>>,
+
     pub(crate) setup_command_buffer: vk::CommandBuffer,
     /// Whether the batched setup command buffer is currently recording initial image layouts.
     setup_recording: Cell<bool>,
@@ -251,10 +256,6 @@ impl VulkanQueue {
             .lock()
             .expect("available command lock poisoned")
             .push(command_buffer);
-    }
-
-    pub fn submit(&self, cmd: VulkanCommandBuffer) -> RhiResult<()> {
-        self.submit_with_desc(cmd, &SubmitDesc::default())
     }
 
     /// Release a destroyed resource's storage immediately: destroy the native handles, hand any
@@ -1245,6 +1246,7 @@ impl VulkanDevice {
                 free_texture_ids: free_texture_ids.clone(),
                 free_sampler_ids: free_sampler_ids.clone(),
             })),
+            device_id: 0,
         };
 
         Ok(Self {
@@ -1278,6 +1280,8 @@ impl VulkanDevice {
             samplers: RefCell::new(Vec::new()),
             next_sampler_id: RefCell::new(0),
             free_sampler_ids,
+            timeline_semaphores: RefCell::new(Vec::new()),
+            query_pools: RefCell::new(Vec::new()),
             setup_command_buffer,
             setup_recording: Cell::new(false),
             mesh_shader_supported: capabilities.mesh_shader,
@@ -1289,6 +1293,10 @@ impl VulkanDevice {
 
     pub fn queue(&self) -> &Queue {
         &self.queue
+    }
+
+    pub(crate) fn set_device_id(&mut self, device_id: usize) {
+        self.queue.device_id = device_id;
     }
 
     pub fn bindless_mode(&self) -> BindlessMode {
@@ -1330,6 +1338,7 @@ impl VulkanDevice {
                 surface,
                 surface_loader: self.surface_loader.clone(),
             }),
+            _owner: None,
         })
     }
 
@@ -1390,6 +1399,7 @@ impl VulkanDevice {
                 device: self.device.clone(),
                 swapchain_loader: self.swapchain_loader.clone(),
             })),
+            _owner: None,
         })
     }
 
@@ -1729,6 +1739,7 @@ impl VulkanDevice {
 
         Ok(GpuBuffer {
             inner: GpuBufferInner::Vulkan(vk_buffer),
+            _owner: None,
         })
     }
 
@@ -2066,6 +2077,7 @@ impl VulkanDevice {
             id: texture_id,
             gpu_address: texture_gpu,
             desc: desc.clone(),
+            _owner: None,
         })
     }
 
@@ -2136,7 +2148,7 @@ impl VulkanDevice {
         }
         samplers[idx] = Some(sampler);
 
-        Ok(Sampler { id })
+        Ok(Sampler { id, _owner: None })
     }
 
     pub fn create_shader_module(&self, desc: &ShaderModuleDesc) -> RhiResult<ShaderModule> {
@@ -2164,6 +2176,7 @@ impl VulkanDevice {
                 entry_point,
             ))),
             stage: desc.stage,
+            _owner: None,
         })
     }
 
@@ -2220,6 +2233,7 @@ impl VulkanDevice {
 
         Ok(GraphicsPso {
             inner: GraphicsPsoInner::Vulkan(Box::new(vk_pso)),
+            _owner: None,
         })
     }
 
@@ -2272,6 +2286,7 @@ impl VulkanDevice {
                 threads_per_threadgroup: desc.threads_per_threadgroup,
                 device: self.device.clone(),
             })),
+            _owner: None,
         })
     }
 
@@ -2334,6 +2349,7 @@ impl VulkanDevice {
 
         Ok(MeshletPso {
             inner: MeshletPsoInner::Vulkan(Box::new(vk_pso)),
+            _owner: None,
         })
     }
 
@@ -2533,6 +2549,7 @@ impl VulkanDevice {
                 accel_loader: accel_loader.clone(),
                 device: self.device.clone(),
             })),
+            _owner: None,
         })
     }
 
@@ -2699,6 +2716,7 @@ impl VulkanDevice {
                 rendered_swapchain_images: SmallVec::new(),
                 ended: false,
             })),
+            _owner: None,
         })
     }
 
@@ -2762,6 +2780,7 @@ impl VulkanDevice {
                 rendered_swapchain_images: SmallVec::new(),
                 ended: false,
             })),
+            _owner: None,
         })
     }
 
@@ -2777,12 +2796,14 @@ impl VulkanDevice {
                 .create_semaphore(&semaphore_info, None)
                 .map_err(|e| RhiError::SyncError(e.to_string()))?
         };
+        self.timeline_semaphores.borrow_mut().push(semaphore);
 
         Ok(TimelineSemaphore {
             inner: TimelineSemaphoreInner::Vulkan(Box::new(VulkanTimelineSemaphore {
                 semaphore,
                 device: self.device.clone(),
             })),
+            _owner: None,
         })
     }
 
@@ -2913,9 +2934,11 @@ impl VulkanDevice {
             .map_err(|e| RhiError::Backend(format!("create_query_pool: {e}")))?;
         // Vulkan requires a query to be reset before its first use.
         unsafe { self.device.reset_query_pool(pool, 0, count) };
+        self.query_pools.borrow_mut().push(pool);
         Ok(QueryPool {
             inner: QueryPoolInner::Vulkan(VulkanQueryPool { pool }),
             count,
+            _owner: None,
         })
     }
 
@@ -2925,7 +2948,10 @@ impl VulkanDevice {
             #[allow(unreachable_patterns)]
             _ => return,
         };
-        unsafe { self.device.destroy_query_pool(p.pool, None) }
+        self.query_pools
+            .borrow_mut()
+            .retain(|&entry| entry != p.pool);
+        unsafe { self.device.destroy_query_pool(p.pool, None) };
     }
 
     pub fn timestamp_period_ns(&self) -> f64 {
@@ -3375,6 +3401,12 @@ impl Drop for VulkanDevice {
         q.wait_idle();
         unsafe {
             self.device.destroy_semaphore(q.completion_semaphore, None);
+            for semaphore in self.timeline_semaphores.get_mut().drain(..) {
+                self.device.destroy_semaphore(semaphore, None);
+            }
+            for pool in self.query_pools.get_mut().drain(..) {
+                self.device.destroy_query_pool(pool, None);
+            }
 
             for t in self
                 .textures

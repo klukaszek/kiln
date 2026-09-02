@@ -7,13 +7,15 @@
 //! nanoseconds with [`Device::timestamp_period_ns`](crate::Device::timestamp_period_ns).
 //!
 //! On Vulkan this wraps a `VkQueryPool` (`VK_QUERY_TYPE_TIMESTAMP`); on Metal an `MTL4CounterHeap`
-//! of type `Timestamp`. Like other RHI resources, pools are freed explicitly with
-//! [`Device::destroy_query_pool`](crate::Device::destroy_query_pool).
+//! of type `Timestamp`. Pools are freed explicitly with
+//! [`Device::destroy_query_pool`](crate::Device::destroy_query_pool); the backend device also
+//! reclaims any forgotten pools during teardown.
 
 /// A pool of GPU timestamp query slots.
 pub struct QueryPool {
     pub(crate) inner: QueryPoolInner,
     pub(crate) count: u32,
+    pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 pub(crate) enum QueryPoolInner {

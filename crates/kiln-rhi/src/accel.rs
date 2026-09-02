@@ -8,6 +8,7 @@ use crate::types::{AccelerationStructureId, GpuAddress};
 pub struct AccelerationStructure {
     pub id: AccelerationStructureId,
     pub(crate) inner: AccelInner,
+    pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 impl AccelerationStructure {

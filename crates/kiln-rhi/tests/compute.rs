@@ -52,13 +52,13 @@ fn compute_doubles_buffer() {
     });
 
     const N: u32 = 1024;
-    let input = device
+    let mut input = device
         .malloc((N * 4) as u64, MemoryType::Default)
         .expect("input");
     let output = device
         .malloc((N * 4) as u64, MemoryType::Readback)
         .expect("output");
-    let data = device
+    let mut data = device
         .malloc(std::mem::size_of::<Data>() as u64, MemoryType::Default)
         .expect("root data");
 

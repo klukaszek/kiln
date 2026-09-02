@@ -480,6 +480,7 @@ impl MetalDevice {
                 in_flight_frame_commands,
                 pending_submissions,
             })),
+            device_id: 0,
         };
 
         let compiler_desc = MTL4CompilerDescriptor::new();
@@ -509,6 +510,10 @@ impl MetalDevice {
 
     pub fn queue(&self) -> &Queue {
         &self.rhi_queue
+    }
+
+    pub(crate) fn set_device_id(&mut self, device_id: usize) {
+        self.rhi_queue.device_id = device_id;
     }
 
     pub fn bindless_mode(&self) -> BindlessMode {
@@ -574,6 +579,7 @@ impl MetalDevice {
 
         Ok(Surface {
             inner: SurfaceInner::Metal(MetalSurface { layer }),
+            _owner: None,
         })
     }
 
@@ -611,6 +617,7 @@ impl MetalDevice {
                 format,
                 extent: [desc.width, desc.height],
             })),
+            _owner: None,
         })
     }
 
@@ -683,6 +690,7 @@ impl MetalDevice {
 
         Ok(GpuBuffer {
             inner: GpuBufferInner::Metal(metal_buffer),
+            _owner: None,
         })
     }
 
@@ -883,6 +891,7 @@ impl MetalDevice {
             id,
             gpu_address: texture_gpu,
             desc: desc.clone(),
+            _owner: None,
         })
     }
 
@@ -927,7 +936,7 @@ impl MetalDevice {
             sampler.gpuResourceID().to_raw(),
         );
 
-        Ok(Sampler { id })
+        Ok(Sampler { id, _owner: None })
     }
 
     pub fn create_shader_module(&self, desc: &ShaderModuleDesc) -> RhiResult<ShaderModule> {
@@ -952,6 +961,7 @@ impl MetalDevice {
                 entry_point: desc.entry_point.to_string(),
             })),
             stage: desc.stage,
+            _owner: None,
         })
     }
 
@@ -1010,6 +1020,7 @@ impl MetalDevice {
                 winding,
                 topology,
             })),
+            _owner: None,
         })
     }
 
@@ -1054,6 +1065,7 @@ impl MetalDevice {
                 threads_per_threadgroup: desc.threads_per_threadgroup,
                 label: desc.label.clone(),
             })),
+            _owner: None,
         })
     }
 
@@ -1122,6 +1134,7 @@ impl MetalDevice {
                 winding,
                 default_pipeline,
             })),
+            _owner: None,
         })
     }
 
@@ -1288,6 +1301,7 @@ impl MetalDevice {
                 scratch_buffer: scratch,
                 shared: self.shared.clone(),
             })),
+            _owner: None,
         })
     }
 
@@ -1380,6 +1394,7 @@ impl MetalDevice {
 
         Ok(CommandBuffer {
             inner: crate::command::CommandBufferInner::Metal(Box::new(mtl_cmd)),
+            _owner: None,
         })
     }
 
@@ -1419,6 +1434,7 @@ impl MetalDevice {
             inner: crate::sync::TimelineSemaphoreInner::Metal(Box::new(MetalTimelineSemaphore {
                 event,
             })),
+            _owner: None,
         })
     }
 
@@ -1573,6 +1589,7 @@ impl MetalDevice {
         Ok(QueryPool {
             inner: QueryPoolInner::Metal(MetalQueryPool { heap }),
             count,
+            _owner: None,
         })
     }
 

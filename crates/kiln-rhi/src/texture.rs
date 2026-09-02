@@ -64,6 +64,7 @@ pub struct Texture {
     pub(crate) id: TextureId,
     pub(crate) gpu_address: GpuAddress,
     pub(crate) desc: TextureDesc,
+    pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 impl Texture {

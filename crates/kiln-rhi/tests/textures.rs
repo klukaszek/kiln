@@ -117,9 +117,9 @@ fn texture_copy_roundtrip() {
 
     common::timed("upload→texture→readback · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
-        cmd.copy_to_texture(mem.gpu(), src.gpu(), &texture);
+        cmd.copy_buffer_to_texture(src.gpu(), &texture);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::TRANSFER);
-        cmd.copy_from_texture(dst.gpu(), mem.gpu(), &texture);
+        cmd.copy_texture_to_buffer(&texture, dst.gpu());
         cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
         cmd.end();
         let queue = device.queue();

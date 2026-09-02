@@ -50,11 +50,7 @@ pub const DEFAULT_RESOLUTION: usize = 1024;
 /// Built-in spectrum names exposed by the light inspector.
 pub const BUILTIN_NAMES: &[&str] = &["A", "D50", "D65", "E", "FL2", "FL7", "FL11"];
 
-/// Number of wavelength bins in the spectral film. The film stores this many
-/// per-band radiance estimates per pixel, so it is the spectral-resolution /
-/// GPU-memory knob: cost is `width*height*BINS*4` bytes. Bins span
-/// [`LAMBDA_MIN`] to [`LAMBDA_MAX`]
-/// uniformly in wavelength, matching how a spectrometer reports bands.
+/// Bands used by the explicit headless spectral-capture mode.
 pub const SPECTRAL_BINS: usize = 4;
 
 /// Width of one spectral bin, in nanometres.
@@ -70,10 +66,7 @@ pub fn spectral_bin_of(nm: f32) -> usize {
     (((nm - LAMBDA_MIN) / SPECTRAL_BIN_WIDTH) as usize).min(SPECTRAL_BINS - 1)
 }
 
-/// Mean linear-sRGB colour-matching response over each spectral bin. The film
-/// stores band-integrated radiance per bin; the display/readout recovers RGB as
-/// `Σ_j cmf_bin[j] · radiance[j]`, so this is the sensor side of the spectral
-/// estimator — independent of the light, computed once and shared CPU/GPU.
+/// Mean sensor response used to preview broad-band spectral captures.
 pub fn cmf_bins_linear_srgb() -> Vec<Vec3> {
     let mut sums = [Vec3::ZERO; SPECTRAL_BINS];
     let mut counts = [0u32; SPECTRAL_BINS];

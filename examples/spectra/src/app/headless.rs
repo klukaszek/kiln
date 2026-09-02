@@ -6,7 +6,7 @@ use glam::UVec2;
 use kiln_rhi::{Device, DeviceDesc, Format};
 
 use spectra::base::renderer::{RenderFrame, Renderer};
-use spectra::base::scene::Camera;
+use spectra::base::scene::{Camera, SpectrumSource};
 use spectra::importers::usd;
 use spectra::renderers::spectral::{PathTracer, Settings};
 
@@ -21,9 +21,9 @@ pub fn run(config: &Config, resolution: UVec2) -> Result<()> {
         ..Default::default()
     })?;
     let mut scene = usd::load(&config.scene_path()?)?;
-    let default_light_spectrum = config.light_spectrum_name().to_owned();
+    let default_spectrum = SpectrumSource::Named(config.light_spectrum_name().to_owned());
     for light in &mut scene.lights {
-        light.spectrum = default_light_spectrum.clone();
+        light.illuminant.spectrum = default_spectrum.clone();
     }
     if std::env::var_os("SPECTRAL_DEBUG_CAMERA").is_some() {
         debug_camera_roundtrip(&scene);
@@ -35,6 +35,7 @@ pub fn run(config: &Config, resolution: UVec2) -> Result<()> {
         passes_per_frame: config.passes_per_frame,
         render_scale: 1,
         pixel_stride: config.headless_pixel_stride,
+        spectral_capture: config.spectral_probe.is_some() || config.spectral_dump.is_some(),
     };
     let mut renderer = PathTracer::new(&device, Format::B8G8R8A8Srgb, &scene, &light, settings)?;
 

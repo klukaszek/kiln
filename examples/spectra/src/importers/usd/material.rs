@@ -3,7 +3,9 @@ use openusd::sdf::{self, Value};
 use openusd::usd::Stage;
 use std::collections::HashMap;
 
-use crate::base::scene::{Image, Material, MaterialId, PrincipledBsdf, Surface, Texture};
+use crate::base::scene::{
+    Illuminant, Image, Material, MaterialId, PrincipledBsdf, Surface, Texture,
+};
 
 use super::texture::TextureLibrary;
 use super::{Error, Result};
@@ -116,11 +118,13 @@ fn read_material(
         &mut surface,
         textures,
     )?;
-    if let Some(color) = read_vec3(stage, &shader_path, "inputs:emissiveColor")? {
-        result.emission.color = color;
-    }
-    if let Some(color) = read_vec3(stage, &shader_path, "inputs:emissionColor")? {
-        result.emission.color = color;
+    // UsdPreviewSurface states emission as a bare colour with no unit, which lands on the
+    // renderer's native quantity at unit intensity. The inspector can restate it in lumens or
+    // watts afterwards; that only changes how the same emitter is authored, not what it emits.
+    for input in ["inputs:emissiveColor", "inputs:emissionColor"] {
+        if let Some(color) = read_vec3(stage, &shader_path, input)? {
+            result.emission = Illuminant::luminance(color, 1.0);
+        }
     }
     if let Some(value) = read_f32(stage, &shader_path, "inputs:roughness")? {
         surface.roughness = value;

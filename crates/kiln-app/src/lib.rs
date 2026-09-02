@@ -473,6 +473,12 @@ impl<E: Example> App<E> {
         });
         egui.state
             .handle_platform_output(window, out.platform_output);
+        egui.repaint_at = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.repaint_delay)
+            .filter(|delay| *delay < std::time::Duration::MAX)
+            .and_then(|delay| std::time::Instant::now().checked_add(delay));
         let ppp = out.pixels_per_point;
         let primitives = egui.ctx.tessellate(out.shapes, ppp);
         egui.renderer
@@ -606,12 +612,23 @@ impl<E: Example> ApplicationHandler for App<E> {
             .example
             .as_ref()
             .is_some_and(|example| example.wants_continuous_redraw());
-        event_loop.set_control_flow(if continuous {
-            ControlFlow::Poll
-        } else {
-            ControlFlow::Wait
+        #[cfg(feature = "egui")]
+        let overlay_repaint = self.egui.as_ref().and_then(|egui| egui.repaint_at);
+        #[cfg(not(feature = "egui"))]
+        let overlay_repaint: Option<std::time::Instant> = None;
+
+        // Redraw now when the example is animating or egui's next pass is already due; otherwise
+        // sleep exactly until that pass, so an idle window costs nothing but a pending fade or
+        // menu still lands on time.
+        let due = overlay_repaint.is_some_and(|at| at <= std::time::Instant::now());
+        event_loop.set_control_flow(match overlay_repaint {
+            _ if continuous || due => ControlFlow::Poll,
+            Some(at) => ControlFlow::WaitUntil(at),
+            None => ControlFlow::Wait,
         });
-        if continuous && let Some(window) = &self.window {
+        if (continuous || due)
+            && let Some(window) = &self.window
+        {
             window.request_redraw();
         }
     }
@@ -640,6 +657,13 @@ struct Egui {
     renderer: kiln_egui::EguiRenderer,
     /// One 2-slot timestamp pool per frame-in-flight (frame start + end).
     query_pools: Vec<kiln_rhi::QueryPool>,
+    /// When egui asked to be run again, or `None` when it is settled.
+    ///
+    /// egui drives a good deal of its interaction across passes: menus, tooltips, hover fades, and
+    /// any two-pass layout resolve on the pass *after* the click that started them. Without
+    /// honouring this the loop sleeps in `ControlFlow::Wait` until some unrelated OS event arrives,
+    /// and the interface reads as running a frame or more behind the pointer.
+    repaint_at: Option<std::time::Instant>,
     cpu_ms: f64,
     gpu_ms: f64,
     wait_ms: f64,
@@ -668,6 +692,7 @@ impl Egui {
             state,
             renderer,
             query_pools,
+            repaint_at: None,
             cpu_ms: 0.0,
             gpu_ms: 0.0,
             wait_ms: 0.0,

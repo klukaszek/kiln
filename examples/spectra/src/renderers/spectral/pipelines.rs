@@ -10,7 +10,8 @@ use super::display;
 use super::integrator;
 use super::sampler;
 use super::scene::{
-    GpuBsdf, GpuInstance, GpuLight, GpuMaterialTexture, GpuMeshLightTriangle, GpuTriangle,
+    GpuBsdf, GpuEmissiveHit, GpuInstance, GpuLight, GpuMaterialTexture, GpuMeshLightTriangle,
+    GpuTriangle,
 };
 use super::shader_types::{CLEAR_SOURCE, CLEAR_THREADS, ClearRoot, DisplayRoot, TraceRoot};
 
@@ -27,8 +28,9 @@ impl Pipelines {
         spectrum_len: u32,
     ) -> renderer::Result<Self> {
         let trace_source = format!(
-            "{}{}{}{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}{}{}{}",
             GpuBsdf::SLANG,
+            GpuEmissiveHit::SLANG,
             GpuMaterialTexture::SLANG,
             GpuTextureBinding::SLANG,
             GpuLight::SLANG,
@@ -106,8 +108,9 @@ mod shader_source_tests {
         }
 
         let trace_source = format!(
-            "{}{}{}{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}{}{}{}",
             GpuBsdf::SLANG,
+            GpuEmissiveHit::SLANG,
             GpuMaterialTexture::SLANG,
             GpuTextureBinding::SLANG,
             GpuLight::SLANG,

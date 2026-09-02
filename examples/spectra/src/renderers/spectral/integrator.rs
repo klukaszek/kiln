@@ -16,8 +16,7 @@ pub(super) fn source(spectrum_len: u32) -> String {
     let spectrum_len = spectrum_len.max(1);
     format!(
         "static const uint SPECTRAL_BINS = {}u;\n\
-         static const uint LIGHT_LANE_COUNT = {}u;\n\
-         static const uint UNIFORM_LANE_COUNT = {}u;\n\
+         static const uint WAVELENGTH_LANE_COUNT = {}u;\n\
          static const uint LIGHT_TRIANGLE = 0u;\n\
          static const uint LIGHT_RECT = 1u;\n\
          static const uint LIGHT_DISK = 2u;\n\
@@ -29,8 +28,7 @@ pub(super) fn source(spectrum_len: u32) -> String {
          static const uint SPECTRUM_LEN = {spectrum_len}u;\n\
          \n{}",
         super::spectrum::SPECTRAL_BINS,
-        super::N_LIGHT_LANES,
-        super::N_UNIFORM_LANES,
+        super::WAVELENGTH_LANES,
         SOURCE_PARTS.join("\n\n")
     )
 }

@@ -2,8 +2,6 @@
 [numthreads(8, 8, 1)]
 void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
 {
-    // Bindless TLAS: the handle in the root resolves to the acceleration structure (no descriptor
-    // binding / argument-table slot). See docs/design/vulkan-binding-convention.md.
     RaytracingAccelerationStructure tlas = r.tlas;
     uint width = r.film_width;
     uint height = r.film_height;
@@ -29,9 +27,7 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
         uint pixel = pixelCoord.y * width + pixelCoord.x;
         uint pixelSeed = hash_u32(pixel);
 
-        // Group 0 = camera jitter + wavelength; per bounce, one group for light
-        // sampling and one for BSDF direction + Russian roulette.
-        float4 camU = sample_4d(pixelSeed, sampleIndex, 0u);
+        float3 camU = sample_3d(pixelSeed, sampleIndex, 0u);
         float2 jitter = camU.xy;
         float2 uv = (float2(pixelCoord) + jitter) / float2((float)width, (float)height);
         float2 ndc = float2(2.0 * uv.x - 1.0, 1.0 - 2.0 * uv.y);
@@ -40,10 +36,8 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
             r.cam_right.xyz * (ndc.x * r.lens.y * r.lens.x) +
             r.cam_up.xyz * (ndc.y * r.lens.y));
 
-        // Light-CDF and uniform-wavelength strata.
         float xi = camU.z;
-        float xiU = camU.w;
-        uint4 spectralIndices = sample_spectral_indices(r, xi, xiU);
+        uint4 spectralIndices = sample_spectral_indices(xi);
 
         float3 rayOrigin = r.cam_pos.xyz;
         float3 rayDirection = rayDir;
@@ -51,6 +45,7 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
         float4 radiance = float4(0.0);   // spectral radiance per wavelength
         float4 throughput = float4(1.0); // reflectance products along the path
         float prevBsdfPdf = 0.0;
+        bool prevNeeEnabled = false;
 
         for (uint bounce = 0u; bounce < 4u; bounce++) {
             uint prim;
@@ -58,25 +53,17 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
             float hitT;
             float2 barycentrics;
             {
-                // Keep the traversal object and RayDesc out of the shading
-                // portion of the bounce. This limits the state that must
-                // survive the ray-query operation on architectures that spill
-                // query state to memory.
                 RayDesc queryRay;
                 queryRay.Origin = rayOrigin;
                 queryRay.Direction = rayDirection;
                 queryRay.TMin = 0.001;
                 queryRay.TMax = 1000.0;
 
-                // Geometry is all OPAQUE in the BLAS, so force-opaque lets the
-                // hardware commit hits during traversal instead of returning
-                // each candidate to this Proceed() loop.
                 RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
                 q.TraceRayInline(tlas, RAY_FLAG_FORCE_OPAQUE, 0xFF, queryRay);
                 while (q.Proceed()) {}
 
                 if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
-                    // Nothing outside the box; escaped rays carry no energy.
                     break;
                 }
                 instanceId = q.CommittedInstanceID();
@@ -85,46 +72,45 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
                 barycentrics = q.CommittedTriangleBarycentrics();
             }
 
-            // Read only the primitive fields needed before branching. The
-            // material ID is deferred until after the emissive-hit case, so
-            // emissive triangles do not carry or fetch material state.
-            float4 normalArea = r.triangles[prim].normal_area;
+            GpuTriangle triangle = r.triangles[prim];
             GpuInstance instance = r.instances[instanceId];
-            float3 localNormal = normalArea.xyz;
+            float3 localNormal = triangle.normal_area.xyz;
             float3 transformedNormal =
                 instance.normal_x.xyz * localNormal.x +
                 instance.normal_y.xyz * localNormal.y +
                 instance.normal_z_determinant.xyz * localNormal.z;
             float3 n = normalize(transformedNormal);
-            float worldArea = normalArea.w * abs(instance.normal_z_determinant.w) *
-                length(transformedNormal);
-            float emission = r.triangles[prim].emission;
+            float emission = triangle.emission;
             float3 p = rayOrigin + rayDirection * hitT;
             if (dot(n, -rayDirection) < 0.0) {
                 n = -n;
             }
 
             if (emission > 0.0) {
-                // MIS against the NEE strategy that could have sampled this
-                // point from the previous vertex; camera hits keep full weight.
+                float4 spectrumScale;
+                uint spectrumBase = triangle.material_id * SPECTRUM_LEN;
+                [ForceUnroll]
+                for (uint k = 0u; k < 4u; k++) {
+                    spectrumScale[k] = r.material_emission_spectrum[
+                        spectrumBase + spectralIndices[k]];
+                }
                 float misWeight = 1.0;
-                if (bounce > 0u) {
+                if (bounce > 0u && prevNeeEnabled) {
+                    GpuLight hitLight = r.lights[r.emissive_hits[prim].light_index];
                     float cosLight = abs(dot(n, rayDirection));
-                    float area = worldArea;
                     float lightPdf = (hitT * hitT) / max(
-                            cosLight * area * (float)max(r.settings.x, 1u), 1e-8);
+                        cosLight * hitLight.edge1_area.w * (float)r.settings.x, 1e-8);
                     misWeight = power_heuristic(prevBsdfPdf, lightPdf);
                 }
-                radiance += throughput * (emission * misWeight);
+                radiance += throughput * (emission * spectrumScale * misWeight);
                 break;
             }
 
-            uint matId = r.triangles[prim].material_id;
+            uint matId = triangle.material_id;
             GpuBsdf surf = r.bsdfs[matId];
             float3 wo = -rayDirection;
             float4 rho = lookup_reflectance(r, matId, spectralIndices);
             if (surf.texture_id != 0xffffffffu) {
-                GpuTriangle triangle = r.triangles[prim];
                 float bary0 = 1.0 - barycentrics.x - barycentrics.y;
                 float2 texcoord = bary0 * triangle.uv01.xy
                     + barycentrics.x * triangle.uv01.zw
@@ -139,17 +125,16 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
                     r, texel * materialTexture.factor.rgb, spectralIndices);
             }
 
-            // A very sharp, highly specular lobe is effectively delta-like:
-            // random-point NEE almost never lands inside it, but still pays for
-            // a full shadow traversal. Keep NEE for every diffuse/glossy case.
             bool near_delta = surf.alpha2 <= 1e-5 && surf.spec_prob >= 0.9;
-            if (!near_delta) {
-                float4 lightU = sample_4d(pixelSeed, sampleIndex, 1u + bounce * 2u);
+            bool neeEnabled = !near_delta && r.settings.x > 0u;
+            if (neeEnabled) {
+                float3 lightU = sample_3d(pixelSeed, sampleIndex, 1u + bounce * 2u);
                 radiance += throughput * sample_direct_light(
                     r, tlas, p, n, wo, surf, rho, lightU, spectralIndices);
             }
 
             float4 bsdfU = sample_4d(pixelSeed, sampleIndex, 2u + bounce * 2u);
+            prevNeeEnabled = neeEnabled;
             float3 wi;
             float4 sampleWeight = bsdf_sample(
                 surf, rho, n, wo, bsdfU, wi, prevBsdfPdf);
@@ -161,10 +146,10 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
             throughput *= sampleWeight;
 
             if (bounce >= 2u) {
-                // Russian roulette on the hero wavelength; all lanes share the
-                // path, so dividing every lane by the same probability is
-                // unbiased.
-                float keep = clamp(throughput.x, 0.05, 0.95);
+                float keep = clamp(
+                    (throughput.x + throughput.y + throughput.z + throughput.w) * 0.25,
+                    0.05,
+                    0.95);
                 if (bsdfU.z > keep) {
                     break;
                 }

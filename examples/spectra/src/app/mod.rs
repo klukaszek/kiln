@@ -4,6 +4,7 @@ mod config;
 mod controls;
 mod headless;
 mod output;
+mod ui;
 mod viewer;
 
 use thiserror::Error;

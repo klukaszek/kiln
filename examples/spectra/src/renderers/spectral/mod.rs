@@ -30,8 +30,7 @@ pub const DEFAULT_TARGET_SPP: u32 = 1024;
 pub const DEFAULT_PASSES_PER_FRAME: u32 = 1;
 
 const FILM_STRIDE: u32 = spectrum::SPECTRAL_BINS as u32;
-const N_LIGHT_LANES: u32 = 2;
-const N_UNIFORM_LANES: u32 = 2;
+const WAVELENGTH_LANES: u32 = 4;
 const FRAME_ARENA_SIZE: u64 = 4096;
 
 #[derive(Clone, Copy, Debug)]
@@ -40,13 +39,15 @@ pub struct Settings {
     pub passes_per_frame: u32,
     pub render_scale: u32,
     pub pixel_stride: u32,
+    pub spectral_capture: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SceneUpdate {
     instance_transforms: Vec<usize>,
     lights: Vec<usize>,
-    materials: Vec<usize>,
+    material_surfaces: Vec<usize>,
+    material_emissions: Vec<usize>,
     topology_changed: bool,
 }
 
@@ -76,7 +77,22 @@ impl SceneUpdate {
 
     pub fn material(index: usize) -> Self {
         Self {
-            materials: vec![index],
+            material_surfaces: vec![index],
+            material_emissions: vec![index],
+            ..Self::default()
+        }
+    }
+
+    pub fn material_surface(index: usize) -> Self {
+        Self {
+            material_surfaces: vec![index],
+            ..Self::default()
+        }
+    }
+
+    pub fn material_emission(index: usize) -> Self {
+        Self {
+            material_emissions: vec![index],
             ..Self::default()
         }
     }
@@ -92,9 +108,14 @@ impl SceneUpdate {
                 self.lights.push(index);
             }
         }
-        for index in other.materials {
-            if !self.materials.contains(&index) {
-                self.materials.push(index);
+        for index in other.material_surfaces {
+            if !self.material_surfaces.contains(&index) {
+                self.material_surfaces.push(index);
+            }
+        }
+        for index in other.material_emissions {
+            if !self.material_emissions.contains(&index) {
+                self.material_emissions.push(index);
             }
         }
         self.topology_changed |= other.topology_changed;
@@ -108,6 +129,7 @@ impl Default for Settings {
             passes_per_frame: DEFAULT_PASSES_PER_FRAME,
             render_scale: 1,
             pixel_stride: 1,
+            spectral_capture: false,
         }
     }
 }
@@ -122,6 +144,7 @@ pub struct PathTracer {
     render_scale: u32,
     cmf_bins_cpu: Vec<Vec3>,
     display_target_is_srgb: bool,
+    spectral_capture: bool,
 }
 
 impl PathTracer {
@@ -166,6 +189,7 @@ impl PathTracer {
             render_scale: settings.render_scale,
             cmf_bins_cpu: spectrum::cmf_bins_linear_srgb(),
             display_target_is_srgb: display::format_is_srgb(color_format),
+            spectral_capture: settings.spectral_capture,
         })
     }
 
@@ -212,20 +236,23 @@ impl PathTracer {
         update: &SceneUpdate,
         frame_slot: usize,
     ) -> render::Result<()> {
-        if !update.materials.is_empty() {
-            // Material edits affect the lowered BSDF, reflectance LUT, texture factors, and
-            // emissive mesh-light records. Rebuild those coupled arrays as one storage snapshot so
-            // a partially patched material can never be observed by a trace dispatch.
-            let new_storage = scene.prepare::<Storage>(device, light_spectrum)?;
-            let old_storage = std::mem::replace(&mut self.storage, new_storage);
-            old_storage.destroy(device);
-        } else {
-            self.storage.begin_frame_update(device, frame_slot);
+        if !update.material_emissions.is_empty() {
+            self.storage
+                .update_material_emission(device, scene, light_spectrum)?;
         }
-        if update.materials.is_empty() && update.topology_changed {
+        self.storage.begin_frame_update(device, frame_slot);
+        if !update.material_surfaces.is_empty() {
+            self.storage.update_material_surfaces(
+                device,
+                scene,
+                &update.material_surfaces,
+                frame_slot,
+            )?;
+        }
+        if update.topology_changed {
             self.storage
                 .update_geometry(device, scene, light_spectrum)?;
-        } else if update.materials.is_empty() {
+        } else {
             if !update.instance_transforms.is_empty() {
                 self.storage.update_instances(
                     device,
@@ -235,7 +262,7 @@ impl PathTracer {
                     frame_slot,
                 )?;
             }
-            if !update.lights.is_empty() {
+            if update.material_emissions.is_empty() && !update.lights.is_empty() {
                 self.storage.update_lights(
                     device,
                     scene,
@@ -259,6 +286,7 @@ impl PathTracer {
             settings.pixel_stride,
         )?;
         self.render_scale = settings.render_scale;
+        self.spectral_capture = settings.spectral_capture;
         self.film.invalidate();
         Ok(())
     }
@@ -272,12 +300,18 @@ impl PathTracer {
             self.schedule,
             self.film.pass_count,
             &self.cmf_bins_cpu,
+            self.spectral_capture,
         ))
     }
 
     /// Per-pixel band-integrated spectral radiance, row-major
     /// `[height][width][SPECTRAL_BINS]`.
     pub fn spectral_bands(&self, device: &Device) -> render::Result<Vec<f32>> {
+        if !self.spectral_capture {
+            return Err(Error::Settings(
+                "spectral bands require spectral capture mode",
+            ));
+        }
         let rows = self.film.readback(device)?;
         Ok(display::film_to_bands(
             &rows,
@@ -358,7 +392,19 @@ mod scene_update_tests {
 
         assert_eq!(update.instance_transforms, vec![4]);
         assert_eq!(update.lights, vec![2]);
-        assert_eq!(update.materials, vec![7]);
+        assert_eq!(update.material_surfaces, vec![7]);
+        assert_eq!(update.material_emissions, vec![7]);
         assert!(update.topology_changed);
+    }
+
+    #[test]
+    fn surface_and_emission_updates_stay_independent() {
+        let surface = SceneUpdate::material_surface(2);
+        assert_eq!(surface.material_surfaces, vec![2]);
+        assert!(surface.material_emissions.is_empty());
+
+        let emission = SceneUpdate::material_emission(3);
+        assert!(emission.material_surfaces.is_empty());
+        assert_eq!(emission.material_emissions, vec![3]);
     }
 }

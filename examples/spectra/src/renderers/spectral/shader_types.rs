@@ -34,17 +34,19 @@ gpu_struct! {
         cam_up: Vec4,
         cam_forward: Vec4,
         lens: Vec4,
-        film: GpuAddress as "float*", // spectral film: per pixel [bin_0..bin_N]
+        film: GpuAddress as "float*",
         triangles: GpuAddress as "Ptr<GpuTriangle, Access.Read>",
+        emissive_hits: GpuAddress as "Ptr<GpuEmissiveHit, Access.Read>",
         instances: GpuAddress as "Ptr<GpuInstance, Access.Read>",
         bsdfs: GpuAddress as "Ptr<GpuBsdf, Access.Read>",
         lights: GpuAddress as "Ptr<GpuLight, Access.Read>",
         mesh_light_triangles: GpuAddress as "Ptr<GpuMeshLightTriangle, Access.Read>",
         mesh_light_cdf: GpuAddress as "Ptr<float, Access.Read>",
         light_spectrum: GpuAddress as "Ptr<float, Access.Read>",
+        material_emission_spectrum: GpuAddress as "Ptr<float, Access.Read>",
         spectrum: GpuAddress as "Ptr<float4, Access.Read>", // CDF table: (phase, wavelength, flux_shape, p_light)
-        lambda: GpuAddress as "Ptr<float4, Access.Read>", // uniform-λ MIS table, same texel layout
-        reflectance: GpuAddress as "Ptr<float, Access.Read>", // [material][light/uniform table][wavelength entry]
+        sensor_spectrum: GpuAddress as "Ptr<float4, Access.Read>",
+        reflectance: GpuAddress as "Ptr<float, Access.Read>", // [material][wavelength entry]
         material_textures: GpuAddress as "Ptr<GpuMaterialTexture, Access.Read>",
         texture_bindings: GpuAddress as "Ptr<GpuTextureBinding, Access.Read>",
         texture_basis: GpuAddress as "Ptr<float, Access.Read>",
@@ -70,7 +72,7 @@ gpu_struct! {
         remaining_phases: u32,
         target_is_srgb: u32,
         pixel_stride: u32,
-        _pad: u32,
+        spectral_capture: u32,
     }
 }
 

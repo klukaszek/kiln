@@ -50,18 +50,22 @@ float4 displayFs(VOut i, uniform DisplayRoot* r) : SV_Target
         fy = min(tileY + sampledPhase / pixelStride, filmH - 1u);
         sampleCount = r.completed_samples + 1u;
     }
-    // The film is pixel-major and SPECTRAL_BINS is a multiple of four. Read
-    // four adjacent bands at a time so the display pass issues vector loads.
-    uint base = (fy * filmW + fx) * DISPLAY_BIN_VECS;
     float inv = 1.0 / max((float)sampleCount, 1.0);
-    float3 c = float3(0.0);
-    [ForceUnroll]
-    for (uint v = 0u; v < DISPLAY_BIN_VECS; v++) {
-        float4 bins = r.film[base + v] * inv;
-        c += DISPLAY_CMF[v * 4u + 0u].xyz * bins.x;
-        c += DISPLAY_CMF[v * 4u + 1u].xyz * bins.y;
-        c += DISPLAY_CMF[v * 4u + 2u].xyz * bins.z;
-        c += DISPLAY_CMF[v * 4u + 3u].xyz * bins.w;
+    uint pixel = fy * filmW + fx;
+    float3 c;
+    if (r.spectral_capture == 0u) {
+        c = r.film[pixel].xyz * inv;
+    } else {
+        uint base = pixel * DISPLAY_BIN_VECS;
+        c = float3(0.0);
+        [ForceUnroll]
+        for (uint v = 0u; v < DISPLAY_BIN_VECS; v++) {
+            float4 bins = r.film[base + v] * inv;
+            c += DISPLAY_CMF[v * 4u + 0u].xyz * bins.x;
+            c += DISPLAY_CMF[v * 4u + 1u].xyz * bins.y;
+            c += DISPLAY_CMF[v * 4u + 2u].xyz * bins.z;
+            c += DISPLAY_CMF[v * 4u + 3u].xyz * bins.w;
+        }
     }
 
     c *= 0.25; // exposure
@@ -134,12 +138,17 @@ pub(super) fn film_to_rgba8(
     schedule: SpatialSchedule,
     pass_count: u32,
     cmf: &[Vec3],
+    spectral_capture: bool,
 ) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(rows.len() / stride * 4);
     let coordinates = (0..extent.y).flat_map(|y| (0..extent.x).map(move |x| (x, y)));
     for ((x, y), row) in coordinates.zip(rows.chunks_exact(stride)) {
         let sample_count = schedule.sample_count_for_pixel(pass_count, x, y);
-        let lin = resolve_linear(row, sample_count, cmf);
+        let lin = if spectral_capture {
+            resolve_linear(row, sample_count, cmf)
+        } else {
+            Vec3::from_slice(&row[..3]) / sample_count.max(1) as f32
+        };
         rgba.extend_from_slice(&[
             tonemap_linear(lin.x),
             tonemap_linear(lin.y),

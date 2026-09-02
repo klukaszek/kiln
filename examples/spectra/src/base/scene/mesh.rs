@@ -153,6 +153,7 @@ impl DisjointSet {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Illuminant;
     use super::*;
 
     fn triangle_mesh() -> Mesh {
@@ -184,12 +185,12 @@ mod tests {
         mesh.refresh_emissive_components(&materials);
         assert!(mesh.emissive_components.is_empty());
 
-        materials[0].emission.color = Vec3::ONE;
+        materials[0].emission = Illuminant::luminance(Vec3::ONE, 1.0);
         mesh.refresh_emissive_components(&materials);
         assert_eq!(mesh.emissive_components.len(), 1);
         assert_eq!(mesh.emissive_components[0].triangles.len(), 1);
 
-        materials[0].emission.color = Vec3::ZERO;
+        materials[0].emission = Illuminant::dark();
         mesh.refresh_emissive_components(&materials);
         assert!(mesh.emissive_components.is_empty());
     }

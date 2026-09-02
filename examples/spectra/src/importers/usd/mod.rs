@@ -18,7 +18,7 @@ use openusd::usd::Stage;
 use glam::Vec3;
 
 use crate::base::scene::{
-    Camera, Light, LightKind, Projection, Scene, SceneData, build_scene_nodes,
+    Camera, Illuminant, Light, LightKind, Projection, Scene, SceneData, build_scene_nodes,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -174,15 +174,17 @@ fn imported_light(
         .filter(|name| !name.is_empty())
         .unwrap_or("Light");
     let transform = transform::world_xform(stage, &sdf::path(path)?)?;
+    // UsdLux intensity is unitless, so it maps onto the renderer's native quantity; exposure stays
+    // a separate control so the inspector shows the authored stops rather than a folded product.
     Ok(Light {
         name: name.to_owned(),
         path: path.to_owned(),
         kind,
         transform,
-        spectrum: "A".into(),
-        color: Vec3::from_array(common.color),
-        intensity: (common.intensity * 2.0_f32.powf(common.exposure)).max(0.0),
-        enabled: true,
+        illuminant: Illuminant {
+            exposure: common.exposure,
+            ..Illuminant::luminance(Vec3::from_array(common.color), common.intensity.max(0.0))
+        },
     })
 }
 

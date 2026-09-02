@@ -65,14 +65,13 @@ pub(super) fn bake(spd: &Spd, resolution: usize) -> EmissionSpectrum {
             sensor_sum += (cmf_linear_srgb(nm) / density).as_dvec3();
             texel_at(nm)
         })
-        .collect();
+        .collect::<Vec<_>>();
 
-    // The MIS partner samples the full sensor range uniformly, covering the
-    // wavelengths whose light-importance probability approaches zero.
-    let lambda_texels = (0..resolution)
-        .map(|bin| {
-            let unit = (bin as f32 + 0.5) / resolution as f32;
-            texel_at(LAMBDA_MIN + unit * (LAMBDA_MAX - LAMBDA_MIN))
+    let sensor_texels = texels
+        .iter()
+        .map(|texel| {
+            let density = (rgb_importance(texel.y) * importance_normalization).max(1e-12);
+            (cmf_linear_srgb(texel.y) / density).extend(0.0)
         })
         .collect();
 
@@ -82,6 +81,6 @@ pub(super) fn bake(spd: &Spd, resolution: usize) -> EmissionSpectrum {
         total_rgb: (sensor_sum / resolution as f64).as_vec3() * integral,
         integral,
         texels,
-        lambda_texels,
+        sensor_texels,
     }
 }

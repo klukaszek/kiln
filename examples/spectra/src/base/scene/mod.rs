@@ -7,16 +7,17 @@ use std::ops::{Deref, DerefMut};
 use kiln_rhi::Device;
 
 mod geometry;
+mod illuminant;
 mod light;
 mod material;
 mod mesh;
 mod node;
 
 pub use geometry::{Geometry, Triangle};
+pub use illuminant::{EmitterExtent, Illuminant, IntensityUnit, SpectrumSource};
 pub use light::{Light, LightKind};
 pub use material::{
-    ColorSpace, Emission, Image, ImageId, Material, PrincipledBsdf, Surface, Texture, TextureId,
-    WrapMode,
+    ColorSpace, Image, ImageId, Material, PrincipledBsdf, Surface, Texture, TextureId, WrapMode,
 };
 pub use mesh::{EmissiveComponent, Instance, Mesh, MeshId, Primitive, Vertex};
 pub use node::{NodeId, NodeObject, SceneNode, build_scene_nodes};

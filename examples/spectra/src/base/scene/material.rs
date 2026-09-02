@@ -2,8 +2,10 @@
 
 use glam::Vec3;
 
+use super::Illuminant;
+
 /// Renderer-neutral principled surface parameters.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PrincipledBsdf {
     pub base_color: Vec3,
     pub base_color_texture: Option<TextureId>,
@@ -91,7 +93,7 @@ fn srgb_to_linear(value: f32) -> f32 {
 /// Backends may lower these descriptions to their own parameter blocks. Keeping the model as an
 /// enum leaves room for materials that cannot be represented by a single principled parameter
 /// set without making the whole scene generic over a Rust type.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Surface {
     Principled(PrincipledBsdf),
     Diffuse { albedo: Vec3 },
@@ -105,22 +107,14 @@ impl Default for Surface {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Emission {
-    pub color: Vec3,
-}
-
-impl Default for Emission {
-    fn default() -> Self {
-        Self { color: Vec3::ZERO }
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Material {
     pub name: String,
     pub surface: Surface,
-    pub emission: Emission,
+    /// The emitter bound to every surface using this material. Emissive materials are how most
+    /// exported USD scenes light themselves, so this is the same [`Illuminant`] an analytic light
+    /// carries rather than a bare emissive colour.
+    pub emission: Illuminant,
 }
 
 impl Material {
@@ -132,7 +126,7 @@ impl Material {
     }
 
     pub fn is_emissive(&self) -> bool {
-        self.emission.color.max_element() > 0.0
+        self.emission.emits()
     }
 }
 
@@ -141,7 +135,7 @@ impl Default for Material {
         Self {
             name: "Material".into(),
             surface: Surface::default(),
-            emission: Emission::default(),
+            emission: Illuminant::dark(),
         }
     }
 }

@@ -22,9 +22,9 @@ pub use illuminants::{
     illuminant_e, monochromatic,
 };
 
-use super::{Error, LAMBDA_MAX, LAMBDA_MIN, Result, interp};
 #[cfg(test)]
-use super::{XYZ_TO_LINEAR_SRGB, cmf_xyz};
+use super::XYZ_TO_LINEAR_SRGB;
+use super::{Error, LAMBDA_MAX, LAMBDA_MIN, Result, cmf_xyz, interp};
 /// A spectral power distribution: piecewise linear over sorted wavelength
 /// samples, clamped to the end values outside the sampled range (the
 /// `numpy.interp` semantics the reference implementation relies on).
@@ -78,6 +78,25 @@ impl Spd {
         interp(&self.wavelengths, &self.powers, nm)
     }
 
+    /// Luminous efficacy of radiation, in lumens per watt: `683 · ∫V(λ)Φ(λ)dλ / ∫Φ(λ)dλ`, where
+    /// V(λ) is the CIE photopic response (the ȳ colour-matching function). This is what makes a
+    /// wattage authored on an emitter comparable across spectra: the same radiant power through a
+    /// tungsten and a fluorescent spectrum yields the luminous flux the real lamps would. Both
+    /// integrals run over the CMF support, so power outside the renderer's wavelength range is not
+    /// counted against the efficacy.
+    pub fn luminous_efficacy(&self) -> f32 {
+        let mut luminous = 0.0;
+        let mut radiant = 0.0;
+        let mut nm = LAMBDA_MIN;
+        while nm <= LAMBDA_MAX {
+            let power = self.power(nm);
+            luminous += cmf_xyz(nm).y * power;
+            radiant += power;
+            nm += 1.0;
+        }
+        683.0 * luminous / radiant.max(1e-12)
+    }
+
     /// ∫ flux dλ over the spectrum's own sample range (trapezoidal).
     pub fn integral(&self) -> f32 {
         self.wavelengths
@@ -121,11 +140,12 @@ impl Spd {
     }
 }
 
-/// A baked light spectrum, ready for GPU upload. Both tables store the same
-/// per-wavelength texel `(phase, wavelength_nm, flux_shape, p_light)`: the phase
+/// A baked light spectrum, ready for GPU upload. Each texel stores
+/// `(phase, wavelength_nm, flux_shape, p_light)`: the phase
 /// drives moment reflectance, the wavelength selects the film bin, `flux_shape`
 /// scales the emitter into true spectral radiance, and `p_light` is the
 /// light-importance pdf used in the spectral-film MIS weight.
+#[derive(Clone)]
 pub struct EmissionSpectrum {
     pub name: String,
     /// Aggregate linear sRGB of the spectrum — the light's colour for RGB
@@ -133,13 +153,11 @@ pub struct EmissionSpectrum {
     pub total_rgb: Vec3,
     /// ∫ flux dλ; the scalar brightness the per-texel weights are relative to.
     pub integral: f32,
-    /// Strategy A: inverse-CDF table indexed by a uniform random number — draws
+    /// Inverse-CDF table indexed by a uniform random number — draws
     /// wavelengths in proportion to `flux · rgb_importance`.
     pub texels: Vec<Vec4>,
-    /// Strategy B: the same texel sampled on a uniform wavelength grid, indexed
-    /// by `(λ − LAMBDA_MIN)/(LAMBDA_MAX − LAMBDA_MIN)` — the MIS partner that
-    /// reaches the deep tails the CDF table cannot.
-    pub lambda_texels: Vec<Vec4>,
+    /// Exact linear-sRGB sensor weight `cmf(λ) · flux(λ) / p(λ)` for each texel.
+    pub sensor_texels: Vec<Vec4>,
 }
 
 impl EmissionSpectrum {
@@ -153,9 +171,10 @@ impl EmissionSpectrum {
         self.integral / luminance(self.total_rgb).max(1e-9)
     }
 
-    /// [`Self::luminance_scale`] applied to a target RGB emitter value.
-    pub fn emission_scale(&self, rgb_emission: Vec3) -> f32 {
-        luminance(rgb_emission) * self.luminance_scale()
+    /// [`Self::luminance_scale`] applied to an emitter's luminance, in cd/m² for a surface emitter
+    /// or cd for a punctual one.
+    pub fn emission_from_luminance(&self, luminance: f32) -> f32 {
+        luminance * self.luminance_scale()
     }
 }
 
@@ -277,6 +296,7 @@ mod tests {
         for spd in [d65(), illuminant_a(), fluorescent_fl11()] {
             let baked = spd.bake(DEFAULT_RESOLUTION);
             assert_eq!(baked.texels.len(), DEFAULT_RESOLUTION);
+            assert_eq!(baked.sensor_texels.len(), DEFAULT_RESOLUTION);
             // Texel = (phase, wavelength_nm, flux_shape, p_light).
             let mut last_phase = f32::NEG_INFINITY;
             for texel in &baked.texels {
@@ -292,6 +312,16 @@ mod tests {
                 assert!(texel.w >= 0.0, "{}: p_light non-negative", baked.name);
                 last_phase = texel.x;
             }
+            assert!(baked.sensor_texels.iter().all(|texel| texel.is_finite()));
+            let sensor_mean = baked
+                .sensor_texels
+                .iter()
+                .map(|texel| texel.truncate().as_dvec3())
+                .sum::<glam::DVec3>()
+                / DEFAULT_RESOLUTION as f64;
+            let reconstructed = (sensor_mean * f64::from(baked.integral)).as_vec3();
+            let error = (reconstructed - baked.total_rgb).length();
+            assert!(error < baked.total_rgb.length() * 1e-5, "{error}");
             // The stratified estimate of the spectrum's colour must agree with
             // direct integration (identical pipelines up to discretisation).
             let direct = spd.linear_srgb();
@@ -301,6 +331,20 @@ mod tests {
                 assert!((a - b).abs() < 0.01, "{}: {a} vs {b}", baked.name);
             }
         }
+    }
+
+    /// A monochromatic line at 555 nm is the peak of the photopic response, so its efficacy must
+    /// approach the 683 lm/W definition; broadband and IR-heavy spectra must fall well below it.
+    #[test]
+    fn luminous_efficacy_peaks_at_the_photopic_maximum() {
+        assert!(monochromatic(555.0).luminous_efficacy() > 600.0);
+        let daylight = d65().luminous_efficacy();
+        let tungsten = illuminant_a().luminous_efficacy();
+        assert!(
+            (150.0..400.0).contains(&daylight),
+            "D65 efficacy {daylight}"
+        );
+        assert!(tungsten < daylight, "A {tungsten} vs D65 {daylight}");
     }
 
     #[test]

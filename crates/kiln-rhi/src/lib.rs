@@ -3,7 +3,7 @@
 //! An Aaltonen "No Graphics API"-inspired abstraction over Vulkan and Metal.
 //!
 //! Core design principles:
-//! - Dual-pointer memory model: every GPU allocation returns (CPU ptr, GPU address)
+//! - One allocation model: optional CPU mapping + typed GPU pointer + byte length
 //! - Single root data pointer per draw/dispatch (no descriptor sets, no bind groups)
 //! - Global texture heap indexed by TextureId(u32)
 //! - Stage-only barriers (no per-resource state tracking)
@@ -37,14 +37,18 @@
 //! constant to prepend to shader source:
 //!
 //! ```ignore
+//! type VertexPtr = GpuPtr<Vertex>;
+//!
 //! gpu_struct! {
 //!     pub struct DrawRoot {
-//!         verts:  GpuAddress as "Vertex*",
+//!         verts:  VertexPtr as "Vertex*",
 //!         count:  u32,
 //!         _pad:   u32,
 //!     }
 //! }
 //! ```
+//! where `VertexPtr` is a local alias for `GpuPtr<Vertex>`. The pointer is still exactly one
+//! 64-bit GPU address; the Rust type only supplies element arithmetic and documents the ABI.
 //!
 //! Accept the struct as an entry-point `uniform` pointer parameter in the shader:
 //!
@@ -78,13 +82,13 @@
 //!         tlas: AccelHandle,
 //!     }
 //! }
-//! // root.tlas = tlas_accel.gpu();
+//! // root.tlas = tlas_accel.handle();
 //! ```
 //!
 //! Slang lowers this to a 64-bit device address + `OpConvertUToAccelerationStructureKHR`
 //! on Vulkan, and an inline `acceleration_structure` member in the Metal root buffer.
 //! No descriptor set, no argument-table slot. For a bindless array, use
-//! `GpuAddress as "DescriptorHandle<RaytracingAccelerationStructure>*"` and index
+//! `GpuPtr<AccelHandle> as "DescriptorHandle<RaytracingAccelerationStructure>*"` and index
 //! dynamically. Do not use `NonUniformResourceIndex` -- it is unavailable in Metal compute.
 
 #[macro_use]
@@ -146,7 +150,7 @@ pub use command::{
 pub use device::{Backend, BindlessMode, Device, DeviceDesc};
 pub use error::{RhiError, RhiResult};
 pub use memory::{
-    BufferDesc, BumpAllocator, GpuAllocation, GpuBuffer, GpuPod, MemoryType, TransientAllocation,
+    Allocation, AllocationDesc, BumpAllocator, GpuPod, MemoryType, TransientAllocation,
 };
 pub use pipeline::*;
 pub use query::QueryPool;

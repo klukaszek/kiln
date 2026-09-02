@@ -98,7 +98,7 @@ fn bindless_texture_sample() {
         .texture_size_align(&tex_desc)
         .expect("tex size_align");
     let tex_mem = device
-        .malloc_aligned(tex_sa.size, tex_sa.align, MemoryType::GpuOnly)
+        .allocate_aligned(tex_sa.size, tex_sa.align, MemoryType::GpuOnly)
         .expect("tex mem");
     let texture = device
         .create_texture(&tex_desc, tex_mem.gpu())
@@ -126,11 +126,11 @@ fn bindless_texture_sample() {
         .expect("create_sampled_view");
 
     let mut root = device
-        .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
+        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
     root.upload(&Root {
-        tex: device.bindless_texture_handle(tex_id),
-        samp: device.bindless_sampler_handle(sampler.id()),
+        tex: device.sampled_texture_handle(tex_id),
+        samp: device.sampler_handle(sampler.id()),
     })
     .expect("upload root");
 
@@ -148,13 +148,13 @@ fn bindless_texture_sample() {
     };
     let rt_sa = device.texture_size_align(&rt_desc).expect("rt size_align");
     let rt_mem = device
-        .malloc_aligned(rt_sa.size, rt_sa.align, MemoryType::GpuOnly)
+        .allocate_aligned(rt_sa.size, rt_sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let rt = device
         .create_texture(&rt_desc, rt_mem.gpu())
         .expect("create rt");
     let readback = device
-        .malloc((SIZE * SIZE * 4) as u64, MemoryType::Readback)
+        .allocate((SIZE * SIZE * 4) as u64, MemoryType::Readback)
         .expect("readback");
 
     common::timed("sample bindless texture · submit+wait", || {

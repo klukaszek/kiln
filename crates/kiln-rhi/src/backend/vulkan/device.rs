@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 use crate::command::{CommandBuffer, CommandBufferInner};
 use crate::device::{BindlessMode, DeviceDesc};
 use crate::error::{RhiError, RhiResult};
-use crate::memory::{BufferDesc, GpuBuffer, GpuBufferInner, MemoryType};
+use crate::memory::{Allocation, AllocationDesc, AllocationInner, MemoryType};
 use crate::pipeline::*;
 use crate::query::{QueryPool, QueryPoolInner};
 use crate::queue::{Queue, QueueInner, SubmitDesc};
@@ -262,7 +262,7 @@ impl VulkanQueue {
     /// bindless ID back to the free list, and return the buffer range to the pool.
     ///
     /// There is no deferral. The caller guarantees the GPU is done with the resource (see the
-    /// contract on `Device::destroy_buffer` and friends).
+    /// contract on `Device::destroy_allocation` and friends).
     pub(crate) fn release_resource(&self, resource: VulkanRetiredResource) {
         unsafe {
             match &resource {
@@ -1605,7 +1605,7 @@ impl VulkanDevice {
         unsafe { loader.set_debug_utils_object_name(&info) }.expect("set_debug_utils_object_name");
     }
 
-    pub fn create_buffer(&self, desc: &BufferDesc) -> RhiResult<GpuBuffer> {
+    pub fn create_allocation(&self, desc: &AllocationDesc) -> RhiResult<Allocation> {
         let mut usage_flags = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::INDEX_BUFFER
             | vk::BufferUsageFlags::VERTEX_BUFFER
@@ -1737,9 +1737,11 @@ impl VulkanDevice {
                 );
         }
 
-        Ok(GpuBuffer {
-            inner: GpuBufferInner::Vulkan(vk_buffer),
+        Ok(Allocation {
+            inner: AllocationInner::Vulkan(vk_buffer),
             _owner: None,
+            offset: 0,
+            size: desc.size,
         })
     }
 
@@ -2364,7 +2366,7 @@ impl VulkanDevice {
                     let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
                         .vertex_format(vk::Format::R32G32B32_SFLOAT)
                         .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.vertex_buffer.0,
+                            device_address: m.vertex_buffer.raw().0,
                         })
                         .vertex_stride(m.vertex_stride)
                         .max_vertex(m.vertex_count.saturating_sub(1))
@@ -2374,7 +2376,7 @@ impl VulkanDevice {
                             vk::IndexType::NONE_KHR
                         })
                         .index_data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.index_buffer.0,
+                            device_address: m.index_buffer.raw().0,
                         });
                     let geo_data = vk::AccelerationStructureGeometryDataKHR { triangles };
                     vk::AccelerationStructureGeometryKHR::default()
@@ -2385,7 +2387,7 @@ impl VulkanDevice {
                 GeometryType::Aabbs => {
                     let aabbs = vk::AccelerationStructureGeometryAabbsDataKHR::default()
                         .data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.aabb_buffer.0,
+                            device_address: m.aabb_buffer.raw().0,
                         })
                         .stride(std::mem::size_of::<vk::AabbPositionsKHR>() as u64);
                     let geo_data = vk::AccelerationStructureGeometryDataKHR { aabbs };
@@ -2453,7 +2455,7 @@ impl VulkanDevice {
         let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::default()
             .array_of_pointers(false)
             .data(vk::DeviceOrHostAddressConstKHR {
-                device_address: desc.instance_buffer.0,
+                device_address: desc.instance_buffer.raw().0,
             });
         let geo_data = vk::AccelerationStructureGeometryDataKHR {
             instances: instances_data,
@@ -2807,9 +2809,9 @@ impl VulkanDevice {
         })
     }
 
-    pub fn destroy_buffer(&self, buffer: GpuBuffer) {
+    pub fn destroy_allocation(&self, buffer: Allocation) {
         match buffer.inner {
-            GpuBufferInner::Vulkan(b) => {
+            AllocationInner::Vulkan(b) => {
                 {
                     let mut allocations =
                         self.allocations.lock().expect("allocations lock poisoned");
@@ -2917,12 +2919,12 @@ impl VulkanDevice {
     /// Value to store in a [`TextureHandle`](crate::TextureHandle) root field for sampled view
     /// `id`. On Vulkan a `DescriptorHandle<Texture2D>` is the bindless heap index, so the handle
     /// is just the id widened to 64 bits.
-    pub fn bindless_texture_handle(&self, id: TextureId) -> GpuAddress {
+    pub fn texture_handle_raw(&self, id: TextureId) -> GpuAddress {
         GpuAddress(id.0 as u64)
     }
 
     /// Value to store in a [`SamplerHandle`](crate::SamplerHandle) root field for sampler `id`.
-    pub fn bindless_sampler_handle(&self, id: crate::types::SamplerId) -> GpuAddress {
+    pub fn sampler_handle_raw(&self, id: crate::types::SamplerId) -> GpuAddress {
         GpuAddress(id.0 as u64)
     }
 

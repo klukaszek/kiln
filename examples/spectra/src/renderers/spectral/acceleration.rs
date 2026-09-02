@@ -1,7 +1,6 @@
 use kiln_rhi::{
-    AccelerationStructure, BlasDesc, BlasMeshDesc, BuildAccelFlags, Device, GeometryFlags,
-    GeometryType, GpuAddress, GpuAllocation, MAX_FRAMES_IN_FLIGHT, MemoryType, TlasDesc,
-    TlasInstance,
+    AccelerationStructure, Allocation, BlasDesc, BlasMeshDesc, BuildAccelFlags, Device,
+    GeometryFlags, GeometryType, GpuPtr, MAX_FRAMES_IN_FLIGHT, MemoryType, TlasDesc, TlasInstance,
 };
 
 use crate::base::gpu::{GpuArray, GpuUploadBatch};
@@ -14,7 +13,7 @@ use crate::base::scene::Scene;
 /// important for editor transforms: changing an instance transform must not rebuild the scene's
 /// BLAS geometry.
 pub(super) struct SceneAccel {
-    instance_buffers: Vec<GpuAllocation>,
+    instance_buffers: Vec<Allocation>,
     blases: Vec<AccelerationStructure>,
     pub(super) tlas: AccelerationStructure,
     ray_vertices: Vec<GpuArray<[f32; 3]>>,
@@ -50,7 +49,7 @@ impl SceneAccel {
         let mut pending = allocations
             .into_iter()
             .map(Some)
-            .collect::<Vec<Option<GpuAllocation>>>();
+            .collect::<Vec<Option<Allocation>>>();
         let mut blases = Vec::with_capacity(geometries.len());
         let mut ray_vertices = Vec::with_capacity(geometries.len());
         let mut ray_indices = Vec::with_capacity(geometries.len());
@@ -73,7 +72,7 @@ impl SceneAccel {
                     vertex_count: vertices_gpu.len(),
                     index_buffer: indices_gpu.gpu(),
                     index_count: indices_gpu.len(),
-                    aabb_buffer: GpuAddress(0),
+                    aabb_buffer: GpuPtr::NULL,
                     aabb_count: 0,
                 }],
                 flags: BuildAccelFlags::PREFER_FAST_TRACE,
@@ -103,7 +102,7 @@ impl SceneAccel {
             device.tlas_instance_stride() as u64 * scene.geometry.instances.len() as u64;
         let mut instance_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            match device.malloc(instance_buffer_size, MemoryType::Default) {
+            match device.allocate(instance_buffer_size, MemoryType::Default) {
                 Ok(buffer) => instance_buffers.push(buffer),
                 Err(error) => {
                     for buffer in instance_buffers {
@@ -209,7 +208,7 @@ fn cleanup_partial(
     blases: Vec<AccelerationStructure>,
     ray_vertices: Vec<GpuArray<[f32; 3]>>,
     ray_indices: Vec<GpuArray<u32>>,
-    pending: Vec<Option<GpuAllocation>>,
+    pending: Vec<Option<Allocation>>,
 ) {
     drop(blases);
     for vertices in ray_vertices {
@@ -267,7 +266,7 @@ fn build_tlas(
     device: &Device,
     blases: &[AccelerationStructure],
     scene: &Scene,
-    instance_buffer: &GpuAllocation,
+    instance_buffer: &Allocation,
     dirty_instances: Option<&[usize]>,
 ) -> render::Result<AccelerationStructure> {
     let write_instance = |index: usize| -> render::Result<()> {
@@ -279,7 +278,7 @@ fn build_tlas(
                 transform: transform_rows(instance.transform),
                 instance_custom_index_and_mask: (index as u32) | (0xFF << 24),
                 instance_sbt_offset_and_flags: 0,
-                acceleration_structure_reference: blases[index].gpu(),
+                acceleration_structure_reference: blases[index].handle(),
             },
         )?;
         Ok(())
@@ -294,7 +293,7 @@ fn build_tlas(
         }
     }
     let desc = TlasDesc {
-        instance_buffer: instance_buffer.gpu(),
+        instance_buffer: instance_buffer.ptr(),
         instance_count: scene.geometry.instances.len() as u32,
         flags: BuildAccelFlags::PREFER_FAST_TRACE,
     };

@@ -1,10 +1,9 @@
-//! Acceleration structure types (BLAS + TLAS) for ray tracing. An AS is just GPU memory: its
-//! address goes into a root struct and the shader dereferences it via `TraceRayInline`.
+//! Acceleration structure types (BLAS + TLAS) for ray tracing.
 
-use crate::types::{AccelerationStructureId, GpuAddress};
+use crate::types::{AccelHandle, AccelerationStructureId, GpuAddress};
 
 /// A built acceleration structure (BLAS or TLAS). Build it with `cmd.build_blas`/`build_tlas`,
-/// then store [`gpu()`](Self::gpu) in a root `GpuAddress` field for the shader.
+/// then store [`handle()`](Self::handle) in an `AccelHandle` field for the shader.
 pub struct AccelerationStructure {
     pub id: AccelerationStructureId,
     pub(crate) inner: AccelInner,
@@ -12,9 +11,9 @@ pub struct AccelerationStructure {
 }
 
 impl AccelerationStructure {
-    /// GPU handle for this acceleration structure.
+    /// Opaque shader handle for this acceleration structure.
     ///
-    /// Assign to an [`AccelHandle`](crate::AccelHandle) field in a root struct:
+    /// Assign it directly to an [`AccelHandle`] field in root data:
     ///
     /// ```ignore
     /// gpu_struct! {
@@ -22,14 +21,13 @@ impl AccelerationStructure {
     ///         tlas: AccelHandle,
     ///     }
     /// }
-    /// root.tlas = tlas_accel.gpu();
+    /// root.tlas = tlas.handle();
     /// ```
-    ///
-    /// Vulkan: acceleration-structure device address
-    /// (`vkGetAccelerationStructureDeviceAddressKHR`). Metal: `gpuResourceID`. Slang
-    /// converts the stored 64-bit value to a `RaytracingAccelerationStructure` handle
-    /// at the use site. No descriptor set or argument-table slot required.
-    pub fn gpu(&self) -> GpuAddress {
+    pub fn handle(&self) -> AccelHandle {
+        AccelHandle::from_raw(self.address())
+    }
+
+    pub(crate) fn address(&self) -> GpuAddress {
         match &self.inner {
             #[cfg(feature = "vulkan")]
             AccelInner::Vulkan(a) => GpuAddress(a.device_address),

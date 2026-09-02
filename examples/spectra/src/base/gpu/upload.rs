@@ -2,18 +2,18 @@
 
 use std::marker::PhantomData;
 
-use kiln_rhi::{CommandBuffer, Device, GpuAddress, GpuAllocation, GpuPod, MemoryType};
+use kiln_rhi::{Allocation, CommandBuffer, Device, GpuPod, GpuPtr, MemoryType};
 
 use crate::base::renderer::Result;
 
 pub(crate) struct GpuArray<T> {
-    allocation: GpuAllocation,
+    allocation: Allocation,
     len: u32,
     marker: PhantomData<fn() -> T>,
 }
 
 impl<T> GpuArray<T> {
-    pub(crate) fn new(allocation: GpuAllocation, len: usize) -> Self {
+    pub(crate) fn new(allocation: Allocation, len: usize) -> Self {
         Self {
             allocation,
             len: len as u32,
@@ -21,8 +21,8 @@ impl<T> GpuArray<T> {
         }
     }
 
-    pub(crate) fn gpu(&self) -> GpuAddress {
-        self.allocation.gpu()
+    pub(crate) fn gpu(&self) -> GpuPtr<T> {
+        self.allocation.ptr()
     }
     pub(crate) fn len(&self) -> u32 {
         self.len
@@ -35,8 +35,8 @@ impl<T> GpuArray<T> {
 /// Stage immutable data into device-local allocations with one copy submission.
 pub(crate) struct GpuUploadBatch<'a> {
     device: &'a Device,
-    allocations: Vec<GpuAllocation>,
-    staging: Vec<GpuAllocation>,
+    allocations: Vec<Allocation>,
+    staging: Vec<Allocation>,
 }
 
 /// Batch range updates into existing device-local arrays. All patches are submitted together so
@@ -44,7 +44,7 @@ pub(crate) struct GpuUploadBatch<'a> {
 pub(crate) struct GpuPatchBatch<'a> {
     device: &'a Device,
     command: Option<CommandBuffer>,
-    staging: Vec<GpuAllocation>,
+    staging: Vec<Allocation>,
 }
 
 impl<'a> GpuPatchBatch<'a> {
@@ -95,7 +95,7 @@ impl<'a> GpuPatchBatch<'a> {
 
     /// Submit the patch copies and return their staging allocations. The caller must retain them
     /// until the frame fence covering this submission signals.
-    pub(crate) fn finish(mut self) -> Result<Vec<GpuAllocation>> {
+    pub(crate) fn finish(mut self) -> Result<Vec<Allocation>> {
         let mut command = self.command.take().expect("patch batch already finished");
         command.end();
         self.device.queue().submit(command)?;
@@ -121,7 +121,7 @@ impl<'a> GpuUploadBatch<'a> {
     }
 
     pub(crate) fn upload<T: GpuPod>(&mut self, data: &[T]) -> Result<()> {
-        let allocation = self.device.malloc(
+        let allocation = self.device.allocate(
             (std::mem::size_of_val(data) as u64).max(1),
             MemoryType::GpuOnly,
         )?;
@@ -137,7 +137,7 @@ impl<'a> GpuUploadBatch<'a> {
         Ok(())
     }
 
-    pub(crate) fn finish<const N: usize>(self) -> Result<[GpuAllocation; N]> {
+    pub(crate) fn finish<const N: usize>(self) -> Result<[Allocation; N]> {
         let allocations = self.finish_vec()?;
         match allocations.try_into() {
             Ok(allocations) => Ok(allocations),
@@ -145,7 +145,7 @@ impl<'a> GpuUploadBatch<'a> {
         }
     }
 
-    pub(crate) fn finish_vec(mut self) -> Result<Vec<GpuAllocation>> {
+    pub(crate) fn finish_vec(mut self) -> Result<Vec<Allocation>> {
         let mut cmd = self.device.create_command_buffer()?;
         for (destination, staging) in self.allocations.iter().zip(&self.staging) {
             cmd.memcpy(destination.gpu(), staging.gpu(), destination.size());

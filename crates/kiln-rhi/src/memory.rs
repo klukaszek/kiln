@@ -1,4 +1,4 @@
-//! GPU memory allocation: buffers, typed allocations, and the bump allocator.
+//! GPU memory allocation and pointer arithmetic.
 
 use crate::types::GpuAddress;
 use crate::{RhiError, RhiResult};
@@ -54,43 +54,62 @@ pub enum MemoryType {
     Readback,
 }
 
-/// Description for creating a GPU buffer.
+/// Description for creating a GPU allocation.
 #[derive(Clone, Debug, Default)]
-pub struct BufferDesc {
+pub struct AllocationDesc {
     pub size: u64,
     pub memory: MemoryType,
     pub label: Option<String>,
 }
 
-/// A GPU memory allocation.
-pub struct GpuAllocation {
-    pub(crate) buffer: GpuBuffer,
+/// Owned GPU memory: an optional CPU mapping, a GPU address, and a byte length.
+///
+/// This is the only public buffer-memory object. Subranges are expressed by pointer arithmetic;
+/// the backend buffer or heap that supplies the address is deliberately not part of the API.
+pub struct Allocation {
+    pub(crate) inner: AllocationInner,
+    pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
     pub(crate) offset: u64,
     pub(crate) size: u64,
 }
 
-impl GpuAllocation {
+pub(crate) enum AllocationInner {
+    #[cfg(feature = "vulkan")]
+    Vulkan(crate::backend::vulkan::memory::VulkanBuffer),
+    #[cfg(feature = "metal")]
+    Metal(crate::backend::metal::memory::MetalBuffer),
+}
+
+impl Allocation {
+    fn base_cpu(&self) -> Option<*mut u8> {
+        backend_dispatch!(&self.inner, AllocationInner, allocation => allocation.mapped_ptr())
+    }
+
+    fn base_gpu(&self) -> GpuAddress {
+        backend_dispatch!(&self.inner, AllocationInner, allocation => allocation.gpu_address())
+    }
+
     /// CPU mapping, or `None` for `GpuOnly` memory.
     pub fn cpu(&self) -> Option<*mut u8> {
-        self.buffer
-            .cpu()
+        self.base_cpu()
             .zip(usize::try_from(self.offset).ok())
             .map(|(ptr, offset)| unsafe { ptr.add(offset) })
     }
 
     /// GPU virtual address.
     pub fn gpu(&self) -> GpuAddress {
-        self.buffer.gpu().offset(self.offset)
+        self.base_gpu().offset(self.offset)
+    }
+
+    /// Typed GPU pointer to the first byte of this allocation.
+    #[inline]
+    pub fn ptr<T>(&self) -> crate::types::GpuPtr<T> {
+        crate::types::GpuPtr::from_raw(self.gpu())
     }
 
     /// Allocation size in bytes.
     pub fn size(&self) -> u64 {
         self.size
-    }
-
-    /// Consume the allocation and return the backing buffer.
-    pub fn into_buffer(self) -> GpuBuffer {
-        self.buffer
     }
 
     /// Upload a value into CPU-mapped memory (bounds-checked). Caller orders the write before
@@ -146,36 +165,6 @@ impl GpuAllocation {
     }
 }
 
-/// A persistent GPU buffer.
-pub struct GpuBuffer {
-    pub(crate) inner: GpuBufferInner,
-    pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
-}
-
-pub(crate) enum GpuBufferInner {
-    #[cfg(feature = "vulkan")]
-    Vulkan(crate::backend::vulkan::memory::VulkanBuffer),
-    #[cfg(feature = "metal")]
-    Metal(crate::backend::metal::memory::MetalBuffer),
-}
-
-impl GpuBuffer {
-    /// CPU-mapped pointer (`None` for `GpuOnly`).
-    pub fn cpu(&self) -> Option<*mut u8> {
-        backend_dispatch!(&self.inner, GpuBufferInner, b => b.mapped_ptr())
-    }
-
-    /// GPU virtual address for shader access.
-    pub fn gpu(&self) -> GpuAddress {
-        backend_dispatch!(&self.inner, GpuBufferInner, b => b.gpu_address())
-    }
-
-    /// Buffer size in bytes.
-    pub fn size(&self) -> u64 {
-        backend_dispatch!(&self.inner, GpuBufferInner, b => b.size())
-    }
-}
-
 /// A transient slice of mapped GPU memory.
 #[derive(Clone, Copy, Debug)]
 pub struct TransientAllocation {
@@ -198,7 +187,7 @@ impl TransientAllocation {
 
 /// Linear allocator over a mapped GPU buffer.
 pub struct BumpAllocator {
-    buffer: GpuBuffer,
+    allocation: Allocation,
     cpu_base: Option<*mut u8>,
     gpu_base: GpuAddress,
     offset: u64,
@@ -207,12 +196,12 @@ pub struct BumpAllocator {
 
 impl BumpAllocator {
     /// Create a new bump allocator with the given buffer.
-    pub fn new(buffer: GpuBuffer) -> Self {
-        let cpu_base = buffer.cpu();
-        let gpu_base = buffer.gpu();
-        let capacity = buffer.size();
+    pub fn new(allocation: Allocation) -> Self {
+        let cpu_base = allocation.cpu();
+        let gpu_base = allocation.gpu();
+        let capacity = allocation.size();
         Self {
-            buffer,
+            allocation,
             cpu_base,
             gpu_base,
             offset: 0,
@@ -233,6 +222,12 @@ impl BumpAllocator {
         self.offset = end;
 
         Some(TransientAllocation { cpu, gpu, size })
+    }
+
+    /// Allocate space for `count` values with their natural alignment.
+    pub fn alloc_array<T>(&mut self, count: usize) -> Option<TransientAllocation> {
+        let size = std::mem::size_of::<T>().checked_mul(count)? as u64;
+        self.alloc(size, std::mem::align_of::<T>() as u64)
     }
 
     /// Reset the allocator for a new frame.
@@ -256,8 +251,8 @@ impl BumpAllocator {
     }
 
     /// Consume the allocator and return the backing buffer.
-    pub fn into_buffer(self) -> GpuBuffer {
-        self.buffer
+    pub fn into_allocation(self) -> Allocation {
+        self.allocation
     }
 }
 

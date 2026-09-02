@@ -23,7 +23,7 @@ use crate::accel::{AccelInner, AccelerationStructure};
 use crate::command::CommandBuffer;
 use crate::device::{BindlessMode, DeviceDesc};
 use crate::error::{RhiError, RhiResult};
-use crate::memory::{BufferDesc, GpuBuffer, GpuBufferInner};
+use crate::memory::{Allocation, AllocationDesc, AllocationInner};
 use crate::pipeline::*;
 use crate::query::{QueryPool, QueryPoolInner};
 use crate::queue::{Queue, QueueInner, SubmitDesc};
@@ -165,7 +165,7 @@ impl MetalQueue {
     }
 
     /// Release a resource's storage immediately. The caller guarantees the GPU is done with it
-    /// (see `Device::destroy_buffer`); the freed slot is reusable by the next create.
+    /// (see `Device::destroy_allocation`); the freed slot is reusable by the next create.
     pub(crate) fn release_resource(&self, resource: MetalRetiredResource) {
         match &resource {
             MetalRetiredResource::Buffer(buffer) => {
@@ -647,7 +647,7 @@ impl MetalDevice {
         }
     }
 
-    pub fn create_buffer(&self, desc: &BufferDesc) -> RhiResult<GpuBuffer> {
+    pub fn create_allocation(&self, desc: &AllocationDesc) -> RhiResult<Allocation> {
         let length = usize::try_from(desc.size).map_err(|_| {
             RhiError::BufferCreation("Metal buffer size exceeds the host address space".into())
         })?;
@@ -688,9 +688,11 @@ impl MetalDevice {
             );
         }
 
-        Ok(GpuBuffer {
-            inner: GpuBufferInner::Metal(metal_buffer),
+        Ok(Allocation {
+            inner: AllocationInner::Metal(metal_buffer),
             _owner: None,
+            offset: 0,
+            size: desc.size,
         })
     }
 
@@ -1164,7 +1166,7 @@ impl MetalDevice {
         let instance_desc = MTL4InstanceAccelerationStructureDescriptor::new();
         unsafe {
             instance_desc.setInstanceDescriptorBuffer(objc2_metal::MTL4BufferRange {
-                bufferAddress: desc.instance_buffer.0,
+                bufferAddress: desc.instance_buffer.raw().0,
                 // The descriptor uses Metal's indirect instance layout; callers write it with
                 // `Device::write_tlas_instance`.
                 length: (desc.instance_count as u64) * self.tlas_instance_stride() as u64,
@@ -1193,7 +1195,7 @@ impl MetalDevice {
     /// Encode `inst` into `dst` in Metal's native indirect instance-descriptor layout.
     /// `dst` must have room for `tlas_instance_stride()` bytes.
     ///
-    /// `inst.acceleration_structure_reference` must be the BLAS `gpuResourceID` (`blas.gpu()`).
+    /// `inst.acceleration_structure_reference` must be the BLAS handle (`blas.handle()`).
     pub fn write_tlas_instance(&self, dst: *mut u8, inst: &crate::types::TlasInstance) {
         use objc2_metal::{
             MTLAccelerationStructureInstanceOptions,
@@ -1438,10 +1440,10 @@ impl MetalDevice {
         })
     }
 
-    pub fn destroy_buffer(&self, buffer: GpuBuffer) {
+    pub fn destroy_allocation(&self, buffer: Allocation) {
         match buffer.inner {
             #[cfg(feature = "metal")]
-            GpuBufferInner::Metal(mtl) => {
+            AllocationInner::Metal(mtl) => {
                 {
                     let mut allocations = self.shared.allocations.borrow_mut();
                     allocations.remove(&mtl.gpu_address().0);
@@ -1455,7 +1457,7 @@ impl MetalDevice {
                     .release_resource(MetalRetiredResource::Buffer(mtl));
             }
             #[cfg(feature = "vulkan")]
-            GpuBufferInner::Vulkan(_) => {}
+            AllocationInner::Vulkan(_) => {}
         }
     }
 
@@ -1548,7 +1550,7 @@ impl MetalDevice {
     /// Value to store in a [`TextureHandle`](crate::TextureHandle) root field for sampled view
     /// `id`. On Metal a `DescriptorHandle<Texture2D>` is the texture's `gpuResourceID`, which the
     /// shader uses directly.
-    pub fn bindless_texture_handle(&self, id: TextureId) -> GpuAddress {
+    pub fn texture_handle_raw(&self, id: TextureId) -> GpuAddress {
         let textures = self.shared.textures.borrow();
         let texture = textures
             .get(id.0 as usize)
@@ -1558,7 +1560,7 @@ impl MetalDevice {
     }
 
     /// Value to store in a [`SamplerHandle`](crate::SamplerHandle) root field for sampler `id`.
-    pub fn bindless_sampler_handle(&self, id: crate::types::SamplerId) -> GpuAddress {
+    pub fn sampler_handle_raw(&self, id: crate::types::SamplerId) -> GpuAddress {
         let samplers = self.shared.samplers.borrow();
         let sampler = samplers
             .get(id.0 as usize)

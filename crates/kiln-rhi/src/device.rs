@@ -3,7 +3,7 @@
 use crate::accel::AccelerationStructure;
 use crate::command::CommandBuffer;
 use crate::error::{RhiError, RhiResult};
-use crate::memory::{BufferDesc, GpuAllocation, GpuBuffer, GpuPod, MemoryType};
+use crate::memory::{Allocation, AllocationDesc, GpuPod, MemoryType};
 use crate::pipeline::{
     ComputePso, ComputePsoDesc, GraphicsPso, GraphicsPsoDesc, MeshletPso, MeshletPsoDesc,
 };
@@ -110,7 +110,7 @@ impl_device_owned!(
     AccelerationStructure,
     CommandBuffer,
     ComputePso,
-    GpuBuffer,
+    Allocation,
     GraphicsPso,
     MeshletPso,
     QueryPool,
@@ -249,24 +249,24 @@ impl Device {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.recreate_swapchain(swapchain, desc))
     }
 
-    /// Create a GPU buffer.
-    pub fn create_buffer(&self, desc: &BufferDesc) -> RhiResult<GpuBuffer> {
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_buffer(desc))
+    /// Create an allocation with an explicit description.
+    pub fn create_allocation(&self, desc: &AllocationDesc) -> RhiResult<Allocation> {
+        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_allocation(desc))
             .map(|resource| self.own(resource))
     }
 
-    /// Allocate GPU memory and return a pointer-first allocation.
-    pub fn malloc(&self, size: u64, memory: MemoryType) -> RhiResult<GpuAllocation> {
-        self.malloc_aligned(size, 16, memory)
+    /// Allocate GPU memory with the default 16-byte address alignment.
+    pub fn allocate(&self, size: u64, memory: MemoryType) -> RhiResult<Allocation> {
+        self.allocate_aligned(size, 16, memory)
     }
 
     /// Allocate GPU memory with explicit alignment.
-    pub fn malloc_aligned(
+    pub fn allocate_aligned(
         &self,
         size: u64,
         align: u64,
         memory: MemoryType,
-    ) -> RhiResult<GpuAllocation> {
+    ) -> RhiResult<Allocation> {
         if !align.is_power_of_two() {
             return Err(RhiError::AllocationFailed(format!(
                 "allocation alignment {align} is not a non-zero power of two"
@@ -274,33 +274,45 @@ impl Device {
         }
 
         let backing_size = aligned_backing_size(size, align)?;
-        let buffer = self.create_buffer(&BufferDesc {
+        let mut allocation = self.create_allocation(&AllocationDesc {
             size: backing_size,
             memory,
             label: None,
         })?;
-        let offset = (align - buffer.gpu().0 % align) % align;
+        allocation.offset = (align - allocation.gpu().0 % align) % align;
+        allocation.size = size;
+        Ok(allocation)
+    }
 
-        Ok(GpuAllocation {
-            buffer,
-            offset,
-            size,
-        })
+    /// Allocate space for `count` values with their natural alignment.
+    pub fn allocate_array<T>(&self, count: usize, memory: MemoryType) -> RhiResult<Allocation> {
+        let size = std::mem::size_of::<T>()
+            .checked_mul(count)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| RhiError::AllocationFailed("typed allocation size overflow".into()))?;
+        self.allocate_aligned(size.max(1), std::mem::align_of::<T>() as u64, memory)
+    }
+
+    /// Allocate mapped memory and upload one value.
+    pub fn upload<T: GpuPod>(&self, value: &T) -> RhiResult<Allocation> {
+        let mut allocation = self.allocate_array::<T>(1, MemoryType::Default)?;
+        allocation.upload(value)?;
+        Ok(allocation)
     }
 
     /// Allocate mapped memory and upload `data`.
-    pub fn upload_slice<T: GpuPod>(&self, data: &[T]) -> RhiResult<GpuAllocation> {
+    pub fn upload_slice<T: GpuPod>(&self, data: &[T]) -> RhiResult<Allocation> {
         let size = std::mem::size_of_val(data).max(1) as u64;
-        let mut alloc = self.malloc(size, MemoryType::Default)?;
+        let mut alloc = self.allocate(size, MemoryType::Default)?;
         if !data.is_empty() {
             alloc.upload_slice(data)?;
         }
         Ok(alloc)
     }
 
-    /// Free a pointer-first allocation. Same contract as [`destroy_buffer`](Self::destroy_buffer).
-    pub fn free(&self, allocation: GpuAllocation) {
-        self.destroy_buffer(allocation.into_buffer());
+    /// Release an allocation. The caller guarantees that submitted GPU work no longer uses it.
+    pub fn free(&self, allocation: Allocation) {
+        self.destroy_allocation(allocation);
     }
 
     /// Translate a CPU-mapped pointer to a GPU virtual address, if possible.
@@ -314,11 +326,12 @@ impl Device {
     }
 
     /// Create a texture in caller-owned GPU memory.
-    pub fn create_texture(
+    pub fn create_texture<P: Into<GpuAddress>>(
         &self,
         desc: &TextureDesc,
-        texture_gpu: GpuAddress,
+        texture_gpu: P,
     ) -> RhiResult<Texture> {
+        let texture_gpu = texture_gpu.into();
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_texture(desc, texture_gpu))
             .map(|resource| self.own(resource))
     }
@@ -353,24 +366,25 @@ impl Device {
             .map(|resource| self.own(resource))
     }
 
-    /// Convert a sampled view ID into a shader-visible handle.
-    pub fn bindless_texture_handle(&self, id: crate::types::TextureId) -> TextureHandle {
-        self.sampled_texture_handle(id)
-    }
-
     /// Convert a sampled view ID into a shader-visible sampled-texture handle.
     pub fn sampled_texture_handle(&self, id: crate::types::TextureId) -> TextureHandle {
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.bindless_texture_handle(id))
+        TextureHandle::from_raw(
+            backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.texture_handle_raw(id)),
+        )
     }
 
     /// Convert a storage view ID into a shader-visible read-write texture handle.
     pub fn storage_texture_handle(&self, id: crate::types::TextureId) -> StorageTextureHandle {
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.bindless_texture_handle(id))
+        StorageTextureHandle::from_raw(
+            backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.texture_handle_raw(id)),
+        )
     }
 
-    /// Convert a sampler ID into a shader-visible handle.
-    pub fn bindless_sampler_handle(&self, id: crate::types::SamplerId) -> SamplerHandle {
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.bindless_sampler_handle(id))
+    /// Convert a sampler ID into an opaque shader-visible handle.
+    pub fn sampler_handle(&self, id: crate::types::SamplerId) -> SamplerHandle {
+        SamplerHandle::from_raw(
+            backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.sampler_handle_raw(id)),
+        )
     }
 
     /// Create a shader module.
@@ -476,11 +490,11 @@ impl Device {
     /// indirect descriptor). Size the buffer as `instance_count * tlas_instance_stride()`.
     pub fn write_tlas_instance(
         &self,
-        dst: &crate::memory::GpuAllocation,
+        dst: &Allocation,
         index: usize,
         instance: &TlasInstance,
     ) -> RhiResult<()> {
-        self.ensure_owns(&dst.buffer, "TLAS instance buffer")?;
+        self.ensure_owns(dst, "TLAS instance buffer")?;
         let stride = self.tlas_instance_stride();
         let offset = index.checked_mul(stride).ok_or_else(|| {
             RhiError::AllocationFailed(format!(
@@ -589,12 +603,12 @@ impl Device {
     /// [`wait_idle`](Self::wait_idle), [`wait_for_frame`](Self::wait_for_frame), or the
     /// swapchain's frames-in-flight fence. Destroying a resource an in-flight submission still
     /// references is a use-after-free.
-    pub fn destroy_buffer(&self, buffer: GpuBuffer) {
-        self.assert_owns(&buffer, "buffer");
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.destroy_buffer(buffer))
+    pub fn destroy_allocation(&self, allocation: Allocation) {
+        self.assert_owns(&allocation, "allocation");
+        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.destroy_allocation(allocation))
     }
 
-    /// Destroy a texture. Same contract as [`destroy_buffer`](Self::destroy_buffer); the
+    /// Destroy a texture. Same contract as [`destroy_allocation`](Self::destroy_allocation); the
     /// `TextureId` is recycled at once, so a still-in-flight draw may read the next texture
     /// to take the slot.
     pub fn destroy_texture(&self, texture: Texture) {
@@ -602,12 +616,14 @@ impl Device {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.destroy_texture(texture))
     }
 
-    /// Destroy a sampled or storage view. Same contract as [`destroy_buffer`](Self::destroy_buffer).
+    /// Destroy a sampled or storage view. Same lifetime contract as
+    /// [`destroy_allocation`](Self::destroy_allocation).
     pub fn destroy_texture_view(&self, id: crate::types::TextureId) {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.destroy_texture_view(id))
     }
 
-    /// Destroy a sampler. Same contract as [`destroy_buffer`](Self::destroy_buffer).
+    /// Destroy a sampler. Same lifetime contract as
+    /// [`destroy_allocation`](Self::destroy_allocation).
     pub fn destroy_sampler(&self, sampler: Sampler) {
         self.assert_owns(&sampler, "sampler");
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.destroy_sampler(sampler))

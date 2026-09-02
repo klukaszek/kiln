@@ -1,9 +1,14 @@
 //! Host and shader argument layouts for spectral tracing.
 
 use glam::{UVec2, UVec4, Vec4};
-use kiln_rhi::{AccelHandle, GpuAddress, gpu_struct};
+use kiln_rhi::{AccelHandle, gpu_struct};
 
+use crate::base::gpu::GpuTextureBinding;
 use crate::base::scene::Camera;
+use crate::renderers::spectral::scene::{
+    GpuBsdf, GpuEmissiveHit, GpuInstance, GpuLight, GpuMaterialTexture, GpuMeshLightTriangle,
+    GpuTriangle,
+};
 
 pub(super) const CLEAR_SOURCE: &str = /*slang*/
     r#"
@@ -21,7 +26,7 @@ pub(super) const CLEAR_THREADS: u32 = 256;
 
 gpu_struct! {
     pub(super) struct ClearRoot {
-        film: GpuAddress as "float*",
+        film: GpuPtr<f32> as "float*",
         count: u32, // number of f32 in the film (stride * pixels)
         _pad: u32,
     }
@@ -34,22 +39,22 @@ gpu_struct! {
         cam_up: Vec4,
         cam_forward: Vec4,
         lens: Vec4,
-        film: GpuAddress as "float*",
-        triangles: GpuAddress as "Ptr<GpuTriangle, Access.Read>",
-        emissive_hits: GpuAddress as "Ptr<GpuEmissiveHit, Access.Read>",
-        instances: GpuAddress as "Ptr<GpuInstance, Access.Read>",
-        bsdfs: GpuAddress as "Ptr<GpuBsdf, Access.Read>",
-        lights: GpuAddress as "Ptr<GpuLight, Access.Read>",
-        mesh_light_triangles: GpuAddress as "Ptr<GpuMeshLightTriangle, Access.Read>",
-        mesh_light_cdf: GpuAddress as "Ptr<float, Access.Read>",
-        light_spectrum: GpuAddress as "Ptr<float, Access.Read>",
-        material_emission_spectrum: GpuAddress as "Ptr<float, Access.Read>",
-        spectrum: GpuAddress as "Ptr<float4, Access.Read>", // CDF table: (phase, wavelength, flux_shape, p_light)
-        sensor_spectrum: GpuAddress as "Ptr<float4, Access.Read>",
-        reflectance: GpuAddress as "Ptr<float, Access.Read>", // [material][wavelength entry]
-        material_textures: GpuAddress as "Ptr<GpuMaterialTexture, Access.Read>",
-        texture_bindings: GpuAddress as "Ptr<GpuTextureBinding, Access.Read>",
-        texture_basis: GpuAddress as "Ptr<float, Access.Read>",
+        film: GpuPtr<f32> as "float*",
+        triangles: GpuPtr<GpuTriangle> as "Ptr<GpuTriangle, Access.Read>",
+        emissive_hits: GpuPtr<GpuEmissiveHit> as "Ptr<GpuEmissiveHit, Access.Read>",
+        instances: GpuPtr<GpuInstance> as "Ptr<GpuInstance, Access.Read>",
+        bsdfs: GpuPtr<GpuBsdf> as "Ptr<GpuBsdf, Access.Read>",
+        lights: GpuPtr<GpuLight> as "Ptr<GpuLight, Access.Read>",
+        mesh_light_triangles: GpuPtr<GpuMeshLightTriangle> as "Ptr<GpuMeshLightTriangle, Access.Read>",
+        mesh_light_cdf: GpuPtr<f32> as "Ptr<float, Access.Read>",
+        light_spectrum: GpuPtr<f32> as "Ptr<float, Access.Read>",
+        material_emission_spectrum: GpuPtr<f32> as "Ptr<float, Access.Read>",
+        spectrum: GpuPtr<Vec4> as "Ptr<float4, Access.Read>", // CDF table: (phase, wavelength, flux_shape, p_light)
+        sensor_spectrum: GpuPtr<Vec4> as "Ptr<float4, Access.Read>",
+        reflectance: GpuPtr<f32> as "Ptr<float, Access.Read>", // [material][wavelength entry]
+        material_textures: GpuPtr<GpuMaterialTexture> as "Ptr<GpuMaterialTexture, Access.Read>",
+        texture_bindings: GpuPtr<GpuTextureBinding> as "Ptr<GpuTextureBinding, Access.Read>",
+        texture_basis: GpuPtr<f32> as "Ptr<float, Access.Read>",
         tlas: AccelHandle,
         film_width: u32,
         film_height: u32,
@@ -62,7 +67,7 @@ gpu_struct! {
 
 gpu_struct! {
     pub(super) struct DisplayRoot {
-        film: GpuAddress as "Ptr<float4, Access.Read>",
+        film: GpuPtr<Vec4> as "Ptr<float4, Access.Read>",
         display_width: u32,
         display_height: u32,
         film_width: u32,

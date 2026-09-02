@@ -1,5 +1,5 @@
 use kiln_rhi::{
-    BufferDesc, BumpAllocator, Device, GpuAddress, GpuPod, MAX_FRAMES_IN_FLIGHT, MemoryType,
+    AllocationDesc, BumpAllocator, Device, GpuAddress, GpuPod, MAX_FRAMES_IN_FLIGHT, MemoryType,
 };
 
 use crate::base::renderer::Result;
@@ -13,7 +13,7 @@ impl FrameArenas {
     pub(crate) fn new(device: &Device, size: u64, label: &str) -> Result<Self> {
         let mut slots = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for slot in 0..MAX_FRAMES_IN_FLIGHT {
-            match device.create_buffer(&BufferDesc {
+            match device.create_allocation(&AllocationDesc {
                 size,
                 memory: MemoryType::Default,
                 label: Some(format!("{label}-{slot}")),
@@ -48,6 +48,6 @@ impl FrameArenas {
 
 fn destroy_slots(device: &Device, slots: impl IntoIterator<Item = BumpAllocator>) {
     for slot in slots {
-        device.destroy_buffer(slot.into_buffer());
+        device.destroy_allocation(slot.into_allocation());
     }
 }

@@ -34,10 +34,6 @@ impl VulkanBuffer {
     pub fn gpu_address(&self) -> GpuAddress {
         self.gpu_address
     }
-
-    pub fn size(&self) -> u64 {
-        self.size
-    }
 }
 
 /// One `VkDeviceMemory` allocation, subdivided between many buffers.

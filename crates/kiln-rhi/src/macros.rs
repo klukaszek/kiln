@@ -32,16 +32,16 @@ macro_rules! backend_expect {
 /// alignment would insert it).
 ///
 /// The Slang type of a field is inferred from its Rust type (see [`crate::gpu_slang_ty!`] for the
-/// table: `Vec4` → `float4`, `u32` → `uint`, …). Pointers are the exception — `GpuAddress`
-/// erases its pointee, so device pointers spell out the Slang type with `as "T*"`. The same
-/// `as "..."` override works for any field whose mapping isn't built in.
+/// table: `Vec4` → `float4`, `u32` → `uint`, …). [`GpuPtr<T>`](crate::GpuPtr) fields infer
+/// `T*`; use `as "..."` when Rust and Slang name the pointee differently. The same override
+/// works for any field whose mapping isn't built in.
 ///
 /// ```ignore
 /// gpu_struct! {
 ///     pub struct Material {
 ///         albedo: u32,                      // -> uint
 ///         tint:   Vec4,                     // -> float4
-///         data:   GpuAddress as "Surface*", // 64-bit device pointer (pointee is explicit)
+///         data:   GpuPtr<Surface>,           // -> Surface*
 ///     }
 /// }
 /// ```
@@ -50,10 +50,22 @@ macro_rules! gpu_struct {
     (
         $(#[$meta:meta])*
         $vis:vis struct $name:ident {
-            $( $fname:ident : $fty:tt $(as $slang:literal)? ),* $(,)?
+            $($fields:tt)*
         }
     ) => {
-        $(#[$meta])*
+        $crate::__gpu_struct_parse! {
+            [$(#[$meta])*] [$vis] [$name] [] [] ; $($fields)*,
+        }
+    };
+}
+
+/// Parser for [`gpu_struct!`] fields. Kept public only because exported macros expand in the
+/// downstream crate; it is not API.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __gpu_struct_parse {
+    ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($slang:tt)*] ; $(,)*) => {
+        $($meta)*
         #[repr(C)]
         #[derive(
             Clone,
@@ -63,23 +75,66 @@ macro_rules! gpu_struct {
             $crate::zerocopy::Immutable,
         )]
         $vis struct $name {
-            $( pub $fname : $fty ),*
+            $($rust)*
         }
         impl $name {
             /// Slang declaration matching this struct's layout; prepend to shader source.
             pub const SLANG: &'static str = concat!(
                 "struct ", stringify!($name), " {\n",
-                $( "    ", $crate::gpu_slang_ty!($fty $(, $slang)?), " ", stringify!($fname), ";\n", )*
+                $($slang)*
                 "};\n"
             );
+        }
+    };
+
+    // Typed device pointer with an explicit Slang spelling.
+    ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
+        $field:ident : GpuPtr<$pointee:tt> as $slang:literal, $($rest:tt)*) => {
+        $crate::__gpu_struct_parse! {
+            [$($meta)*] [$vis] [$name]
+            [$($rust)* pub $field: $crate::GpuPtr<$pointee>,]
+            [$($out)* "    ", $slang, " ", stringify!($field), ";\n",]
+            ; $($rest)*
+        }
+    };
+
+    // Typed device pointer whose Rust and Slang pointee names are identical.
+    ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
+        $field:ident : GpuPtr<$pointee:tt>, $($rest:tt)*) => {
+        $crate::__gpu_struct_parse! {
+            [$($meta)*] [$vis] [$name]
+            [$($rust)* pub $field: $crate::GpuPtr<$pointee>,]
+            [$($out)* "    ", stringify!($pointee), "* ", stringify!($field), ";\n",]
+            ; $($rest)*
+        }
+    };
+
+    // Ordinary field with an explicit Slang spelling.
+    ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
+        $field:ident : $ty:tt as $slang:literal, $($rest:tt)*) => {
+        $crate::__gpu_struct_parse! {
+            [$($meta)*] [$vis] [$name]
+            [$($rust)* pub $field: $ty,]
+            [$($out)* "    ", $slang, " ", stringify!($field), ";\n",]
+            ; $($rest)*
+        }
+    };
+
+    // Ordinary field using the built-in Rust-to-Slang mapping.
+    ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
+        $field:ident : $ty:tt, $($rest:tt)*) => {
+        $crate::__gpu_struct_parse! {
+            [$($meta)*] [$vis] [$name]
+            [$($rust)* pub $field: $ty,]
+            [$($out)* "    ", $crate::gpu_slang_ty!($ty), " ", stringify!($field), ";\n",]
+            ; $($rest)*
         }
     };
 }
 
 /// Map a Rust field type to its Slang spelling for [`gpu_struct!`]. A trailing
-/// `, "literal"` overrides the mapping — used for `GpuAddress` device pointers,
-/// whose pointee the Rust type can't carry. Field types must be a single token
-/// (import the type rather than writing a path).
+/// `, "literal"` overrides the mapping when the Rust and Slang names differ.
+/// Field types must be a single token (import the type rather than writing a path).
 #[doc(hidden)]
 #[macro_export]
 macro_rules! gpu_slang_ty {

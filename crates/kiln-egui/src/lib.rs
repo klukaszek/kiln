@@ -4,8 +4,8 @@
 //! [`egui::ClippedPrimitive`] mesh is uploaded into per-frame vertex/index buffers and drawn with
 //! [`kiln_rhi::CommandBuffer::draw_indexed`], reading its vertices through a root pointer and
 //! sampling the font/image atlas through the bindless heap ([`kiln_rhi::TextureHandle`] /
-//! [`kiln_rhi::SamplerHandle`], filled by [`kiln_rhi::Device::bindless_texture_handle`] /
-//! [`kiln_rhi::Device::bindless_sampler_handle`]). This is the Kiln analogue of `egui_wgpu` /
+//! [`kiln_rhi::SamplerHandle`], filled by [`kiln_rhi::Device::sampled_texture_handle`] /
+//! [`kiln_rhi::Device::sampler_handle`]). This is the Kiln analogue of `egui_wgpu` /
 //! `egui_glow`; the windowed input glue (winit) lives in the caller (see the `egui_demo` example).
 //!
 //! Usage per frame, around the swapchain render pass:
@@ -23,11 +23,11 @@ use std::collections::HashMap;
 
 use kiln_rhi::compiler::SlangCompiler;
 use kiln_rhi::{
-    AddressMode, BlendAttachment, BlendFactor, BlendOp, BlendState, BufferDesc, ColorTarget,
-    ColorWriteMask, CommandBuffer, Cull, Device, FilterMode, Format, GpuAddress, GpuAllocation,
-    GpuBuffer, GraphicsPso, GraphicsPsoDesc, MAX_FRAMES_IN_FLIGHT, MemoryType, RhiError, RhiResult,
-    SampleCount, Sampler, SamplerDesc, SamplerHandle, ShaderStage, StageFlags, Texture,
-    TextureDesc, TextureDimension, TextureHandle, TextureId, TextureUsage, Topology, gpu_struct,
+    AddressMode, Allocation, AllocationDesc, BlendAttachment, BlendFactor, BlendOp, BlendState,
+    ColorTarget, ColorWriteMask, CommandBuffer, Cull, Device, FilterMode, Format, GraphicsPso,
+    GraphicsPsoDesc, MAX_FRAMES_IN_FLIGHT, MemoryType, RhiError, RhiResult, SampleCount, Sampler,
+    SamplerDesc, SamplerHandle, ShaderStage, StageFlags, Texture, TextureDesc, TextureDimension,
+    TextureHandle, TextureId, TextureUsage, Topology, gpu_struct,
 };
 
 gpu_struct! {
@@ -44,7 +44,7 @@ gpu_struct! {
     /// Per-mesh draw root. `verts` points at this mesh's vertex sub-array (egui indices are
     /// per-mesh 0-based, so `r.verts[vid]` resolves directly). `flags` bit 0 = sRGB target.
     struct EguiRoot {
-        verts: GpuAddress as "EguiVertex*",
+        verts: GpuPtr<EguiVertex>,
         screen_size: [f32; 2],
         flags: u32,
         _pad: u32,
@@ -109,13 +109,13 @@ float4 fsMain(VOut i, uniform EguiRoot* r) : SV_Target
 
 /// A GPU texture egui asked us to manage (the font atlas, or a user image), plus a CPU shadow
 /// copy so egui's sub-region patch updates can be applied and the whole texture re-uploaded
-/// (the RHI's `copy_to_texture` has no sub-rect form).
+/// (the RHI's texture copy has no sub-rect form).
 struct ManagedTexture {
     texture: Texture,
     view: TextureId,
-    mem: GpuAllocation,
+    mem: Allocation,
     /// Value for the root's [`TextureHandle`] field (heap index on Vulkan, `gpuResourceID` on Metal).
-    handle: GpuAddress,
+    handle: TextureHandle,
     width: u32,
     height: u32,
     shadow: Vec<u8>, // RGBA8, width*height*4
@@ -133,9 +133,9 @@ impl ManagedTexture {
 /// retired, which the swapchain's per-slot fence guarantees before recording begins.
 #[derive(Default)]
 struct FrameBuffers {
-    vtx: Option<GpuBuffer>,
-    idx: Option<GpuBuffer>,
-    root: Option<GpuBuffer>,
+    vtx: Option<Allocation>,
+    idx: Option<Allocation>,
+    root: Option<Allocation>,
 }
 
 /// egui renderer/painter built on the Kiln RHI. Create once with the swapchain's colour format;
@@ -201,7 +201,7 @@ impl EguiRenderer {
             label: Some("egui-sampler".into()),
             ..Default::default()
         })?;
-        let sampler_handle = device.bindless_sampler_handle(sampler.id());
+        let sampler_handle = device.sampler_handle(sampler.id());
 
         Ok(Self {
             pso,
@@ -299,9 +299,9 @@ impl EguiRenderer {
         let vtx = frame.vtx.as_ref().unwrap();
         let idx = frame.idx.as_ref().unwrap();
         let root = frame.root.as_ref().unwrap();
-        let (vtx_cpu, vtx_gpu) = (cpu(vtx), vtx.gpu());
-        let (idx_cpu, idx_gpu) = (cpu(idx), idx.gpu());
-        let (root_cpu, root_gpu) = (cpu(root), root.gpu());
+        let (vtx_cpu, vtx_gpu) = (cpu(vtx), vtx.ptr::<EguiVertex>());
+        let (idx_cpu, idx_gpu) = (cpu(idx), idx.ptr::<u32>());
+        let (root_cpu, root_gpu) = (cpu(root), root.ptr::<EguiRoot>());
 
         let [fb_w, fb_h] = framebuffer_px;
         let screen_size = [
@@ -353,14 +353,14 @@ impl EguiRenderer {
             }
 
             let root_data = EguiRoot {
-                verts: vtx_gpu.offset(v_off * VERTEX_SIZE),
+                verts: vtx_gpu.offset(v_off),
                 screen_size,
                 flags,
                 _pad: 0,
                 tex: managed.handle,
                 smp: self.sampler_handle,
             };
-            let root_addr = root_gpu.offset(m_off * ROOT_STRIDE);
+            let root_addr = root_gpu.byte_add(m_off * ROOT_STRIDE);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     (&root_data as *const EguiRoot) as *const u8,
@@ -372,7 +372,7 @@ impl EguiRenderer {
             cmd.set_scissor(sx, sy, sw, sh);
             cmd.draw_indexed(
                 root_addr,
-                idx_gpu.offset(i_off * INDEX_SIZE),
+                idx_gpu.offset(i_off),
                 mesh.indices.len() as u32,
                 1,
             );
@@ -398,7 +398,7 @@ impl EguiRenderer {
         }
         for f in frames {
             for b in [f.vtx, f.idx, f.root].into_iter().flatten() {
-                device.destroy_buffer(b);
+                device.destroy_allocation(b);
             }
         }
         device.destroy_sampler(_sampler);
@@ -456,22 +456,22 @@ fn is_srgb(format: Format) -> bool {
 }
 
 /// CPU-mapped base pointer of a `Default` buffer (always mapped; panics otherwise — a bug).
-fn cpu(buf: &GpuBuffer) -> *mut u8 {
+fn cpu(buf: &Allocation) -> *mut u8 {
     buf.cpu().expect("egui geometry buffer must be CPU-mapped")
 }
 
 /// Ensure `buf` exists and holds at least `need` bytes, reallocating (and freeing the old) on
 /// growth. Grows in powers of two to amortize reallocation as egui's geometry fluctuates.
-fn grow(device: &Device, buf: &mut Option<GpuBuffer>, need: u64, label: &str) -> RhiResult<()> {
+fn grow(device: &Device, buf: &mut Option<Allocation>, need: u64, label: &str) -> RhiResult<()> {
     let have = buf.as_ref().map_or(0, |b| b.size());
     if have >= need {
         return Ok(());
     }
     if let Some(old) = buf.take() {
-        device.destroy_buffer(old);
+        device.destroy_allocation(old);
     }
     let size = need.next_power_of_two().max(4096);
-    *buf = Some(device.create_buffer(&BufferDesc {
+    *buf = Some(device.create_allocation(&AllocationDesc {
         size,
         memory: MemoryType::Default,
         label: Some(label.into()),
@@ -528,7 +528,7 @@ fn create_texture(
         label: Some("egui-texture".into()),
     };
     let sa = device.texture_size_align(&desc)?;
-    let mem = device.malloc_aligned(sa.size, sa.align, MemoryType::GpuOnly)?;
+    let mem = device.allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)?;
     let texture = device.create_texture(&desc, mem.gpu())?;
     let tex_id = match device.create_sampled_view(&texture, &Default::default()) {
         Ok(id) => id,
@@ -538,7 +538,7 @@ fn create_texture(
             return Err(error);
         }
     };
-    let handle = device.bindless_texture_handle(tex_id);
+    let handle = device.sampled_texture_handle(tex_id);
     Ok(ManagedTexture {
         texture,
         view: tex_id,
@@ -555,7 +555,7 @@ fn create_texture(
 fn upload_full(device: &Device, m: &ManagedTexture) -> RhiResult<()> {
     let staging = device.upload_slice(&m.shadow)?;
     let mut cmd = device.create_command_buffer()?;
-    cmd.copy_to_texture(m.mem.gpu(), staging.gpu(), &m.texture);
+    cmd.copy_buffer_to_texture(staging.gpu(), &m.texture);
     cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
     cmd.end();
     let queue = device.queue();

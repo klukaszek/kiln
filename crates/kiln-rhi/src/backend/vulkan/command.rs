@@ -523,9 +523,14 @@ impl VulkanCommandBuffer {
         }
     }
 
-    pub fn copy_to_texture(&mut self, texture_gpu: GpuAddress, src: GpuAddress, texture: &Texture) {
+    pub fn copy_buffer_to_texture(
+        &mut self,
+        texture_gpu: GpuAddress,
+        src: GpuAddress,
+        texture: &Texture,
+    ) {
         let (image, aspect, width, height, layout, src_buffer, src_offset) =
-            self.prepare_texture_copy(texture_gpu, src, texture, "copy_to_texture");
+            self.prepare_texture_copy(texture_gpu, src, texture, "copy_buffer_to_texture");
         self.transition_texture(
             image,
             aspect,
@@ -556,14 +561,14 @@ impl VulkanCommandBuffer {
         );
     }
 
-    pub fn copy_from_texture(
+    pub fn copy_texture_to_buffer(
         &mut self,
         dst: GpuAddress,
         texture_gpu: GpuAddress,
         texture: &Texture,
     ) {
         let (image, aspect, width, height, layout, dst_buffer, dst_offset) =
-            self.prepare_texture_copy(texture_gpu, dst, texture, "copy_from_texture");
+            self.prepare_texture_copy(texture_gpu, dst, texture, "copy_texture_to_buffer");
         self.transition_texture(
             image,
             aspect,
@@ -889,7 +894,7 @@ impl VulkanCommandBuffer {
                     let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
                         .vertex_format(vk::Format::R32G32B32_SFLOAT)
                         .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.vertex_buffer.0,
+                            device_address: m.vertex_buffer.raw().0,
                         })
                         .vertex_stride(m.vertex_stride)
                         .max_vertex(m.vertex_count.saturating_sub(1))
@@ -899,7 +904,7 @@ impl VulkanCommandBuffer {
                             vk::IndexType::NONE_KHR
                         })
                         .index_data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.index_buffer.0,
+                            device_address: m.index_buffer.raw().0,
                         });
                     vk::AccelerationStructureGeometryKHR::default()
                         .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
@@ -909,7 +914,7 @@ impl VulkanCommandBuffer {
                 GeometryType::Aabbs => {
                     let aabbs = vk::AccelerationStructureGeometryAabbsDataKHR::default()
                         .data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.aabb_buffer.0,
+                            device_address: m.aabb_buffer.raw().0,
                         })
                         .stride(std::mem::size_of::<vk::AabbPositionsKHR>() as u64);
                     vk::AccelerationStructureGeometryKHR::default()
@@ -975,7 +980,7 @@ impl VulkanCommandBuffer {
         let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::default()
             .array_of_pointers(false)
             .data(vk::DeviceOrHostAddressConstKHR {
-                device_address: desc.instance_buffer.0,
+                device_address: desc.instance_buffer.raw().0,
             });
         let geometry = vk::AccelerationStructureGeometryKHR::default()
             .geometry_type(vk::GeometryTypeKHR::INSTANCES)

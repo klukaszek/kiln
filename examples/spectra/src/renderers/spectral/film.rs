@@ -1,5 +1,5 @@
 use glam::UVec2;
-use kiln_rhi::{Device, GpuAllocation, MemoryType};
+use kiln_rhi::{Allocation, Device, MemoryType};
 
 use crate::base::renderer::{self as render, Error};
 
@@ -21,7 +21,7 @@ impl FilmSignature {
 }
 
 pub(super) struct Film {
-    accum: Option<GpuAllocation>,
+    accum: Option<Allocation>,
     pub(super) extent: UVec2,
     pub(super) pass_count: u32,
     signature: Option<FilmSignature>,
@@ -60,7 +60,7 @@ impl Film {
                     device.free(stale);
                 }
                 element_count = self.element_count_for(extent)?;
-                device.malloc(
+                device.allocate(
                     u64::from(element_count) * std::mem::size_of::<f32>() as u64,
                     MemoryType::GpuOnly,
                 )?
@@ -77,7 +77,7 @@ impl Film {
 
     pub(super) fn readback(&self, device: &Device) -> render::Result<Vec<f32>> {
         let accum = self.accum();
-        let readback = device.malloc(accum.size(), MemoryType::Readback)?;
+        let readback = device.allocate(accum.size(), MemoryType::Readback)?;
         let result = copy_to_readback(device, accum, &readback);
         device.free(readback);
         result
@@ -95,7 +95,7 @@ impl Film {
         self.signature = None;
     }
 
-    pub(super) fn accum(&self) -> &GpuAllocation {
+    pub(super) fn accum(&self) -> &Allocation {
         self.accum
             .as_ref()
             .expect("film allocation follows successful prepare")
@@ -114,8 +114,8 @@ impl Film {
 
 fn copy_to_readback(
     device: &Device,
-    source: &GpuAllocation,
-    destination: &GpuAllocation,
+    source: &Allocation,
+    destination: &Allocation,
 ) -> render::Result<Vec<f32>> {
     device.wait_idle();
     let mut cmd = device.create_command_buffer()?;

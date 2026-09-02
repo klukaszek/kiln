@@ -40,10 +40,6 @@ impl MetalBuffer {
         GpuAddress(self.buffer.gpuAddress())
     }
 
-    pub fn size(&self) -> u64 {
-        self.size
-    }
-
     /// Return this buffer's placement range to the pool after GPU retirement.
     pub(crate) fn release_to_pool(self) {
         self.pool

@@ -1,38 +1,48 @@
 //! Shared primitive types: addresses, handles, formats, and ray-tracing descriptors.
 
+use std::marker::PhantomData;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-/// Acceleration-structure handle field type for [`gpu_struct!`].
-///
-/// A [`GpuAddress`] that maps to `DescriptorHandle<RaytracingAccelerationStructure>` on
-/// the Slang side with no `as "..."` annotation needed. Assign [`AccelerationStructure::gpu()`]
-/// directly.
-///
-/// [`AccelerationStructure::gpu()`]: crate::AccelerationStructure::gpu
-pub type AccelHandle = GpuAddress;
+macro_rules! shader_handle {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[repr(transparent)]
+        #[derive(
+            Clone, Copy, Debug, Default, PartialEq, Eq, Hash, IntoBytes, FromBytes, Immutable,
+        )]
+        pub struct $name(pub(crate) u64);
 
-/// Sampled-texture handle field type for [`gpu_struct!`].
-///
-/// A [`GpuAddress`] that maps to `DescriptorHandle<Texture2D>` on the Slang side with no
-/// `as "..."` annotation needed. Assign the value from [`Device::bindless_texture_handle`];
-/// the shader samples it as `root.tex.Sample(root.smp, uv)`.
-///
-/// [`Device::bindless_texture_handle`]: crate::Device::bindless_texture_handle
-pub type TextureHandle = GpuAddress;
+        impl $name {
+            pub const NULL: Self = Self(0);
 
-/// Read-write texture handle field type for [`gpu_struct!`].
-///
-/// This maps to `DescriptorHandle<RWTexture2D<float>>`; assign the value from
-/// [`crate::Device::storage_texture_handle`] for a view created with `create_storage_view`.
-pub type StorageTextureHandle = GpuAddress;
+            pub(crate) const fn from_raw(address: GpuAddress) -> Self {
+                Self(address.0)
+            }
 
-/// Sampler handle field type for [`gpu_struct!`].
-///
-/// A [`GpuAddress`] that maps to `DescriptorHandle<SamplerState>` on the Slang side with no
-/// `as "..."` annotation needed. Assign the value from [`Device::bindless_sampler_handle`].
-///
-/// [`Device::bindless_sampler_handle`]: crate::Device::bindless_sampler_handle
-pub type SamplerHandle = GpuAddress;
+            #[inline]
+            pub const fn is_null(self) -> bool {
+                self.0 == 0
+            }
+        }
+    };
+}
+
+shader_handle!(
+    AccelHandle,
+    "Opaque acceleration-structure shader handle produced by `AccelerationStructure::handle`."
+);
+shader_handle!(
+    TextureHandle,
+    "Opaque sampled-texture shader handle produced by `Device::sampled_texture_handle`."
+);
+shader_handle!(
+    StorageTextureHandle,
+    "Opaque storage-texture shader handle produced by `Device::storage_texture_handle`."
+);
+shader_handle!(
+    SamplerHandle,
+    "Opaque sampler shader handle produced by `Device::sampler_handle`."
+);
 
 /// GPU virtual address for buffer device address / Metal `gpuAddress`.
 ///
@@ -56,7 +66,7 @@ impl GpuAddress {
     }
 
     #[inline]
-    pub fn is_null(self) -> bool {
+    pub const fn is_null(self) -> bool {
         self.0 == 0
     }
 
@@ -71,6 +81,121 @@ impl GpuAddress {
 impl std::fmt::LowerHex for GpuAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+/// Typed pointer into GPU virtual memory.
+///
+/// `GpuPtr<T>` has exactly the same 64-bit representation as [`GpuAddress`]. The type parameter
+/// documents the pointee and makes element arithmetic explicit; it carries no ownership,
+/// lifetime, bounds, or synchronization machinery.
+#[repr(transparent)]
+#[derive(IntoBytes, FromBytes, Immutable)]
+pub struct GpuPtr<T: ?Sized> {
+    address: GpuAddress,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T: ?Sized> GpuPtr<T> {
+    pub const NULL: Self = Self::from_raw(GpuAddress::NULL);
+
+    #[inline]
+    pub const fn from_raw(address: GpuAddress) -> Self {
+        Self {
+            address,
+            marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn raw(self) -> GpuAddress {
+        self.address
+    }
+
+    #[inline]
+    pub const fn is_null(self) -> bool {
+        self.address.is_null()
+    }
+
+    /// Offset by bytes, wrapping with raw-pointer semantics.
+    #[inline]
+    pub fn byte_add(self, bytes: u64) -> Self {
+        Self::from_raw(self.address.offset(bytes))
+    }
+
+    /// Reinterpret the pointee type without changing the address.
+    #[inline]
+    pub const fn cast<U: ?Sized>(self) -> GpuPtr<U> {
+        GpuPtr::from_raw(self.address)
+    }
+}
+
+impl<T> GpuPtr<T> {
+    /// Offset by `count` elements, wrapping with raw-pointer semantics.
+    #[inline]
+    pub fn offset(self, count: u64) -> Self {
+        self.byte_add((std::mem::size_of::<T>() as u64).wrapping_mul(count))
+    }
+}
+
+impl<T> std::ops::Add<u64> for GpuPtr<T> {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, count: u64) -> Self::Output {
+        self.offset(count)
+    }
+}
+
+impl<T: ?Sized> Copy for GpuPtr<T> {}
+
+impl<T: ?Sized> Clone for GpuPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: ?Sized> Default for GpuPtr<T> {
+    fn default() -> Self {
+        Self::NULL
+    }
+}
+
+impl<T: ?Sized> PartialEq for GpuPtr<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address
+    }
+}
+
+impl<T: ?Sized> Eq for GpuPtr<T> {}
+
+impl<T: ?Sized> std::hash::Hash for GpuPtr<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.address.hash(state);
+    }
+}
+
+impl<T: ?Sized> std::fmt::Debug for GpuPtr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GpuPtr(0x{:x})", self.address)
+    }
+}
+
+impl<T: ?Sized> std::fmt::LowerHex for GpuPtr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::LowerHex::fmt(&self.address, f)
+    }
+}
+
+impl<T: ?Sized> From<GpuAddress> for GpuPtr<T> {
+    fn from(address: GpuAddress) -> Self {
+        Self::from_raw(address)
+    }
+}
+
+impl<T: ?Sized> From<GpuPtr<T>> for GpuAddress {
+    fn from(pointer: GpuPtr<T>) -> Self {
+        pointer.raw()
     }
 }
 
@@ -276,7 +401,7 @@ pub enum ClipSpaceY {
 pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 /// Opaque acceleration-structure handle (BLAS or TLAS). Exists so the backend can issue
-/// `build` against the right object; shaders use its GPU address (`accel.gpu()`).
+/// `build` against the right object; shaders use its opaque handle (`accel.handle()`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AccelerationStructureId(pub u32);
 
@@ -331,20 +456,28 @@ bitflags::bitflags! {
 pub struct BlasMeshDesc {
     pub geometry_type: GeometryType,
     pub flags: GeometryFlags,
-    /// GPU address of the vertex position buffer (for Triangles).
-    pub vertex_buffer: GpuAddress,
+    /// Vertex positions (for triangles).
+    pub vertex_buffer: GpuPtr<[f32; 3]>,
     /// Bytes between successive vertex positions (for Triangles).
     pub vertex_stride: u64,
     /// Number of vertices.
     pub vertex_count: u32,
-    /// GPU address of index buffer (0 = non-indexed).
-    pub index_buffer: GpuAddress,
+    /// Triangle indices, or [`GpuPtr::NULL`] for non-indexed geometry.
+    pub index_buffer: GpuPtr<u32>,
     /// Index count (0 = non-indexed).
     pub index_count: u32,
-    /// GPU address of the AABB buffer (for Aabbs geometry).
-    pub aabb_buffer: GpuAddress,
+    /// Axis-aligned bounding boxes (for AABB geometry).
+    pub aabb_buffer: GpuPtr<Aabb>,
     /// Number of AABBs.
     pub aabb_count: u32,
+}
+
+/// Axis-aligned bounding box consumed by procedural BLAS geometry.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, IntoBytes, FromBytes, Immutable)]
+pub struct Aabb {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
 }
 
 /// Descriptor for building a Bottom-Level Acceleration Structure.
@@ -367,16 +500,34 @@ pub struct TlasInstance {
     /// Low 24 bits: shader binding table hit group offset.
     /// High 8 bits: `InstanceFlags`.
     pub instance_sbt_offset_and_flags: u32,
-    /// GPU address of the BLAS for this instance — assign `blas.gpu()`.
-    pub acceleration_structure_reference: GpuAddress,
+    /// BLAS referenced by this instance — assign `blas.handle()`.
+    pub acceleration_structure_reference: AccelHandle,
 }
 
 /// Descriptor for building a Top-Level Acceleration Structure.
 #[derive(Clone, Debug, Default)]
 pub struct TlasDesc {
     /// GPU address of an array of `TlasInstance`.
-    pub instance_buffer: GpuAddress,
+    pub instance_buffer: GpuPtr<TlasInstance>,
     /// Number of instances.
     pub instance_count: u32,
     pub flags: BuildAccelFlags,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GpuAddress, GpuPtr};
+
+    #[test]
+    fn typed_gpu_pointer_is_a_zero_cost_address() {
+        fn assert_gpu_pod<T: crate::GpuPod>() {}
+
+        assert_gpu_pod::<GpuPtr<u32>>();
+        assert_eq!(std::mem::size_of::<GpuPtr<u32>>(), 8);
+        assert_eq!(std::mem::align_of::<GpuPtr<u32>>(), 8);
+
+        let base = GpuPtr::<u32>::from_raw(GpuAddress(0x1000));
+        assert_eq!((base + 3).raw(), GpuAddress(0x100c));
+        assert_eq!(base.byte_add(7).cast::<u8>().raw(), GpuAddress(0x1007));
+    }
 }

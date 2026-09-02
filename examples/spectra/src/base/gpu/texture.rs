@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use kiln_rhi::{
-    AddressMode, Device, FilterMode, Format, GpuAllocation, MemoryType, SampleCount, Sampler,
+    AddressMode, Allocation, Device, FilterMode, Format, MemoryType, SampleCount, Sampler,
     SamplerDesc, SamplerHandle, StageFlags, Texture as RhiTexture, TextureDesc, TextureDimension,
     TextureHandle, TextureId as RhiTextureId, TextureUsage, gpu_struct,
 };
@@ -43,9 +43,7 @@ impl TextureResources {
             };
             bindings.push(GpuTextureBinding {
                 image: upload.images[texture.image.0].handle,
-                sampler: upload
-                    .device
-                    .bindless_sampler_handle(upload.samplers[sampler].id()),
+                sampler: upload.device.sampler_handle(upload.samplers[sampler].id()),
             });
         }
         upload.finish(bindings)
@@ -66,7 +64,7 @@ impl TextureResources {
 }
 
 struct GpuImage {
-    memory: GpuAllocation,
+    memory: Allocation,
     texture: RhiTexture,
     view: RhiTextureId,
     handle: TextureHandle,
@@ -90,7 +88,7 @@ impl GpuImage {
             label: Some(image.name.clone()),
         };
         let size = device.texture_size_align(&desc)?;
-        let memory = device.malloc_aligned(size.size, size.align, MemoryType::GpuOnly)?;
+        let memory = device.allocate_aligned(size.size, size.align, MemoryType::GpuOnly)?;
         let texture = match device.create_texture(&desc, memory.gpu()) {
             Ok(texture) => texture,
             Err(error) => {
@@ -107,7 +105,7 @@ impl GpuImage {
             }
         };
         Ok(Self {
-            handle: device.bindless_texture_handle(view),
+            handle: device.sampled_texture_handle(view),
             memory,
             texture,
             view,
@@ -124,7 +122,7 @@ impl GpuImage {
 struct TextureUpload<'a> {
     device: &'a Device,
     images: Vec<GpuImage>,
-    staging: Vec<GpuAllocation>,
+    staging: Vec<Allocation>,
     samplers: Vec<Sampler>,
 }
 
@@ -172,7 +170,7 @@ impl<'a> TextureUpload<'a> {
         if !self.images.is_empty() {
             let mut commands = self.device.create_command_buffer()?;
             for (image, staging) in self.images.iter().zip(&self.staging) {
-                commands.copy_to_texture(image.memory.gpu(), staging.gpu(), &image.texture);
+                commands.copy_buffer_to_texture(staging.gpu(), &image.texture);
             }
             commands.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
             commands.end();

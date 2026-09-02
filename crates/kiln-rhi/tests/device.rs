@@ -2,7 +2,7 @@
 
 mod common;
 
-use kiln_rhi::{BufferDesc, Device, DeviceDesc, MemoryType};
+use kiln_rhi::{AllocationDesc, Device, DeviceDesc, MemoryType};
 
 /// Device creation exposes a usable backend and bindless mode.
 #[test]
@@ -37,18 +37,18 @@ fn resources_may_outlive_the_device_handle() {
         return;
     };
 
-    let buffer = device
-        .create_buffer(&BufferDesc {
+    let allocation = device
+        .create_allocation(&AllocationDesc {
             size: 256,
             memory: MemoryType::Default,
             label: Some("device-lifetime-buffer".into()),
         })
-        .expect("buffer");
+        .expect("allocation");
     let queries = device.create_query_pool(2).expect("query pool");
     let timeline = device.create_timeline_semaphore(0).expect("timeline");
 
     drop(device);
     drop(queries);
     drop(timeline);
-    drop(buffer);
+    drop(allocation);
 }

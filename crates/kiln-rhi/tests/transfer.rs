@@ -14,8 +14,8 @@ fn gpu_memcpy_roundtrip() {
 
     const SIZE: u64 = 1 << 16; // 64 KiB
 
-    let mut src = device.malloc(SIZE, MemoryType::Default).expect("src");
-    let dst = device.malloc(SIZE, MemoryType::Readback).expect("dst");
+    let mut src = device.allocate(SIZE, MemoryType::Default).expect("src");
+    let dst = device.allocate(SIZE, MemoryType::Readback).expect("dst");
 
     for (i, b) in src
         .as_mut_slice::<u8>()
@@ -54,8 +54,8 @@ fn gpu_memcpy_size_sweep() {
 
     for &kib in &[4u64, 64, 1024, 16 * 1024] {
         let size = kib * 1024;
-        let src = device.malloc(size, MemoryType::Default).expect("src");
-        let dst = device.malloc(size, MemoryType::GpuOnly).expect("dst");
+        let src = device.allocate(size, MemoryType::Default).expect("src");
+        let dst = device.allocate(size, MemoryType::GpuOnly).expect("dst");
 
         common::timed(&format!("memcpy {kib} KiB → GpuOnly"), || {
             let mut cmd = device.create_command_buffer().expect("cmd");

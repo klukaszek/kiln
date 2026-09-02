@@ -8,10 +8,10 @@ mod common;
 
 use kiln_rhi::gpu_struct;
 use kiln_rhi::{
-    BufferDesc, BumpAllocator, ColorAttachment, ColorTarget, ColorWriteMask, Cull, Device, Format,
-    GpuAddress, GraphicsPso, GraphicsPsoDesc, LoadOp, MemoryType, RenderPassDesc, RenderTarget,
-    SampleCount, ShaderModule, ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension,
-    TextureUsage, Topology,
+    AllocationDesc, BumpAllocator, ColorAttachment, ColorTarget, ColorWriteMask, Cull, Device,
+    Format, GpuAddress, GraphicsPso, GraphicsPsoDesc, LoadOp, MemoryType, RenderPassDesc,
+    RenderTarget, SampleCount, ShaderModule, ShaderStage, StageFlags, StoreOp, TextureDesc,
+    TextureDimension, TextureUsage, Topology,
 };
 
 // Shared host/device root: a single colour, used by the pixel shader.
@@ -93,7 +93,7 @@ fn graphics_fullscreen_color() {
     };
     let sa = device.texture_size_align(&tex_desc).expect("size_align");
     let tex_mem = device
-        .malloc_aligned(sa.size, sa.align, MemoryType::GpuOnly)
+        .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let texture = device
         .create_texture(&tex_desc, tex_mem.gpu())
@@ -101,14 +101,14 @@ fn graphics_fullscreen_color() {
 
     // Root color and readback buffer.
     let mut root = device
-        .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
+        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
     root.upload(&Root {
         color: [1.0, 0.0, 0.0, 1.0],
     })
     .expect("upload root");
     let readback = device
-        .malloc((SIZE * SIZE * 4) as u64, MemoryType::Readback)
+        .allocate((SIZE * SIZE * 4) as u64, MemoryType::Readback)
         .expect("readback");
 
     common::timed("render full-screen triangle · submit+wait", || {
@@ -193,7 +193,7 @@ fn graphics_static_color_write_mask() {
         )
         .expect("create masked graphics pso");
     let mut root = device
-        .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
+        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
     root.upload(&Root {
         color: [1.0, 1.0, 1.0, 0.0],
@@ -262,13 +262,13 @@ fn render_draw(
     };
     let sa = device.texture_size_align(&tex_desc).expect("size_align");
     let tex_mem = device
-        .malloc_aligned(sa.size, sa.align, MemoryType::GpuOnly)
+        .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let texture = device
         .create_texture(&tex_desc, tex_mem.gpu())
         .expect("create_texture");
     let readback = device
-        .malloc((size * size * 4) as u64, MemoryType::Readback)
+        .allocate((size * size * 4) as u64, MemoryType::Readback)
         .expect("readback");
 
     let mut cmd = device.create_command_buffer().expect("cmd");
@@ -306,10 +306,10 @@ fn render_draw(
 
 /// A per-test bump allocator over CPU-mapped memory — the doc's preferred source for
 /// transient per-draw arguments (root structs, configs). Caller releases it with
-/// `device.destroy_buffer(bump.into_buffer())` after the draw has completed.
+/// `device.destroy_allocation(bump.into_allocation())` after the draw has completed.
 fn test_bump(device: &Device) -> BumpAllocator {
     let buffer = device
-        .create_buffer(&BufferDesc {
+        .create_allocation(&AllocationDesc {
             size: 64 * 1024,
             memory: MemoryType::Default,
             label: Some("test-bump".into()),
@@ -564,7 +564,7 @@ fn graphics_instanced_grid() {
         }
     }
 
-    device.destroy_buffer(bump.into_buffer());
+    device.destroy_allocation(bump.into_allocation());
 }
 
 // Root data from a transient bump allocation.
@@ -589,7 +589,7 @@ fn graphics_root_from_bump_allocator() {
 
     // The root is a transient sub-allocation from one CPU-mapped buffer.
     let buffer = device
-        .create_buffer(&BufferDesc {
+        .create_allocation(&AllocationDesc {
             size: 4096,
             memory: MemoryType::Default,
             label: Some("bump-root".into()),
@@ -624,5 +624,5 @@ fn graphics_root_from_bump_allocator() {
         );
     }
 
-    device.destroy_buffer(bump.into_buffer());
+    device.destroy_allocation(bump.into_allocation());
 }

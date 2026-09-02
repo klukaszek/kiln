@@ -5,12 +5,12 @@ mod common;
 use kiln_rhi::gpu_struct;
 use kiln_rhi::{
     AccelHandle, BlasDesc, BlasMeshDesc, BuildAccelFlags, ComputePsoDesc, GeometryFlags,
-    GeometryType, GpuAddress, MemoryType, ShaderStage, StageFlags, TlasDesc, TlasInstance,
+    GeometryType, GpuPtr, MemoryType, ShaderStage, StageFlags, TlasDesc, TlasInstance,
 };
 
 gpu_struct! {
     pub struct Root {
-        output: GpuAddress as "uint*",
+        output: GpuPtr<u32> as "uint*",
         tlas: AccelHandle,
     }
 }
@@ -70,7 +70,7 @@ fn ray_query_triangle_hit() {
     // Triangle at z=0, with the ray starting at z=-1.
     let verts: [[f32; 3]; 3] = [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]];
     let mut vbuf = device
-        .malloc(std::mem::size_of_val(&verts) as u64, MemoryType::Default)
+        .allocate(std::mem::size_of_val(&verts) as u64, MemoryType::Default)
         .expect("vertex buffer");
     vbuf.upload(&verts).expect("upload vertices");
 
@@ -78,12 +78,12 @@ fn ray_query_triangle_hit() {
         meshes: vec![BlasMeshDesc {
             geometry_type: GeometryType::Triangles,
             flags: GeometryFlags::OPAQUE,
-            vertex_buffer: vbuf.gpu(),
+            vertex_buffer: vbuf.ptr(),
             vertex_stride: 12,
             vertex_count: 3,
-            index_buffer: GpuAddress(0),
+            index_buffer: GpuPtr::NULL,
             index_count: 0,
-            aabb_buffer: GpuAddress(0),
+            aabb_buffer: GpuPtr::NULL,
             aabb_count: 0,
         }],
         flags: BuildAccelFlags::PREFER_FAST_TRACE,
@@ -108,7 +108,7 @@ fn ray_query_triangle_hit() {
     // Identity instance referencing the BLAS.
     let stride = device.tlas_instance_stride();
     let instbuf = device
-        .malloc(stride as u64, MemoryType::Default)
+        .allocate(stride as u64, MemoryType::Default)
         .expect("instance buffer");
     let instance = TlasInstance {
         transform: [
@@ -118,14 +118,14 @@ fn ray_query_triangle_hit() {
         ],
         instance_custom_index_and_mask: 0xFF << 24, // mask = 0xFF
         instance_sbt_offset_and_flags: 0,
-        acceleration_structure_reference: blas.gpu(),
+        acceleration_structure_reference: blas.handle(),
     };
     device
         .write_tlas_instance(&instbuf, 0, &instance)
         .expect("write instance");
 
     let tlas_desc = TlasDesc {
-        instance_buffer: instbuf.gpu(),
+        instance_buffer: instbuf.ptr(),
         instance_count: 1,
         flags: BuildAccelFlags::PREFER_FAST_TRACE,
     };
@@ -140,13 +140,13 @@ fn ray_query_triangle_hit() {
         q.wait_idle();
     });
 
-    let output = device.malloc(4, MemoryType::Readback).expect("output");
+    let output = device.allocate(4, MemoryType::Readback).expect("output");
     let mut root = device
-        .malloc(std::mem::size_of::<Root>() as u64, MemoryType::Default)
+        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
     root.upload(&Root {
-        output: output.gpu(),
-        tlas: tlas.gpu(),
+        output: output.ptr(),
+        tlas: tlas.handle(),
     })
     .expect("upload root");
 

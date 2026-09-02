@@ -21,9 +21,9 @@ gpu_struct! {
         cam_pos: Vec4,
         tri_count: u32,
         _pad: u32,
-        verts: GpuAddress as "RasterVertex*",
-        materials: GpuAddress as "GpuRasterMaterial*",
-        texture_bindings: GpuAddress as "GpuTextureBinding*",
+        verts: GpuPtr<RasterVertex> as "RasterVertex*",
+        materials: GpuPtr<GpuRasterMaterial> as "GpuRasterMaterial*",
+        texture_bindings: GpuPtr<GpuTextureBinding> as "GpuTextureBinding*",
     }
 }
 

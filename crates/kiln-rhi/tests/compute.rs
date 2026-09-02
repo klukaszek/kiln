@@ -2,12 +2,12 @@
 
 mod common;
 
-use kiln_rhi::{ComputePsoDesc, GpuAddress, MemoryType, ShaderStage, StageFlags, gpu_struct};
+use kiln_rhi::{ComputePsoDesc, MemoryType, ShaderStage, StageFlags, gpu_struct};
 
 gpu_struct! {
     pub struct Data {
-        input: GpuAddress as "uint*",
-        output: GpuAddress as "uint*",
+        input: GpuPtr<u32> as "uint*",
+        output: GpuPtr<u32> as "uint*",
         count: u32,
         // Keep the host and Slang layouts identical.
         _pad: u32,
@@ -53,21 +53,21 @@ fn compute_doubles_buffer() {
 
     const N: u32 = 1024;
     let mut input = device
-        .malloc((N * 4) as u64, MemoryType::Default)
+        .allocate((N * 4) as u64, MemoryType::Default)
         .expect("input");
     let output = device
-        .malloc((N * 4) as u64, MemoryType::Readback)
+        .allocate((N * 4) as u64, MemoryType::Readback)
         .expect("output");
     let mut data = device
-        .malloc(std::mem::size_of::<Data>() as u64, MemoryType::Default)
+        .allocate(std::mem::size_of::<Data>() as u64, MemoryType::Default)
         .expect("root data");
 
     input
         .upload_slice(&(0..N).collect::<Vec<u32>>())
         .expect("upload input");
     data.upload(&Data {
-        input: input.gpu(),
-        output: output.gpu(),
+        input: input.ptr(),
+        output: output.ptr(),
         count: N,
         _pad: 0,
     })
@@ -76,7 +76,7 @@ fn compute_doubles_buffer() {
     common::timed("dispatch 1024 · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
         cmd.set_compute_pipeline(&pso);
-        cmd.dispatch(data.gpu(), N.div_ceil(64), 1, 1);
+        cmd.dispatch(data.ptr::<Data>(), N.div_ceil(64), 1, 1);
         cmd.barrier(StageFlags::COMPUTE, StageFlags::ALL_COMMANDS);
         // Submitting unrelated work must not retire a pipeline referenced by `cmd`.
         drop(pso);

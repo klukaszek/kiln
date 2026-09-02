@@ -2,7 +2,7 @@
 
 mod common;
 
-use kiln_rhi::{BufferDesc, BumpAllocator, MemoryType};
+use kiln_rhi::{AllocationDesc, BumpAllocator, MemoryType};
 
 /// `Default` memory is CPU-mapped GPU memory: a write through the mapped pointer must read
 /// straight back (the dual-pointer model the whole RHI is built on).
@@ -13,10 +13,10 @@ fn default_memory_is_cpu_mapped_roundtrip() {
     };
 
     const N: usize = 4096;
-    let mut allocation = common::timed("malloc 4 KiB (Default)", || {
+    let mut allocation = common::timed("allocate 4 KiB (Default)", || {
         device
-            .malloc(N as u64, MemoryType::Default)
-            .expect("malloc(Default) should succeed")
+            .allocate(N as u64, MemoryType::Default)
+            .expect("allocate(Default) should succeed")
     });
 
     common::timed("CPU write+read 4 KiB roundtrip", || {
@@ -50,8 +50,8 @@ fn host_to_device_pointer_translates_with_offset() {
     };
 
     let allocation = device
-        .malloc(256, MemoryType::Default)
-        .expect("malloc(Default) should succeed");
+        .allocate(256, MemoryType::Default)
+        .expect("allocate(Default) should succeed");
     let cpu = allocation
         .cpu()
         .expect("Default memory must expose a CPU-mapped pointer");
@@ -76,7 +76,7 @@ fn host_to_device_pointer_translates_with_offset() {
 
 fn bump(device: &kiln_rhi::Device, size: u64) -> BumpAllocator {
     let buffer = device
-        .create_buffer(&BufferDesc {
+        .create_allocation(&AllocationDesc {
             size,
             memory: MemoryType::Default,
             label: Some("bump".into()),
@@ -115,7 +115,7 @@ fn bump_alloc_aligns_and_accounts() {
         prev_end = a.gpu.0 + 100;
     }
 
-    device.destroy_buffer(bump.into_buffer());
+    device.destroy_allocation(bump.into_allocation());
 }
 
 /// The dual-pointer invariant: `cpu` and `gpu` from one allocation name the *same*
@@ -150,7 +150,7 @@ fn bump_alloc_cpu_gpu_correspond() {
         "write through cpu pointer must persist"
     );
 
-    device.destroy_buffer(bump.into_buffer());
+    device.destroy_allocation(bump.into_allocation());
 }
 
 /// A full allocator returns `None` rather than panicking or overrunning: both an
@@ -179,7 +179,7 @@ fn bump_full_returns_none() {
     assert_eq!(count, 4, "exactly four 64B chunks fit in 256 bytes");
     assert!(bump.alloc(1, 1).is_none(), "exhausted allocator stays full");
 
-    device.destroy_buffer(bump.into_buffer());
+    device.destroy_allocation(bump.into_allocation());
 }
 
 /// `reset()` rewinds to the start: post-reset allocations reuse the same addresses,
@@ -203,5 +203,5 @@ fn bump_reset_reuses_space() {
     assert_eq!(reused.cpu, first_cpu, "reset reuses the same cpu pointer");
     assert_eq!(reused.gpu, first_gpu, "reset reuses the same gpu address");
 
-    device.destroy_buffer(bump.into_buffer());
+    device.destroy_allocation(bump.into_allocation());
 }

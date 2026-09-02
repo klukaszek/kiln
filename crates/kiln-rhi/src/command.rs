@@ -166,97 +166,92 @@ impl CommandBuffer {
     }
 
     /// Draw non-indexed geometry using `root` as the shared vertex/fragment root.
-    pub fn draw(
+    pub fn draw<R: Into<GpuAddress>>(
         &mut self,
-        root: GpuAddress,
+        root: R,
         vertex_count: u32,
         instance_count: u32,
         first_vertex: u32,
         first_instance: u32,
     ) {
-        self.set_root_data(root);
+        self.set_root_data(root.into());
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd =>
             cmd.draw(vertex_count, instance_count, first_vertex, first_instance))
     }
 
     /// Draw indexed geometry.
-    pub fn draw_indexed(
+    pub fn draw_indexed<R: Into<GpuAddress>, I: Into<GpuAddress>>(
         &mut self,
-        root: GpuAddress,
-        indices: GpuAddress,
+        root: R,
+        indices: I,
         index_count: u32,
         instance_count: u32,
     ) {
-        self.set_root_data(root);
+        self.set_root_data(root.into());
+        let indices = indices.into();
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd =>
             cmd.draw_indexed(indices, index_count, instance_count))
     }
 
     /// Dispatch compute work.
-    pub fn dispatch(&mut self, root: GpuAddress, x: u32, y: u32, z: u32) {
-        self.set_compute_root(root);
+    pub fn dispatch<R: Into<GpuAddress>>(&mut self, root: R, x: u32, y: u32, z: u32) {
+        self.set_compute_root(root.into());
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch(x, y, z))
     }
 
     /// Dispatch compute work from GPU arguments.
-    pub fn dispatch_indirect(&mut self, root: GpuAddress, args: GpuAddress) {
-        self.set_compute_root(root);
+    pub fn dispatch_indirect<R: Into<GpuAddress>, A: Into<GpuAddress>>(
+        &mut self,
+        root: R,
+        args: A,
+    ) {
+        self.set_compute_root(root.into());
+        let args = args.into();
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch_indirect(args))
     }
 
     /// Draw indexed geometry from GPU arguments.
-    pub fn draw_indexed_indirect(
+    pub fn draw_indexed_indirect<R: Into<GpuAddress>, I: Into<GpuAddress>, A: Into<GpuAddress>>(
         &mut self,
-        root: GpuAddress,
-        indices: GpuAddress,
-        args: GpuAddress,
+        root: R,
+        indices: I,
+        args: A,
     ) {
-        self.set_root_data(root);
+        self.set_root_data(root.into());
+        let indices = indices.into();
+        let args = args.into();
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indexed_indirect(indices, args))
     }
 
     /// Copy bytes between two GPU pointers.
-    pub fn memcpy(&mut self, dst: GpuAddress, src: GpuAddress, size: u64) {
+    pub fn memcpy<D: Into<GpuAddress>, S: Into<GpuAddress>>(&mut self, dst: D, src: S, size: u64) {
+        let dst = dst.into();
+        let src = src.into();
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.memcpy(dst, src, size))
     }
 
-    /// Compatibility spelling for [`copy_buffer_to_texture`](Self::copy_buffer_to_texture).
-    #[doc(hidden)]
-    pub fn copy_to_texture(
-        &mut self,
-        texture_gpu: GpuAddress,
-        src: GpuAddress,
-        texture: &crate::texture::Texture,
-    ) {
-        self.assert_same_device(&texture._owner, "texture");
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_to_texture(texture_gpu, src, texture))
-    }
-
     /// Copy a tightly-packed buffer into the base mip and first layer of a texture.
-    ///
-    /// This is the common-case spelling. Unlike [`copy_to_texture`](Self::copy_to_texture),
-    /// the texture's placement address cannot accidentally disagree with the texture object.
-    pub fn copy_buffer_to_texture(&mut self, src: GpuAddress, texture: &crate::texture::Texture) {
-        self.copy_to_texture(texture.gpu(), src, texture);
-    }
-
-    /// Compatibility spelling for [`copy_texture_to_buffer`](Self::copy_texture_to_buffer).
-    #[doc(hidden)]
-    pub fn copy_from_texture(
+    pub fn copy_buffer_to_texture<S: Into<GpuAddress>>(
         &mut self,
-        dst: GpuAddress,
-        texture_gpu: GpuAddress,
+        src: S,
         texture: &crate::texture::Texture,
     ) {
         self.assert_same_device(&texture._owner, "texture");
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_from_texture(dst, texture_gpu, texture))
+        let src = src.into();
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_buffer_to_texture(texture.gpu(), src, texture))
     }
 
     /// Copy the base mip and first layer of a texture into a tightly-packed buffer.
     ///
     /// This is the common-case spelling and derives the placement address from `texture`.
-    pub fn copy_texture_to_buffer(&mut self, texture: &crate::texture::Texture, dst: GpuAddress) {
-        self.copy_from_texture(dst, texture.gpu(), texture);
+    pub fn copy_texture_to_buffer<D: Into<GpuAddress>>(
+        &mut self,
+        texture: &crate::texture::Texture,
+        dst: D,
+    ) {
+        self.assert_same_device(&texture._owner, "texture");
+        let dst = dst.into();
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_texture_to_buffer(dst, texture.gpu(), texture))
     }
 
     /// Stage-only global barrier.
@@ -361,14 +356,19 @@ impl CommandBuffer {
     }
 
     /// Draw mesh tasks using the active mesh pipeline.
-    pub fn draw_meshlets(&mut self, root: GpuAddress, x: u32, y: u32, z: u32) {
-        self.set_root_data(root);
+    pub fn draw_meshlets<R: Into<GpuAddress>>(&mut self, root: R, x: u32, y: u32, z: u32) {
+        self.set_root_data(root.into());
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets(x, y, z))
     }
 
     /// Draw mesh tasks from GPU arguments.
-    pub fn draw_meshlets_indirect(&mut self, root: GpuAddress, args: GpuAddress) {
-        self.set_root_data(root);
+    pub fn draw_meshlets_indirect<R: Into<GpuAddress>, A: Into<GpuAddress>>(
+        &mut self,
+        root: R,
+        args: A,
+    ) {
+        self.set_root_data(root.into());
+        let args = args.into();
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets_indirect(args))
     }
 

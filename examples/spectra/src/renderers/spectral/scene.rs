@@ -4,7 +4,7 @@
 //! structure, BSDF parameters, light list, and spectral tables exist only for this backend.
 
 use glam::{DMat4, DVec3, Vec2, Vec3, Vec4};
-use kiln_rhi::{Device, GpuAllocation, MAX_FRAMES_IN_FLIGHT, gpu_struct};
+use kiln_rhi::{Allocation, Device, MAX_FRAMES_IN_FLIGHT, gpu_struct};
 use std::collections::HashMap;
 
 use super::spectrum;
@@ -153,7 +153,7 @@ pub(super) struct Storage {
     mesh_light_records: Vec<GpuLight>,
     mesh_light_spectrum: Vec<f32>,
     analytic_light_count: usize,
-    pending_staging: [Vec<GpuAllocation>; MAX_FRAMES_IN_FLIGHT],
+    pending_staging: [Vec<Allocation>; MAX_FRAMES_IN_FLIGHT],
     textures: TextureResources,
 }
 
@@ -185,7 +185,7 @@ impl Storage {
         &mut self,
         device: &Device,
         frame_slot: usize,
-        staging: Vec<GpuAllocation>,
+        staging: Vec<Allocation>,
     ) -> renderer::Result<()> {
         let Some(slot_staging) = self.pending_staging.get_mut(frame_slot) else {
             for allocation in staging {

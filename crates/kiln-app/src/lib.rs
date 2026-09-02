@@ -23,7 +23,7 @@ use clap::Parser;
 use glam::UVec2;
 
 use kiln_rhi::{
-    ColorAttachment, CommandBuffer, DepthAttachment, Device, DeviceDesc, Format, GpuAllocation,
+    Allocation, ColorAttachment, CommandBuffer, DepthAttachment, Device, DeviceDesc, Format,
     LoadOp, MAX_FRAMES_IN_FLIGHT, MemoryType, RenderPassDesc, RenderTarget, SampleCount, StoreOp,
     Surface, SurfaceDesc, Swapchain, SwapchainDesc, Texture, TextureDesc, TextureDimension,
     TextureUsage,
@@ -212,7 +212,7 @@ pub fn run_with<E: Example + 'static>(
 
 /// Create a swapchain-sized depth texture in its own GPU-only allocation. The caller keeps both
 /// alive together; the texture borrows the allocation's storage.
-fn make_depth(device: &Device, format: Format, w: u32, h: u32) -> (Texture, GpuAllocation) {
+fn make_depth(device: &Device, format: Format, w: u32, h: u32) -> (Texture, Allocation) {
     let desc = TextureDesc {
         width: w,
         height: h,
@@ -227,7 +227,7 @@ fn make_depth(device: &Device, format: Format, w: u32, h: u32) -> (Texture, GpuA
     };
     let sa = device.texture_size_align(&desc).expect("depth size_align");
     let mem = device
-        .malloc_aligned(sa.size, sa.align, MemoryType::GpuOnly)
+        .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("depth mem");
     let texture = device
         .create_texture(&desc, mem.gpu())
@@ -243,7 +243,7 @@ struct App<E: Example> {
     swapchain: Option<Swapchain>,
     surface: Option<Surface>,
     window: Option<Window>,
-    depth: Option<(Texture, GpuAllocation)>,
+    depth: Option<(Texture, Allocation)>,
     example: Option<E>,
     frame_index: usize,
     benchmark_frame_count: u32,

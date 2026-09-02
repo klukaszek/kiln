@@ -725,9 +725,14 @@ impl MetalCommandBuffer {
         encoder.endEncoding();
     }
 
-    pub fn copy_to_texture(&mut self, texture_gpu: GpuAddress, src: GpuAddress, texture: &Texture) {
+    pub fn copy_buffer_to_texture(
+        &mut self,
+        texture_gpu: GpuAddress,
+        src: GpuAddress,
+        texture: &Texture,
+    ) {
         let (mtl_texture, buffer, offset, size, origin, bytes_per_row, bytes_per_image) =
-            self.prepare_texture_copy(texture_gpu, src, texture, "copy_to_texture");
+            self.prepare_texture_copy(texture_gpu, src, texture, "copy_buffer_to_texture");
 
         self.end_active_encoders();
         let encoder = self.begin_compute_encoder("copy to texture");
@@ -747,14 +752,14 @@ impl MetalCommandBuffer {
         encoder.endEncoding();
     }
 
-    pub fn copy_from_texture(
+    pub fn copy_texture_to_buffer(
         &mut self,
         dst: GpuAddress,
         texture_gpu: GpuAddress,
         texture: &Texture,
     ) {
         let (mtl_texture, buffer, offset, size, origin, bytes_per_row, bytes_per_image) =
-            self.prepare_texture_copy(texture_gpu, dst, texture, "copy_from_texture");
+            self.prepare_texture_copy(texture_gpu, dst, texture, "copy_texture_to_buffer");
 
         self.end_active_encoders();
         let encoder = self.begin_compute_encoder("copy from texture");
@@ -1155,7 +1160,7 @@ impl MetalCommandBuffer {
         let instance_desc = MTL4InstanceAccelerationStructureDescriptor::new();
         unsafe {
             instance_desc.setInstanceDescriptorBuffer(objc2_metal::MTL4BufferRange {
-                bufferAddress: desc.instance_buffer.0,
+                bufferAddress: desc.instance_buffer.raw().0,
                 // Metal uses its indirect instance layout, written by `Device::write_tlas_instance`.
                 length: (desc.instance_count as u64)
                     * std::mem::size_of::<

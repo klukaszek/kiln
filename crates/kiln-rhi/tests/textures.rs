@@ -46,7 +46,7 @@ fn texture_create_and_views() {
     );
 
     let mem = device
-        .malloc_aligned(size_align.size, size_align.align, MemoryType::GpuOnly)
+        .allocate_aligned(size_align.size, size_align.align, MemoryType::GpuOnly)
         .expect("texture backing memory");
     let texture = common::timed("create_texture (placement)", || {
         device
@@ -83,7 +83,7 @@ fn texture_create_and_views() {
 }
 
 /// Upload a pattern into a texture and read it straight back out — exercises both
-/// `copy_to_texture` and `copy_from_texture` with a GPU round-trip and CPU verification.
+/// Texture upload and readback with a GPU round-trip and CPU verification.
 #[test]
 fn texture_copy_roundtrip() {
     let Some((device, _gpu)) = common::device_or_skip() else {
@@ -92,7 +92,7 @@ fn texture_copy_roundtrip() {
     let desc = test_texture_desc();
     let size_align = device.texture_size_align(&desc).expect("size_align");
     let mem = device
-        .malloc_aligned(size_align.size, size_align.align, MemoryType::GpuOnly)
+        .allocate_aligned(size_align.size, size_align.align, MemoryType::GpuOnly)
         .expect("texture backing");
     let texture = device
         .create_texture(&desc, mem.gpu())
@@ -100,10 +100,10 @@ fn texture_copy_roundtrip() {
 
     let bytes = (W as usize) * (H as usize) * BPP;
     let mut src = device
-        .malloc(bytes as u64, MemoryType::Default)
+        .allocate(bytes as u64, MemoryType::Default)
         .expect("upload");
     let dst = device
-        .malloc(bytes as u64, MemoryType::Readback)
+        .allocate(bytes as u64, MemoryType::Readback)
         .expect("readback");
 
     for (i, b) in src

@@ -93,14 +93,14 @@ pub(crate) fn make_blas_geometry_descriptors(desc: &BlasDesc) -> MetalBlasGeomet
                 let geo = MTL4AccelerationStructureTriangleGeometryDescriptor::new();
                 unsafe {
                     geo.setVertexBuffer(MTL4BufferRange {
-                        bufferAddress: mesh.vertex_buffer.0,
+                        bufferAddress: mesh.vertex_buffer.raw().0,
                         length: (mesh.vertex_count as u64) * mesh.vertex_stride,
                     });
                     geo.setVertexStride(mesh.vertex_stride as usize);
                     geo.setTriangleCount(triangle_primitive_count(mesh) as usize);
                     if mesh.index_count > 0 {
                         geo.setIndexBuffer(MTL4BufferRange {
-                            bufferAddress: mesh.index_buffer.0,
+                            bufferAddress: mesh.index_buffer.raw().0,
                             length: (mesh.index_count as u64) * 4,
                         });
                         geo.setIndexType(MTLIndexType::UInt32);
@@ -111,7 +111,7 @@ pub(crate) fn make_blas_geometry_descriptors(desc: &BlasDesc) -> MetalBlasGeomet
             GeometryType::Aabbs => {
                 let geo = MTL4AccelerationStructureBoundingBoxGeometryDescriptor::new();
                 geo.setBoundingBoxBuffer(MTL4BufferRange {
-                    bufferAddress: mesh.aabb_buffer.0,
+                    bufferAddress: mesh.aabb_buffer.raw().0,
                     length: (mesh.aabb_count as u64) * 24,
                 });
                 unsafe {

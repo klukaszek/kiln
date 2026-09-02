@@ -89,7 +89,7 @@ impl PathTracer {
         let root = self.frame_arenas.upload(
             ctx.slot,
             &DisplayRoot {
-                film: accum.gpu(),
+                film: accum.ptr(),
                 display_width: ctx.extent.x,
                 display_height: ctx.extent.y,
                 film_width: film.x,
@@ -129,7 +129,7 @@ impl PathTracer {
                 cam_up: camera.up,
                 cam_forward: camera.forward,
                 lens: camera.lens,
-                film: accum.gpu(),
+                film: accum.ptr(),
                 triangles: resources.triangles.gpu(),
                 emissive_hits: resources.emissive_hits.gpu(),
                 instances: resources.instances.gpu(),
@@ -145,7 +145,7 @@ impl PathTracer {
                 material_textures: resources.material_textures.gpu(),
                 texture_bindings: resources.texture_bindings.gpu(),
                 texture_basis: resources.texture_basis.gpu(),
-                tlas: resources.accel.tlas.gpu(),
+                tlas: resources.accel.tlas.handle(),
                 film_width: extent.x,
                 film_height: extent.y,
                 pass_start: batch.start,
@@ -179,7 +179,7 @@ impl PathTracer {
         let root = self.frame_arenas.upload(
             ctx.slot,
             &ClearRoot {
-                film: accum.gpu(),
+                film: accum.ptr(),
                 count: float_count,
                 _pad: 0,
             },

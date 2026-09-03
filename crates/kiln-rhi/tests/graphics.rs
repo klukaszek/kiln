@@ -53,11 +53,12 @@ fn graphics_fullscreen_color() {
 
     let src = format!("{}{}", Root::SLANG, GFX_BODY);
     let Some(vs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex, &[])
     else {
         return;
     };
-    let Some(fs) = kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel)
+    let Some(fs) =
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
     else {
         return;
     };
@@ -96,12 +97,12 @@ fn graphics_fullscreen_color() {
         .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let texture = device
-        .create_texture(&tex_desc, tex_mem.ptr())
+        .create_texture(&tex_desc, tex_mem.gpu())
         .expect("create_texture");
 
     // Root color and readback buffer.
     let mut root = device
-        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Default)
+        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Upload)
         .expect("root");
     root.upload(&Root {
         color: [1.0, 0.0, 0.0, 1.0],
@@ -124,7 +125,7 @@ fn graphics_fullscreen_color() {
             render_area: [0, 0, SIZE, SIZE],
             label: Some("graphics test"),
         });
-        cmd.set_graphics_pipeline(&pso);
+        cmd.set_pipeline(&pso);
         cmd.set_viewport(0.0, 0.0, SIZE as f32, SIZE as f32, 0.0, 1.0);
         cmd.set_scissor(0, 0, SIZE, SIZE);
         cmd.draw(root.gpu(), 3, 1, 0, 0);
@@ -155,10 +156,10 @@ fn graphics_fullscreen_color() {
         );
     }
 
-    device.free(root);
-    device.free(readback);
-    device.destroy_texture(texture);
-    device.free(tex_mem);
+    device.destroy(root);
+    device.destroy(readback);
+    device.destroy(texture);
+    device.destroy(tex_mem);
 }
 
 #[test]
@@ -169,11 +170,12 @@ fn graphics_static_color_write_mask() {
 
     let src = format!("{}{}", Root::SLANG, GFX_BODY);
     let Some(vs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex, &[])
     else {
         return;
     };
-    let Some(fs) = kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel)
+    let Some(fs) =
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
     else {
         return;
     };
@@ -193,7 +195,7 @@ fn graphics_static_color_write_mask() {
         )
         .expect("create masked graphics pso");
     let mut root = device
-        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Default)
+        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Upload)
         .expect("root");
     root.upload(&Root {
         color: [1.0, 1.0, 1.0, 0.0],
@@ -208,7 +210,7 @@ fn graphics_static_color_write_mask() {
             "pixel {pixel_index} ignored the static red-only write mask"
         );
     }
-    device.free(root);
+    device.destroy(root);
 }
 
 // Shared helpers for the graphics-pipeline tests below.
@@ -265,7 +267,7 @@ fn render_draw(
         .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let texture = device
-        .create_texture(&tex_desc, tex_mem.ptr())
+        .create_texture(&tex_desc, tex_mem.gpu())
         .expect("create_texture");
     let readback = device
         .allocate((size * size * 4) as u64, MemoryType::Readback)
@@ -283,7 +285,7 @@ fn render_draw(
         render_area: [0, 0, size, size],
         label: Some("graphics test"),
     });
-    cmd.set_graphics_pipeline(pso);
+    cmd.set_pipeline(pso);
     cmd.set_viewport(0.0, 0.0, size as f32, size as f32, 0.0, 1.0);
     cmd.set_scissor(0, 0, size, size);
     cmd.draw(root, vertex_count, instance_count, 0, 0);
@@ -298,21 +300,22 @@ fn render_draw(
     queue.wait_idle();
 
     let pixels = readback.as_slice::<u8>().expect("read readback").to_vec();
-    device.free(readback);
-    device.destroy_texture(texture);
-    device.free(tex_mem);
+    device.destroy(readback);
+    device.destroy(texture);
+    device.destroy(tex_mem);
     pixels
 }
 
 /// A per-test bump allocator over CPU-mapped memory — the doc's preferred source for
 /// transient per-draw arguments (root structs, configs). Caller releases it with
-/// `device.destroy_allocation(bump.into_allocation())` after the draw has completed.
+/// `device.destroy(bump.into_allocation())` after the draw has completed.
 fn test_bump(device: &Device) -> BumpAllocator {
     let buffer = device
         .create_allocation(&AllocationDesc {
             size: 64 * 1024,
-            memory: MemoryType::Default,
+            memory: MemoryType::Upload,
             label: Some("test-bump".into()),
+            ..Default::default()
         })
         .expect("create_buffer");
     BumpAllocator::new(buffer)
@@ -346,14 +349,22 @@ fn graphics_clip_space_is_y_up() {
         return;
     };
 
-    let Some(vs) =
-        kiln_rhi::compiler::compile_or_skip(&device, ORIENT_BODY, "vsMain", ShaderStage::Vertex)
-    else {
+    let Some(vs) = kiln_rhi::compiler::compile_or_skip(
+        &device,
+        ORIENT_BODY,
+        "vsMain",
+        ShaderStage::Vertex,
+        &[],
+    ) else {
         return;
     };
-    let Some(fs) =
-        kiln_rhi::compiler::compile_or_skip(&device, ORIENT_BODY, "fsMain", ShaderStage::Pixel)
-    else {
+    let Some(fs) = kiln_rhi::compiler::compile_or_skip(
+        &device,
+        ORIENT_BODY,
+        "fsMain",
+        ShaderStage::Pixel,
+        &[],
+    ) else {
         return;
     };
     let pso = make_graphics_pso(&device, &vs, &fs, "orient");
@@ -410,12 +421,12 @@ fn graphics_interpolated_triangle() {
     };
 
     let Some(vs) =
-        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "vsMain", ShaderStage::Vertex)
+        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "vsMain", ShaderStage::Vertex, &[])
     else {
         return;
     };
     let Some(fs) =
-        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "fsMain", ShaderStage::Pixel)
+        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "fsMain", ShaderStage::Pixel, &[])
     else {
         return;
     };
@@ -524,24 +535,27 @@ fn graphics_instanced_grid() {
 
     let src = format!("{}{}", GridCfg::SLANG, GRID_BODY);
     let Some(vs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex, &[])
     else {
         return;
     };
-    let Some(fs) = kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel)
+    let Some(fs) =
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
     else {
         return;
     };
     let pso = make_graphics_pso(&device, &vs, &fs, "grid");
 
-    let mut bump = test_bump(&device);
+    let bump = test_bump(&device);
     let cfg = bump
         .alloc(std::mem::size_of::<GridCfg>() as u64, 16)
         .expect("bump cfg");
-    cfg.upload(&GridCfg { dim: GRID }).expect("upload cfg");
+    cfg.cast::<GridCfg>()
+        .write(&GridCfg { dim: GRID })
+        .expect("upload cfg");
 
     let pixels = common::timed("instanced grid (4×4) · submit+wait", || {
-        render_draw(&device, &pso, cfg.gpu, GRID_SIZE, 6, GRID * GRID)
+        render_draw(&device, &pso, cfg.gpu(), GRID_SIZE, 6, GRID * GRID)
     });
     common::save_rgba_png("graphics_instanced_grid", GRID_SIZE, GRID_SIZE, &pixels);
 
@@ -564,7 +578,7 @@ fn graphics_instanced_grid() {
         }
     }
 
-    device.destroy_allocation(bump.into_allocation());
+    device.destroy(bump.into_allocation());
 }
 
 // Root data from a transient bump allocation.
@@ -577,11 +591,12 @@ fn graphics_root_from_bump_allocator() {
 
     let src = format!("{}{}", Root::SLANG, GFX_BODY);
     let Some(vs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex, &[])
     else {
         return;
     };
-    let Some(fs) = kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel)
+    let Some(fs) =
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
     else {
         return;
     };
@@ -591,22 +606,24 @@ fn graphics_root_from_bump_allocator() {
     let buffer = device
         .create_allocation(&AllocationDesc {
             size: 4096,
-            memory: MemoryType::Default,
+            memory: MemoryType::Upload,
             label: Some("bump-root".into()),
+            ..Default::default()
         })
         .expect("create_buffer");
-    let mut bump = BumpAllocator::new(buffer);
+    let bump = BumpAllocator::new(buffer);
 
     let root = bump
         .alloc(std::mem::size_of::<Root>() as u64, 16)
-        .expect("bump alloc for root");
-    root.upload(&Root {
+        .expect("bump alloc for root")
+        .cast::<Root>();
+    root.write(&Root {
         color: [0.0, 0.0, 1.0, 1.0],
     })
-    .expect("upload root via bump cpu pointer");
+    .expect("upload root via bump handle");
 
     let pixels = common::timed("draw with bump-allocated root · submit+wait", || {
-        render_draw(&device, &pso, root.gpu, SIZE, 3, 1)
+        render_draw(&device, &pso, root.gpu().cast(), SIZE, 3, 1)
     });
     common::save_rgba_png("graphics_root_from_bump_allocator", SIZE, SIZE, &pixels);
 
@@ -624,5 +641,5 @@ fn graphics_root_from_bump_allocator() {
         );
     }
 
-    device.destroy_allocation(bump.into_allocation());
+    device.destroy(bump.into_allocation());
 }

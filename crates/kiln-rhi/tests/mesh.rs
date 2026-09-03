@@ -49,11 +49,13 @@ fn mesh_fullscreen_color() {
     };
 
     let src = format!("{}{}", Root::SLANG, MESH_BODY);
-    let Some(ms) = kiln_rhi::compiler::compile_or_skip(&device, &src, "msMain", ShaderStage::Mesh)
+    let Some(ms) =
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "msMain", ShaderStage::Mesh, &[])
     else {
         return;
     };
-    let Some(fs) = kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel)
+    let Some(fs) =
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
     else {
         return;
     };
@@ -67,7 +69,6 @@ fn mesh_fullscreen_color() {
             sample_count: SampleCount::S1,
             alpha_to_coverage: false,
             cull: Cull::None,
-            support_dual_source_blending: false,
             blendstate: None,
             label: Some("mesh".into()),
         },
@@ -98,12 +99,12 @@ fn mesh_fullscreen_color() {
         .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let texture = device
-        .create_texture(&tex_desc, tex_mem.ptr())
+        .create_texture(&tex_desc, tex_mem.gpu())
         .expect("create_texture");
 
     // Root data is allocated directly; the other mesh tests use the bump allocator.
     let mut root = device
-        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Default)
+        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Upload)
         .expect("root");
     root.upload(&Root {
         color: [0.0, 1.0, 0.0, 1.0],
@@ -126,7 +127,7 @@ fn mesh_fullscreen_color() {
             render_area: [0, 0, SIZE, SIZE],
             label: Some("mesh test"),
         });
-        cmd.set_meshlet_pipeline(&pso);
+        cmd.set_pipeline(&pso);
         cmd.set_viewport(0.0, 0.0, SIZE as f32, SIZE as f32, 0.0, 1.0);
         cmd.set_scissor(0, 0, SIZE, SIZE);
         cmd.draw_meshlets(root.gpu(), 1, 1, 1);
@@ -157,10 +158,10 @@ fn mesh_fullscreen_color() {
         );
     }
 
-    device.destroy_texture(texture);
-    device.free(tex_mem);
-    device.free(root);
-    device.free(readback);
+    device.destroy(texture);
+    device.destroy(tex_mem);
+    device.destroy(root);
+    device.destroy(readback);
 }
 
 // Shared helpers for the mesh-shader tests below.
@@ -182,7 +183,6 @@ fn make_meshlet_pso(
             sample_count: SampleCount::S1,
             alpha_to_coverage: false,
             cull: Cull::None,
-            support_dual_source_blending: false,
             blendstate: None,
             label: Some(label.into()),
         },
@@ -225,7 +225,7 @@ fn render_meshlets(
         .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let texture = device
-        .create_texture(&tex_desc, tex_mem.ptr())
+        .create_texture(&tex_desc, tex_mem.gpu())
         .expect("create_texture");
     let readback = device
         .allocate((size * size * 4) as u64, MemoryType::Readback)
@@ -243,7 +243,7 @@ fn render_meshlets(
         render_area: [0, 0, size, size],
         label: Some("meshlet grid"),
     });
-    cmd.set_meshlet_pipeline(pso);
+    cmd.set_pipeline(pso);
     cmd.set_viewport(0.0, 0.0, size as f32, size as f32, 0.0, 1.0);
     cmd.set_scissor(0, 0, size, size);
     cmd.draw_meshlets(root, groups[0], groups[1], groups[2]);
@@ -258,21 +258,22 @@ fn render_meshlets(
     queue.wait_idle();
 
     let pixels = readback.as_slice::<u8>().expect("read readback").to_vec();
-    device.free(readback);
-    device.destroy_texture(texture);
-    device.free(tex_mem);
+    device.destroy(readback);
+    device.destroy(texture);
+    device.destroy(tex_mem);
     pixels
 }
 
 /// A per-test bump allocator over CPU-mapped memory — the doc's preferred source for
 /// transient per-draw arguments. Caller releases it with
-/// `device.destroy_allocation(bump.into_allocation())` after the draw has completed.
+/// `device.destroy(bump.into_allocation())` after the draw has completed.
 fn test_bump(device: &Device) -> BumpAllocator {
     let buffer = device
         .create_allocation(&AllocationDesc {
             size: 64 * 1024,
-            memory: MemoryType::Default,
+            memory: MemoryType::Upload,
             label: Some("test-bump".into()),
+            ..Default::default()
         })
         .expect("create_buffer");
     BumpAllocator::new(buffer)
@@ -311,13 +312,17 @@ fn mesh_clip_space_is_y_up() {
     };
 
     let Some(ms) =
-        kiln_rhi::compiler::compile_or_skip(&device, ORIENT_BODY, "msMain", ShaderStage::Mesh)
+        kiln_rhi::compiler::compile_or_skip(&device, ORIENT_BODY, "msMain", ShaderStage::Mesh, &[])
     else {
         return;
     };
-    let Some(fs) =
-        kiln_rhi::compiler::compile_or_skip(&device, ORIENT_BODY, "fsMain", ShaderStage::Pixel)
-    else {
+    let Some(fs) = kiln_rhi::compiler::compile_or_skip(
+        &device,
+        ORIENT_BODY,
+        "fsMain",
+        ShaderStage::Pixel,
+        &[],
+    ) else {
         return;
     };
     let Some(pso) = make_meshlet_pso(&device, &ms, &fs, "orient") else {
@@ -403,11 +408,13 @@ fn mesh_meshlet_grid() {
     };
 
     let src = format!("{}{}", GridCfg::SLANG, GRID_BODY);
-    let Some(ms) = kiln_rhi::compiler::compile_or_skip(&device, &src, "msMain", ShaderStage::Mesh)
+    let Some(ms) =
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "msMain", ShaderStage::Mesh, &[])
     else {
         return;
     };
-    let Some(fs) = kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel)
+    let Some(fs) =
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
     else {
         return;
     };
@@ -415,14 +422,16 @@ fn mesh_meshlet_grid() {
         return;
     };
 
-    let mut bump = test_bump(&device);
+    let bump = test_bump(&device);
     let cfg = bump
         .alloc(std::mem::size_of::<GridCfg>() as u64, 16)
         .expect("bump cfg");
-    cfg.upload(&GridCfg { dim: GRID }).expect("upload cfg");
+    cfg.cast::<GridCfg>()
+        .write(&GridCfg { dim: GRID })
+        .expect("upload cfg");
 
     let pixels = common::timed("meshlet grid (4×4) · submit+wait", || {
-        render_meshlets(&device, &pso, cfg.gpu, GRID_SIZE, [GRID, GRID, 1])
+        render_meshlets(&device, &pso, cfg.gpu(), GRID_SIZE, [GRID, GRID, 1])
     });
     common::save_rgba_png("mesh_meshlet_grid", GRID_SIZE, GRID_SIZE, &pixels);
 
@@ -445,7 +454,7 @@ fn mesh_meshlet_grid() {
         }
     }
 
-    device.destroy_allocation(bump.into_allocation());
+    device.destroy(bump.into_allocation());
 }
 
 // Interpolated triangle: verify attribute interpolation and coverage.
@@ -480,12 +489,12 @@ fn mesh_interpolated_triangle() {
     };
 
     let Some(ms) =
-        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "msMain", ShaderStage::Mesh)
+        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "msMain", ShaderStage::Mesh, &[])
     else {
         return;
     };
     let Some(fs) =
-        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "fsMain", ShaderStage::Pixel)
+        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "fsMain", ShaderStage::Pixel, &[])
     else {
         return;
     };

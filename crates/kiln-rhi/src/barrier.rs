@@ -16,15 +16,14 @@ bitflags::bitflags! {
 }
 
 bitflags::bitflags! {
-    /// Special-case cache-invalidation hints added to a barrier; most barriers need none.
-    ///
-    /// - `DRAW_ARGUMENTS`: GPU-written indirect args — stall the command-processor prefetcher.
-    /// - `DESCRIPTORS`: descriptor heap written — invalidate the sampler descriptor cache.
-    /// - `DEPTH_STENCIL`: depth written by compute — invalidate HiZ/depth caches.
+    /// Extra cache invalidation; most barriers need none.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct HazardFlags: u32 {
+        /// GPU-written indirect args; stalls the command-processor prefetcher.
         const DRAW_ARGUMENTS    = 0x0001;
+        /// Descriptor heap written; invalidates the sampler descriptor cache.
         const DESCRIPTORS       = 0x0002;
+        /// Depth written by compute; invalidates HiZ/depth caches.
         const DEPTH_STENCIL     = 0x0004;
     }
 }

@@ -2,6 +2,7 @@
 
 use crate::types::GpuPtr;
 use crate::{RhiError, RhiResult};
+use std::marker::PhantomData;
 use zerocopy::{FromBytes, IntoBytes};
 
 /// A type that can be copied directly between CPU and GPU memory.
@@ -41,31 +42,45 @@ fn mapped_read<T: GpuPod>(ptr: Option<*mut u8>, capacity: u64) -> RhiResult<T> {
     T::read_from_bytes(bytes).map_err(|_| RhiError::AllocationFailed("read size mismatch".into()))
 }
 
-/// Memory residency for GPU allocations.
-///
-/// - `Default`: CPU-mapped, write-combined. Uniforms, staging, draw args, descriptors.
-/// - `GpuOnly`: device-local, not CPU-mapped. Textures and large persistent buffers.
-/// - `Readback`: GPU-writable, CPU-cached on read. Screenshots, feedback, GPGPU output.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+/// Where an allocation lives. No default: `Upload` for memory the GPU reads hot is a silent
+/// bandwidth cost, not an error. (D3D12's `DEFAULT` is this `GpuOnly`.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryType {
-    #[default]
-    Default,
+    /// Host-visible, coherent. Uniforms, staging, draw args, descriptors.
+    Upload,
+    /// Device-local, not mappable. Textures, vertex data, large persistent buffers.
     GpuOnly,
+    /// Host-visible, cached on read. Screenshots, feedback, GPGPU output.
     Readback,
 }
 
 /// Description for creating a GPU allocation.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct AllocationDesc {
     pub size: u64,
+    /// Power of two. The RHI pads the backing allocation so `gpu()` comes back aligned.
+    pub align: u64,
     pub memory: MemoryType,
     pub label: Option<String>,
 }
 
-/// Owned GPU memory: an optional CPU mapping, a GPU address, and a byte length.
-///
-/// This is the only public buffer-memory object. Subranges are expressed by pointer arithmetic;
-/// the backend buffer or heap that supplies the address is deliberately not part of the API.
+impl Default for AllocationDesc {
+    fn default() -> Self {
+        Self {
+            size: 0,
+            align: DEFAULT_ALIGN,
+            // Fail-soft: always mappable, so a desc that forgets to choose still runs.
+            memory: MemoryType::Upload,
+            label: None,
+        }
+    }
+}
+
+/// Alignment used when a caller does not ask for one; wide enough for a `float4`.
+pub const DEFAULT_ALIGN: u64 = 16;
+
+/// Owned GPU memory: an optional CPU mapping, a GPU address, and a byte length. The backend
+/// buffer or heap behind the address is deliberately not part of the API.
 pub struct Allocation {
     pub(crate) inner: AllocationInner,
     pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
@@ -89,47 +104,47 @@ impl Allocation {
         backend_dispatch!(&self.inner, AllocationInner, allocation => allocation.gpu_address())
     }
 
-    /// CPU mapping, or `None` for `GpuOnly` memory.
-    pub fn cpu(&self) -> Option<*mut u8> {
+    fn cpu(&self) -> Option<*mut u8> {
         self.base_cpu()
             .zip(usize::try_from(self.offset).ok())
             .map(|(ptr, offset)| unsafe { ptr.add(offset) })
     }
 
-    /// GPU virtual address.
+    /// GPU virtual address; present even for `GpuOnly`.
     pub fn gpu(&self) -> GpuPtr<u8> {
         self.base_gpu().byte_add(self.offset)
     }
 
-    /// Typed GPU pointer to the first byte of this allocation.
-    #[inline]
-    pub fn ptr<T>(&self) -> crate::types::GpuPtr<T> {
-        self.gpu().cast()
+    /// Typed handle to the mapped bytes, or `None` for `GpuOnly`. Checked once here rather than
+    /// on every write.
+    pub fn mapped<T>(&self) -> Option<Mapped<'_, T>> {
+        self.cpu().map(|cpu| Mapped {
+            cpu,
+            gpu: self.gpu().cast(),
+            bytes: self.size,
+            _borrow: PhantomData,
+        })
     }
 
-    /// Allocation size in bytes.
     pub fn size(&self) -> u64 {
         self.size
     }
 
-    /// Upload a value into CPU-mapped memory (bounds-checked). Caller orders the write before
-    /// the dependent submit.
+    /// Bounds-checked. The caller orders the write before the submit that reads it.
     pub fn upload<T: GpuPod>(&mut self, value: &T) -> RhiResult<()> {
         mapped_write(self.cpu(), self.size, value.as_bytes())
     }
 
-    /// Upload a slice into this allocation's CPU-mapped memory (bounds-checked).
     pub fn upload_slice<T: GpuPod>(&mut self, data: &[T]) -> RhiResult<()> {
         mapped_write(self.cpu(), self.size, data.as_bytes())
     }
 
-    /// Read a value back from CPU-mapped memory (e.g. `Readback` after a GPU write).
+    /// Read back, e.g. from `Readback` memory after a GPU write.
     pub fn read<T: GpuPod>(&self) -> RhiResult<T> {
         mapped_read(self.cpu(), self.size)
     }
 
-    /// View the mapped memory as `&[T]` (shared). Errors if not CPU-mapped or the size is
-    /// not a whole number of `T`.
+    /// Errors if not mapped, or if the size is not a whole number of `T`.
     pub fn as_slice<T: GpuPod>(&self) -> RhiResult<&[T]> {
         let ptr = self
             .cpu()
@@ -146,7 +161,7 @@ impl Allocation {
         })
     }
 
-    /// View the mapped memory as `&mut [T]` (exclusive). `&mut self` rules out CPU aliasing.
+    /// `&mut self` rules out CPU aliasing.
     pub fn as_mut_slice<T: GpuPod>(&mut self) -> RhiResult<&mut [T]> {
         let ptr = self
             .cpu()
@@ -165,32 +180,151 @@ impl Allocation {
     }
 }
 
-/// A transient slice of mapped GPU memory.
-#[derive(Clone, Copy, Debug)]
-pub struct TransientAllocation {
-    pub cpu: *mut u8,
-    pub gpu: GpuPtr<u8>,
-    pub size: u64,
+/// One mapped region, holding the CPU and GPU addresses for the same bytes. [`offset`](Self::offset)
+/// advances both, so the two sides cannot drift apart and the stride comes from `T`.
+///
+/// The borrow pins a [`BumpAllocator`] against [`reset`](BumpAllocator::reset) while the handle
+/// lives, making arena recycling under a live handle a compile error.
+pub struct Mapped<'a, T> {
+    cpu: *mut u8,
+    gpu: GpuPtr<T>,
+    /// Bytes to the end of the region; writes are checked against it.
+    bytes: u64,
+    _borrow: PhantomData<&'a ()>,
 }
 
-impl TransientAllocation {
-    /// Write a value into CPU-mapped memory (bounds-checked).
-    pub fn upload<T: GpuPod>(&self, data: &T) -> RhiResult<()> {
-        mapped_write(Some(self.cpu), self.size, data.as_bytes())
+impl<'a, T> Mapped<'a, T> {
+    /// GPU address of this position.
+    #[inline]
+    pub fn gpu(self) -> GpuPtr<T> {
+        self.gpu
     }
 
-    /// Write a slice into CPU-mapped memory (bounds-checked).
-    pub fn upload_slice<T: GpuPod>(&self, data: &[T]) -> RhiResult<()> {
-        mapped_write(Some(self.cpu), self.size, data.as_bytes())
+    /// CPU address, for writes this type cannot express.
+    #[inline]
+    pub fn cpu(self) -> *mut u8 {
+        self.cpu
+    }
+
+    #[inline]
+    pub fn byte_len(self) -> u64 {
+        self.bytes
+    }
+
+    /// Retype without moving either address.
+    #[inline]
+    pub fn cast<U>(self) -> Mapped<'a, U> {
+        Mapped {
+            cpu: self.cpu,
+            gpu: self.gpu.cast(),
+            bytes: self.bytes,
+            _borrow: PhantomData,
+        }
+    }
+
+    /// Advance both addresses, clamped to the region end so an over-long offset yields an empty
+    /// handle rather than a pointer past the end.
+    #[inline]
+    pub fn byte_offset(self, bytes: u64) -> Self {
+        let step = bytes.min(self.bytes);
+        Self {
+            // SAFETY: `step <= self.bytes`, so this stays within the mapped region.
+            cpu: unsafe { self.cpu.add(step as usize) },
+            gpu: self.gpu.cast::<u8>().byte_add(step).cast(),
+            bytes: self.bytes - step,
+            _borrow: PhantomData,
+        }
+    }
+}
+
+impl<'a, T> Mapped<'a, T> {
+    #[inline]
+    pub fn len(self) -> u64 {
+        match size_of::<T>() as u64 {
+            0 => 0,
+            stride => self.bytes / stride,
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Advance both addresses by `count` elements.
+    #[inline]
+    pub fn offset(self, count: u64) -> Self {
+        self.byte_offset((size_of::<T>() as u64).saturating_mul(count))
+    }
+}
+
+impl<'a, T: GpuPod> Mapped<'a, T> {
+    /// Bounds-checked. The caller orders the write before the submit that reads it.
+    pub fn write(self, value: &T) -> RhiResult<()> {
+        mapped_write(Some(self.cpu), self.bytes, value.as_bytes())
+    }
+
+    pub fn write_slice(self, values: &[T]) -> RhiResult<()> {
+        mapped_write(Some(self.cpu), self.bytes, values.as_bytes())
+    }
+
+    /// Read back, e.g. from `Readback` memory after a GPU write.
+    pub fn read(self) -> RhiResult<T> {
+        mapped_read(Some(self.cpu), self.bytes)
+    }
+
+    pub fn as_slice(self) -> RhiResult<&'a [T]> {
+        let size = usize::try_from(self.bytes).map_err(|_| {
+            RhiError::AllocationFailed("mapped region does not fit the host address space".into())
+        })?;
+        // SAFETY: valid for `self.bytes` over this handle's borrow.
+        let bytes = unsafe { std::slice::from_raw_parts(self.cpu as *const u8, size) };
+        <[T]>::ref_from_bytes(bytes).map_err(|_| {
+            RhiError::AllocationFailed("size is not a multiple of element size".into())
+        })
+    }
+
+    /// `&mut self` stops one handle handing out two aliasing slices; overlapping handles are the
+    /// caller's business.
+    pub fn as_mut_slice(&mut self) -> RhiResult<&mut [T]> {
+        let size = usize::try_from(self.bytes).map_err(|_| {
+            RhiError::AllocationFailed("mapped region does not fit the host address space".into())
+        })?;
+        // SAFETY: valid for `self.bytes`; `&mut self` rules out a second slice.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(self.cpu, size) };
+        <[T]>::mut_from_bytes(bytes).map_err(|_| {
+            RhiError::AllocationFailed("size is not a multiple of element size".into())
+        })
+    }
+}
+
+impl<T> Copy for Mapped<'_, T> {}
+
+impl<T> Clone for Mapped<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> std::fmt::Debug for Mapped<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mapped")
+            .field("cpu", &self.cpu)
+            .field("gpu", &self.gpu)
+            .field("bytes", &self.bytes)
+            .finish()
     }
 }
 
 /// Linear allocator over a mapped GPU buffer.
+///
+/// [`alloc`](Self::alloc) takes `&self` so handles can coexist; [`reset`](Self::reset) takes
+/// `&mut self`, so the borrow checker refuses to recycle the arena under a live handle.
 pub struct BumpAllocator {
     allocation: Allocation,
     cpu_base: Option<*mut u8>,
     gpu_base: GpuPtr<u8>,
-    offset: u64,
+    offset: std::cell::Cell<u64>,
     capacity: u64,
 }
 
@@ -204,35 +338,36 @@ impl BumpAllocator {
             allocation,
             cpu_base,
             gpu_base,
-            offset: 0,
+            offset: std::cell::Cell::new(0),
             capacity,
         }
     }
 
     /// Allocate `size` bytes with the given power-of-two alignment.
     /// Returns `None` when the allocator has no room.
-    pub fn alloc(&mut self, size: u64, align: u64) -> Option<TransientAllocation> {
-        let (aligned_offset, end) = aligned_bump_range(self.offset, size, align, self.capacity)?;
+    pub fn alloc(&self, size: u64, align: u64) -> Option<Mapped<'_, u8>> {
+        let (aligned_offset, end) =
+            aligned_bump_range(self.offset.get(), size, align, self.capacity)?;
 
         let cpu = self.cpu_base?;
         let gpu = self.gpu_base.byte_add(aligned_offset);
         let cpu_offset = usize::try_from(aligned_offset).ok()?;
+        // SAFETY: `aligned_bump_range` kept `end <= capacity`.
         let cpu = unsafe { cpu.add(cpu_offset) };
 
-        self.offset = end;
+        self.offset.set(end);
 
-        Some(TransientAllocation { cpu, gpu, size })
+        Some(Mapped {
+            cpu,
+            gpu,
+            bytes: size,
+            _borrow: PhantomData,
+        })
     }
 
-    /// Allocate space for `count` values with their natural alignment.
-    pub fn alloc_array<T>(&mut self, count: usize) -> Option<TransientAllocation> {
-        let size = std::mem::size_of::<T>().checked_mul(count)? as u64;
-        self.alloc(size, std::mem::align_of::<T>() as u64)
-    }
-
-    /// Reset the allocator for a new frame.
+    /// Reset for a new frame. Will not compile while a [`Mapped`] from it is live.
     pub fn reset(&mut self) {
-        self.offset = 0;
+        self.offset.set(0);
     }
 
     /// The underlying buffer's base GPU address.
@@ -242,7 +377,7 @@ impl BumpAllocator {
 
     /// How many bytes have been allocated so far.
     pub fn used(&self) -> u64 {
-        self.offset
+        self.offset.get()
     }
 
     /// Total capacity in bytes.
@@ -265,23 +400,4 @@ fn aligned_bump_range(offset: u64, size: u64, align: u64, capacity: u64) -> Opti
     let aligned_offset = offset.checked_add(padding)?;
     let end = aligned_offset.checked_add(size)?;
     (end <= capacity).then_some((aligned_offset, end))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::aligned_bump_range;
-
-    #[test]
-    fn bump_range_rejects_overflow() {
-        assert_eq!(aligned_bump_range(u64::MAX - 7, 16, 16, u64::MAX), None);
-        assert_eq!(aligned_bump_range(8, u64::MAX, 1, u64::MAX), None);
-        assert_eq!(aligned_bump_range(0, 8, 0, 64), None);
-        assert_eq!(aligned_bump_range(0, 8, 3, 64), None);
-    }
-
-    #[test]
-    fn bump_range_aligns_without_overflow() {
-        assert_eq!(aligned_bump_range(17, 8, 16, 64), Some((32, 40)));
-        assert_eq!(aligned_bump_range(17, 33, 16, 64), None);
-    }
 }

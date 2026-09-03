@@ -64,12 +64,12 @@ impl MetalGraphicsPso {
         for (i, fmt) in color_formats.iter().enumerate() {
             let att = unsafe { color_attachments.objectAtIndexedSubscript(i) };
             att.setPixelFormat(*fmt);
-            let mut blend_att = blend.attachments.get(i).cloned().unwrap_or_default();
-            blend_att.write_mask &= color_write_masks
+            let blend_att = blend.attachments.get(i).cloned().unwrap_or_default();
+            let write_mask = color_write_masks
                 .get(i)
                 .copied()
                 .unwrap_or(ColorWriteMask::ALL);
-            apply_blend_to_attachment(att.as_ref(), blend_att);
+            apply_blend_to_attachment(att.as_ref(), blend_att, write_mask);
         }
 
         // Metal 4 supplies depth/stencil formats when the render pass is created, not here.
@@ -96,13 +96,14 @@ impl MetalGraphicsPso {
 pub(crate) fn apply_blend_to_attachment(
     att: &MTL4RenderPipelineColorAttachmentDescriptor,
     blend: BlendAttachment,
+    write_mask: ColorWriteMask,
 ) {
     att.setBlendingState(if blend.blend_enable {
         MTL4BlendState::Enabled
     } else {
         MTL4BlendState::Disabled
     });
-    att.setWriteMask(color_write_mask_to_mtl(blend.write_mask));
+    att.setWriteMask(color_write_mask_to_mtl(write_mask));
     if blend.blend_enable {
         att.setSourceRGBBlendFactor(blend_factor_to_mtl(blend.src_color));
         att.setDestinationRGBBlendFactor(blend_factor_to_mtl(blend.dst_color));

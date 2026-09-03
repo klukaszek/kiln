@@ -66,7 +66,7 @@ pub struct PerformanceStats {
     /// Time spent acquiring the next frame slot/image. This is commonly compositor/vsync or a
     /// frames-in-flight fence wait, not renderer CPU work.
     pub wait_ms: f64,
-    pub backend: &'static str,
+    pub backend: kiln_rhi::Backend,
 }
 
 /// What each windowed example implements: build its pipelines once, then record draw commands into
@@ -230,7 +230,7 @@ fn make_depth(device: &Device, format: Format, w: u32, h: u32) -> (Texture, Allo
         .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("depth mem");
     let texture = device
-        .create_texture(&desc, mem.ptr())
+        .create_texture(&desc, mem.gpu())
         .expect("create depth texture");
     (texture, mem)
 }
@@ -281,8 +281,8 @@ impl<E: Example> App<E> {
             .as_ref()
             .and_then(|example| example.depth_format());
         if let Some((tex, mem)) = self.depth.take() {
-            self.device.destroy_texture(tex);
-            self.device.free(mem);
+            self.device.destroy(tex);
+            self.device.destroy(mem);
         }
         self.depth = depth_format.map(|fmt| make_depth(&self.device, fmt, w, h));
     }
@@ -466,7 +466,7 @@ impl<E: Example> App<E> {
             cpu_ms: egui.cpu_ms,
             gpu_ms: egui.gpu_ms,
             wait_ms: egui.wait_ms,
-            backend: device.backend_name(),
+            backend: device.backend(),
         };
         let out = ctx.run_ui(raw_input, |ui| {
             example.ui(ui, stats);
@@ -575,8 +575,8 @@ impl<E: Example> ApplicationHandler for App<E> {
                 self.device.wait_idle();
                 // Release device-owned storage explicitly (drops are no-ops for RHI handles).
                 if let Some((tex, mem)) = self.depth.take() {
-                    self.device.destroy_texture(tex);
-                    self.device.free(mem);
+                    self.device.destroy(tex);
+                    self.device.destroy(mem);
                 }
                 if let Some(example) = self.example.take() {
                     example.destroy(&self.device);
@@ -703,7 +703,7 @@ impl Egui {
     fn destroy(self, device: &Device) {
         self.renderer.destroy(device);
         for pool in self.query_pools {
-            device.destroy_query_pool(pool);
+            device.destroy(pool);
         }
     }
 }

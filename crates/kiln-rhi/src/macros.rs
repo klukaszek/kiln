@@ -26,22 +26,16 @@ macro_rules! backend_expect {
     };
 }
 
-/// Define a GPU-facing struct once, generating the `#[repr(C)]` [`GpuPod`](crate::GpuPod) Rust
-/// type and a matching Slang declaration string `Name::SLANG` to prepend to a shader — keeping
-/// the host/device layout in lockstep. Must be padding-free (add explicit tail padding where
-/// alignment would insert it).
-///
-/// The Slang type of a field is inferred from its Rust type (see [`crate::gpu_slang_ty!`] for the
-/// table: `Vec4` → `float4`, `u32` → `uint`, …). [`GpuPtr<T>`](crate::GpuPtr) fields infer
-/// `T*`; use `as "..."` when Rust and Slang name the pointee differently. The same override
-/// works for any field whose mapping isn't built in.
+/// Define a GPU struct once, emitting the `#[repr(C)]` Rust type and a matching Slang
+/// declaration in `Name::SLANG`. Field types map through [`gpu_slang_ty!`](crate::gpu_slang_ty);
+/// `as "..."` overrides a mapping. Padding is rejected at compile time by `IntoBytes`.
 ///
 /// ```ignore
 /// gpu_struct! {
 ///     pub struct Material {
-///         albedo: u32,                      // -> uint
-///         tint:   Vec4,                     // -> float4
-///         data:   GpuPtr<Surface>,           // -> Surface*
+///         albedo: u32,                // -> uint
+///         tint:   Vec4,               // -> float4
+///         data:   GpuPtr<Surface>,    // -> Surface*
 ///     }
 /// }
 /// ```

@@ -14,7 +14,7 @@ fn gpu_memcpy_roundtrip() {
 
     const SIZE: u64 = 1 << 16; // 64 KiB
 
-    let mut src = device.allocate(SIZE, MemoryType::Default).expect("src");
+    let mut src = device.allocate(SIZE, MemoryType::Upload).expect("src");
     let dst = device.allocate(SIZE, MemoryType::Readback).expect("dst");
 
     for (i, b) in src
@@ -41,8 +41,8 @@ fn gpu_memcpy_roundtrip() {
         assert_eq!(b, expected, "byte {i} mismatch");
     }
 
-    device.free(src);
-    device.free(dst);
+    device.destroy(src);
+    device.destroy(dst);
 }
 
 /// Copy round-trips across several allocation sizes.
@@ -54,7 +54,7 @@ fn gpu_memcpy_size_sweep() {
 
     for &kib in &[4u64, 64, 1024, 16 * 1024] {
         let size = kib * 1024;
-        let src = device.allocate(size, MemoryType::Default).expect("src");
+        let src = device.allocate(size, MemoryType::Upload).expect("src");
         let dst = device.allocate(size, MemoryType::GpuOnly).expect("dst");
 
         common::timed(&format!("memcpy {kib} KiB → GpuOnly"), || {
@@ -67,7 +67,7 @@ fn gpu_memcpy_size_sweep() {
             queue.wait_idle();
         });
 
-        device.free(src);
-        device.free(dst);
+        device.destroy(src);
+        device.destroy(dst);
     }
 }

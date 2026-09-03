@@ -20,14 +20,14 @@
 //! Requires `slangc` on `PATH` (the painter compiles its shader through `kiln_rhi::compiler`).
 
 use std::collections::HashMap;
+use std::mem::size_of;
 
-use kiln_rhi::compiler::SlangCompiler;
 use kiln_rhi::{
     AddressMode, Allocation, AllocationDesc, BlendAttachment, BlendFactor, BlendOp, BlendState,
-    ColorTarget, ColorWriteMask, CommandBuffer, Cull, Device, FilterMode, Format, GraphicsPso,
-    GraphicsPsoDesc, MAX_FRAMES_IN_FLIGHT, MemoryType, RhiError, RhiResult, SampleCount, Sampler,
-    SamplerDesc, SamplerHandle, ShaderStage, StageFlags, Texture, TextureDesc, TextureDimension,
-    TextureHandle, TextureUsage, Topology, gpu_struct,
+    ColorTarget, CommandBuffer, Cull, Device, FilterMode, Format, GraphicsPso, GraphicsPsoDesc,
+    MAX_FRAMES_IN_FLIGHT, MemoryType, RhiError, RhiResult, SampleCount, Sampler, SamplerDesc,
+    SamplerHandle, ShaderStage, StageFlags, Texture, TextureDesc, TextureDimension, TextureHandle,
+    TextureUsage, Topology, gpu_struct,
 };
 
 gpu_struct! {
@@ -55,8 +55,6 @@ gpu_struct! {
 
 /// Root stride, rounded up to 16 bytes so each per-mesh root stays aligned in the ring buffer.
 const ROOT_STRIDE: u64 = (std::mem::size_of::<EguiRoot>() as u64 + 15) & !15;
-const VERTEX_SIZE: u64 = std::mem::size_of::<EguiVertex>() as u64; // 20
-const INDEX_SIZE: u64 = 4; // egui uses u32 indices; matches the RHI's UINT32 index path.
 
 // One Slang source: `EguiVertex` + `EguiRoot` declarations are prepended so the host/device
 // layouts stay locked. Colours follow the canonical egui pipeline: vertex colours and texels are
@@ -122,8 +120,8 @@ struct ManagedTexture {
 
 impl ManagedTexture {
     fn destroy(self, device: &Device) {
-        device.destroy_texture(self.texture);
-        device.free(self.mem);
+        device.destroy(self.texture);
+        device.destroy(self.mem);
     }
 }
 
@@ -152,9 +150,8 @@ impl EguiRenderer {
     /// format). Compiles the painter shader via `slangc` (must be on `PATH`).
     pub fn new(device: &Device, color_format: Format) -> RhiResult<Self> {
         let src = format!("{}{}{}", EguiVertex::SLANG, EguiRoot::SLANG, SHADER_BODY);
-        let compiler = SlangCompiler::new();
-        let vs = compiler.try_compile(device, &src, "vsMain", ShaderStage::Vertex, &[])?;
-        let fs = compiler.try_compile(device, &src, "fsMain", ShaderStage::Pixel, &[])?;
+        let vs = kiln_rhi::compiler::compile(device, &src, "vsMain", ShaderStage::Vertex, &[])?;
+        let fs = kiln_rhi::compiler::compile(device, &src, "fsMain", ShaderStage::Pixel, &[])?;
 
         // Premultiplied-alpha blending: out = src + dst*(1-src.a); alpha accumulates so the
         // result composites correctly even when rendering egui into an offscreen target.
@@ -167,7 +164,6 @@ impl EguiRenderer {
                 src_alpha: BlendFactor::OneMinusDstAlpha,
                 dst_alpha: BlendFactor::One,
                 alpha_op: BlendOp::Add,
-                write_mask: ColorWriteMask::ALL,
             }],
         };
 
@@ -278,13 +274,13 @@ impl EguiRenderer {
         grow(
             device,
             &mut frame.vtx,
-            total_verts * VERTEX_SIZE,
+            total_verts * size_of::<EguiVertex>() as u64,
             "egui-vtx",
         )?;
         grow(
             device,
             &mut frame.idx,
-            total_indices * INDEX_SIZE,
+            total_indices * size_of::<u32>() as u64,
             "egui-idx",
         )?;
         grow(
@@ -297,9 +293,9 @@ impl EguiRenderer {
         let vtx = frame.vtx.as_ref().unwrap();
         let idx = frame.idx.as_ref().unwrap();
         let root = frame.root.as_ref().unwrap();
-        let (vtx_cpu, vtx_gpu) = (cpu(vtx), vtx.ptr::<EguiVertex>());
-        let (idx_cpu, idx_gpu) = (cpu(idx), idx.ptr::<u32>());
-        let (root_cpu, root_gpu) = (cpu(root), root.ptr::<EguiRoot>());
+        let vtx = mapped::<EguiVertex>(vtx);
+        let idx = mapped::<u32>(idx);
+        let root = mapped::<u8>(root);
 
         let [fb_w, fb_h] = framebuffer_px;
         let screen_size = [
@@ -308,7 +304,7 @@ impl EguiRenderer {
         ];
         let flags = self.srgb_target as u32;
 
-        cmd.set_graphics_pipeline(&self.pso);
+        cmd.set_pipeline(&self.pso);
         cmd.set_viewport(0.0, 0.0, fb_w as f32, fb_h as f32, 0.0, 1.0);
 
         let mut v_off = 0u64; // vertices written so far
@@ -333,47 +329,28 @@ impl EguiRenderer {
                 continue; // fully clipped
             };
 
-            // Upload this mesh's vertices and indices (verbatim — layouts match Slang's natural
-            // layout: vertex stride 20, u32 indices).
-            let vbytes: &[u8] = bytemuck::cast_slice(&mesh.vertices);
-            let ibytes: &[u8] = bytemuck::cast_slice(&mesh.indices);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    vbytes.as_ptr(),
-                    vtx_cpu.add((v_off * VERTEX_SIZE) as usize),
-                    vbytes.len(),
-                );
-                std::ptr::copy_nonoverlapping(
-                    ibytes.as_ptr(),
-                    idx_cpu.add((i_off * INDEX_SIZE) as usize),
-                    ibytes.len(),
-                );
-            }
+            // One offset per buffer moves the CPU and GPU addresses together, so the bytes
+            // written here and the address handed to the draw cannot disagree.
+            let verts = vtx.offset(v_off);
+            let indices = idx.offset(i_off);
+            // egui's `Vertex` is byte-identical to `EguiVertex`, so blit it.
+            verts
+                .cast::<u8>()
+                .write_slice(bytemuck::cast_slice(&mesh.vertices))?;
+            indices.write_slice(&mesh.indices)?;
 
-            let root_data = EguiRoot {
-                verts: vtx_gpu.offset(v_off),
+            let slot = root.byte_offset(m_off * ROOT_STRIDE);
+            slot.cast::<EguiRoot>().write(&EguiRoot {
+                verts: verts.gpu(),
                 screen_size,
                 flags,
                 _pad: 0,
                 tex: managed.handle,
                 smp: self.sampler_handle,
-            };
-            let root_addr = root_gpu.byte_add(m_off * ROOT_STRIDE);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    (&root_data as *const EguiRoot) as *const u8,
-                    root_cpu.add((m_off * ROOT_STRIDE) as usize),
-                    std::mem::size_of::<EguiRoot>(),
-                );
-            }
+            })?;
 
             cmd.set_scissor(sx, sy, sw, sh);
-            cmd.draw_indexed(
-                root_addr,
-                idx_gpu.offset(i_off),
-                mesh.indices.len() as u32,
-                1,
-            );
+            cmd.draw_indexed(slot.gpu(), indices.gpu(), mesh.indices.len() as u32, 1);
 
             v_off += mesh.vertices.len() as u64;
             i_off += mesh.indices.len() as u64;
@@ -396,10 +373,10 @@ impl EguiRenderer {
         }
         for f in frames {
             for b in [f.vtx, f.idx, f.root].into_iter().flatten() {
-                device.destroy_allocation(b);
+                device.destroy(b);
             }
         }
-        device.destroy_sampler(_sampler);
+        device.destroy(_sampler);
     }
 
     /// Apply one egui texture delta (create / full update / sub-region patch), then upload the
@@ -454,8 +431,9 @@ fn is_srgb(format: Format) -> bool {
 }
 
 /// CPU-mapped base pointer of a `Default` buffer (always mapped; panics otherwise — a bug).
-fn cpu(buf: &Allocation) -> *mut u8 {
-    buf.cpu().expect("egui geometry buffer must be CPU-mapped")
+fn mapped<T>(buf: &Allocation) -> kiln_rhi::Mapped<'_, T> {
+    buf.mapped()
+        .expect("egui geometry buffer must be CPU-mapped")
 }
 
 /// Ensure `buf` exists and holds at least `need` bytes, reallocating (and freeing the old) on
@@ -466,13 +444,14 @@ fn grow(device: &Device, buf: &mut Option<Allocation>, need: u64, label: &str) -
         return Ok(());
     }
     if let Some(old) = buf.take() {
-        device.destroy_allocation(old);
+        device.destroy(old);
     }
     let size = need.next_power_of_two().max(4096);
     *buf = Some(device.create_allocation(&AllocationDesc {
         size,
-        memory: MemoryType::Default,
+        memory: MemoryType::Upload,
         label: Some(label.into()),
+        ..Default::default()
     })?);
     Ok(())
 }
@@ -527,7 +506,7 @@ fn create_texture(
     };
     let sa = device.texture_size_align(&desc)?;
     let mem = device.allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)?;
-    let texture = device.create_texture(&desc, mem.ptr())?;
+    let texture = device.create_texture(&desc, mem.gpu())?;
     let handle = texture.gpu();
     Ok(ManagedTexture {
         texture,
@@ -550,6 +529,6 @@ fn upload_full(device: &Device, m: &ManagedTexture) -> RhiResult<()> {
     let queue = device.queue();
     queue.submit(cmd)?;
     queue.wait_idle();
-    device.free(staging);
+    device.destroy(staging);
     Ok(())
 }

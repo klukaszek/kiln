@@ -41,16 +41,6 @@ use super::sync::VulkanTimelineSemaphore;
 use super::texture::VulkanTexture;
 use crate::accel::{AccelInner, AccelerationStructure};
 
-/// Raw Vulkan handles exposed for escape-hatch scenarios (e.g. ImGui integration).
-pub struct VulkanHandles {
-    pub instance: Instance,
-    pub physical_device: vk::PhysicalDevice,
-    pub device: Device,
-    pub queue: vk::Queue,
-    pub queue_family_index: u32,
-    pub command_pool: vk::CommandPool,
-}
-
 #[derive(Clone)]
 pub(crate) struct BufferAllocation {
     pub base: GpuPtr<u8>,
@@ -137,7 +127,6 @@ pub struct VulkanDevice {
     pub(crate) instance: Instance,
     pub(crate) device: Device,
     pub(crate) physical_device: vk::PhysicalDevice,
-    pub(crate) queue_family_index: u32,
     pub(crate) queue: Queue,
     pub(crate) present_queue: vk::Queue,
     pub(crate) command_pool: vk::CommandPool,
@@ -189,8 +178,6 @@ pub struct VulkanDevice {
 
     /// Present when VK_KHR_acceleration_structure was enabled (for BLAS/TLAS builds).
     pub(crate) acceleration_structure: Option<vk_accel_structure::Device>,
-    /// Monotonic counter for AccelerationStructureId assignment.
-    pub(crate) accel_counter: RefCell<u32>,
 }
 
 /// Vulkan queue wrapper.
@@ -262,7 +249,7 @@ impl VulkanQueue {
     /// bindless ID back to the free list, and return the buffer range to the pool.
     ///
     /// There is no deferral. The caller guarantees the GPU is done with the resource (see the
-    /// contract on `Device::destroy_allocation` and friends).
+    /// contract on `Device::destroy`).
     pub(crate) fn release_resource(&self, resource: VulkanRetiredResource) {
         unsafe {
             match &resource {
@@ -966,7 +953,6 @@ fn create_logical_device(
     physical_device: vk::PhysicalDevice,
     queue_family_index: u32,
     capabilities: &VulkanCapabilities,
-    desc: &DeviceDesc,
 ) -> RhiResult<ash::Device> {
     let device_extension_props = unsafe {
         instance
@@ -995,11 +981,6 @@ fn create_logical_device(
         "RHI: Optional extensions — mesh_shader={supports_mesh_shader} mutable_descriptors={supports_mutable_descriptor_type} acceleration_structure={supports_accel} ray_query={supports_ray_query} rt_maintenance1={supports_rt_maintenance1} rt_pipeline={supports_ray_tracing_pipeline}"
     );
 
-    if desc.bindless_mode == Some(BindlessMode::ArgumentTable) {
-        return Err(RhiError::Unsupported(
-            "Vulkan does not support Metal argument tables".into(),
-        ));
-    }
     if !supports_descriptor_buffer {
         return Err(RhiError::Unsupported(
             "Vulkan descriptor buffer is required but not supported".into(),
@@ -1147,7 +1128,6 @@ impl VulkanDevice {
             physical_device,
             queue_family_index,
             &capabilities,
-            desc,
         )?;
         let bindless_mode = BindlessMode::DescriptorBuffer;
 
@@ -1254,7 +1234,7 @@ impl VulkanDevice {
             instance,
             device,
             physical_device,
-            queue_family_index,
+
             queue,
             present_queue,
             command_pool,
@@ -1287,7 +1267,6 @@ impl VulkanDevice {
             mesh_shader_supported: capabilities.mesh_shader,
             mesh_shader_loader,
             acceleration_structure: acceleration_structure_opt,
-            accel_counter: RefCell::new(0),
         })
     }
 
@@ -1308,18 +1287,6 @@ impl VulkanDevice {
     }
 
     pub fn wait_for_frame(&self, _frame_index: usize) {}
-
-    /// Get raw Vulkan handles for escape-hatch scenarios (e.g. ImGui).
-    pub fn vulkan_handles(&self) -> VulkanHandles {
-        VulkanHandles {
-            instance: self.instance.clone(),
-            physical_device: self.physical_device,
-            device: self.device.clone(),
-            queue: self.present_queue,
-            queue_family_index: self.queue_family_index,
-            command_pool: self.command_pool,
-        }
-    }
 
     pub fn create_surface(&self, desc: &SurfaceDesc) -> RhiResult<Surface> {
         let surface = unsafe {
@@ -1634,7 +1601,7 @@ impl VulkanDevice {
         let mem_flags = buffer_memory_flags(desc.memory);
 
         let preferred_flags = match desc.memory {
-            MemoryType::Default => vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            MemoryType::Upload => vk::MemoryPropertyFlags::DEVICE_LOCAL,
             MemoryType::GpuOnly | MemoryType::Readback => vk::MemoryPropertyFlags::empty(),
         };
         let mem_type_index = find_memorytype_index(
@@ -1691,7 +1658,7 @@ impl VulkanDevice {
 
         // `GpuOnly` promises no CPU pointer even when it happens to land in host-visible memory.
         let mapped_ptr = match desc.memory {
-            MemoryType::Default | MemoryType::Readback => suballocation.mapped_ptr,
+            MemoryType::Upload | MemoryType::Readback => suballocation.mapped_ptr,
             MemoryType::GpuOnly => None,
         };
 
@@ -1823,12 +1790,15 @@ impl VulkanDevice {
             TextureDimension::Cube => desc.array_layers * 6,
             _ => desc.array_layers,
         };
-        let image_flags = match desc.dimension {
+        let mut image_flags = match desc.dimension {
             TextureDimension::Cube | TextureDimension::CubeArray => {
                 vk::ImageCreateFlags::CUBE_COMPATIBLE
             }
             _ => vk::ImageCreateFlags::empty(),
         };
+        if desc.usage.contains(TextureUsage::FORMAT_VIEW) {
+            image_flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
+        }
 
         let image_info = vk::ImageCreateInfo::default()
             .flags(image_flags)
@@ -2537,15 +2507,7 @@ impl VulkanDevice {
             self.allocate_scratch_buffer(scratch_size + scratch_align)?;
         let scratch_address = scratch_base.next_multiple_of(scratch_align);
 
-        let id = {
-            let mut next = self.accel_counter.borrow_mut();
-            let id = *next;
-            *next += 1;
-            AccelerationStructureId(id)
-        };
-
         Ok(AccelerationStructure {
-            id,
             inner: AccelInner::Vulkan(Box::new(VulkanAccelerationStructure {
                 acceleration_structure,
                 buffer,
@@ -3634,7 +3596,7 @@ fn compare_op_to_vk(op: CompareOp) -> vk::CompareOp {
 fn buffer_memory_flags(memory: MemoryType) -> vk::MemoryPropertyFlags {
     match memory {
         MemoryType::GpuOnly => vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        MemoryType::Default => {
+        MemoryType::Upload => {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
         }
         MemoryType::Readback => {

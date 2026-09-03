@@ -18,22 +18,17 @@ pub(crate) enum QueueInner {
     Metal(Box<crate::backend::metal::device::MetalQueue>),
 }
 
-/// What to wait/signal when submitting.
 #[derive(Default)]
 pub struct SubmitDesc<'a> {
-    /// Timeline semaphores to wait on before execution.
     pub wait_semaphores: &'a [(TimelineSemaphore, u64)],
-    /// Timeline semaphores to signal after execution.
     pub signal_semaphores: &'a [(TimelineSemaphore, u64)],
 }
 
 impl Queue {
-    /// Submit a command buffer for execution.
     pub fn submit(&self, cmd: CommandBuffer) -> RhiResult<()> {
         self.submit_with_desc(cmd, &SubmitDesc::default())
     }
 
-    /// Submit with timeline dependencies.
     pub fn submit_with_desc(&self, cmd: CommandBuffer, desc: &SubmitDesc<'_>) -> RhiResult<()> {
         self.assert_owns(&cmd);
         match (&self.inner, cmd.inner) {
@@ -50,7 +45,6 @@ impl Queue {
         }
     }
 
-    /// Acquire the next swapchain image for rendering.
     pub fn acquire_image(
         &self,
         swapchain: &Swapchain,
@@ -70,7 +64,7 @@ impl Queue {
         }
     }
 
-    /// Submit a frame command buffer.
+    /// Submits and presents `image_index`.
     pub fn submit_frame(
         &self,
         cmd: CommandBuffer,
@@ -97,7 +91,6 @@ impl Queue {
         }
     }
 
-    /// Wait for the queue to be idle.
     pub fn wait_idle(&self) {
         match &self.inner {
             #[cfg(feature = "vulkan")]

@@ -1,28 +1,16 @@
 //! Acceleration structure types (BLAS + TLAS) for ray tracing.
 
-use crate::types::{AccelHandle, AccelerationStructureId};
+use crate::types::AccelHandle;
 
-/// A built acceleration structure (BLAS or TLAS). Build it with `cmd.build_blas`/`build_tlas`,
-/// then store [`gpu()`](Self::gpu) in an `AccelHandle` field for the shader.
+/// A BLAS or TLAS. Build with `cmd.build_blas`/`build_tlas`, then pass [`gpu()`](Self::gpu) to
+/// the shader.
 pub struct AccelerationStructure {
-    pub id: AccelerationStructureId,
     pub(crate) inner: AccelInner,
     pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 impl AccelerationStructure {
-    /// Opaque shader handle for this acceleration structure.
-    ///
-    /// Assign it directly to an [`AccelHandle`] field in root data:
-    ///
-    /// ```ignore
-    /// gpu_struct! {
-    ///     pub struct TraceRoot {
-    ///         tlas: AccelHandle,
-    ///     }
-    /// }
-    /// root.tlas = tlas.gpu();
-    /// ```
+    /// Opaque shader handle; assign to an [`AccelHandle`] field in root data.
     pub fn gpu(&self) -> AccelHandle {
         let value = match &self.inner {
             #[cfg(feature = "vulkan")]
@@ -40,8 +28,3 @@ pub(crate) enum AccelInner {
     #[cfg(feature = "metal")]
     Metal(Box<crate::backend::metal::accel::MetalAccelerationStructure>),
 }
-
-pub use crate::types::{
-    BlasDesc, BlasMeshDesc, BuildAccelFlags, GeometryFlags, GeometryType, InstanceFlags, TlasDesc,
-    TlasInstance,
-};

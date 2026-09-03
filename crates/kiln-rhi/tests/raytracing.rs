@@ -43,7 +43,7 @@ fn ray_query_triangle_hit() {
     };
 
     let src = format!("{}{}", Root::SLANG, RQ_BODY);
-    let Some(module) = kiln_rhi::compiler::compile_caps_or_skip(
+    let Some(module) = kiln_rhi::compiler::compile_or_skip(
         &device,
         &src,
         "rqMain",
@@ -70,7 +70,7 @@ fn ray_query_triangle_hit() {
     // Triangle at z=0, with the ray starting at z=-1.
     let verts: [[f32; 3]; 3] = [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]];
     let mut vbuf = device
-        .allocate(std::mem::size_of_val(&verts) as u64, MemoryType::Default)
+        .allocate(std::mem::size_of_val(&verts) as u64, MemoryType::Upload)
         .expect("vertex buffer");
     vbuf.upload(&verts).expect("upload vertices");
 
@@ -78,7 +78,7 @@ fn ray_query_triangle_hit() {
         meshes: vec![BlasMeshDesc {
             geometry_type: GeometryType::Triangles,
             flags: GeometryFlags::OPAQUE,
-            vertex_buffer: vbuf.ptr(),
+            vertex_buffer: vbuf.gpu().cast(),
             vertex_stride: 12,
             vertex_count: 3,
             index_buffer: GpuPtr::NULL,
@@ -108,7 +108,7 @@ fn ray_query_triangle_hit() {
     // Identity instance referencing the BLAS.
     let stride = device.tlas_instance_stride();
     let instbuf = device
-        .allocate(stride as u64, MemoryType::Default)
+        .allocate(stride as u64, MemoryType::Upload)
         .expect("instance buffer");
     let instance = TlasInstance {
         transform: [
@@ -125,7 +125,7 @@ fn ray_query_triangle_hit() {
         .expect("write instance");
 
     let tlas_desc = TlasDesc {
-        instance_buffer: instbuf.ptr(),
+        instance_buffer: instbuf.gpu().cast(),
         instance_count: 1,
         flags: BuildAccelFlags::PREFER_FAST_TRACE,
     };
@@ -142,17 +142,17 @@ fn ray_query_triangle_hit() {
 
     let output = device.allocate(4, MemoryType::Readback).expect("output");
     let mut root = device
-        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Default)
+        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Upload)
         .expect("root");
     root.upload(&Root {
-        output: output.ptr(),
+        output: output.gpu().cast(),
         tlas: tlas.gpu(),
     })
     .expect("upload root");
 
     common::timed("ray query dispatch · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
-        cmd.set_compute_pipeline(&pso);
+        cmd.set_pipeline(&pso);
         cmd.dispatch(root.gpu(), 1, 1, 1);
         cmd.barrier(StageFlags::COMPUTE, StageFlags::ALL_COMMANDS);
         cmd.end();
@@ -167,8 +167,8 @@ fn ray_query_triangle_hit() {
     // Resources borrowed while recording must remain alive until the submitted work retires.
     drop(tlas);
     drop(blas);
-    device.free(vbuf);
-    device.free(instbuf);
-    device.free(output);
-    device.free(root);
+    device.destroy(vbuf);
+    device.destroy(instbuf);
+    device.destroy(output);
+    device.destroy(root);
 }

@@ -38,12 +38,10 @@ pub(crate) enum SwapchainInner {
 }
 
 impl Swapchain {
-    /// Get the swapchain color format.
     pub fn format(&self) -> Format {
         backend_dispatch!(&self.inner, SwapchainInner, sc => sc.format)
     }
 
-    /// Get the swapchain extent [width, height].
     pub fn extent(&self) -> [u32; 2] {
         match &self.inner {
             #[cfg(feature = "vulkan")]
@@ -52,32 +50,12 @@ impl Swapchain {
             SwapchainInner::Metal(sc) => sc.extent,
         }
     }
-
-    /// Get raw Vulkan swapchain image views for escape-hatch scenarios (e.g. ImGui framebuffers).
-    #[cfg(feature = "vulkan")]
-    pub fn vulkan_image_views(&self) -> &[ash::vk::ImageView] {
-        match &self.inner {
-            SwapchainInner::Vulkan(sc) => &sc.image_views,
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
-        }
-    }
-
-    /// Get the Vulkan swapchain extent for escape-hatch scenarios.
-    #[cfg(feature = "vulkan")]
-    pub fn vulkan_extent(&self) -> ash::vk::Extent2D {
-        backend_expect!(&self.inner, SwapchainInner::Vulkan).extent
-    }
 }
 
 /// An acquired swapchain image, ready for rendering.
 pub struct AcquiredImage {
-    /// Index into the swapchain images.
     pub index: u32,
-    /// The format of the acquired image.
     pub format: Format,
-    /// Width of the image.
     pub width: u32,
-    /// Height of the image.
     pub height: u32,
 }

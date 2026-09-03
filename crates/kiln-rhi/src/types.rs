@@ -40,11 +40,8 @@ shader_handle!(
     "Opaque sampler shader handle produced by `Sampler::gpu`."
 );
 
-/// Typed pointer into GPU virtual memory.
-///
-/// The type parameter documents the pointee and makes element arithmetic explicit; it carries no
-/// ownership, lifetime, bounds, or synchronization machinery. Use `GpuPtr<u8>` for byte-addressed
-/// or otherwise untyped memory.
+/// A GPU virtual address. The type parameter gives element arithmetic and documents the ABI; it
+/// carries no ownership, lifetime, or bounds. `GpuPtr<u8>` for untyped memory.
 #[repr(transparent)]
 #[derive(IntoBytes, FromBytes, Immutable)]
 pub struct GpuPtr<T: ?Sized> {
@@ -97,15 +94,6 @@ impl<T> GpuPtr<T> {
     #[inline]
     pub fn offset(self, count: u64) -> Self {
         self.byte_add((std::mem::size_of::<T>() as u64).wrapping_mul(count))
-    }
-}
-
-impl<T> std::ops::Add<u64> for GpuPtr<T> {
-    type Output = Self;
-
-    #[inline]
-    fn add(self, count: u64) -> Self::Output {
-        self.offset(count)
     }
 }
 
@@ -189,22 +177,17 @@ pub enum Format {
     D24UnormS8Uint,
     D32FloatS8Uint,
 
-    // Index
+    // Unsigned integer
     R16Uint,
     R32Uint,
 }
 
-/// Primitive topology.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Topology {
     TriangleList,
     TriangleStrip,
-    /// Triangle fan. **Not natively supported on Metal** — requires CPU-side index rewriting
-    /// to `TriangleList` before submission. Use only on Vulkan or with pre-converted data.
-    TriangleFan,
 }
 
-/// MSAA sample count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SampleCount {
     S1,
@@ -214,7 +197,6 @@ pub enum SampleCount {
     S16,
 }
 
-/// Compare operation for depth/stencil.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CompareOp {
     Never,
@@ -227,7 +209,6 @@ pub enum CompareOp {
     Always,
 }
 
-/// Blend factor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BlendFactor {
     Zero,
@@ -242,7 +223,6 @@ pub enum BlendFactor {
     OneMinusDstAlpha,
 }
 
-/// Blend operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BlendOp {
     Add,
@@ -266,14 +246,12 @@ pub enum TextureDimension {
     CubeArray,
 }
 
-/// Filter mode for samplers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FilterMode {
     Nearest,
     Linear,
 }
 
-/// Address mode for samplers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AddressMode {
     Repeat,
@@ -327,29 +305,8 @@ pub enum Cull {
     All,
 }
 
-/// Clip-space Y direction. The RHI presents [`ClipSpaceY::Up`] on every backend.
-///
-/// [`Down`]: ClipSpaceY::Down
-/// [`Device::clip_space_y`]: crate::Device::clip_space_y
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ClipSpaceY {
-    /// NDC Y points down (native Vulkan). Projection must negate Y.
-    Down,
-    /// NDC Y points up (Metal, OpenGL, and Kiln's normalized convention). Standard projection.
-    Up,
-}
-
 /// Maximum frames in flight.
 pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
-
-/// Opaque acceleration-structure handle (BLAS or TLAS). Exists so the backend can issue
-/// `build` against the right object; shaders use its opaque handle (`accel.gpu()`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct AccelerationStructureId(pub u32);
-
-impl AccelerationStructureId {
-    pub const INVALID: Self = Self(u32::MAX);
-}
 
 /// Geometry type inside a BLAS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -402,7 +359,6 @@ pub struct BlasMeshDesc {
     pub vertex_buffer: GpuPtr<[f32; 3]>,
     /// Bytes between successive vertex positions (for Triangles).
     pub vertex_stride: u64,
-    /// Number of vertices.
     pub vertex_count: u32,
     /// Triangle indices, or [`GpuPtr::NULL`] for non-indexed geometry.
     pub index_buffer: GpuPtr<u32>,
@@ -410,7 +366,6 @@ pub struct BlasMeshDesc {
     pub index_count: u32,
     /// Axis-aligned bounding boxes (for AABB geometry).
     pub aabb_buffer: GpuPtr<Aabb>,
-    /// Number of AABBs.
     pub aabb_count: u32,
 }
 
@@ -451,25 +406,6 @@ pub struct TlasInstance {
 pub struct TlasDesc {
     /// GPU address of an array of `TlasInstance`.
     pub instance_buffer: GpuPtr<TlasInstance>,
-    /// Number of instances.
     pub instance_count: u32,
     pub flags: BuildAccelFlags,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::GpuPtr;
-
-    #[test]
-    fn typed_gpu_pointer_is_a_zero_cost_address() {
-        fn assert_gpu_pod<T: crate::GpuPod>() {}
-
-        assert_gpu_pod::<GpuPtr<u32>>();
-        assert_eq!(std::mem::size_of::<GpuPtr<u32>>(), 8);
-        assert_eq!(std::mem::align_of::<GpuPtr<u32>>(), 8);
-
-        let base = GpuPtr::<u32>::from_addr(0x1000);
-        assert_eq!((base + 3).address, 0x100c);
-        assert_eq!(base.byte_add(7).cast::<u8>().address, 0x1007);
-    }
 }

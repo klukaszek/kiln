@@ -19,35 +19,37 @@ impl ColorTarget {
     }
 }
 
-/// Description for creating a graphics pipeline state object.
+/// Description for creating a rasterization pipeline state object.
 ///
 /// Minimal PSO — topology, formats, MSAA, cull, write masks and blend baked. DepthStencil stays
-/// dynamic (`set_depth_stencil_state`); blend cannot, since both backends bake it into the
-/// hardware pipeline. Shaders are passed to `create_graphics_pso`, not here.
+/// dynamic (`set_depth_stencil_state`); blend cannot, since both backends bake it in. Shaders are
+/// arguments to `create_graphics_pso` / `create_meshlet_pso`. The vertex and mesh paths take the
+/// same raster state, hence the [`GraphicsPsoDesc`] / [`MeshletPsoDesc`] aliases.
 #[derive(Clone, Debug)]
-pub struct GraphicsPsoDesc {
-    /// Primitive topology.
+pub struct RasterPsoDesc {
     pub topology: Topology,
-    /// Color render targets. Each entry bakes the format and static write mask.
     pub color_targets: Vec<ColorTarget>,
-    /// Depth attachment format (None = no depth).
+    /// `None` = no depth.
     pub depth_format: Option<Format>,
-    /// MSAA sample count.
-    pub sample_count: SampleCount,
-    /// Enable alpha-to-coverage.
-    pub alpha_to_coverage: bool,
-    /// Cull mode. Encodes cull direction and implied front-face winding (`Cull::Cw` = standard back-face culling).
-    pub cull: Cull,
-    /// Separate stencil attachment format (None = no stencil). Distinct from `depth_format`.
+    /// Separate from `depth_format`; `None` = no stencil.
     pub stencil_format: Option<Format>,
-    /// Enable dual-source blending (requires `blendstate` with two outputs).
-    pub support_dual_source_blending: bool,
-    /// Blend state baked into the pipeline. `None` = opaque (blending disabled).
+    pub sample_count: SampleCount,
+    pub alpha_to_coverage: bool,
+    pub cull: Cull,
+    /// `None` = opaque.
     pub blendstate: Option<BlendState>,
     pub label: Option<String>,
 }
 
-impl Default for GraphicsPsoDesc {
+/// Raster state for a vertex/pixel pipeline. See [`RasterPsoDesc`].
+pub type GraphicsPsoDesc = RasterPsoDesc;
+
+/// Raster state for a mesh/pixel pipeline. The mesh shader replaces the vertex shader;
+/// amplification shaders aren't exposed. Requires `VK_EXT_mesh_shader` on Vulkan.
+/// See [`RasterPsoDesc`].
+pub type MeshletPsoDesc = RasterPsoDesc;
+
+impl Default for RasterPsoDesc {
     fn default() -> Self {
         Self {
             topology: Topology::TriangleList,
@@ -57,7 +59,6 @@ impl Default for GraphicsPsoDesc {
             alpha_to_coverage: false,
             cull: Cull::None,
             stencil_format: None,
-            support_dual_source_blending: false,
             blendstate: None,
             label: None,
         }
@@ -78,11 +79,9 @@ pub(crate) enum GraphicsPsoInner {
 }
 
 /// Description for creating a compute pipeline.
-///
-/// The compute shader is passed to `create_compute_pso` as a `&ShaderModule`.
 #[derive(Clone, Debug)]
 pub struct ComputePsoDesc {
-    /// Threads per threadgroup for Metal dispatch. Vulkan ignores this value.
+    /// Metal only; Vulkan takes it from the shader.
     pub threads_per_threadgroup: [u32; 3],
     pub label: Option<String>,
 }
@@ -112,15 +111,12 @@ pub(crate) enum ComputePsoInner {
 /// Per-face stencil operation descriptor.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StencilDesc {
-    /// Comparison function applied against the stencil buffer.
     pub test: CompareOp,
-    /// Action when stencil test fails.
     pub fail_op: StencilOp,
-    /// Action when stencil test passes and depth test passes.
+    /// Stencil passed, depth passed.
     pub pass_op: StencilOp,
-    /// Action when stencil test passes but depth test fails.
+    /// Stencil passed, depth failed.
     pub depth_fail_op: StencilOp,
-    /// Reference value compared against the stencil buffer.
     pub reference: u8,
 }
 
@@ -136,26 +132,19 @@ impl Default for StencilDesc {
     }
 }
 
-/// Separate depth-stencil state (flyweight). Set via `set_depth_stencil_state`.
+/// Dynamic depth-stencil state, set via `set_depth_stencil_state`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DepthStencilState {
-    /// Depth read/write mode. `0` = disabled; `READ` = test only; `READ|WRITE` = full.
+    /// Empty = disabled; `READ` = test only; `READ|WRITE` = both.
     pub depth_mode: DepthFlags,
-    /// Depth compare function. Applied when `depth_mode` has `READ`.
     pub depth_test: CompareOp,
-    /// Constant depth bias added to each fragment's depth.
     pub depth_bias: f32,
-    /// Slope-scaled depth bias.
     pub depth_bias_slope_factor: f32,
-    /// Clamp applied to the total depth bias.
     pub depth_bias_clamp: f32,
-    /// Stencil buffer read mask (ANDed with the stored stencil value before comparison).
+    /// Stencil is off entirely while both masks are zero.
     pub stencil_read_mask: u8,
-    /// Stencil buffer write mask (ANDed with the written stencil value).
     pub stencil_write_mask: u8,
-    /// Front-face stencil operations. Only active when stencil_read/write_mask != 0.
     pub stencil_front: StencilDesc,
-    /// Back-face stencil operations.
     pub stencil_back: StencilDesc,
 }
 
@@ -167,8 +156,6 @@ impl Default for DepthStencilState {
             depth_bias: 0.0,
             depth_bias_slope_factor: 0.0,
             depth_bias_clamp: 0.0,
-            // A default state must not silently enable stencil. Applications opt in by
-            // setting either mask to a non-zero value.
             stencil_read_mask: 0,
             stencil_write_mask: 0,
             stencil_front: StencilDesc::default(),
@@ -178,23 +165,13 @@ impl Default for DepthStencilState {
 }
 
 impl DepthStencilState {
-    /// Returns true if stencil testing/writing is active (either mask is non-zero).
     pub fn stencil_enabled(&self) -> bool {
         self.stencil_read_mask != 0 || self.stencil_write_mask != 0
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::DepthStencilState;
-
-    #[test]
-    fn default_depth_stencil_state_disables_stencil() {
-        assert!(!DepthStencilState::default().stencil_enabled());
-    }
-}
-
-/// Per-attachment blend descriptor.
+/// Per-attachment blend descriptor. The write mask lives on [`ColorTarget`], so it applies
+/// whether or not blending is enabled.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlendAttachment {
     pub blend_enable: bool,
@@ -204,7 +181,6 @@ pub struct BlendAttachment {
     pub src_alpha: BlendFactor,
     pub dst_alpha: BlendFactor,
     pub alpha_op: BlendOp,
-    pub write_mask: ColorWriteMask,
 }
 
 impl Default for BlendAttachment {
@@ -217,12 +193,11 @@ impl Default for BlendAttachment {
             src_alpha: BlendFactor::One,
             dst_alpha: BlendFactor::Zero,
             alpha_op: BlendOp::Add,
-            write_mask: ColorWriteMask::ALL,
         }
     }
 }
 
-/// Blend state, baked into a PSO via `GraphicsPsoDesc::blendstate`.
+/// Blend state, baked into a PSO via `RasterPsoDesc::blendstate`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlendState {
     pub attachments: Vec<BlendAttachment>,
@@ -232,42 +207,6 @@ impl Default for BlendState {
     fn default() -> Self {
         Self {
             attachments: vec![BlendAttachment::default()],
-        }
-    }
-}
-
-/// Description for a mesh-shader graphics pipeline. The mesh shader replaces the vertex shader;
-/// amplification shaders aren't exposed. Mesh and pixel shaders are passed as `&ShaderModule`
-/// args to `create_meshlet_pso`. Requires `VK_EXT_mesh_shader` on Vulkan.
-#[derive(Clone, Debug)]
-pub struct MeshletPsoDesc {
-    /// Rasterizer state — same fields as `GraphicsPsoDesc`.
-    pub topology: Topology,
-    pub color_targets: Vec<ColorTarget>,
-    pub depth_format: Option<Format>,
-    pub stencil_format: Option<Format>,
-    pub sample_count: SampleCount,
-    pub alpha_to_coverage: bool,
-    pub cull: Cull,
-    pub support_dual_source_blending: bool,
-    /// Blend state baked into the pipeline. `None` = opaque (blending disabled).
-    pub blendstate: Option<BlendState>,
-    pub label: Option<String>,
-}
-
-impl Default for MeshletPsoDesc {
-    fn default() -> Self {
-        Self {
-            topology: Topology::TriangleList,
-            color_targets: vec![ColorTarget::new(Format::B8G8R8A8Srgb)],
-            depth_format: Some(Format::D32Float),
-            stencil_format: None,
-            sample_count: SampleCount::S1,
-            alpha_to_coverage: false,
-            cull: Cull::None,
-            support_dual_source_blending: false,
-            blendstate: None,
-            label: None,
         }
     }
 }

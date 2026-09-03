@@ -66,7 +66,6 @@ impl VulkanGraphicsPso {
             match self.desc.topology {
                 Topology::TriangleList => vk::PrimitiveTopology::TRIANGLE_LIST,
                 Topology::TriangleStrip => vk::PrimitiveTopology::TRIANGLE_STRIP,
-                Topology::TriangleFan => vk::PrimitiveTopology::TRIANGLE_FAN,
             },
         );
 
@@ -106,10 +105,8 @@ impl VulkanGraphicsPso {
             .iter()
             .enumerate()
             .map(|(i, target)| {
-                let mut att = blend.attachments.get(i).cloned().unwrap_or_default();
-                // AND the static PSO write mask (ColorTarget) with the dynamic blend mask.
-                att.write_mask &= target.write_mask;
-                blend_attachment_to_vk(att)
+                let att = blend.attachments.get(i).cloned().unwrap_or_default();
+                blend_attachment_to_vk(att, target.write_mask)
             })
             .collect();
 
@@ -196,9 +193,12 @@ fn cull_to_vk(cull: Cull) -> (vk::CullModeFlags, vk::FrontFace) {
     }
 }
 
-fn blend_attachment_to_vk(att: BlendAttachment) -> vk::PipelineColorBlendAttachmentState {
+fn blend_attachment_to_vk(
+    att: BlendAttachment,
+    write_mask: ColorWriteMask,
+) -> vk::PipelineColorBlendAttachmentState {
     let mut state = vk::PipelineColorBlendAttachmentState::default()
-        .color_write_mask(color_write_mask_to_vk(att.write_mask))
+        .color_write_mask(color_write_mask_to_vk(write_mask))
         .blend_enable(att.blend_enable);
 
     if att.blend_enable {
@@ -322,9 +322,8 @@ impl VulkanMeshletPso {
             .iter()
             .enumerate()
             .map(|(i, target)| {
-                let mut att = blend.attachments.get(i).cloned().unwrap_or_default();
-                att.write_mask &= target.write_mask;
-                blend_attachment_to_vk(att)
+                let att = blend.attachments.get(i).cloned().unwrap_or_default();
+                blend_attachment_to_vk(att, target.write_mask)
             })
             .collect();
         let color_blending =

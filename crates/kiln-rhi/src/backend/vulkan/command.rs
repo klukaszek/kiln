@@ -4,8 +4,8 @@ use super::device::{
 };
 use crate::barrier::{HazardFlags, StageFlags};
 use crate::command::{
-    DispatchIndirectArgs, DrawIndexedIndirectArgs, LoadOp, RenderPassDesc, RenderTargetKind,
-    StoreOp,
+    DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectArgs, LoadOp, RenderPassDesc,
+    RenderTargetKind, StoreOp,
 };
 use crate::pipeline::{
     ComputePso, ComputePsoInner, DepthStencilState, GraphicsPso, GraphicsPsoInner, MeshletPso,
@@ -483,6 +483,20 @@ impl VulkanCommandBuffer {
         }
     }
 
+    pub fn draw_indirect(&mut self, args: GpuPtr<u8>) {
+        let (arg_buffer, arg_offset) =
+            self.resolve_buffer(args, std::mem::size_of::<DrawIndirectArgs>() as u64);
+        unsafe {
+            self.device.cmd_draw_indirect(
+                self.command_buffer,
+                arg_buffer,
+                arg_offset,
+                1,
+                std::mem::size_of::<DrawIndirectArgs>() as u32,
+            );
+        }
+    }
+
     pub fn draw_indexed_indirect(&mut self, indices: GpuPtr<u8>, args: GpuPtr<u8>) {
         let (arg_buffer, arg_offset) =
             self.resolve_buffer(args, std::mem::size_of::<DrawIndexedIndirectArgs>() as u64);
@@ -690,20 +704,10 @@ impl VulkanCommandBuffer {
         }
     }
 
+    /// The no-hazard case: `to_vk_access_flags(empty)` is `NONE` and the descriptor-buffer path
+    /// is skipped, leaving exactly the write-to-read dependency.
     pub fn barrier(&mut self, src: StageFlags, dst: StageFlags) {
-        let memory_barrier = vk::MemoryBarrier2::default()
-            .src_stage_mask(to_vk_stage_flags(src))
-            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-            .dst_stage_mask(to_vk_stage_flags(dst))
-            .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE);
-
-        let dep_info =
-            vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&memory_barrier));
-
-        unsafe {
-            self.device
-                .cmd_pipeline_barrier2(self.command_buffer, &dep_info);
-        }
+        self.barrier_with_hazard(src, dst, HazardFlags::empty());
     }
 
     pub fn barrier_with_hazard(&mut self, src: StageFlags, dst: StageFlags, hazard: HazardFlags) {

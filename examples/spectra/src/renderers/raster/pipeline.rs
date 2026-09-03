@@ -91,9 +91,12 @@ impl Pipeline {
             Root::SLANG,
             SHADER_BODY
         );
-        let mesh_shader = kiln_rhi::compiler::compile(device, &source, "msMain", ShaderStage::Mesh);
+        let mesh_shader =
+            kiln_rhi::compiler::compile(device, &source, "msMain", ShaderStage::Mesh, &[])
+                .expect("shader compilation");
         let fragment_shader =
-            kiln_rhi::compiler::compile(device, &source, "fsMain", ShaderStage::Pixel);
+            kiln_rhi::compiler::compile(device, &source, "fsMain", ShaderStage::Pixel, &[])
+                .expect("shader compilation");
         let pipeline = device.create_meshlet_pso(
             &MeshletPsoDesc {
                 topology: Topology::TriangleList,
@@ -103,7 +106,6 @@ impl Pipeline {
                 sample_count: SampleCount::S1,
                 alpha_to_coverage: false,
                 cull: Cull::None,
-                support_dual_source_blending: false,
                 blendstate: None,
                 label: Some("spectra-raster".into()),
             },
@@ -114,7 +116,7 @@ impl Pipeline {
     }
 
     pub(super) fn record<T>(&self, commands: &mut CommandBuffer, root: GpuPtr<T>, triangles: u32) {
-        commands.set_meshlet_pipeline(&self.0);
+        commands.set_pipeline(&self.0);
         commands.set_depth_stencil_state(&DepthStencilState {
             depth_mode: DepthFlags::READ | DepthFlags::WRITE,
             depth_test: CompareOp::Less,

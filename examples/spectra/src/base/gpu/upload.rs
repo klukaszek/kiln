@@ -22,13 +22,13 @@ impl<T> GpuArray<T> {
     }
 
     pub(crate) fn gpu(&self) -> GpuPtr<T> {
-        self.allocation.ptr()
+        self.allocation.gpu().cast()
     }
     pub(crate) fn len(&self) -> u32 {
         self.len
     }
     pub(crate) fn destroy(self, device: &Device) {
-        device.free(self.allocation);
+        device.destroy(self.allocation);
     }
 }
 
@@ -106,7 +106,7 @@ impl<'a> GpuPatchBatch<'a> {
 impl Drop for GpuPatchBatch<'_> {
     fn drop(&mut self) {
         for staging in self.staging.drain(..) {
-            self.device.free(staging);
+            self.device.destroy(staging);
         }
     }
 }
@@ -128,7 +128,7 @@ impl<'a> GpuUploadBatch<'a> {
         let staging = match self.device.upload_slice(data) {
             Ok(staging) => staging,
             Err(error) => {
-                self.device.free(allocation);
+                self.device.destroy(allocation);
                 return Err(error.into());
             }
         };
@@ -154,7 +154,7 @@ impl<'a> GpuUploadBatch<'a> {
         self.device.queue().submit(cmd)?;
         self.device.queue().wait_idle();
         for staging in self.staging.drain(..) {
-            self.device.free(staging);
+            self.device.destroy(staging);
         }
         Ok(std::mem::take(&mut self.allocations))
     }
@@ -163,10 +163,10 @@ impl<'a> GpuUploadBatch<'a> {
 impl Drop for GpuUploadBatch<'_> {
     fn drop(&mut self) {
         for allocation in self.allocations.drain(..) {
-            self.device.free(allocation);
+            self.device.destroy(allocation);
         }
         for staging in self.staging.drain(..) {
-            self.device.free(staging);
+            self.device.destroy(staging);
         }
     }
 }

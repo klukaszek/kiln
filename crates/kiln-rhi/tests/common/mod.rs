@@ -3,7 +3,6 @@
 
 //! Tests use the real backend without a window or swapchain and skip when no device is available.
 
-use kiln_rhi::compiler::SlangCompiler;
 use kiln_rhi::{Device, DeviceDesc};
 
 /// Serializes GPU access across test threads in the same binary.
@@ -77,11 +76,6 @@ pub fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
     let elapsed = start.elapsed();
     eprintln!("    ⏱  {label}: {}", fmt_dur(elapsed));
     out
-}
-
-/// True if the `slangc` compiler is available. Shader-path tests skip when it is not.
-pub fn slangc_available() -> bool {
-    SlangCompiler::available()
 }
 
 /// Write `rgba` (exactly `width * height * 4` bytes, row-major, `R8G8B8A8`) to

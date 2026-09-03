@@ -18,6 +18,9 @@ bitflags::bitflags! {
         const DEPTH_STENCIL_ATTACHMENT = 0x08;
         const TRANSFER_SRC      = 0x10;
         const TRANSFER_DST      = 0x20;
+        /// Allow format-reinterpreting views (see [`formats_are_view_compatible`]). Both
+        /// backends need this at creation time, and it can rule out framebuffer compression.
+        const FORMAT_VIEW       = 0x40;
     }
 }
 
@@ -85,23 +88,18 @@ impl Texture {
         crate::command::RenderTarget::texture(self.id)
     }
 
-    /// Create a sampled subresource view. It is released with this texture.
-    pub fn sampled_view(&mut self, view: &TextureViewDesc) -> crate::RhiResult<TextureHandle> {
-        self.create_view(view, false).map(TextureHandle::from_raw)
+    /// Subresource view; released with this texture. The source must carry `kind`'s usage.
+    pub fn view(
+        &mut self,
+        kind: ViewKind,
+        view: &TextureViewDesc,
+    ) -> crate::RhiResult<TextureHandle> {
+        self.create_view(view, kind).map(TextureHandle::from_raw)
     }
 
-    /// Create a read-write subresource view. It is released with this texture.
-    pub fn storage_view(&mut self, view: &TextureViewDesc) -> crate::RhiResult<TextureHandle> {
-        self.create_view(view, true).map(TextureHandle::from_raw)
-    }
-
-    fn create_view(&mut self, view: &TextureViewDesc, storage: bool) -> crate::RhiResult<u64> {
-        let usage = if storage {
-            TextureUsage::STORAGE
-        } else {
-            TextureUsage::SAMPLED
-        };
-        crate::device::validate_texture_view(self, view, usage)?;
+    fn create_view(&mut self, view: &TextureViewDesc, kind: ViewKind) -> crate::RhiResult<u64> {
+        let storage = kind == ViewKind::Storage;
+        crate::device::validate_texture_view(self, view, kind.required_usage())?;
         let owner = self
             ._owner
             .clone()
@@ -116,9 +114,26 @@ impl Texture {
         Ok(address)
     }
 
-    /// Texture description.
     pub fn desc(&self) -> &TextureDesc {
         &self.desc
+    }
+}
+
+/// How a [`Texture::view`] is read in shaders, fixing the usage the source must carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ViewKind {
+    /// Read-only, sampled through a `SamplerState`.
+    Sampled,
+    /// Read-write storage image.
+    Storage,
+}
+
+impl ViewKind {
+    fn required_usage(self) -> TextureUsage {
+        match self {
+            ViewKind::Sampled => TextureUsage::SAMPLED,
+            ViewKind::Storage => TextureUsage::STORAGE,
+        }
     }
 }
 
@@ -149,21 +164,56 @@ impl Default for TextureViewDesc {
     }
 }
 
-/// Bytes per pixel for uncompressed formats.
+/// Whether a view may reinterpret `a` as `b`: same channel layout and bit depth, differing only
+/// in how the bits are read (`R8G8B8A8Unorm` / `R8G8B8A8Srgb`, `R32Float` / `R32Uint`).
+///
+/// The portable intersection, not the union: Vulkan would also allow swizzled pairs like
+/// `R8G8B8A8Unorm` / `B8G8R8A8Unorm`, but Metal treats channel order as part of the format
+/// family. Depth never reinterprets on either backend.
+pub fn formats_are_view_compatible(a: Format, b: Format) -> bool {
+    a == b || matches!((view_class(a), view_class(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// Channel layout and bit depth, ignoring interpretation. `None` for depth/stencil.
+fn view_class(format: Format) -> Option<u8> {
+    Some(match format {
+        Format::R8Unorm => 0,
+        Format::R8G8Unorm => 1,
+        Format::R8G8B8A8Unorm | Format::R8G8B8A8Srgb => 2,
+        Format::B8G8R8A8Unorm | Format::B8G8R8A8Srgb => 3,
+        Format::R16Float | Format::R16Uint => 4,
+        Format::R16G16Float => 5,
+        Format::R16G16B16A16Float => 6,
+        Format::R32Float | Format::R32Uint => 7,
+        Format::R32G32Float => 8,
+        Format::R32G32B32A32Float => 9,
+        Format::R10G10B10A2Unorm => 10,
+        Format::R11G11B10Float => 11,
+        Format::D16Unorm | Format::D32Float | Format::D24UnormS8Uint | Format::D32FloatS8Uint => {
+            return None;
+        }
+    })
+}
+
+/// Bytes per pixel for colour formats. `None` for depth/stencil, which copy as separate aspects
+/// and have no single texel size. Exhaustive on purpose: the copy paths panic on `None`, so a
+/// catch-all arm here turns a new format into a copy failure.
 pub fn bytes_per_pixel(format: Format) -> Option<usize> {
-    match format {
-        Format::R8Unorm => Some(1),
-        Format::R8G8Unorm => Some(2),
-        Format::R8G8B8A8Unorm | Format::R8G8B8A8Srgb => Some(4),
-        Format::B8G8R8A8Unorm | Format::B8G8R8A8Srgb => Some(4),
-        Format::R16Float => Some(2),
-        Format::R16G16Float => Some(4),
-        Format::R16G16B16A16Float => Some(8),
-        Format::R32Float => Some(4),
-        Format::R32G32Float => Some(8),
-        Format::R32G32B32A32Float => Some(16),
-        Format::R10G10B10A2Unorm => Some(4),
-        Format::R11G11B10Float => Some(4),
-        _ => None,
-    }
+    Some(match format {
+        Format::R8Unorm => 1,
+        Format::R8G8Unorm => 2,
+        Format::R8G8B8A8Unorm | Format::R8G8B8A8Srgb => 4,
+        Format::B8G8R8A8Unorm | Format::B8G8R8A8Srgb => 4,
+        Format::R16Float | Format::R16Uint => 2,
+        Format::R16G16Float => 4,
+        Format::R16G16B16A16Float => 8,
+        Format::R32Float | Format::R32Uint => 4,
+        Format::R32G32Float => 8,
+        Format::R32G32B32A32Float => 16,
+        Format::R10G10B10A2Unorm => 4,
+        Format::R11G11B10Float => 4,
+        Format::D16Unorm | Format::D32Float | Format::D24UnormS8Uint | Format::D32FloatS8Uint => {
+            return None;
+        }
+    })
 }

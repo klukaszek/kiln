@@ -33,9 +33,13 @@ fn compute_doubles_buffer() {
     };
 
     let src = format!("{}{}", Data::SLANG, COMPUTE_BODY);
-    let Some(module) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "computeMain", ShaderStage::Compute)
-    else {
+    let Some(module) = kiln_rhi::compiler::compile_or_skip(
+        &device,
+        &src,
+        "computeMain",
+        ShaderStage::Compute,
+        &[],
+    ) else {
         return;
     };
 
@@ -53,21 +57,21 @@ fn compute_doubles_buffer() {
 
     const N: u32 = 1024;
     let mut input = device
-        .allocate((N * 4) as u64, MemoryType::Default)
+        .allocate((N * 4) as u64, MemoryType::Upload)
         .expect("input");
     let output = device
         .allocate((N * 4) as u64, MemoryType::Readback)
         .expect("output");
     let mut data = device
-        .allocate(std::mem::size_of::<Data>() as u64, MemoryType::Default)
+        .allocate(std::mem::size_of::<Data>() as u64, MemoryType::Upload)
         .expect("root data");
 
     input
         .upload_slice(&(0..N).collect::<Vec<u32>>())
         .expect("upload input");
     data.upload(&Data {
-        input: input.ptr(),
-        output: output.ptr(),
+        input: input.gpu().cast(),
+        output: output.gpu().cast(),
         count: N,
         _pad: 0,
     })
@@ -75,8 +79,8 @@ fn compute_doubles_buffer() {
 
     common::timed("dispatch 1024 · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
-        cmd.set_compute_pipeline(&pso);
-        cmd.dispatch(data.ptr::<Data>(), N.div_ceil(64), 1, 1);
+        cmd.set_pipeline(&pso);
+        cmd.dispatch(data.gpu().cast::<Data>(), N.div_ceil(64), 1, 1);
         cmd.barrier(StageFlags::COMPUTE, StageFlags::ALL_COMMANDS);
         // Submitting unrelated work must not retire a pipeline referenced by `cmd`.
         drop(pso);
@@ -95,7 +99,7 @@ fn compute_doubles_buffer() {
         assert_eq!(value, i as u32 * 2, "element {i} not doubled");
     }
 
-    device.free(input);
-    device.free(output);
-    device.free(data);
+    device.destroy(input);
+    device.destroy(output);
+    device.destroy(data);
 }

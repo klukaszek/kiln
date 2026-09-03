@@ -16,15 +16,12 @@ pub(crate) enum TimelineSemaphoreInner {
 }
 
 impl TimelineSemaphore {
-    /// Get the current signaled value.
     pub fn value(&self) -> RhiResult<u64> {
         backend_dispatch!(&self.inner, TimelineSemaphoreInner, s => s.value())
     }
 
-    /// CPU-side wait until the semaphore reaches `value`.
-    ///
-    /// Returns `Ok(true)` when the value was reached and `Ok(false)` when the timeout expired.
-    /// Backend failures are returned instead of being mistaken for a successful wait.
+    /// `Ok(true)` if the value was reached, `Ok(false)` on timeout. Backend failures are `Err`
+    /// rather than being mistaken for a successful wait.
     pub fn wait(&self, value: u64, timeout_ns: u64) -> RhiResult<bool> {
         backend_dispatch!(&self.inner, TimelineSemaphoreInner, s => s.wait(value, timeout_ns))
     }

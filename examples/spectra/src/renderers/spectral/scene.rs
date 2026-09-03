@@ -163,7 +163,7 @@ impl Storage {
             return;
         };
         for allocation in staging.drain(..) {
-            device.free(allocation);
+            device.destroy(allocation);
         }
         self.accel.begin_frame(frame_slot);
     }
@@ -171,7 +171,7 @@ impl Storage {
     fn retire_all_staging(&mut self, device: &Device) {
         for staging in &mut self.pending_staging {
             for allocation in staging.drain(..) {
-                device.free(allocation);
+                device.destroy(allocation);
             }
         }
     }
@@ -189,7 +189,7 @@ impl Storage {
     ) -> renderer::Result<()> {
         let Some(slot_staging) = self.pending_staging.get_mut(frame_slot) else {
             for allocation in staging {
-                device.free(allocation);
+                device.destroy(allocation);
             }
             return Err(Error::Capacity("frame slot is out of bounds"));
         };

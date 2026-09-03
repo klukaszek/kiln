@@ -10,7 +10,6 @@ use crate::types::{BlasDesc, TlasDesc};
 /// Color attachment for dynamic rendering.
 #[derive(Clone, Debug)]
 pub struct ColorAttachment {
-    /// Swapchain image or offscreen texture.
     pub target: RenderTarget,
     pub load_op: LoadOp,
     pub store_op: StoreOp,
@@ -73,13 +72,8 @@ pub struct RenderPassDesc {
     pub color_attachments: Vec<ColorAttachment>,
     pub depth_attachment: Option<DepthAttachment>,
     pub render_area: [u32; 4], // x, y, width, height
-    /// Debug name for the pass, shown against the encoder in a GPU capture. A `&'static str`
-    /// rather than the `String` the creation-time descriptors use: this struct is rebuilt every
-    /// frame, so the name is expected to be a literal.
-    ///
-    /// Applied on Metal today. Vulkan needs a device-level `VK_EXT_debug_utils` loader that the
-    /// backend does not create yet (it only builds the instance-level messenger), so the name is
-    /// ignored there for now.
+    /// Pass name in a GPU capture. `&'static str` because this struct is rebuilt every frame.
+    /// Metal only for now; Vulkan needs a device-level `VK_EXT_debug_utils` loader.
     pub label: Option<&'static str>,
 }
 
@@ -113,6 +107,31 @@ pub struct DispatchIndirectArgs {
     pub z: u32,
 }
 
+/// A pipeline state object bindable with [`CommandBuffer::set_pipeline`].
+pub trait Pipeline: crate::sealed::Sealed {
+    #[doc(hidden)]
+    fn bind_to(&self, cmd: &mut CommandBuffer);
+}
+
+macro_rules! impl_pipeline {
+    ($($ty:ty => $kind:literal, $bind:ident),+ $(,)?) => {
+        $(
+            impl Pipeline for $ty {
+                fn bind_to(&self, cmd: &mut CommandBuffer) {
+                    cmd.assert_same_device(&self._owner, $kind);
+                    backend_dispatch!(&mut cmd.inner, CommandBufferInner, c => c.$bind(self))
+                }
+            }
+        )+
+    };
+}
+
+impl_pipeline!(
+    GraphicsPso => "graphics pipeline", set_graphics_pipeline,
+    ComputePso => "compute pipeline", set_compute_pipeline,
+    MeshletPso => "meshlet pipeline", set_meshlet_pipeline,
+);
+
 /// Transient command buffer. Created, recorded, submitted, auto-reclaimed.
 pub struct CommandBuffer {
     pub(crate) inner: CommandBufferInner,
@@ -140,35 +159,19 @@ impl CommandBuffer {
         assert!(same, "{resource} belongs to a different device");
     }
 
-    /// Begin a render pass.
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.begin_render_pass(desc))
     }
 
-    /// End dynamic rendering.
     pub fn end_render_pass(&mut self) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.end_render_pass())
     }
 
-    /// Set the active graphics pipeline.
-    pub fn set_graphics_pipeline(&mut self, pso: &GraphicsPso) {
-        self.assert_same_device(&pso._owner, "graphics pipeline");
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_graphics_pipeline(pso))
+    /// Bind a pipeline. Its type selects which draw or dispatch calls are then valid.
+    pub fn set_pipeline<P: Pipeline>(&mut self, pso: &P) {
+        pso.bind_to(self);
     }
 
-    /// Set the active compute pipeline.
-    pub fn set_compute_pipeline(&mut self, pso: &ComputePso) {
-        self.assert_same_device(&pso._owner, "compute pipeline");
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_compute_pipeline(pso))
-    }
-
-    /// Set the active mesh pipeline.
-    pub fn set_meshlet_pipeline(&mut self, pso: &MeshletPso) {
-        self.assert_same_device(&pso._owner, "meshlet pipeline");
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_meshlet_pipeline(pso))
-    }
-
-    /// Set depth-stencil state.
     pub fn set_depth_stencil_state(&mut self, state: &DepthStencilState) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_depth_stencil_state(state))
     }
@@ -181,7 +184,7 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_compute_root(root.cast()))
     }
 
-    /// Draw non-indexed geometry using `root` as the shared vertex/fragment root.
+    /// `root` is shared by the vertex and pixel stages.
     pub fn draw<R: ?Sized>(
         &mut self,
         root: GpuPtr<R>,
@@ -195,7 +198,6 @@ impl CommandBuffer {
             cmd.draw(vertex_count, instance_count, first_vertex, first_instance))
     }
 
-    /// Draw indexed geometry.
     pub fn draw_indexed<R: ?Sized>(
         &mut self,
         root: GpuPtr<R>,
@@ -208,13 +210,12 @@ impl CommandBuffer {
             cmd.draw_indexed(indices.cast(), index_count, instance_count))
     }
 
-    /// Dispatch compute work.
     pub fn dispatch<R: ?Sized>(&mut self, root: GpuPtr<R>, x: u32, y: u32, z: u32) {
         self.set_compute_root(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch(x, y, z))
     }
 
-    /// Dispatch compute work from GPU arguments.
+    /// Indirect dispatch.
     pub fn dispatch_indirect<R: ?Sized>(
         &mut self,
         root: GpuPtr<R>,
@@ -224,7 +225,13 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch_indirect(args.cast()))
     }
 
-    /// Draw indexed geometry from GPU arguments.
+    /// Indirect draw.
+    pub fn draw_indirect<R: ?Sized>(&mut self, root: GpuPtr<R>, args: GpuPtr<DrawIndirectArgs>) {
+        self.set_root_data(root);
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indirect(args.cast()))
+    }
+
+    /// Indirect indexed draw.
     pub fn draw_indexed_indirect<R: ?Sized>(
         &mut self,
         root: GpuPtr<R>,
@@ -235,12 +242,11 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indexed_indirect(indices.cast(), args.cast()))
     }
 
-    /// Copy bytes between two GPU pointers.
     pub fn memcpy<D: ?Sized, S: ?Sized>(&mut self, dst: GpuPtr<D>, src: GpuPtr<S>, size: u64) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.memcpy(dst.cast(), src.cast(), size))
     }
 
-    /// Copy a tightly-packed buffer into the base mip and first layer of a texture.
+    /// Base mip and first layer only.
     pub fn copy_buffer_to_texture<S: ?Sized>(
         &mut self,
         src: GpuPtr<S>,
@@ -250,9 +256,7 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_buffer_to_texture(texture.gpu_address, src.cast(), texture))
     }
 
-    /// Copy the base mip and first layer of a texture into a tightly-packed buffer.
-    ///
-    /// This is the common-case spelling and derives the placement address from `texture`.
+    /// Base mip and first layer only.
     pub fn copy_texture_to_buffer<D: ?Sized>(
         &mut self,
         texture: &crate::texture::Texture,
@@ -262,12 +266,10 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_texture_to_buffer(dst.cast(), texture.gpu_address, texture))
     }
 
-    /// Stage-only global barrier.
     pub fn barrier(&mut self, src: StageFlags, dst: StageFlags) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.barrier(src, dst))
     }
 
-    /// Stage barrier with hazard flags.
     pub fn barrier_with_hazard(&mut self, src: StageFlags, dst: StageFlags, hazard: HazardFlags) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.barrier_with_hazard(src, dst, hazard))
     }
@@ -285,7 +287,6 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.wait_before(dst, hazard))
     }
 
-    /// Set viewport.
     pub fn set_viewport(
         &mut self,
         x: f32,
@@ -299,12 +300,11 @@ impl CommandBuffer {
             cmd.set_viewport(x, y, width, height, min_depth, max_depth))
     }
 
-    /// Set scissor rect.
     pub fn set_scissor(&mut self, x: i32, y: i32, width: u32, height: u32) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_scissor(x, y, width, height))
     }
 
-    /// Reset a timestamp pool outside a render pass.
+    /// Must be outside a render pass.
     pub fn reset_queries(&mut self, pool: &QueryPool) {
         self.assert_same_device(&pool._owner, "query pool");
         match (&mut self.inner, &pool.inner) {
@@ -319,7 +319,7 @@ impl CommandBuffer {
         }
     }
 
-    /// Write a timestamp outside a render pass.
+    /// Must be outside a render pass.
     pub fn write_timestamp(&mut self, pool: &QueryPool, query: u32) {
         self.assert_same_device(&pool._owner, "query pool");
         match (&mut self.inner, &pool.inner) {
@@ -336,7 +336,7 @@ impl CommandBuffer {
         }
     }
 
-    /// Transition a swapchain image to present-ready layout.
+    /// No-op on Metal, which transitions on present.
     pub fn transition_to_present(&mut self, _swapchain_image_index: u32) {
         match &mut self.inner {
             #[cfg(feature = "vulkan")]
@@ -363,13 +363,12 @@ impl CommandBuffer {
         }
     }
 
-    /// Draw mesh tasks using the active mesh pipeline.
     pub fn draw_meshlets<R: ?Sized>(&mut self, root: GpuPtr<R>, x: u32, y: u32, z: u32) {
         self.set_root_data(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets(x, y, z))
     }
 
-    /// Draw mesh tasks from GPU arguments.
+    /// Indirect mesh draw.
     pub fn draw_meshlets_indirect<R: ?Sized>(
         &mut self,
         root: GpuPtr<R>,
@@ -379,13 +378,12 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets_indirect(args.cast()))
     }
 
-    /// Build a BLAS. `accel` must come from `device.create_blas(desc)` with the same `desc`.
+    /// `accel` must come from `device.create_blas` with this same `desc`.
     pub fn build_blas(&mut self, accel: &AccelerationStructure, desc: &BlasDesc) {
         self.assert_same_device(&accel._owner, "acceleration structure");
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.build_blas(accel, desc))
     }
 
-    /// Build a TLAS.
     pub fn build_tlas(&mut self, accel: &AccelerationStructure, desc: &TlasDesc) {
         self.assert_same_device(&accel._owner, "acceleration structure");
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.build_tlas(accel, desc))

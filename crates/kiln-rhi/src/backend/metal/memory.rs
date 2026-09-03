@@ -137,7 +137,7 @@ impl MetalBufferPool {
             buffer,
             heap: block.heap.clone(),
             size: length as u64,
-            is_shared: matches!(memory, MemoryType::Default | MemoryType::Readback),
+            is_shared: matches!(memory, MemoryType::Upload | MemoryType::Readback),
             pool,
             block_index,
             heap_offset,
@@ -212,7 +212,7 @@ impl MetalBufferPool {
 
 fn resource_options(memory: MemoryType) -> MTLResourceOptions {
     match memory {
-        MemoryType::Default => {
+        MemoryType::Upload => {
             MTLResourceOptions::StorageModeShared | MTLResourceOptions::CPUCacheModeWriteCombined
         }
         MemoryType::Readback => {

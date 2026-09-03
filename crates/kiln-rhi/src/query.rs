@@ -1,15 +1,7 @@
-//! GPU timestamp queries for profiling (e.g. per-frame GPU time).
+//! GPU timestamp queries.
 //!
-//! Record timestamps into a [`QueryPool`] on a command buffer with
-//! [`CommandBuffer::write_timestamp`](crate::CommandBuffer::write_timestamp), then once the GPU
-//! work has completed (e.g. the frame slot's fence has been waited) read the raw tick values back
-//! with [`Device::read_timestamps`](crate::Device::read_timestamps) and convert tick deltas to
-//! nanoseconds with [`Device::timestamp_period_ns`](crate::Device::timestamp_period_ns).
-//!
-//! On Vulkan this wraps a `VkQueryPool` (`VK_QUERY_TYPE_TIMESTAMP`); on Metal an `MTL4CounterHeap`
-//! of type `Timestamp`. Pools are freed explicitly with
-//! [`Device::destroy_query_pool`](crate::Device::destroy_query_pool); the backend device also
-//! reclaims any forgotten pools during teardown.
+//! `cmd.write_timestamp` records into a pool; once the work has completed,
+//! `device.read_timestamps` returns raw ticks and `device.timestamp_period_ns` scales them.
 
 /// A pool of GPU timestamp query slots.
 pub struct QueryPool {
@@ -26,7 +18,6 @@ pub(crate) enum QueryPoolInner {
 }
 
 impl QueryPool {
-    /// Number of timestamp slots in this pool.
     pub fn count(&self) -> u32 {
         self.count
     }

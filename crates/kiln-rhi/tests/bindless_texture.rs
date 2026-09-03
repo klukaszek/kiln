@@ -57,11 +57,12 @@ fn bindless_texture_sample() {
 
     let src = format!("{}{}", Root::SLANG, BODY);
     let Some(vs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex)
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex, &[])
     else {
         return;
     };
-    let Some(fs) = kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel)
+    let Some(fs) =
+        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
     else {
         return;
     };
@@ -101,7 +102,7 @@ fn bindless_texture_sample() {
         .allocate_aligned(tex_sa.size, tex_sa.align, MemoryType::GpuOnly)
         .expect("tex mem");
     let texture = device
-        .create_texture(&tex_desc, tex_mem.ptr())
+        .create_texture(&tex_desc, tex_mem.gpu())
         .expect("create_texture");
 
     let staging = device
@@ -122,7 +123,7 @@ fn bindless_texture_sample() {
         .expect("create_sampler");
 
     let mut root = device
-        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Default)
+        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Upload)
         .expect("root");
     root.upload(&Root {
         tex: texture.gpu(),
@@ -147,7 +148,7 @@ fn bindless_texture_sample() {
         .allocate_aligned(rt_sa.size, rt_sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let rt = device
-        .create_texture(&rt_desc, rt_mem.ptr())
+        .create_texture(&rt_desc, rt_mem.gpu())
         .expect("create rt");
     let readback = device
         .allocate((SIZE * SIZE * 4) as u64, MemoryType::Readback)
@@ -174,7 +175,7 @@ fn bindless_texture_sample() {
             render_area: [0, 0, SIZE, SIZE],
             label: Some("bindless texture test"),
         });
-        cmd.set_graphics_pipeline(&pso);
+        cmd.set_pipeline(&pso);
         cmd.set_viewport(0.0, 0.0, SIZE as f32, SIZE as f32, 0.0, 1.0);
         cmd.set_scissor(0, 0, SIZE, SIZE);
         cmd.draw(root.gpu(), 3, 1, 0, 0);
@@ -209,12 +210,12 @@ fn bindless_texture_sample() {
         );
     }
 
-    device.free(root);
-    device.free(staging);
-    device.free(readback);
-    device.destroy_texture(texture);
-    device.free(tex_mem);
-    device.destroy_texture(rt);
-    device.free(rt_mem);
-    device.destroy_sampler(sampler);
+    device.destroy(root);
+    device.destroy(staging);
+    device.destroy(readback);
+    device.destroy(texture);
+    device.destroy(tex_mem);
+    device.destroy(rt);
+    device.destroy(rt_mem);
+    device.destroy(sampler);
 }

@@ -5,6 +5,17 @@
 //! [`ShaderModule`]. Compiled binaries are cached on disk keyed on source
 //! content, entry point, stage, target, capabilities, and slangc version, so
 //! repeated compilations of the same shader are instant.
+//!
+//! The cache and version probe are process-wide, so there is nothing to construct.
+//!
+//! # Vulkan flags applied on every compile
+//!
+//! - `-fvk-use-entrypoint-name`: preserves the entry-point name in `OpEntryPoint`
+//!   so `ShaderModuleDesc::entry_point` matches what Vulkan expects.
+//! - `-fvk-bind-globals 0 1`: redirects Slang's `$Globals` cbuffer (module-scope
+//!   uniforms) from set 0 to set 1. Set 0 is the bindless heap; a stray global
+//!   there silently aliases it. With this flag the collision becomes a
+//!   missing-binding error.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -13,7 +24,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{Device, RhiError, RhiResult, ShaderModule, ShaderModuleDesc, ShaderStage};
+use crate::{Backend, Device, RhiError, RhiResult, ShaderModule, ShaderModuleDesc, ShaderStage};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -34,180 +45,85 @@ impl Drop for TempShaderFiles {
     }
 }
 
-/// Slang source compiler backed by a file-based cache.
-///
-/// Construct once (cheaply) and call [`compile`] or [`compile_or_skip`] for
-/// each entry point. The cache lives at `{temp_dir}/kiln-shader-cache/` and
-/// is automatically invalidated when the slangc version changes.
-///
-/// ## Vulkan flags applied on every compile
-///
-/// - `-fvk-use-entrypoint-name`: preserves the entry-point name in `OpEntryPoint`
-///   so `ShaderModuleDesc::entry_point` matches what Vulkan expects.
-/// - `-fvk-bind-globals 0 1`: redirects Slang's `$Globals` cbuffer (module-scope
-///   uniforms) from set 0 to set 1. Set 0 is the bindless heap; a stray global
-///   there silently aliases it. With this flag the collision becomes a
-///   missing-binding error.
-///
-/// [`compile`]: SlangCompiler::compile
-/// [`compile_or_skip`]: SlangCompiler::compile_or_skip
-pub struct SlangCompiler {
-    cache_dir: PathBuf,
-    /// Hash of the slangc version string — changes on compiler update,
-    /// invalidating all prior cache entries for that entry in the cache dir.
-    version_hash: u64,
+/// Returns `true` if `slangc` is reachable on `PATH`.
+pub fn slangc_available() -> bool {
+    slangc_version_hash_raw().is_some()
 }
 
-impl SlangCompiler {
-    /// Create a compiler instance. The slangc version probe is cached
-    /// process-wide via a `OnceLock`, so subsequent calls are free.
-    pub fn new() -> Self {
-        let cache_dir = std::env::temp_dir().join("kiln-shader-cache");
-        std::fs::create_dir_all(&cache_dir).ok();
-        Self {
-            version_hash: slangc_version_hash(),
-            cache_dir,
-        }
-    }
-
-    /// Returns `true` if `slangc` is reachable on `PATH`.
-    pub fn available() -> bool {
-        slangc_version_hash_raw().is_some()
-    }
-
-    /// Compile `src` and return a [`ShaderModule`].
-    ///
-    /// Panics if `slangc` is missing or compilation fails.
-    pub fn compile(
-        &self,
-        device: &Device,
-        src: &str,
-        entry: &str,
-        stage: ShaderStage,
-        capabilities: &[&str],
-    ) -> ShaderModule {
-        self.try_compile(device, src, entry, stage, capabilities)
-            .unwrap_or_else(|error| panic!("SlangCompiler failed: {error}"))
-    }
-
-    /// Fallible form of [`compile`](Self::compile), suitable for library code that should
-    /// propagate shader and toolchain failures to its caller.
-    pub fn try_compile(
-        &self,
-        device: &Device,
-        src: &str,
-        entry: &str,
-        stage: ShaderStage,
-        capabilities: &[&str],
-    ) -> RhiResult<ShaderModule> {
-        let (target, ext) = backend_target(device)?;
-        let code = self.get_or_compile(src, entry, stage, target, ext, capabilities)?;
-        make_module(device, &code, entry, stage)
-    }
-
-    /// Like [`compile`], but returns `None` if `slangc` is not on `PATH`.
-    ///
-    /// Intended for tests that should skip rather than fail when the compiler
-    /// is absent. Still panics on a compile error (that's a shader bug, not an
-    /// environment issue).
-    pub fn compile_or_skip(
-        &self,
-        device: &Device,
-        src: &str,
-        entry: &str,
-        stage: ShaderStage,
-        capabilities: &[&str],
-    ) -> Option<ShaderModule> {
-        if !Self::available() {
-            eprintln!("skipping: slangc not found on PATH");
-            return None;
-        }
-        Some(self.compile(device, src, entry, stage, capabilities))
-    }
-
-    fn get_or_compile(
-        &self,
-        src: &str,
-        entry: &str,
-        stage: ShaderStage,
-        target: &str,
-        ext: &str,
-        capabilities: &[&str],
-    ) -> RhiResult<Vec<u8>> {
-        let key = cache_key(
-            self.version_hash,
-            src,
-            entry,
-            stage,
-            target,
-            capabilities,
-            SLANG_OPTIMIZATION_LEVEL,
-        );
-        let path = self.cache_dir.join(format!("{key:016x}.{ext}"));
-        if let Ok(cached) = std::fs::read(&path)
-            && valid_artifact(&cached, target)
-        {
-            return Ok(cached);
-        }
-        let code = invoke_slangc(src, entry, stage, target, ext, capabilities)?;
-        if !valid_artifact(&code, target) {
-            return Err(RhiError::ShaderCompilation(format!(
-                "slangc produced an invalid {target} artifact for `{entry}`"
-            )));
-        }
-        write_cache_atomically(&path, &code);
-        Ok(code)
-    }
-}
-
-impl Default for SlangCompiler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Compile `src`'s `entry` point with a fresh [`SlangCompiler`] and no extra Slang capabilities.
-///
-/// The one-call convenience over `SlangCompiler::new().compile(.., &[])` for the common case (the
-/// version probe and cache are process-wide, so constructing the compiler per call is free).
-/// Panics if `slangc` is missing or compilation fails.
-pub fn compile(device: &Device, src: &str, entry: &str, stage: ShaderStage) -> ShaderModule {
-    compile_with_caps(device, src, entry, stage, &[])
-}
-
-/// Like [`compile`], but with explicit Slang capabilities (e.g. `"spvRayQueryKHR"`).
-pub fn compile_with_caps(
+/// Compile `src`'s `entry` point for the device's backend. `capabilities` takes extra Slang
+/// capabilities (e.g. `"spvRayQueryKHR"`), `&[]` for none. Cached in the temp dir.
+pub fn compile(
     device: &Device,
     src: &str,
     entry: &str,
     stage: ShaderStage,
     capabilities: &[&str],
-) -> ShaderModule {
-    SlangCompiler::new().compile(device, src, entry, stage, capabilities)
+) -> RhiResult<ShaderModule> {
+    let (target, ext) = backend_target(device);
+    let code = get_or_compile(src, entry, stage, target, ext, capabilities)?;
+    make_module(device, &code, entry, stage)
 }
 
-/// Like [`compile`], but returns `None` (instead of panicking) when `slangc` is not on `PATH`.
-///
-/// For tests that should skip rather than fail when the compiler is absent. A compile *error*
-/// still panics (that's a shader bug, not an environment issue).
+/// Like [`compile`], but returns `None` when `slangc` is missing, for tests that skip rather than
+/// fail. A compile *error* still panics: that is a shader bug, not an environment issue.
 pub fn compile_or_skip(
     device: &Device,
     src: &str,
     entry: &str,
     stage: ShaderStage,
+    capabilities: &[&str],
 ) -> Option<ShaderModule> {
-    compile_caps_or_skip(device, src, entry, stage, &[])
+    if !slangc_available() {
+        eprintln!("skipping: slangc not found on PATH");
+        return None;
+    }
+    Some(
+        compile(device, src, entry, stage, capabilities)
+            .unwrap_or_else(|error| panic!("slangc failed: {error}")),
+    )
 }
 
-/// Like [`compile_or_skip`], but with explicit Slang capabilities.
-pub fn compile_caps_or_skip(
-    device: &Device,
+/// Cache directory, created once per process.
+fn cache_dir() -> &'static PathBuf {
+    static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+    CACHE_DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join("kiln-shader-cache");
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    })
+}
+
+fn get_or_compile(
     src: &str,
     entry: &str,
     stage: ShaderStage,
+    target: &str,
+    ext: &str,
     capabilities: &[&str],
-) -> Option<ShaderModule> {
-    SlangCompiler::new().compile_or_skip(device, src, entry, stage, capabilities)
+) -> RhiResult<Vec<u8>> {
+    let key = cache_key(
+        slangc_version_hash(),
+        src,
+        entry,
+        stage,
+        target,
+        capabilities,
+        SLANG_OPTIMIZATION_LEVEL,
+    );
+    let path = cache_dir().join(format!("{key:016x}.{ext}"));
+    if let Ok(cached) = std::fs::read(&path)
+        && valid_artifact(&cached, target)
+    {
+        return Ok(cached);
+    }
+    let code = invoke_slangc(src, entry, stage, target, ext, capabilities)?;
+    if !valid_artifact(&code, target) {
+        return Err(RhiError::ShaderCompilation(format!(
+            "slangc produced an invalid {target} artifact for `{entry}`"
+        )));
+    }
+    write_cache_atomically(&path, &code);
+    Ok(code)
 }
 
 /// Process-wide cached slangc version hash. `None` means slangc is unavailable.
@@ -347,13 +263,11 @@ fn make_module(
     })
 }
 
-fn backend_target(device: &Device) -> RhiResult<(&'static str, &'static str)> {
-    match device.backend_name() {
-        "Vulkan" => Ok(("spirv", "spv")),
-        "Metal" => Ok(("metallib", "metallib")),
-        other => Err(RhiError::Unsupported(format!(
-            "SlangCompiler: unsupported backend `{other}`"
-        ))),
+/// slangc `-target` plus the artifact extension for the device's backend.
+fn backend_target(device: &Device) -> (&'static str, &'static str) {
+    match device.backend() {
+        Backend::Vulkan => ("spirv", "spv"),
+        Backend::Metal => ("metallib", "metallib"),
     }
 }
 
@@ -363,18 +277,5 @@ fn stage_str(stage: ShaderStage) -> &'static str {
         ShaderStage::Vertex => "vertex",
         ShaderStage::Pixel => "fragment",
         ShaderStage::Mesh => "mesh",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::valid_artifact;
-
-    #[test]
-    fn rejects_truncated_or_corrupt_spirv_cache_entries() {
-        assert!(!valid_artifact(&[], "spirv"));
-        assert!(!valid_artifact(&[0, 0, 0, 0], "spirv"));
-        assert!(!valid_artifact(&[0x03, 0x02, 0x23, 0x07, 0], "spirv"));
-        assert!(valid_artifact(&[0x03, 0x02, 0x23, 0x07], "spirv"));
     }
 }

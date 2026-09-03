@@ -89,7 +89,7 @@ impl PathTracer {
         let root = self.frame_arenas.upload(
             ctx.slot,
             &DisplayRoot {
-                film: accum.ptr(),
+                film: accum.gpu().cast(),
                 display_width: ctx.extent.x,
                 display_height: ctx.extent.y,
                 film_width: film.x,
@@ -103,7 +103,7 @@ impl PathTracer {
             },
         );
 
-        cmd.set_graphics_pipeline(&self.pipelines.display);
+        cmd.set_pipeline(&self.pipelines.display);
         cmd.draw(root, 3, 1, 0, 0);
     }
 
@@ -129,7 +129,7 @@ impl PathTracer {
                 cam_up: camera.up,
                 cam_forward: camera.forward,
                 lens: camera.lens,
-                film: accum.ptr(),
+                film: accum.gpu().cast(),
                 triangles: resources.triangles.gpu(),
                 emissive_hits: resources.emissive_hits.gpu(),
                 instances: resources.instances.gpu(),
@@ -160,7 +160,7 @@ impl PathTracer {
             },
         );
 
-        cmd.set_compute_pipeline(&self.pipelines.trace);
+        cmd.set_pipeline(&self.pipelines.trace);
         let stride = self.schedule.pixel_stride;
         cmd.dispatch(
             root,
@@ -179,13 +179,13 @@ impl PathTracer {
         let root = self.frame_arenas.upload(
             ctx.slot,
             &ClearRoot {
-                film: accum.ptr(),
+                film: accum.gpu().cast(),
                 count: float_count,
                 _pad: 0,
             },
         );
 
-        cmd.set_compute_pipeline(&self.pipelines.clear);
+        cmd.set_pipeline(&self.pipelines.clear);
         cmd.dispatch(root, float_count.div_ceil(CLEAR_THREADS), 1, 1);
         // Each pipeline switch opens a new compute encoder. Including the
         // pixel stage forces a queue-scoped barrier, ordering both the trace

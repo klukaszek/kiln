@@ -2,6 +2,7 @@
 
 mod common;
 
+use kiln_rhi::Backend;
 use kiln_rhi::{AllocationDesc, Device, DeviceDesc, MemoryType};
 
 /// Device creation exposes a usable backend and bindless mode.
@@ -21,12 +22,11 @@ fn device_creation_and_properties() {
     };
     eprintln!("    ⏱  Device::new: {}", common::fmt_dur(start.elapsed()));
     eprintln!(
-        "    backend={}  bindless={:?}  clip_space_y={:?}",
-        device.backend_name(),
+        "    backend={}  bindless={:?}",
+        device.backend(),
         device.bindless_mode(),
-        device.clip_space_y()
     );
-    assert!(!device.backend_name().is_empty());
+    assert!(matches!(device.backend(), Backend::Vulkan | Backend::Metal));
 }
 
 /// Owning resources retain the backend device, so ordinary Rust drop order cannot make their
@@ -40,8 +40,9 @@ fn resources_may_outlive_the_device_handle() {
     let allocation = device
         .create_allocation(&AllocationDesc {
             size: 256,
-            memory: MemoryType::Default,
+            memory: MemoryType::Upload,
             label: Some("device-lifetime-buffer".into()),
+            ..Default::default()
         })
         .expect("allocation");
     let queries = device.create_query_pool(2).expect("query pool");

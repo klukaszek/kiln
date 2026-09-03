@@ -15,8 +15,9 @@ impl FrameArenas {
         for slot in 0..MAX_FRAMES_IN_FLIGHT {
             match device.create_allocation(&AllocationDesc {
                 size,
-                memory: MemoryType::Default,
+                memory: MemoryType::Upload,
                 label: Some(format!("{label}-{slot}")),
+                ..Default::default()
             }) {
                 Ok(buffer) => slots.push(BumpAllocator::new(buffer)),
                 Err(error) => {
@@ -36,9 +37,10 @@ impl FrameArenas {
     pub(crate) fn upload<T: GpuPod>(&mut self, slot: usize, value: &T) -> GpuPtr<T> {
         let allocation = self.0[slot]
             .alloc(std::mem::size_of::<T>() as u64, ROOT_ALIGNMENT)
-            .expect("frame arena exhausted");
-        allocation.upload(value).expect("upload frame data");
-        allocation.gpu.cast()
+            .expect("frame arena exhausted")
+            .cast::<T>();
+        allocation.write(value).expect("upload frame data");
+        allocation.gpu()
     }
 
     pub(crate) fn destroy(self, device: &Device) {
@@ -48,6 +50,6 @@ impl FrameArenas {
 
 fn destroy_slots(device: &Device, slots: impl IntoIterator<Item = BumpAllocator>) {
     for slot in slots {
-        device.destroy_allocation(slot.into_allocation());
+        device.destroy(slot.into_allocation());
     }
 }

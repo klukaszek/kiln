@@ -145,8 +145,6 @@ pub struct MetalDevice {
     /// Free list of table slots for non-swapchain command buffers.
     table_slot_pool: SharedTableSlotPool,
     bindless_mode: BindlessMode,
-    /// Monotonic counter for AccelerationStructureId assignment.
-    accel_counter: RefCell<u32>,
 }
 
 pub struct MetalQueue {
@@ -165,7 +163,7 @@ impl MetalQueue {
     }
 
     /// Release a resource's storage immediately. The caller guarantees the GPU is done with it
-    /// (see `Device::destroy_allocation`); the freed slot is reusable by the next create.
+    /// (see `Device::destroy`); the freed slot is reusable by the next create.
     pub(crate) fn release_resource(&self, resource: MetalRetiredResource) {
         match &resource {
             MetalRetiredResource::Buffer(buffer) => {
@@ -431,11 +429,6 @@ impl MetalDevice {
 
         log::info!("Metal device created: {}", device.name());
 
-        if desc.bindless_mode == Some(BindlessMode::DescriptorBuffer) {
-            return Err(RhiError::Unsupported(
-                "Metal requires argument-table bindless mode".into(),
-            ));
-        }
         let bindless_mode = BindlessMode::ArgumentTable;
 
         let create_heap = |len: usize, label: &str| {
@@ -502,7 +495,6 @@ impl MetalDevice {
             frame_table_slots,
             table_slot_pool: Rc::new(RefCell::new(Vec::new())),
             bindless_mode,
-            accel_counter: RefCell::new(0),
         };
 
         Ok(device)
@@ -739,6 +731,9 @@ impl MetalDevice {
         }
         if desc.usage.contains(TextureUsage::DEPTH_STENCIL_ATTACHMENT) {
             usage |= MtlTextureUsage::RenderTarget;
+        }
+        if desc.usage.contains(TextureUsage::FORMAT_VIEW) {
+            usage |= MtlTextureUsage::PixelFormatView;
         }
 
         unsafe {
@@ -1014,11 +1009,6 @@ impl MetalDevice {
         let topology = match desc.topology {
             Topology::TriangleList => objc2_metal::MTLPrimitiveType::Triangle,
             Topology::TriangleStrip => objc2_metal::MTLPrimitiveType::TriangleStrip,
-            // Metal has no native TriangleFan; use TriangleList instead.
-            Topology::TriangleFan => panic!(
-                "TriangleFan is not supported on Metal. \
-                 Rewrite fan indices to TriangleList before creating this PSO."
-            ),
         };
 
         Ok(GraphicsPso {
@@ -1123,9 +1113,8 @@ impl MetalDevice {
         for (i, target) in desc.color_targets.iter().enumerate() {
             let att = unsafe { pipeline_desc.colorAttachments().objectAtIndexedSubscript(i) };
             att.setPixelFormat(super::texture::format_to_mtl(target.format));
-            let mut blend_att = blend.attachments.get(i).cloned().unwrap_or_default();
-            blend_att.write_mask &= target.write_mask;
-            super::pipeline::apply_blend_to_attachment(att.as_ref(), blend_att);
+            let blend_att = blend.attachments.get(i).cloned().unwrap_or_default();
+            super::pipeline::apply_blend_to_attachment(att.as_ref(), blend_att, target.write_mask);
         }
 
         let base_desc: &MTL4PipelineDescriptor = pipeline_desc.as_ref();
@@ -1256,8 +1245,7 @@ impl MetalDevice {
     }
 
     /// Allocate the acceleration structure + scratch buffer for `sizes`, register both
-    /// with the residency set, query the GPU resource ID, mint an `AccelerationStructureId`,
-    /// and wrap into the public handle. Shared by `create_blas` / `create_tlas`.
+    /// with the residency set and query the GPU resource ID. Shared by `create_blas`/`create_tlas`.
     fn finalize_accel_structure(
         &self,
         sizes: objc2_metal::MTLAccelerationStructureSizes,
@@ -1294,15 +1282,7 @@ impl MetalDevice {
 
         let gpu_resource_id = accel.gpuResourceID().to_raw();
 
-        let id = {
-            let mut counter = self.accel_counter.borrow_mut();
-            let next = *counter;
-            *counter += 1;
-            AccelerationStructureId(next)
-        };
-
         Ok(AccelerationStructure {
-            id,
             inner: AccelInner::Metal(Box::new(MetalAccelerationStructure {
                 acceleration_structure: accel,
                 gpu_resource_id,

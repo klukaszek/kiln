@@ -43,8 +43,10 @@ struct TriangleMesh {
 
 impl Example for TriangleMesh {
     fn new(device: &Device, color_format: Format) -> Self {
-        let ms = kiln_rhi::compiler::compile(device, TRI_BODY, "msMain", ShaderStage::Mesh);
-        let fs = kiln_rhi::compiler::compile(device, TRI_BODY, "fsMain", ShaderStage::Pixel);
+        let ms = kiln_rhi::compiler::compile(device, TRI_BODY, "msMain", ShaderStage::Mesh, &[])
+            .expect("shader compilation");
+        let fs = kiln_rhi::compiler::compile(device, TRI_BODY, "fsMain", ShaderStage::Pixel, &[])
+            .expect("shader compilation");
 
         let pso = device
             .create_meshlet_pso(
@@ -56,7 +58,6 @@ impl Example for TriangleMesh {
                     sample_count: SampleCount::S1,
                     alpha_to_coverage: false,
                     cull: Cull::None,
-                    support_dual_source_blending: false,
                     blendstate: None,
                     label: Some("triangle-mesh".into()),
                 },
@@ -72,7 +73,7 @@ impl Example for TriangleMesh {
     }
 
     fn render(&mut self, _ctx: &FrameCtx, cmd: &mut CommandBuffer) {
-        cmd.set_meshlet_pipeline(&self.pso);
+        cmd.set_pipeline(&self.pso);
         cmd.draw_meshlets(GpuPtr::<u8>::NULL, 1, 1, 1);
     }
 }

@@ -676,6 +676,24 @@ impl MetalCommandBuffer {
         }
     }
 
+    pub fn draw_indirect(&mut self, args: GpuPtr<u8>) {
+        let arg_addr_gpu: MTLGPUAddress = args.address;
+        let root_table = self.current_root_table;
+        let topology = self.current_topology;
+        self.bind_root_table(root_table);
+        let encoder = self
+            .render_encoder
+            .as_ref()
+            .expect("No active render encoder");
+        unsafe {
+            encoder.setArgumentTable_atStages(
+                &self.argument_table,
+                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+            );
+            encoder.drawPrimitives_indirectBuffer(topology, arg_addr_gpu);
+        }
+    }
+
     pub fn draw_indexed_indirect(&mut self, indices: GpuPtr<u8>, args: GpuPtr<u8>) {
         let index_addr_gpu: MTLGPUAddress = indices.address;
         // The GPU supplies the count, so bound the address range by the allocation remainder.
@@ -1048,7 +1066,7 @@ impl MetalCommandBuffer {
         );
     }
 
-    /// Draw using the bound mesh-shader pipeline. Pipeline must be set via `set_meshlet_pipeline`.
+    /// Draw using the bound mesh-shader pipeline, set via `CommandBuffer::set_pipeline`.
     pub fn draw_meshlets(&mut self, x: u32, y: u32, z: u32) {
         use objc2_metal::MTL4RenderCommandEncoder as _;
         let tg_obj = self.current_mesh_tpg_object;
@@ -1072,7 +1090,7 @@ impl MetalCommandBuffer {
         );
     }
 
-    /// Indirect mesh draw. Pipeline must be set via `set_meshlet_pipeline`.
+    /// Indirect mesh draw. Pipeline must be set via `CommandBuffer::set_pipeline`.
     /// `args` points to one indirect mesh dispatch command.
     pub fn draw_meshlets_indirect(&mut self, args: GpuPtr<u8>) {
         use objc2_metal::MTL4RenderCommandEncoder as _;

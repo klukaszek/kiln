@@ -11,9 +11,8 @@ pub enum ShaderStage {
 
 /// A compiled shader module.
 ///
-/// Owns its backend resource and is passed by reference to `create_*_pso`
-/// (matching `gpuCreateGraphicsPipeline(vertexIR, pixelIR, desc)` in the spec — shaders
-/// are arguments to pipeline creation, not fields of the raster desc).
+/// Passed by reference to `create_*_pso`: shaders are arguments to pipeline creation, not fields
+/// of [`RasterPsoDesc`](crate::RasterPsoDesc). The stage is checked against the slot.
 pub struct ShaderModule {
     pub(crate) inner: ShaderModuleInner,
     pub(crate) stage: ShaderStage,

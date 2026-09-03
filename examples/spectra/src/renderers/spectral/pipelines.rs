@@ -41,13 +41,14 @@ impl Pipelines {
             sampler::source(),
             integrator::source(spectrum_len)
         );
-        let trace_shader = kiln_rhi::compiler::compile_with_caps(
+        let trace_shader = kiln_rhi::compiler::compile(
             device,
             &trace_source,
             "traceMain",
             ShaderStage::Compute,
             &["spvRayQueryKHR"],
-        );
+        )
+        .expect("shader compilation");
         let trace = device.create_compute_pso(
             &ComputePsoDesc {
                 threads_per_threadgroup: [integrator::THREADS_X, integrator::THREADS_Y, 1],
@@ -57,8 +58,14 @@ impl Pipelines {
         )?;
 
         let clear_source = format!("{}{}", ClearRoot::SLANG, CLEAR_SOURCE);
-        let clear_shader =
-            kiln_rhi::compiler::compile(device, &clear_source, "clearMain", ShaderStage::Compute);
+        let clear_shader = kiln_rhi::compiler::compile(
+            device,
+            &clear_source,
+            "clearMain",
+            ShaderStage::Compute,
+            &[],
+        )
+        .expect("shader compilation");
         let clear = device.create_compute_pso(
             &ComputePsoDesc {
                 threads_per_threadgroup: [CLEAR_THREADS, 1, 1],
@@ -68,10 +75,22 @@ impl Pipelines {
         )?;
 
         let display_source = format!("{}{}", DisplayRoot::SLANG, display::source());
-        let display_vs =
-            kiln_rhi::compiler::compile(device, &display_source, "displayVs", ShaderStage::Vertex);
-        let display_fs =
-            kiln_rhi::compiler::compile(device, &display_source, "displayFs", ShaderStage::Pixel);
+        let display_vs = kiln_rhi::compiler::compile(
+            device,
+            &display_source,
+            "displayVs",
+            ShaderStage::Vertex,
+            &[],
+        )
+        .expect("shader compilation");
+        let display_fs = kiln_rhi::compiler::compile(
+            device,
+            &display_source,
+            "displayFs",
+            ShaderStage::Pixel,
+            &[],
+        )
+        .expect("shader compilation");
         let display = device.create_graphics_pso(
             &GraphicsPsoDesc {
                 topology: Topology::TriangleList,
@@ -103,7 +122,7 @@ mod shader_source_tests {
 
     #[test]
     fn specialized_sources_compile() {
-        if !kiln_rhi::compiler::SlangCompiler::available() {
+        if !kiln_rhi::compiler::slangc_available() {
             return;
         }
 

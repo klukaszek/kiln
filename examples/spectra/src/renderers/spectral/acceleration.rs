@@ -102,11 +102,11 @@ impl SceneAccel {
             device.tlas_instance_stride() as u64 * scene.geometry.instances.len() as u64;
         let mut instance_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            match device.allocate(instance_buffer_size, MemoryType::Default) {
+            match device.allocate(instance_buffer_size, MemoryType::Upload) {
                 Ok(buffer) => instance_buffers.push(buffer),
                 Err(error) => {
                     for buffer in instance_buffers {
-                        device.free(buffer);
+                        device.destroy(buffer);
                     }
                     cleanup_partial(device, blases, ray_vertices, ray_indices, pending);
                     return Err(error.into());
@@ -117,7 +117,7 @@ impl SceneAccel {
             Ok(tlas) => tlas,
             Err(error) => {
                 for buffer in instance_buffers {
-                    device.free(buffer);
+                    device.destroy(buffer);
                 }
                 cleanup_partial(device, blases, ray_vertices, ray_indices, pending);
                 return Err(error);
@@ -192,7 +192,7 @@ impl SceneAccel {
         drop(retired_tlas);
         drop(blases);
         for instance_buffer in instance_buffers {
-            device.free(instance_buffer);
+            device.destroy(instance_buffer);
         }
         for vertices in ray_vertices {
             vertices.destroy(device);
@@ -218,7 +218,7 @@ fn cleanup_partial(
         indices.destroy(device);
     }
     for allocation in pending.into_iter().flatten() {
-        device.free(allocation);
+        device.destroy(allocation);
     }
 }
 
@@ -293,7 +293,7 @@ fn build_tlas(
         }
     }
     let desc = TlasDesc {
-        instance_buffer: instance_buffer.ptr(),
+        instance_buffer: instance_buffer.gpu().cast(),
         instance_count: scene.geometry.instances.len() as u32,
         flags: BuildAccelFlags::PREFER_FAST_TRACE,
     };

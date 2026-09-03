@@ -10,12 +10,12 @@ use crate::pipeline::{
 use crate::query::QueryPool;
 use crate::queue::Queue;
 use crate::sampler::{Sampler, SamplerDesc};
-use crate::shader::{ShaderModule, ShaderModuleDesc, ShaderModuleInner};
+use crate::shader::{ShaderModule, ShaderModuleDesc, ShaderModuleInner, ShaderStage};
 use crate::surface::{Surface, SurfaceDesc};
 use crate::swapchain::{Swapchain, SwapchainDesc};
 use crate::sync::TimelineSemaphore;
 use crate::texture::{Texture, TextureDesc, TextureSizeAlign, TextureViewDesc};
-use crate::types::{BlasDesc, ClipSpaceY, GpuPtr, TlasDesc, TlasInstance};
+use crate::types::{BlasDesc, GpuPtr, TlasDesc, TlasInstance};
 use std::rc::Rc;
 
 /// Which GPU backend to use.
@@ -47,15 +47,10 @@ impl std::fmt::Display for Backend {
 
 /// Description for creating a device.
 pub struct DeviceDesc {
-    /// Enable validation/debug layers.
     pub validation: bool,
     pub label: Option<String>,
     /// Preferred backend. `None` uses the default for the platform.
     pub preferred_backend: Option<Backend>,
-    /// Preferred bindless mode. `None` lets the backend choose the best available mode.
-    /// Vulkan requires descriptor buffers and mutable image descriptors; device creation fails if
-    /// either is unavailable.
-    pub bindless_mode: Option<BindlessMode>,
 }
 
 impl Default for DeviceDesc {
@@ -64,7 +59,6 @@ impl Default for DeviceDesc {
             validation: cfg!(debug_assertions),
             label: None,
             preferred_backend: None,
-            bindless_mode: None,
         }
     }
 }
@@ -119,10 +113,75 @@ impl_device_owned!(
     TimelineSemaphore,
 );
 
+use crate::sealed;
+
+/// A resource released through [`Device::destroy`].
+///
+/// [`Allocation`], [`Texture`], [`Sampler`] and [`QueryPool`] hold storage and heap slots the RHI
+/// reclaims only here, so dropping one leaks. The rest free on drop; `destroy` just pins when.
+pub trait DeviceResource: sealed::Sealed + Sized {
+    #[doc(hidden)]
+    fn destroy_on(self, device: &Device);
+}
+
+/// Freed by their own `Drop`; `destroy` only checks provenance and pins the release point.
+macro_rules! impl_destroy_by_drop {
+    ($($ty:ty => $kind:literal),+ $(,)?) => {
+        $(
+            impl DeviceResource for $ty {
+                fn destroy_on(self, device: &Device) {
+                    device.assert_owns(&self, $kind);
+                }
+            }
+        )+
+    };
+}
+
+impl_destroy_by_drop!(
+    AccelerationStructure => "acceleration structure",
+    CommandBuffer => "command buffer",
+    ComputePso => "compute pipeline",
+    GraphicsPso => "graphics pipeline",
+    MeshletPso => "meshlet pipeline",
+    ShaderModule => "shader module",
+    Surface => "surface",
+    Swapchain => "swapchain",
+    TimelineSemaphore => "timeline semaphore",
+);
+
+impl DeviceResource for Allocation {
+    fn destroy_on(self, device: &Device) {
+        device.assert_owns(&self, "allocation");
+        backend_dispatch!(device.inner.as_ref(), DeviceInner, d => d.destroy_allocation(self))
+    }
+}
+
+impl DeviceResource for Texture {
+    fn destroy_on(mut self, device: &Device) {
+        device.assert_owns(&self, "texture");
+        for id in self.views.drain(..) {
+            backend_dispatch!(device.inner.as_ref(), DeviceInner, d => d.destroy_texture_view(id));
+        }
+        backend_dispatch!(device.inner.as_ref(), DeviceInner, d => d.destroy_texture(self))
+    }
+}
+
+impl DeviceResource for Sampler {
+    fn destroy_on(self, device: &Device) {
+        device.assert_owns(&self, "sampler");
+        backend_dispatch!(device.inner.as_ref(), DeviceInner, d => d.destroy_sampler(self))
+    }
+}
+
+impl DeviceResource for QueryPool {
+    fn destroy_on(self, device: &Device) {
+        device.assert_owns(&self, "query pool");
+        backend_dispatch!(device.inner.as_ref(), DeviceInner, d => d.destroy_query_pool(self))
+    }
+}
+
 impl Device {
-    /// Create a new device, selecting the backend based on `desc.preferred_backend`.
-    ///
-    /// If no preference is given, defaults to Vulkan (if available) then Metal.
+    /// Selects `desc.preferred_backend`, else Vulkan if compiled in, else Metal.
     pub fn new(desc: &DeviceDesc) -> RhiResult<Self> {
         let backend = desc.preferred_backend.unwrap_or(Self::default_backend());
 
@@ -183,6 +242,19 @@ impl Device {
         );
     }
 
+    /// Both backends key entry points by name alone, so a module in the wrong slot otherwise
+    /// fails deep inside pipeline compilation without naming the mistake.
+    fn ensure_stage(module: &ShaderModule, expected: ShaderStage) -> RhiResult<()> {
+        if module.stage == expected {
+            Ok(())
+        } else {
+            Err(RhiError::PipelineCreation(format!(
+                "expected a {expected:?} shader module, got {:?}",
+                module.stage
+            )))
+        }
+    }
+
     /// The default backend for this build.
     fn default_backend() -> Backend {
         #[cfg(feature = "vulkan")]
@@ -199,33 +271,25 @@ impl Device {
         }
     }
 
-    /// The name of the active backend (e.g. "Vulkan", "Metal").
-    pub fn backend_name(&self) -> &'static str {
+    pub fn backend(&self) -> Backend {
         match self.inner.as_ref() {
             #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(_) => "Vulkan",
+            DeviceInner::Vulkan(_) => Backend::Vulkan,
             #[cfg(feature = "metal")]
-            DeviceInner::Metal(_) => "Metal",
+            DeviceInner::Metal(_) => Backend::Metal,
         }
     }
 
-    /// The active bindless mode selected by the backend.
+    /// Determined by the backend.
     pub fn bindless_mode(&self) -> BindlessMode {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.bindless_mode())
     }
 
-    /// Clip-space Y convention. The RHI normalizes both backends to Y-up.
-    pub fn clip_space_y(&self) -> ClipSpaceY {
-        ClipSpaceY::Up
-    }
-
-    /// Create a presentation surface from raw window handles.
     pub fn create_surface(&self, desc: &SurfaceDesc) -> RhiResult<Surface> {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_surface(desc))
             .map(|resource| self.own(resource))
     }
 
-    /// Create a swapchain for the given surface.
     pub fn create_swapchain(
         &self,
         surface: &Surface,
@@ -236,7 +300,7 @@ impl Device {
             .map(|resource| self.own(resource))
     }
 
-    /// Recreate swapchain (on resize).
+    /// On resize.
     pub fn recreate_swapchain(
         &self,
         swapchain: &mut Swapchain,
@@ -246,70 +310,57 @@ impl Device {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.recreate_swapchain(swapchain, desc))
     }
 
-    /// Create an allocation with an explicit description.
+    /// The canonical allocation path; [`allocate`](Self::allocate) and
+    /// [`allocate_aligned`](Self::allocate_aligned) are shorthands over it.
     pub fn create_allocation(&self, desc: &AllocationDesc) -> RhiResult<Allocation> {
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_allocation(desc))
-            .map(|resource| self.own(resource))
-    }
-
-    /// Allocate GPU memory with the default 16-byte address alignment.
-    pub fn allocate(&self, size: u64, memory: MemoryType) -> RhiResult<Allocation> {
-        self.allocate_aligned(size, 16, memory)
-    }
-
-    /// Allocate GPU memory with explicit alignment.
-    pub fn allocate_aligned(
-        &self,
-        size: u64,
-        align: u64,
-        memory: MemoryType,
-    ) -> RhiResult<Allocation> {
+        let align = desc.align;
         if !align.is_power_of_two() {
             return Err(RhiError::AllocationFailed(format!(
                 "allocation alignment {align} is not a non-zero power of two"
             )));
         }
 
-        let backing_size = aligned_backing_size(size, align)?;
-        let mut allocation = self.create_allocation(&AllocationDesc {
-            size: backing_size,
+        // Over-allocate so an aligned address exists inside, then point the handle at it.
+        // `size` still reports what was asked for, keeping bounds checks in usable terms.
+        let backing = AllocationDesc {
+            size: aligned_backing_size(desc.size, align)?,
+            ..desc.clone()
+        };
+        let mut allocation =
+            backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_allocation(&backing))
+                .map(|resource| self.own(resource))?;
+        allocation.offset = (align - allocation.gpu().address % align) % align;
+        allocation.size = desc.size;
+        Ok(allocation)
+    }
+
+    /// Allocate with [`DEFAULT_ALIGN`](crate::memory::DEFAULT_ALIGN) alignment.
+    pub fn allocate(&self, size: u64, memory: MemoryType) -> RhiResult<Allocation> {
+        self.allocate_aligned(size, crate::memory::DEFAULT_ALIGN, memory)
+    }
+
+    pub fn allocate_aligned(
+        &self,
+        size: u64,
+        align: u64,
+        memory: MemoryType,
+    ) -> RhiResult<Allocation> {
+        self.create_allocation(&AllocationDesc {
+            size,
+            align,
             memory,
             label: None,
-        })?;
-        allocation.offset = (align - allocation.gpu().address % align) % align;
-        allocation.size = size;
-        Ok(allocation)
+        })
     }
 
-    /// Allocate space for `count` values with their natural alignment.
-    pub fn allocate_array<T>(&self, count: usize, memory: MemoryType) -> RhiResult<Allocation> {
-        let size = std::mem::size_of::<T>()
-            .checked_mul(count)
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(|| RhiError::AllocationFailed("typed allocation size overflow".into()))?;
-        self.allocate_aligned(size.max(1), std::mem::align_of::<T>() as u64, memory)
-    }
-
-    /// Allocate mapped memory and upload one value.
-    pub fn upload<T: GpuPod>(&self, value: &T) -> RhiResult<Allocation> {
-        let mut allocation = self.allocate_array::<T>(1, MemoryType::Default)?;
-        allocation.upload(value)?;
-        Ok(allocation)
-    }
-
-    /// Allocate mapped memory and upload `data`.
+    /// Allocate mapped memory and upload `data`. Use `std::slice::from_ref` for a single value.
     pub fn upload_slice<T: GpuPod>(&self, data: &[T]) -> RhiResult<Allocation> {
         let size = std::mem::size_of_val(data).max(1) as u64;
-        let mut alloc = self.allocate(size, MemoryType::Default)?;
+        let mut alloc = self.allocate(size, MemoryType::Upload)?;
         if !data.is_empty() {
             alloc.upload_slice(data)?;
         }
         Ok(alloc)
-    }
-
-    /// Release an allocation. The caller guarantees that submitted GPU work no longer uses it.
-    pub fn free(&self, allocation: Allocation) {
-        self.destroy_allocation(allocation);
     }
 
     /// Translate a CPU-mapped pointer to a GPU virtual address, if possible.
@@ -332,19 +383,16 @@ impl Device {
             .map(|resource| self.own(resource))
     }
 
-    /// Create a sampler.
     pub fn create_sampler(&self, desc: &SamplerDesc) -> RhiResult<Sampler> {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_sampler(desc))
             .map(|resource| self.own(resource))
     }
 
-    /// Create a shader module.
     pub fn create_shader_module(&self, desc: &ShaderModuleDesc) -> RhiResult<ShaderModule> {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_shader_module(desc))
             .map(|resource| self.own(resource))
     }
 
-    /// Create a graphics pipeline.
     pub fn create_graphics_pso(
         &self,
         desc: &GraphicsPsoDesc,
@@ -353,6 +401,8 @@ impl Device {
     ) -> RhiResult<GraphicsPso> {
         self.ensure_owns(vertex, "vertex shader")?;
         self.ensure_owns(pixel, "pixel shader")?;
+        Self::ensure_stage(vertex, ShaderStage::Vertex)?;
+        Self::ensure_stage(pixel, ShaderStage::Pixel)?;
         let result = match (self.inner.as_ref(), &vertex.inner, &pixel.inner) {
             #[cfg(feature = "vulkan")]
             (
@@ -370,13 +420,13 @@ impl Device {
         result.map(|resource| self.own(resource))
     }
 
-    /// Create a compute pipeline.
     pub fn create_compute_pso(
         &self,
         desc: &ComputePsoDesc,
         compute: &ShaderModule,
     ) -> RhiResult<ComputePso> {
         self.ensure_owns(compute, "compute shader")?;
+        Self::ensure_stage(compute, ShaderStage::Compute)?;
         let result = match (self.inner.as_ref(), &compute.inner) {
             #[cfg(feature = "vulkan")]
             (DeviceInner::Vulkan(d), ShaderModuleInner::Vulkan(c)) => d.create_compute_pso(desc, c),
@@ -388,7 +438,6 @@ impl Device {
         result.map(|resource| self.own(resource))
     }
 
-    /// Create a mesh-shader graphics pipeline.
     pub fn create_meshlet_pso(
         &self,
         desc: &MeshletPsoDesc,
@@ -397,6 +446,8 @@ impl Device {
     ) -> RhiResult<MeshletPso> {
         self.ensure_owns(mesh, "mesh shader")?;
         self.ensure_owns(pixel, "pixel shader")?;
+        Self::ensure_stage(mesh, ShaderStage::Mesh)?;
+        Self::ensure_stage(pixel, ShaderStage::Pixel)?;
         let result = match (self.inner.as_ref(), &mesh.inner, &pixel.inner) {
             #[cfg(feature = "vulkan")]
             (
@@ -414,16 +465,13 @@ impl Device {
         result.map(|resource| self.own(resource))
     }
 
-    /// Allocate a Bottom-Level Acceleration Structure.
-    ///
-    /// The returned `AccelerationStructure` must be built via `cmd.build_blas(as, desc)`
-    /// before it can be referenced in a TLAS instance.
+    /// Allocates only; build it with `cmd.build_blas` before referencing it from a TLAS.
     pub fn create_blas(&self, desc: &BlasDesc) -> RhiResult<AccelerationStructure> {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_blas(desc))
             .map(|resource| self.own(resource))
     }
 
-    /// Allocate a Top-Level Acceleration Structure.
+    /// Allocates only; build it with `cmd.build_tlas`.
     pub fn create_tlas(&self, desc: &TlasDesc) -> RhiResult<AccelerationStructure> {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_tlas(desc))
             .map(|resource| self.own(resource))
@@ -446,44 +494,26 @@ impl Device {
         instance: &TlasInstance,
     ) -> RhiResult<()> {
         self.ensure_owns(dst, "TLAS instance buffer")?;
-        let stride = self.tlas_instance_stride();
-        let offset = index.checked_mul(stride).ok_or_else(|| {
-            RhiError::AllocationFailed(format!(
-                "TLAS instance index {index} overflows the host address space"
-            ))
+        let stride = self.tlas_instance_stride() as u64;
+        let base = dst.mapped::<u8>().ok_or_else(|| {
+            RhiError::AllocationFailed("instance buffer is not CPU-mapped".into())
         })?;
-        let end = offset.checked_add(stride).ok_or_else(|| {
-            RhiError::AllocationFailed(format!(
-                "TLAS instance {index} end overflows the host address space"
-            ))
-        })?;
-        let dst_size = usize::try_from(dst.size()).map_err(|_| {
-            RhiError::AllocationFailed(
-                "TLAS instance buffer size does not fit in the host address space".into(),
-            )
-        })?;
-        if end > dst_size {
+        let slot = base.byte_offset(stride.saturating_mul(index as u64));
+        if slot.byte_len() < stride {
             return Err(RhiError::AllocationFailed(format!(
                 "TLAS instance {index} (stride {stride}) exceeds the instance buffer"
             )));
         }
-        let base = dst.cpu().ok_or_else(|| {
-            RhiError::AllocationFailed("instance buffer is not CPU-mapped".into())
-        })?;
-        // SAFETY: bounds-checked above, and `base` is valid for `dst.size()` mapped bytes.
-        let ptr = unsafe { base.add(offset) };
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.write_tlas_instance(ptr, instance));
+        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.write_tlas_instance(slot.cpu(), instance));
         Ok(())
     }
 
-    /// Create a transient command buffer for recording.
     pub fn create_command_buffer(&self) -> RhiResult<CommandBuffer> {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_command_buffer())
             .map(|resource| self.own(resource))
     }
 
-    /// Create a command buffer pre-configured with swapchain image views.
-    /// Use this for the main render loop where you need to render to swapchain images.
+    /// Pre-wired with the swapchain's image views, for the main render loop.
     pub fn create_command_buffer_for_swapchain(
         &self,
         swapchain: &Swapchain,
@@ -494,41 +524,31 @@ impl Device {
             .map(|resource| self.own(resource))
     }
 
-    /// Get the primary queue.
     pub fn queue(&self) -> &Queue {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.queue())
     }
 
-    /// Create a timeline semaphore.
     pub fn create_timeline_semaphore(&self, initial_value: u64) -> RhiResult<TimelineSemaphore> {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_timeline_semaphore(initial_value))
             .map(|resource| self.own(resource))
     }
 
-    /// Create a GPU timestamp pool.
     pub fn create_query_pool(&self, count: u32) -> RhiResult<QueryPool> {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_query_pool(count))
             .map(|resource| self.own(resource))
     }
 
-    /// Destroy a query pool after its GPU work completes.
-    pub fn destroy_query_pool(&self, pool: QueryPool) {
-        self.assert_owns(&pool, "query pool");
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.destroy_query_pool(pool))
-    }
-
-    /// Nanoseconds per timestamp tick.
     pub fn timestamp_period_ns(&self) -> f64 {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.timestamp_period_ns())
     }
 
-    /// Read timestamp ticks after the writing GPU work completes.
+    /// Valid once the writing GPU work has completed.
     pub fn read_timestamps(&self, pool: &QueryPool) -> RhiResult<Vec<u64>> {
         self.ensure_owns(pool, "query pool")?;
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.read_timestamps(pool))
     }
 
-    /// Elapsed milliseconds between two timestamp slots, or `None` for invalid samples.
+    /// `None` if either sample is unwritten.
     pub fn gpu_elapsed_ms(&self, pool: &QueryPool, begin: u32, end: u32) -> RhiResult<Option<f64>> {
         let ticks = self.read_timestamps(pool)?;
         let (Some(&b), Some(&e)) = (ticks.get(begin as usize), ticks.get(end as usize)) else {
@@ -543,50 +563,23 @@ impl Device {
         Ok(Some((e - b) as f64 * self.timestamp_period_ns() / 1.0e6))
     }
 
-    /// Wait for the device to be idle.
     pub fn wait_idle(&self) {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.wait_idle())
     }
 
-    /// Destroy a buffer, releasing its storage immediately.
+    /// Release a resource, freeing its storage immediately.
     ///
     /// The RHI tracks no lifetimes: the caller guarantees the GPU is done, via
-    /// [`wait_idle`](Self::wait_idle), [`wait_for_frame`](Self::wait_for_frame), or the
-    /// swapchain's frames-in-flight fence. Destroying a resource an in-flight submission still
-    /// references is a use-after-free.
-    pub fn destroy_allocation(&self, allocation: Allocation) {
-        self.assert_owns(&allocation, "allocation");
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.destroy_allocation(allocation))
+    /// [`wait_idle`](Self::wait_idle), [`wait_for_frame`](Self::wait_for_frame), or the swapchain
+    /// fence. Destroying a resource an in-flight submission references is a use-after-free, and
+    /// a texture's shader handles are recycled at once. Panics on a foreign device.
+    pub fn destroy<R: DeviceResource>(&self, resource: R) {
+        resource.destroy_on(self);
     }
 
-    /// Destroy a texture. Same contract as [`destroy_allocation`](Self::destroy_allocation); the
-    /// Its shader handles are recycled at once, so a still-in-flight draw may read a new texture
-    /// that reuses them.
-    pub fn destroy_texture(&self, mut texture: Texture) {
-        self.assert_owns(&texture, "texture");
-        for id in texture.views.drain(..) {
-            backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.destroy_texture_view(id));
-        }
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.destroy_texture(texture))
-    }
-
-    /// Destroy a sampler. Same lifetime contract as
-    /// [`destroy_allocation`](Self::destroy_allocation).
-    pub fn destroy_sampler(&self, sampler: Sampler) {
-        self.assert_owns(&sampler, "sampler");
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.destroy_sampler(sampler))
-    }
-
-    /// Wait for a specific frame's fence before reusing resources.
+    /// Blocks until that frame slot's prior work has retired.
     pub fn wait_for_frame(&self, frame_index: usize) {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.wait_for_frame(frame_index))
-    }
-
-    /// Get raw Vulkan handles for escape-hatch scenarios (e.g. ImGui).
-    /// Only available with the vulkan feature.
-    #[cfg(feature = "vulkan")]
-    pub fn vulkan_handles(&self) -> crate::raw::VulkanHandles {
-        backend_expect!(self.inner.as_ref(), DeviceInner::Vulkan).vulkan_handles()
     }
 }
 
@@ -605,10 +598,25 @@ pub(crate) fn validate_texture_view(
     if let Some(format) = view.format
         && format != source.desc().format
     {
-        return Err(RhiError::Unsupported(
-            "format-reinterpreting texture views are not in the portable Metal/Vulkan baseline"
-                .into(),
-        ));
+        let source_format = source.desc().format;
+        if !crate::texture::formats_are_view_compatible(source_format, format) {
+            return Err(RhiError::Unsupported(format!(
+                "texture view format {format:?} does not reinterpret {source_format:?}: the two \
+                 must share a channel layout and bit depth, and depth/stencil formats never \
+                 reinterpret"
+            )));
+        }
+        if !source
+            .desc()
+            .usage
+            .contains(crate::texture::TextureUsage::FORMAT_VIEW)
+        {
+            return Err(RhiError::Unsupported(
+                "a format-reinterpreting view requires TextureUsage::FORMAT_VIEW on the source \
+                 texture, which must be set when the texture is created"
+                    .into(),
+            ));
+        }
     }
 
     let base_mip = u32::from(view.base_mip);
@@ -650,71 +658,4 @@ fn aligned_backing_size(size: u64, align: u64) -> RhiResult<u64> {
             "allocation size {size} with alignment {align} overflows u64"
         ))
     })
-}
-
-impl CommandBuffer {
-    /// Get the raw Vulkan command buffer handle for escape-hatch scenarios.
-    #[cfg(feature = "vulkan")]
-    pub fn vulkan_command_buffer(&self) -> ash::vk::CommandBuffer {
-        backend_expect!(&self.inner, crate::command::CommandBufferInner::Vulkan).command_buffer
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::texture::TextureUsage;
-    use crate::types::{Format, TextureId};
-
-    fn test_texture() -> Texture {
-        Texture {
-            id: TextureId(0),
-            gpu_address: GpuPtr::NULL,
-            handle: crate::TextureHandle::NULL,
-            views: Vec::new(),
-            desc: TextureDesc {
-                mip_levels: 4,
-                array_layers: 2,
-                usage: TextureUsage::SAMPLED,
-                ..Default::default()
-            },
-            _owner: None,
-        }
-    }
-
-    #[test]
-    fn portable_texture_views_reject_format_reinterpretation() {
-        let source = test_texture();
-        let view = TextureViewDesc {
-            format: Some(Format::R32Float),
-            ..Default::default()
-        };
-        assert!(validate_texture_view(&source, &view, TextureUsage::SAMPLED).is_err());
-    }
-
-    #[test]
-    fn portable_texture_views_validate_subresource_ranges() {
-        let source = test_texture();
-        let valid = TextureViewDesc {
-            base_mip: 1,
-            mip_count: 3,
-            base_layer: 1,
-            layer_count: 1,
-            ..Default::default()
-        };
-        assert!(validate_texture_view(&source, &valid, TextureUsage::SAMPLED).is_ok());
-
-        let invalid = TextureViewDesc {
-            base_mip: 4,
-            ..Default::default()
-        };
-        assert!(validate_texture_view(&source, &invalid, TextureUsage::SAMPLED).is_err());
-    }
-
-    #[test]
-    fn aligned_allocation_size_overflow_is_reported_before_backend_use() {
-        assert!(aligned_backing_size(u64::MAX, 16).is_err());
-        assert_eq!(aligned_backing_size(0, 1).unwrap(), 1);
-        assert_eq!(aligned_backing_size(17, 16).unwrap(), 32);
-    }
 }

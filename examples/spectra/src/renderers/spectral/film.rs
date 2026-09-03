@@ -57,7 +57,7 @@ impl Film {
             stale => {
                 if let Some(stale) = stale {
                     device.wait_idle();
-                    device.free(stale);
+                    device.destroy(stale);
                 }
                 element_count = self.element_count_for(extent)?;
                 device.allocate(
@@ -79,13 +79,13 @@ impl Film {
         let accum = self.accum();
         let readback = device.allocate(accum.size(), MemoryType::Readback)?;
         let result = copy_to_readback(device, accum, &readback);
-        device.free(readback);
+        device.destroy(readback);
         result
     }
 
     pub(super) fn destroy(mut self, device: &Device) {
         if let Some(accum) = self.accum.take() {
-            device.free(accum);
+            device.destroy(accum);
         }
     }
 

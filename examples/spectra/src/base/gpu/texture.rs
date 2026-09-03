@@ -58,7 +58,7 @@ impl TextureResources {
             image.destroy(device);
         }
         for sampler in self.samplers {
-            device.destroy_sampler(sampler);
+            device.destroy(sampler);
         }
     }
 }
@@ -88,10 +88,10 @@ impl GpuImage {
         };
         let size = device.texture_size_align(&desc)?;
         let memory = device.allocate_aligned(size.size, size.align, MemoryType::GpuOnly)?;
-        let texture = match device.create_texture(&desc, memory.ptr()) {
+        let texture = match device.create_texture(&desc, memory.gpu()) {
             Ok(texture) => texture,
             Err(error) => {
-                device.free(memory);
+                device.destroy(memory);
                 return Err(error.into());
             }
         };
@@ -103,8 +103,8 @@ impl GpuImage {
     }
 
     fn destroy(self, device: &Device) {
-        device.destroy_texture(self.texture);
-        device.free(self.memory);
+        device.destroy(self.texture);
+        device.destroy(self.memory);
     }
 }
 
@@ -167,7 +167,7 @@ impl<'a> TextureUpload<'a> {
             self.device.queue().wait_idle();
         }
         for staging in self.staging.drain(..) {
-            self.device.free(staging);
+            self.device.destroy(staging);
         }
         Ok(TextureResources {
             images: std::mem::take(&mut self.images),
@@ -183,10 +183,10 @@ impl Drop for TextureUpload<'_> {
             image.destroy(self.device);
         }
         for staging in self.staging.drain(..) {
-            self.device.free(staging);
+            self.device.destroy(staging);
         }
         for sampler in self.samplers.drain(..) {
-            self.device.destroy_sampler(sampler);
+            self.device.destroy(sampler);
         }
     }
 }

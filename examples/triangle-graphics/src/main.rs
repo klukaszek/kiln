@@ -38,8 +38,10 @@ struct TriangleGraphics {
 
 impl Example for TriangleGraphics {
     fn new(device: &Device, color_format: Format) -> Self {
-        let vs = kiln_rhi::compiler::compile(device, TRI_BODY, "vsMain", ShaderStage::Vertex);
-        let fs = kiln_rhi::compiler::compile(device, TRI_BODY, "fsMain", ShaderStage::Pixel);
+        let vs = kiln_rhi::compiler::compile(device, TRI_BODY, "vsMain", ShaderStage::Vertex, &[])
+            .expect("shader compilation");
+        let fs = kiln_rhi::compiler::compile(device, TRI_BODY, "fsMain", ShaderStage::Pixel, &[])
+            .expect("shader compilation");
 
         let pso = device
             .create_graphics_pso(
@@ -62,7 +64,7 @@ impl Example for TriangleGraphics {
     }
 
     fn render(&mut self, _ctx: &FrameCtx, cmd: &mut CommandBuffer) {
-        cmd.set_graphics_pipeline(&self.pso);
+        cmd.set_pipeline(&self.pso);
         cmd.draw(GpuPtr::<u8>::NULL, 3, 1, 0, 0);
     }
 }

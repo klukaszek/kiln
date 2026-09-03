@@ -1,5 +1,5 @@
 use kiln_rhi::{
-    AllocationDesc, BumpAllocator, Device, GpuAddress, GpuPod, MAX_FRAMES_IN_FLIGHT, MemoryType,
+    AllocationDesc, BumpAllocator, Device, GpuPod, GpuPtr, MAX_FRAMES_IN_FLIGHT, MemoryType,
 };
 
 use crate::base::renderer::Result;
@@ -33,12 +33,12 @@ impl FrameArenas {
         self.0[slot].reset();
     }
 
-    pub(crate) fn upload<T: GpuPod>(&mut self, slot: usize, value: &T) -> GpuAddress {
+    pub(crate) fn upload<T: GpuPod>(&mut self, slot: usize, value: &T) -> GpuPtr<T> {
         let allocation = self.0[slot]
             .alloc(std::mem::size_of::<T>() as u64, ROOT_ALIGNMENT)
             .expect("frame arena exhausted");
         allocation.upload(value).expect("upload frame data");
-        allocation.gpu
+        allocation.gpu.cast()
     }
 
     pub(crate) fn destroy(self, device: &Device) {

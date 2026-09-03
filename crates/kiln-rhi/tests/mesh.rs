@@ -8,10 +8,9 @@ mod common;
 
 use kiln_rhi::gpu_struct;
 use kiln_rhi::{
-    AllocationDesc, BumpAllocator, ColorAttachment, ColorTarget, Cull, Device, Format, GpuAddress,
-    LoadOp, MemoryType, MeshletPso, MeshletPsoDesc, RenderPassDesc, RenderTarget, SampleCount,
-    ShaderModule, ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension, TextureUsage,
-    Topology,
+    AllocationDesc, BumpAllocator, ColorAttachment, ColorTarget, Cull, Device, Format, GpuPtr,
+    LoadOp, MemoryType, MeshletPso, MeshletPsoDesc, RenderPassDesc, SampleCount, ShaderModule,
+    ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension, TextureUsage, Topology,
 };
 
 gpu_struct! {
@@ -99,7 +98,7 @@ fn mesh_fullscreen_color() {
         .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let texture = device
-        .create_texture(&tex_desc, tex_mem.gpu())
+        .create_texture(&tex_desc, tex_mem.ptr())
         .expect("create_texture");
 
     // Root data is allocated directly; the other mesh tests use the bump allocator.
@@ -118,7 +117,7 @@ fn mesh_fullscreen_color() {
         let mut cmd = device.create_command_buffer().expect("cmd");
         cmd.begin_render_pass(&RenderPassDesc {
             color_attachments: vec![ColorAttachment {
-                target: RenderTarget::Texture(texture.id()),
+                target: texture.target(),
                 load_op: LoadOp::Clear,
                 store_op: StoreOp::Store,
                 clear_color: [0.0, 0.0, 0.0, 1.0],
@@ -205,7 +204,7 @@ fn make_meshlet_pso(
 fn render_meshlets(
     device: &Device,
     pso: &MeshletPso,
-    root: GpuAddress,
+    root: GpuPtr<u8>,
     size: u32,
     groups: [u32; 3],
 ) -> Vec<u8> {
@@ -226,7 +225,7 @@ fn render_meshlets(
         .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let texture = device
-        .create_texture(&tex_desc, tex_mem.gpu())
+        .create_texture(&tex_desc, tex_mem.ptr())
         .expect("create_texture");
     let readback = device
         .allocate((size * size * 4) as u64, MemoryType::Readback)
@@ -235,7 +234,7 @@ fn render_meshlets(
     let mut cmd = device.create_command_buffer().expect("cmd");
     cmd.begin_render_pass(&RenderPassDesc {
         color_attachments: vec![ColorAttachment {
-            target: RenderTarget::Texture(texture.id()),
+            target: texture.target(),
             load_op: LoadOp::Clear,
             store_op: StoreOp::Store,
             clear_color: [0.0, 0.0, 0.0, 1.0],
@@ -327,7 +326,7 @@ fn mesh_clip_space_is_y_up() {
 
     const SIZE: u32 = 128;
     let pixels = common::timed("mesh clip-space orientation · submit+wait", || {
-        render_meshlets(&device, &pso, GpuAddress::NULL, SIZE, [1, 1, 1])
+        render_meshlets(&device, &pso, GpuPtr::NULL, SIZE, [1, 1, 1])
     });
     common::save_rgba_png("mesh_clip_space_is_y_up", SIZE, SIZE, &pixels);
 
@@ -496,7 +495,7 @@ fn mesh_interpolated_triangle() {
 
     const SIZE: u32 = 128;
     let pixels = common::timed("interpolated triangle · submit+wait", || {
-        render_meshlets(&device, &pso, GpuAddress::NULL, SIZE, [1, 1, 1])
+        render_meshlets(&device, &pso, GpuPtr::NULL, SIZE, [1, 1, 1])
     });
     common::save_rgba_png("mesh_interpolated_triangle", SIZE, SIZE, &pixels);
 

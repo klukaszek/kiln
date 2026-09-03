@@ -149,9 +149,6 @@ macro_rules! gpu_slang_ty {
     (TextureHandle) => {
         "DescriptorHandle<Texture2D>"
     };
-    (StorageTextureHandle) => {
-        "DescriptorHandle<RWTexture2D<float>>"
-    };
     (SamplerHandle) => {
         "DescriptorHandle<SamplerState>"
     };

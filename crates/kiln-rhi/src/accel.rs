@@ -1,9 +1,9 @@
 //! Acceleration structure types (BLAS + TLAS) for ray tracing.
 
-use crate::types::{AccelHandle, AccelerationStructureId, GpuAddress};
+use crate::types::{AccelHandle, AccelerationStructureId};
 
 /// A built acceleration structure (BLAS or TLAS). Build it with `cmd.build_blas`/`build_tlas`,
-/// then store [`handle()`](Self::handle) in an `AccelHandle` field for the shader.
+/// then store [`gpu()`](Self::gpu) in an `AccelHandle` field for the shader.
 pub struct AccelerationStructure {
     pub id: AccelerationStructureId,
     pub(crate) inner: AccelInner,
@@ -21,19 +21,16 @@ impl AccelerationStructure {
     ///         tlas: AccelHandle,
     ///     }
     /// }
-    /// root.tlas = tlas.handle();
+    /// root.tlas = tlas.gpu();
     /// ```
-    pub fn handle(&self) -> AccelHandle {
-        AccelHandle::from_raw(self.address())
-    }
-
-    pub(crate) fn address(&self) -> GpuAddress {
-        match &self.inner {
+    pub fn gpu(&self) -> AccelHandle {
+        let value = match &self.inner {
             #[cfg(feature = "vulkan")]
-            AccelInner::Vulkan(a) => GpuAddress(a.device_address),
+            AccelInner::Vulkan(a) => a.device_address,
             #[cfg(feature = "metal")]
-            AccelInner::Metal(a) => GpuAddress(a.gpu_resource_id),
-        }
+            AccelInner::Metal(a) => a.gpu_resource_id,
+        };
+        AccelHandle::from_raw(value)
     }
 }
 

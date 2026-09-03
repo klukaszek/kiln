@@ -1,6 +1,6 @@
 //! GPU memory allocation and pointer arithmetic.
 
-use crate::types::GpuAddress;
+use crate::types::GpuPtr;
 use crate::{RhiError, RhiResult};
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -85,7 +85,7 @@ impl Allocation {
         backend_dispatch!(&self.inner, AllocationInner, allocation => allocation.mapped_ptr())
     }
 
-    fn base_gpu(&self) -> GpuAddress {
+    fn base_gpu(&self) -> GpuPtr<u8> {
         backend_dispatch!(&self.inner, AllocationInner, allocation => allocation.gpu_address())
     }
 
@@ -97,14 +97,14 @@ impl Allocation {
     }
 
     /// GPU virtual address.
-    pub fn gpu(&self) -> GpuAddress {
-        self.base_gpu().offset(self.offset)
+    pub fn gpu(&self) -> GpuPtr<u8> {
+        self.base_gpu().byte_add(self.offset)
     }
 
     /// Typed GPU pointer to the first byte of this allocation.
     #[inline]
     pub fn ptr<T>(&self) -> crate::types::GpuPtr<T> {
-        crate::types::GpuPtr::from_raw(self.gpu())
+        self.gpu().cast()
     }
 
     /// Allocation size in bytes.
@@ -169,7 +169,7 @@ impl Allocation {
 #[derive(Clone, Copy, Debug)]
 pub struct TransientAllocation {
     pub cpu: *mut u8,
-    pub gpu: GpuAddress,
+    pub gpu: GpuPtr<u8>,
     pub size: u64,
 }
 
@@ -189,7 +189,7 @@ impl TransientAllocation {
 pub struct BumpAllocator {
     allocation: Allocation,
     cpu_base: Option<*mut u8>,
-    gpu_base: GpuAddress,
+    gpu_base: GpuPtr<u8>,
     offset: u64,
     capacity: u64,
 }
@@ -215,7 +215,7 @@ impl BumpAllocator {
         let (aligned_offset, end) = aligned_bump_range(self.offset, size, align, self.capacity)?;
 
         let cpu = self.cpu_base?;
-        let gpu = self.gpu_base.offset(aligned_offset);
+        let gpu = self.gpu_base.byte_add(aligned_offset);
         let cpu_offset = usize::try_from(aligned_offset).ok()?;
         let cpu = unsafe { cpu.add(cpu_offset) };
 
@@ -236,7 +236,7 @@ impl BumpAllocator {
     }
 
     /// The underlying buffer's base GPU address.
-    pub fn gpu(&self) -> GpuAddress {
+    pub fn gpu(&self) -> GpuPtr<u8> {
         self.gpu_base
     }
 

@@ -53,7 +53,7 @@ pub struct VulkanHandles {
 
 #[derive(Clone)]
 pub(crate) struct BufferAllocation {
-    pub base: GpuAddress,
+    pub base: GpuPtr<u8>,
     pub size: u64,
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
@@ -65,14 +65,14 @@ pub(crate) struct BufferAllocation {
 /// Reverse index for CPU-mapped allocations: encoding looks up by GPU address, the public
 /// pointer bridge by CPU address, and a second index keeps both a predecessor lookup.
 struct MappedAllocation {
-    gpu_base: GpuAddress,
+    gpu_base: GpuPtr<u8>,
     size: u64,
 }
 
 fn resolve_mapped_pointer(
     allocations: &BTreeMap<usize, MappedAllocation>,
     ptr: usize,
-) -> Option<GpuAddress> {
+) -> Option<GpuPtr<u8>> {
     let (&base, allocation) = allocations.range(..=ptr).next_back()?;
     let offset = (ptr - base) as u64;
     (offset < allocation.size).then(|| allocation.gpu_base.offset(offset))
@@ -86,7 +86,7 @@ pub(crate) struct DescriptorBufferHeap {
     pub memory: vk::DeviceMemory,
     pub mapped_ptr: *mut u8,
     pub size: u64,
-    pub gpu_address: GpuAddress,
+    pub gpu_address: GpuPtr<u8>,
     pub layout: vk::DescriptorSetLayout,
     pub sampled_image_offset: u64,
     pub sampler_offset: u64,
@@ -1704,7 +1704,7 @@ impl VulkanDevice {
             memory: suballocation.memory,
             size: desc.size,
             mapped_ptr,
-            gpu_address: GpuAddress(gpu_addr),
+            gpu_address: GpuPtr::from_addr(gpu_addr),
             block_index: suballocation.block_index,
             block_offset: suballocation.offset,
             block_range: suballocation.range,
@@ -1713,7 +1713,7 @@ impl VulkanDevice {
         {
             let mut allocations = self.allocations.lock().expect("allocations lock poisoned");
             allocations.insert(
-                vk_buffer.gpu_address.0,
+                vk_buffer.gpu_address.address,
                 BufferAllocation {
                     base: vk_buffer.gpu_address,
                     size: vk_buffer.size,
@@ -1745,7 +1745,7 @@ impl VulkanDevice {
         })
     }
 
-    pub fn host_to_device_pointer(&self, cpu_ptr: *const u8) -> Option<GpuAddress> {
+    pub fn host_to_device_pointer(&self, cpu_ptr: *const u8) -> Option<GpuPtr<u8>> {
         if cpu_ptr.is_null() {
             return None;
         }
@@ -1906,7 +1906,7 @@ impl VulkanDevice {
     pub fn create_texture(
         &self,
         desc: &TextureDesc,
-        texture_gpu: GpuAddress,
+        texture_gpu: GpuPtr<u8>,
     ) -> RhiResult<Texture> {
         if texture_gpu.is_null() {
             return Err(RhiError::TextureCreation(
@@ -1920,28 +1920,28 @@ impl VulkanDevice {
         let resolve = || -> RhiResult<(vk::DeviceMemory, u64)> {
             let allocations = self.allocations.lock().expect("allocations lock poisoned");
             let alloc = allocations
-                .range(..=texture_gpu.0)
+                .range(..=texture_gpu.address)
                 .next_back()
                 .map(|(_, alloc)| alloc)
-                .filter(|alloc| texture_gpu.0 - alloc.base.0 < alloc.size)
+                .filter(|alloc| texture_gpu.address - alloc.base.address < alloc.size)
                 .ok_or_else(|| {
                     RhiError::TextureCreation(format!(
                         "texture allocation address 0x{:x} was not returned by gpuMalloc",
-                        texture_gpu.0
+                        texture_gpu.address
                     ))
                 })?;
-            let offset = texture_gpu.0 - alloc.base.0;
+            let offset = texture_gpu.address - alloc.base.address;
             let memory_offset = alloc.memory_offset + offset;
             if !memory_offset.is_multiple_of(mem_reqs.alignment) {
                 return Err(RhiError::TextureCreation(format!(
                     "texture allocation address 0x{:x} has memory offset {memory_offset}, expected alignment {}",
-                    texture_gpu.0, mem_reqs.alignment
+                    texture_gpu.address, mem_reqs.alignment
                 )));
             }
             if mem_reqs.size > alloc.size - offset {
                 return Err(RhiError::TextureCreation(format!(
                     "texture allocation address 0x{:x} has {} bytes available, needs {}",
-                    texture_gpu.0,
+                    texture_gpu.address,
                     alloc.size - offset,
                     mem_reqs.size
                 )));
@@ -2078,6 +2078,8 @@ impl VulkanDevice {
         Ok(Texture {
             id: texture_id,
             gpu_address: texture_gpu,
+            handle: TextureHandle::from_raw(texture_id.0 as u64),
+            views: Vec::new(),
             desc: desc.clone(),
             _owner: None,
         })
@@ -2150,7 +2152,11 @@ impl VulkanDevice {
         }
         samplers[idx] = Some(sampler);
 
-        Ok(Sampler { id, _owner: None })
+        Ok(Sampler {
+            id,
+            handle: SamplerHandle::from_raw(id.0 as u64),
+            _owner: None,
+        })
     }
 
     pub fn create_shader_module(&self, desc: &ShaderModuleDesc) -> RhiResult<ShaderModule> {
@@ -2208,7 +2214,7 @@ impl VulkanDevice {
         let push_constant_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(std::mem::size_of::<GpuAddress>() as u32);
+            .size(std::mem::size_of::<GpuPtr<u8>>() as u32);
 
         let set_layouts = [self.texture_descriptor_set_layout];
         let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
@@ -2252,7 +2258,7 @@ impl VulkanDevice {
         let push_constant_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(std::mem::size_of::<GpuAddress>() as u32);
+            .size(std::mem::size_of::<GpuPtr<u8>>() as u32);
 
         let set_layouts = [self.texture_descriptor_set_layout];
         let layout_info = vk::PipelineLayoutCreateInfo::default()
@@ -2323,7 +2329,7 @@ impl VulkanDevice {
         let push_constant_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(std::mem::size_of::<GpuAddress>() as u32);
+            .size(std::mem::size_of::<GpuPtr<u8>>() as u32);
 
         let set_layouts = [self.texture_descriptor_set_layout];
         let layout_info = vk::PipelineLayoutCreateInfo::default()
@@ -2366,7 +2372,7 @@ impl VulkanDevice {
                     let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
                         .vertex_format(vk::Format::R32G32B32_SFLOAT)
                         .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.vertex_buffer.raw().0,
+                            device_address: m.vertex_buffer.address,
                         })
                         .vertex_stride(m.vertex_stride)
                         .max_vertex(m.vertex_count.saturating_sub(1))
@@ -2376,7 +2382,7 @@ impl VulkanDevice {
                             vk::IndexType::NONE_KHR
                         })
                         .index_data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.index_buffer.raw().0,
+                            device_address: m.index_buffer.address,
                         });
                     let geo_data = vk::AccelerationStructureGeometryDataKHR { triangles };
                     vk::AccelerationStructureGeometryKHR::default()
@@ -2387,7 +2393,7 @@ impl VulkanDevice {
                 GeometryType::Aabbs => {
                     let aabbs = vk::AccelerationStructureGeometryAabbsDataKHR::default()
                         .data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.aabb_buffer.raw().0,
+                            device_address: m.aabb_buffer.address,
                         })
                         .stride(std::mem::size_of::<vk::AabbPositionsKHR>() as u64);
                     let geo_data = vk::AccelerationStructureGeometryDataKHR { aabbs };
@@ -2455,7 +2461,7 @@ impl VulkanDevice {
         let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::default()
             .array_of_pointers(false)
             .data(vk::DeviceOrHostAddressConstKHR {
-                device_address: desc.instance_buffer.raw().0,
+                device_address: desc.instance_buffer.address,
             });
         let geo_data = vk::AccelerationStructureGeometryDataKHR {
             instances: instances_data,
@@ -2686,7 +2692,7 @@ impl VulkanDevice {
             .as_ref()
             .expect("descriptor buffer heap missing");
         let descriptor_buffer_binding = vk::DescriptorBufferBindingInfoEXT::default()
-            .address(heap.gpu_address.0)
+            .address(heap.gpu_address.address)
             .usage(
                 vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT
                     | vk::BufferUsageFlags::SAMPLER_DESCRIPTOR_BUFFER_EXT,
@@ -2750,7 +2756,7 @@ impl VulkanDevice {
             .as_ref()
             .expect("descriptor buffer heap missing");
         let descriptor_buffer_binding = vk::DescriptorBufferBindingInfoEXT::default()
-            .address(heap.gpu_address.0)
+            .address(heap.gpu_address.address)
             .usage(
                 vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT
                     | vk::BufferUsageFlags::SAMPLER_DESCRIPTOR_BUFFER_EXT,
@@ -2815,7 +2821,7 @@ impl VulkanDevice {
                 {
                     let mut allocations =
                         self.allocations.lock().expect("allocations lock poisoned");
-                    allocations.remove(&b.gpu_address.0);
+                    allocations.remove(&b.gpu_address.address);
                 }
                 if let Some(mapped_ptr) = b.mapped_ptr {
                     self.mapped_allocations
@@ -2919,13 +2925,8 @@ impl VulkanDevice {
     /// Value to store in a [`TextureHandle`](crate::TextureHandle) root field for sampled view
     /// `id`. On Vulkan a `DescriptorHandle<Texture2D>` is the bindless heap index, so the handle
     /// is just the id widened to 64 bits.
-    pub fn texture_handle_raw(&self, id: TextureId) -> GpuAddress {
-        GpuAddress(id.0 as u64)
-    }
-
-    /// Value to store in a [`SamplerHandle`](crate::SamplerHandle) root field for sampler `id`.
-    pub fn sampler_handle_raw(&self, id: crate::types::SamplerId) -> GpuAddress {
-        GpuAddress(id.0 as u64)
+    pub fn texture_handle_raw(&self, id: TextureId) -> u64 {
+        id.0 as u64
     }
 
     pub fn create_query_pool(&self, count: u32) -> RhiResult<QueryPool> {
@@ -3596,7 +3597,7 @@ fn create_descriptor_buffer_heap(
         memory,
         mapped_ptr,
         size: aligned_size,
-        gpu_address: GpuAddress(gpu_addr),
+        gpu_address: GpuPtr::from_addr(gpu_addr),
         layout,
         sampled_image_offset,
         sampler_offset,
@@ -3707,25 +3708,25 @@ mod tests {
         allocations.insert(
             0x1000,
             MappedAllocation {
-                gpu_base: GpuAddress(0x8000),
+                gpu_base: GpuPtr::from_addr(0x8000),
                 size: 0x20,
             },
         );
         allocations.insert(
             0x2000,
             MappedAllocation {
-                gpu_base: GpuAddress(0x9000),
+                gpu_base: GpuPtr::from_addr(0x9000),
                 size: 0x10,
             },
         );
 
         assert_eq!(
             resolve_mapped_pointer(&allocations, 0x100f),
-            Some(GpuAddress(0x800f))
+            Some(GpuPtr::from_addr(0x800f))
         );
         assert_eq!(
             resolve_mapped_pointer(&allocations, 0x200f),
-            Some(GpuAddress(0x900f))
+            Some(GpuPtr::from_addr(0x900f))
         );
         assert_eq!(resolve_mapped_pointer(&allocations, 0x1020), None);
         assert_eq!(resolve_mapped_pointer(&allocations, 0x1fff), None);

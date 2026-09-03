@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::backend::suballoc::FreeRanges;
 use crate::error::{RhiError, RhiResult};
-use crate::types::GpuAddress;
+use crate::types::GpuPtr;
 use ash::vk;
 
 /// Matches the Metal pool's block size, so both backends fragment the same way.
@@ -14,7 +14,7 @@ pub struct VulkanBuffer {
     pub(crate) memory: vk::DeviceMemory,
     pub(crate) size: u64,
     pub(crate) mapped_ptr: Option<*mut u8>,
-    pub(crate) gpu_address: GpuAddress,
+    pub(crate) gpu_address: GpuPtr<u8>,
     /// Backing block and the padded range to hand back on destruction.
     pub(crate) block_index: usize,
     pub(crate) block_offset: u64,
@@ -31,7 +31,7 @@ impl VulkanBuffer {
         self.mapped_ptr
     }
 
-    pub fn gpu_address(&self) -> GpuAddress {
+    pub fn gpu_address(&self) -> GpuPtr<u8> {
         self.gpu_address
     }
 }

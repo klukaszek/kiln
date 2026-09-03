@@ -15,10 +15,7 @@ use crate::surface::{Surface, SurfaceDesc};
 use crate::swapchain::{Swapchain, SwapchainDesc};
 use crate::sync::TimelineSemaphore;
 use crate::texture::{Texture, TextureDesc, TextureSizeAlign, TextureViewDesc};
-use crate::types::{
-    BlasDesc, ClipSpaceY, GpuAddress, SamplerHandle, StorageTextureHandle, TextureHandle, TlasDesc,
-    TlasInstance,
-};
+use crate::types::{BlasDesc, ClipSpaceY, GpuPtr, TlasDesc, TlasInstance};
 use std::rc::Rc;
 
 /// Which GPU backend to use.
@@ -279,7 +276,7 @@ impl Device {
             memory,
             label: None,
         })?;
-        allocation.offset = (align - allocation.gpu().0 % align) % align;
+        allocation.offset = (align - allocation.gpu().address % align) % align;
         allocation.size = size;
         Ok(allocation)
     }
@@ -316,7 +313,7 @@ impl Device {
     }
 
     /// Translate a CPU-mapped pointer to a GPU virtual address, if possible.
-    pub fn host_to_device_pointer(&self, cpu_ptr: *const u8) -> Option<GpuAddress> {
+    pub fn host_to_device_pointer(&self, cpu_ptr: *const u8) -> Option<GpuPtr<u8>> {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.host_to_device_pointer(cpu_ptr))
     }
 
@@ -326,65 +323,19 @@ impl Device {
     }
 
     /// Create a texture in caller-owned GPU memory.
-    pub fn create_texture<P: Into<GpuAddress>>(
+    pub fn create_texture(
         &self,
         desc: &TextureDesc,
-        texture_gpu: P,
+        texture_gpu: GpuPtr<u8>,
     ) -> RhiResult<Texture> {
-        let texture_gpu = texture_gpu.into();
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_texture(desc, texture_gpu))
             .map(|resource| self.own(resource))
-    }
-
-    /// Create a sampled view. The source texture must outlive the returned handle; release the
-    /// returned ID with [`Device::destroy_texture_view`] when the view is no longer used.
-    pub fn create_sampled_view(
-        &self,
-        source: &Texture,
-        view: &TextureViewDesc,
-    ) -> RhiResult<crate::types::TextureId> {
-        self.ensure_owns(source, "texture")?;
-        validate_texture_view(source, view, crate::texture::TextureUsage::SAMPLED)?;
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_sampled_view(source, view))
-    }
-
-    /// Create a storage view. The source texture must outlive the returned handle; release the
-    /// returned ID with [`Device::destroy_texture_view`] when the view is no longer used.
-    pub fn create_storage_view(
-        &self,
-        source: &Texture,
-        view: &TextureViewDesc,
-    ) -> RhiResult<crate::types::TextureId> {
-        self.ensure_owns(source, "texture")?;
-        validate_texture_view(source, view, crate::texture::TextureUsage::STORAGE)?;
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_storage_view(source, view))
     }
 
     /// Create a sampler.
     pub fn create_sampler(&self, desc: &SamplerDesc) -> RhiResult<Sampler> {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_sampler(desc))
             .map(|resource| self.own(resource))
-    }
-
-    /// Convert a sampled view ID into a shader-visible sampled-texture handle.
-    pub fn sampled_texture_handle(&self, id: crate::types::TextureId) -> TextureHandle {
-        TextureHandle::from_raw(
-            backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.texture_handle_raw(id)),
-        )
-    }
-
-    /// Convert a storage view ID into a shader-visible read-write texture handle.
-    pub fn storage_texture_handle(&self, id: crate::types::TextureId) -> StorageTextureHandle {
-        StorageTextureHandle::from_raw(
-            backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.texture_handle_raw(id)),
-        )
-    }
-
-    /// Convert a sampler ID into an opaque shader-visible handle.
-    pub fn sampler_handle(&self, id: crate::types::SamplerId) -> SamplerHandle {
-        SamplerHandle::from_raw(
-            backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.sampler_handle_raw(id)),
-        )
     }
 
     /// Create a shader module.
@@ -609,17 +560,14 @@ impl Device {
     }
 
     /// Destroy a texture. Same contract as [`destroy_allocation`](Self::destroy_allocation); the
-    /// `TextureId` is recycled at once, so a still-in-flight draw may read the next texture
-    /// to take the slot.
-    pub fn destroy_texture(&self, texture: Texture) {
+    /// Its shader handles are recycled at once, so a still-in-flight draw may read a new texture
+    /// that reuses them.
+    pub fn destroy_texture(&self, mut texture: Texture) {
         self.assert_owns(&texture, "texture");
+        for id in texture.views.drain(..) {
+            backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.destroy_texture_view(id));
+        }
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.destroy_texture(texture))
-    }
-
-    /// Destroy a sampled or storage view. Same lifetime contract as
-    /// [`destroy_allocation`](Self::destroy_allocation).
-    pub fn destroy_texture_view(&self, id: crate::types::TextureId) {
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.destroy_texture_view(id))
     }
 
     /// Destroy a sampler. Same lifetime contract as
@@ -642,7 +590,7 @@ impl Device {
     }
 }
 
-fn validate_texture_view(
+pub(crate) fn validate_texture_view(
     source: &Texture,
     view: &TextureViewDesc,
     required_usage: crate::texture::TextureUsage,
@@ -721,7 +669,9 @@ mod tests {
     fn test_texture() -> Texture {
         Texture {
             id: TextureId(0),
-            gpu_address: GpuAddress::NULL,
+            gpu_address: GpuPtr::NULL,
+            handle: crate::TextureHandle::NULL,
+            views: Vec::new(),
             desc: TextureDesc {
                 mip_levels: 4,
                 array_layers: 2,

@@ -230,7 +230,7 @@ fn make_depth(device: &Device, format: Format, w: u32, h: u32) -> (Texture, Allo
         .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("depth mem");
     let texture = device
-        .create_texture(&desc, mem.gpu())
+        .create_texture(&desc, mem.ptr())
         .expect("create depth texture");
     (texture, mem)
 }
@@ -356,13 +356,13 @@ impl<E: Example> App<E> {
         example.pre_render(&ctx, &mut cmd);
         cmd.begin_render_pass(&RenderPassDesc {
             color_attachments: vec![ColorAttachment {
-                target: RenderTarget::SwapchainImage(image.index),
+                target: RenderTarget::swapchain_image(image.index),
                 load_op: LoadOp::Clear,
                 store_op: StoreOp::Store,
                 clear_color: self.clear,
             }],
             depth_attachment: self.depth.as_ref().map(|(tex, _)| DepthAttachment {
-                target: RenderTarget::Texture(tex.id()),
+                target: tex.target(),
                 load_op: LoadOp::Clear,
                 store_op: StoreOp::DontCare, // depth is transient; never read back
                 clear_depth: 1.0,
@@ -384,7 +384,7 @@ impl<E: Example> App<E> {
         if let (Some(egui), Some(frame)) = (self.egui.as_mut(), egui_frame.as_ref()) {
             cmd.begin_render_pass(&RenderPassDesc {
                 color_attachments: vec![ColorAttachment {
-                    target: RenderTarget::SwapchainImage(image.index),
+                    target: RenderTarget::swapchain_image(image.index),
                     load_op: LoadOp::Load,
                     store_op: StoreOp::Store,
                     clear_color: [0.0; 4],

@@ -278,7 +278,7 @@ fn build_tlas(
                 transform: transform_rows(instance.transform),
                 instance_custom_index_and_mask: (index as u32) | (0xFF << 24),
                 instance_sbt_offset_and_flags: 0,
-                acceleration_structure_reference: blases[index].handle(),
+                acceleration_structure_reference: blases[index].gpu(),
             },
         )?;
         Ok(())

@@ -1,6 +1,7 @@
 //! Texture creation, view descriptors, and bindless heap registration.
 
-use crate::types::{Format, GpuAddress, SampleCount, TextureDimension, TextureId};
+use crate::device::DeviceInner;
+use crate::types::{Format, GpuPtr, SampleCount, TextureDimension, TextureHandle, TextureId};
 
 /// Sentinel for `TextureViewDesc::mip_count`: include all remaining mip levels.
 pub const ALL_MIPS: u8 = 0xFF;
@@ -62,20 +63,57 @@ pub struct TextureSizeAlign {
 /// A texture backed by caller-owned GPU memory.
 pub struct Texture {
     pub(crate) id: TextureId,
-    pub(crate) gpu_address: GpuAddress,
+    pub(crate) gpu_address: GpuPtr<u8>,
+    pub(crate) handle: TextureHandle,
+    pub(crate) views: Vec<TextureId>,
     pub(crate) desc: TextureDesc,
     pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 impl Texture {
-    /// Bindless texture ID.
-    pub fn id(&self) -> TextureId {
+    pub(crate) fn id(&self) -> TextureId {
         self.id
     }
 
-    /// The backing GPU allocation address this texture was created at.
-    pub fn gpu(&self) -> GpuAddress {
-        self.gpu_address
+    /// Opaque shader handle for the texture's full view.
+    pub fn gpu(&self) -> TextureHandle {
+        self.handle
+    }
+
+    /// Render-target reference for this texture.
+    pub fn target(&self) -> crate::command::RenderTarget {
+        crate::command::RenderTarget::texture(self.id)
+    }
+
+    /// Create a sampled subresource view. It is released with this texture.
+    pub fn sampled_view(&mut self, view: &TextureViewDesc) -> crate::RhiResult<TextureHandle> {
+        self.create_view(view, false).map(TextureHandle::from_raw)
+    }
+
+    /// Create a read-write subresource view. It is released with this texture.
+    pub fn storage_view(&mut self, view: &TextureViewDesc) -> crate::RhiResult<TextureHandle> {
+        self.create_view(view, true).map(TextureHandle::from_raw)
+    }
+
+    fn create_view(&mut self, view: &TextureViewDesc, storage: bool) -> crate::RhiResult<u64> {
+        let usage = if storage {
+            TextureUsage::STORAGE
+        } else {
+            TextureUsage::SAMPLED
+        };
+        crate::device::validate_texture_view(self, view, usage)?;
+        let owner = self
+            ._owner
+            .clone()
+            .ok_or_else(|| crate::RhiError::Backend("texture has no owning device".into()))?;
+        let id = if storage {
+            backend_dispatch!(owner.as_ref(), DeviceInner, d => d.create_storage_view(self, view))?
+        } else {
+            backend_dispatch!(owner.as_ref(), DeviceInner, d => d.create_sampled_view(self, view))?
+        };
+        let address = backend_dispatch!(owner.as_ref(), DeviceInner, d => d.texture_handle_raw(id));
+        self.views.push(id);
+        Ok(address)
     }
 
     /// Texture description.

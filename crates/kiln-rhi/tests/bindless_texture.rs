@@ -7,9 +7,9 @@ mod common;
 use kiln_rhi::gpu_struct;
 use kiln_rhi::{
     AddressMode, ColorAttachment, ColorTarget, Cull, FilterMode, Format, GraphicsPsoDesc,
-    HazardFlags, LoadOp, MemoryType, RenderPassDesc, RenderTarget, SampleCount, SamplerDesc,
-    SamplerHandle, ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension, TextureHandle,
-    TextureUsage, Topology,
+    HazardFlags, LoadOp, MemoryType, RenderPassDesc, SampleCount, SamplerDesc, SamplerHandle,
+    ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension, TextureHandle, TextureUsage,
+    Topology,
 };
 
 // `gpu_struct!` maps these fields to Slang descriptor handles.
@@ -101,7 +101,7 @@ fn bindless_texture_sample() {
         .allocate_aligned(tex_sa.size, tex_sa.align, MemoryType::GpuOnly)
         .expect("tex mem");
     let texture = device
-        .create_texture(&tex_desc, tex_mem.gpu())
+        .create_texture(&tex_desc, tex_mem.ptr())
         .expect("create_texture");
 
     let staging = device
@@ -121,16 +121,12 @@ fn bindless_texture_sample() {
         })
         .expect("create_sampler");
 
-    let tex_id = device
-        .create_sampled_view(&texture, &Default::default())
-        .expect("create_sampled_view");
-
     let mut root = device
         .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Default)
         .expect("root");
     root.upload(&Root {
-        tex: device.sampled_texture_handle(tex_id),
-        samp: device.sampler_handle(sampler.id()),
+        tex: texture.gpu(),
+        samp: sampler.gpu(),
     })
     .expect("upload root");
 
@@ -151,7 +147,7 @@ fn bindless_texture_sample() {
         .allocate_aligned(rt_sa.size, rt_sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let rt = device
-        .create_texture(&rt_desc, rt_mem.gpu())
+        .create_texture(&rt_desc, rt_mem.ptr())
         .expect("create rt");
     let readback = device
         .allocate((SIZE * SIZE * 4) as u64, MemoryType::Readback)
@@ -169,7 +165,7 @@ fn bindless_texture_sample() {
 
         cmd.begin_render_pass(&RenderPassDesc {
             color_attachments: vec![ColorAttachment {
-                target: RenderTarget::Texture(rt.id()),
+                target: rt.target(),
                 load_op: LoadOp::Clear,
                 store_op: StoreOp::Store,
                 clear_color: [0.0, 0.0, 0.0, 1.0],
@@ -216,7 +212,6 @@ fn bindless_texture_sample() {
     device.free(root);
     device.free(staging);
     device.free(readback);
-    device.destroy_texture_view(tex_id);
     device.destroy_texture(texture);
     device.free(tex_mem);
     device.destroy_texture(rt);

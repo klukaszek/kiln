@@ -48,9 +48,9 @@ fn texture_create_and_views() {
     let mem = device
         .allocate_aligned(size_align.size, size_align.align, MemoryType::GpuOnly)
         .expect("texture backing memory");
-    let texture = common::timed("create_texture (placement)", || {
+    let mut texture = common::timed("create_texture (placement)", || {
         device
-            .create_texture(&desc, mem.gpu())
+            .create_texture(&desc, mem.ptr())
             .expect("create_texture")
     });
 
@@ -61,23 +61,14 @@ fn texture_create_and_views() {
         base_layer: 0,
         layer_count: ALL_LAYERS,
     };
-    let sampled = common::timed("create_sampled_view", || {
-        device
-            .create_sampled_view(&texture, &view)
-            .expect("sampled view")
+    let sampled = common::timed("sampled_view", || {
+        texture.sampled_view(&view).expect("sampled view")
     });
-    let storage = common::timed("create_storage_view", || {
-        device
-            .create_storage_view(&texture, &view)
-            .expect("storage view")
+    let storage = common::timed("storage_view", || {
+        texture.storage_view(&view).expect("storage view")
     });
-    assert_ne!(
-        sampled, storage,
-        "distinct views should get distinct bindless ids"
-    );
-
-    device.destroy_texture_view(sampled);
-    device.destroy_texture_view(storage);
+    assert!(!sampled.is_null());
+    assert!(!storage.is_null());
     device.destroy_texture(texture);
     device.free(mem);
 }
@@ -95,7 +86,7 @@ fn texture_copy_roundtrip() {
         .allocate_aligned(size_align.size, size_align.align, MemoryType::GpuOnly)
         .expect("texture backing");
     let texture = device
-        .create_texture(&desc, mem.gpu())
+        .create_texture(&desc, mem.ptr())
         .expect("create_texture");
 
     let bytes = (W as usize) * (H as usize) * BPP;

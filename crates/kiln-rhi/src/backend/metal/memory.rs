@@ -10,7 +10,7 @@ use objc2_metal::{
 use crate::backend::suballoc::FreeRanges;
 use crate::error::{RhiError, RhiResult};
 use crate::memory::MemoryType;
-use crate::types::GpuAddress;
+use crate::types::GpuPtr;
 
 const BUFFER_HEAP_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
 
@@ -36,8 +36,8 @@ impl MetalBuffer {
         }
     }
 
-    pub fn gpu_address(&self) -> GpuAddress {
-        GpuAddress(self.buffer.gpuAddress())
+    pub fn gpu_address(&self) -> GpuPtr<u8> {
+        GpuPtr::from_addr(self.buffer.gpuAddress())
     }
 
     /// Return this buffer's placement range to the pool after GPU retirement.

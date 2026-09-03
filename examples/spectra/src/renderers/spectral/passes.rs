@@ -145,7 +145,7 @@ impl PathTracer {
                 material_textures: resources.material_textures.gpu(),
                 texture_bindings: resources.texture_bindings.gpu(),
                 texture_basis: resources.texture_basis.gpu(),
-                tlas: resources.accel.tlas.handle(),
+                tlas: resources.accel.tlas.gpu(),
                 film_width: extent.x,
                 film_height: extent.y,
                 pass_start: batch.start,

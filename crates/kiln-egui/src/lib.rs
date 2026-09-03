@@ -4,8 +4,8 @@
 //! [`egui::ClippedPrimitive`] mesh is uploaded into per-frame vertex/index buffers and drawn with
 //! [`kiln_rhi::CommandBuffer::draw_indexed`], reading its vertices through a root pointer and
 //! sampling the font/image atlas through the bindless heap ([`kiln_rhi::TextureHandle`] /
-//! [`kiln_rhi::SamplerHandle`], filled by [`kiln_rhi::Device::sampled_texture_handle`] /
-//! [`kiln_rhi::Device::sampler_handle`]). This is the Kiln analogue of `egui_wgpu` /
+//! [`kiln_rhi::SamplerHandle`], obtained directly from texture and sampler objects). This is the
+//! Kiln analogue of `egui_wgpu` /
 //! `egui_glow`; the windowed input glue (winit) lives in the caller (see the `egui_demo` example).
 //!
 //! Usage per frame, around the swapchain render pass:
@@ -27,7 +27,7 @@ use kiln_rhi::{
     ColorTarget, ColorWriteMask, CommandBuffer, Cull, Device, FilterMode, Format, GraphicsPso,
     GraphicsPsoDesc, MAX_FRAMES_IN_FLIGHT, MemoryType, RhiError, RhiResult, SampleCount, Sampler,
     SamplerDesc, SamplerHandle, ShaderStage, StageFlags, Texture, TextureDesc, TextureDimension,
-    TextureHandle, TextureId, TextureUsage, Topology, gpu_struct,
+    TextureHandle, TextureUsage, Topology, gpu_struct,
 };
 
 gpu_struct! {
@@ -112,7 +112,6 @@ float4 fsMain(VOut i, uniform EguiRoot* r) : SV_Target
 /// (the RHI's texture copy has no sub-rect form).
 struct ManagedTexture {
     texture: Texture,
-    view: TextureId,
     mem: Allocation,
     /// Value for the root's [`TextureHandle`] field (heap index on Vulkan, `gpuResourceID` on Metal).
     handle: TextureHandle,
@@ -123,7 +122,6 @@ struct ManagedTexture {
 
 impl ManagedTexture {
     fn destroy(self, device: &Device) {
-        device.destroy_texture_view(self.view);
         device.destroy_texture(self.texture);
         device.free(self.mem);
     }
@@ -201,7 +199,7 @@ impl EguiRenderer {
             label: Some("egui-sampler".into()),
             ..Default::default()
         })?;
-        let sampler_handle = device.sampler_handle(sampler.id());
+        let sampler_handle = sampler.gpu();
 
         Ok(Self {
             pso,
@@ -529,19 +527,10 @@ fn create_texture(
     };
     let sa = device.texture_size_align(&desc)?;
     let mem = device.allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)?;
-    let texture = device.create_texture(&desc, mem.gpu())?;
-    let tex_id = match device.create_sampled_view(&texture, &Default::default()) {
-        Ok(id) => id,
-        Err(error) => {
-            device.destroy_texture(texture);
-            device.free(mem);
-            return Err(error);
-        }
-    };
-    let handle = device.sampled_texture_handle(tex_id);
+    let texture = device.create_texture(&desc, mem.ptr())?;
+    let handle = texture.gpu();
     Ok(ManagedTexture {
         texture,
-        view: tex_id,
         mem,
         handle,
         width,

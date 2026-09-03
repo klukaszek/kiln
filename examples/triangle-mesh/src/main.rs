@@ -9,7 +9,7 @@
 
 use kiln_app::{Example, FrameCtx};
 use kiln_rhi::{
-    ColorTarget, CommandBuffer, Cull, Device, Format, GpuAddress, MeshletPso, MeshletPsoDesc,
+    ColorTarget, CommandBuffer, Cull, Device, Format, GpuPtr, MeshletPso, MeshletPsoDesc,
     SampleCount, ShaderStage, Topology,
 };
 
@@ -73,7 +73,7 @@ impl Example for TriangleMesh {
 
     fn render(&mut self, _ctx: &FrameCtx, cmd: &mut CommandBuffer) {
         cmd.set_meshlet_pipeline(&self.pso);
-        cmd.draw_meshlets(GpuAddress::NULL, 1, 1, 1);
+        cmd.draw_meshlets(GpuPtr::<u8>::NULL, 1, 1, 1);
     }
 }
 

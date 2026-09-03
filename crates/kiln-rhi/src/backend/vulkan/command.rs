@@ -4,7 +4,8 @@ use super::device::{
 };
 use crate::barrier::{HazardFlags, StageFlags};
 use crate::command::{
-    DispatchIndirectArgs, DrawIndexedIndirectArgs, LoadOp, RenderPassDesc, RenderTarget, StoreOp,
+    DispatchIndirectArgs, DrawIndexedIndirectArgs, LoadOp, RenderPassDesc, RenderTargetKind,
+    StoreOp,
 };
 use crate::pipeline::{
     ComputePso, ComputePsoInner, DepthStencilState, GraphicsPso, GraphicsPsoInner, MeshletPso,
@@ -86,8 +87,8 @@ impl VulkanCommandBuffer {
         }
     }
 
-    fn resolve_buffer_bounds(&self, addr: GpuAddress) -> (vk::Buffer, u64, u64) {
-        let addr_u64 = addr.0;
+    fn resolve_buffer_bounds(&self, addr: GpuPtr<u8>) -> (vk::Buffer, u64, u64) {
+        let addr_u64 = addr.address;
         let allocations = self.allocations.lock().expect("allocations lock poisoned");
         if let Some((&base, alloc)) = allocations.range(..=addr_u64).next_back() {
             let offset = addr_u64 - base;
@@ -98,12 +99,12 @@ impl VulkanCommandBuffer {
         panic!("GPU address {addr_u64:#x} not found in allocation registry");
     }
 
-    fn resolve_buffer(&self, addr: GpuAddress, size: u64) -> (vk::Buffer, u64) {
+    fn resolve_buffer(&self, addr: GpuPtr<u8>, size: u64) -> (vk::Buffer, u64) {
         let (buffer, offset, remaining) = self.resolve_buffer_bounds(addr);
         if size > remaining {
             panic!(
                 "GPU address {:#x} size {} exceeds allocation bounds (remaining {})",
-                addr.0, size, remaining
+                addr.address, size, remaining
             );
         }
         (buffer, offset)
@@ -133,7 +134,7 @@ impl VulkanCommandBuffer {
         }
 
         for ca in &desc.color_attachments {
-            if let RenderTarget::SwapchainImage(idx) = ca.target {
+            if let RenderTargetKind::SwapchainImage(idx) = ca.target.kind() {
                 let image = self.swapchain_images[idx as usize];
                 let first_pass = !self.rendered_swapchain_images.contains(&idx);
                 // The first pass starts from UNDEFINED or PRESENT; later passes resume from the
@@ -191,12 +192,12 @@ impl VulkanCommandBuffer {
             .color_attachments
             .iter()
             .map(|ca| {
-                let (image_view, image_layout) = match ca.target {
-                    RenderTarget::SwapchainImage(idx) => (
+                let (image_view, image_layout) = match ca.target.kind() {
+                    RenderTargetKind::SwapchainImage(idx) => (
                         self.swapchain_image_views[idx as usize],
                         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                     ),
-                    RenderTarget::Texture(id) => {
+                    RenderTargetKind::Texture(id) => {
                         let (_, image_view, image_layout) = self.resolve_texture_info(id);
                         (image_view, image_layout)
                     }
@@ -226,12 +227,12 @@ impl VulkanCommandBuffer {
             .collect();
 
         let depth_attachment = desc.depth_attachment.as_ref().map(|da| {
-            let (image_view, image_layout) = match da.target {
-                RenderTarget::SwapchainImage(_) => (
+            let (image_view, image_layout) = match da.target.kind() {
+                RenderTargetKind::SwapchainImage(_) => (
                     self.depth_image_view,
                     vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 ),
-                RenderTarget::Texture(id) => {
+                RenderTargetKind::Texture(id) => {
                     let (_, image_view, image_layout) = self.resolve_texture_info(id);
                     (image_view, image_layout)
                 }
@@ -409,8 +410,8 @@ impl VulkanCommandBuffer {
         self.current_depth_stencil = Some(state.clone());
     }
 
-    pub fn set_root_data(&mut self, root: GpuAddress) {
-        let bytes = root.0.to_ne_bytes();
+    pub fn set_root_data(&mut self, root: GpuPtr<u8>) {
+        let bytes = root.address.to_ne_bytes();
         unsafe {
             self.device.cmd_push_constants(
                 self.command_buffer,
@@ -422,8 +423,8 @@ impl VulkanCommandBuffer {
         }
     }
 
-    pub fn set_compute_root(&mut self, root: GpuAddress) {
-        let bytes = root.0.to_ne_bytes();
+    pub fn set_compute_root(&mut self, root: GpuPtr<u8>) {
+        let bytes = root.address.to_ne_bytes();
         unsafe {
             self.device.cmd_push_constants(
                 self.command_buffer,
@@ -453,7 +454,7 @@ impl VulkanCommandBuffer {
         }
     }
 
-    pub fn draw_indexed(&mut self, indices: GpuAddress, index_count: u32, instance_count: u32) {
+    pub fn draw_indexed(&mut self, indices: GpuPtr<u8>, index_count: u32, instance_count: u32) {
         let (index_buffer, offset) = self.resolve_buffer(indices, index_count as u64 * 4);
         unsafe {
             self.device.cmd_bind_index_buffer(
@@ -473,7 +474,7 @@ impl VulkanCommandBuffer {
         }
     }
 
-    pub fn dispatch_indirect(&mut self, args: GpuAddress) {
+    pub fn dispatch_indirect(&mut self, args: GpuPtr<u8>) {
         let (arg_buffer, arg_offset) =
             self.resolve_buffer(args, std::mem::size_of::<DispatchIndirectArgs>() as u64);
         unsafe {
@@ -482,7 +483,7 @@ impl VulkanCommandBuffer {
         }
     }
 
-    pub fn draw_indexed_indirect(&mut self, indices: GpuAddress, args: GpuAddress) {
+    pub fn draw_indexed_indirect(&mut self, indices: GpuPtr<u8>, args: GpuPtr<u8>) {
         let (arg_buffer, arg_offset) =
             self.resolve_buffer(args, std::mem::size_of::<DrawIndexedIndirectArgs>() as u64);
         let (index_buffer, index_offset) = self.resolve_buffer(indices, 4);
@@ -503,7 +504,7 @@ impl VulkanCommandBuffer {
         }
     }
 
-    pub fn memcpy(&mut self, dst: GpuAddress, src: GpuAddress, size: u64) {
+    pub fn memcpy(&mut self, dst: GpuPtr<u8>, src: GpuPtr<u8>, size: u64) {
         if size == 0 {
             return;
         }
@@ -525,8 +526,8 @@ impl VulkanCommandBuffer {
 
     pub fn copy_buffer_to_texture(
         &mut self,
-        texture_gpu: GpuAddress,
-        src: GpuAddress,
+        texture_gpu: GpuPtr<u8>,
+        src: GpuPtr<u8>,
         texture: &Texture,
     ) {
         let (image, aspect, width, height, layout, src_buffer, src_offset) =
@@ -563,8 +564,8 @@ impl VulkanCommandBuffer {
 
     pub fn copy_texture_to_buffer(
         &mut self,
-        dst: GpuAddress,
-        texture_gpu: GpuAddress,
+        dst: GpuPtr<u8>,
+        texture_gpu: GpuPtr<u8>,
         texture: &Texture,
     ) {
         let (image, aspect, width, height, layout, dst_buffer, dst_offset) =
@@ -603,8 +604,8 @@ impl VulkanCommandBuffer {
     /// `(image, aspect, w, h, current layout, buffer, offset)` for a copy command.
     fn prepare_texture_copy(
         &self,
-        texture_gpu: GpuAddress,
-        buffer_gpu: GpuAddress,
+        texture_gpu: GpuPtr<u8>,
+        buffer_gpu: GpuPtr<u8>,
         texture: &Texture,
         op: &'static str,
     ) -> (
@@ -617,8 +618,7 @@ impl VulkanCommandBuffer {
         u64,
     ) {
         assert_eq!(
-            texture_gpu,
-            texture.gpu(),
+            texture_gpu, texture.gpu_address,
             "{op} texture_gpu must match the address used to create the texture"
         );
         let (image, _view, layout) = self.resolve_texture_info(texture.id());
@@ -870,7 +870,7 @@ impl VulkanCommandBuffer {
     }
 
     /// `args` points to one `VkDrawMeshTasksIndirectCommandEXT` (x, y, z: u32 = 12 bytes).
-    pub fn draw_meshlets_indirect(&mut self, args: GpuAddress) {
+    pub fn draw_meshlets_indirect(&mut self, args: GpuPtr<u8>) {
         let Some(loader) = self.mesh_shader.as_ref() else {
             return;
         };
@@ -894,7 +894,7 @@ impl VulkanCommandBuffer {
                     let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
                         .vertex_format(vk::Format::R32G32B32_SFLOAT)
                         .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.vertex_buffer.raw().0,
+                            device_address: m.vertex_buffer.address,
                         })
                         .vertex_stride(m.vertex_stride)
                         .max_vertex(m.vertex_count.saturating_sub(1))
@@ -904,7 +904,7 @@ impl VulkanCommandBuffer {
                             vk::IndexType::NONE_KHR
                         })
                         .index_data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.index_buffer.raw().0,
+                            device_address: m.index_buffer.address,
                         });
                     vk::AccelerationStructureGeometryKHR::default()
                         .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
@@ -914,7 +914,7 @@ impl VulkanCommandBuffer {
                 GeometryType::Aabbs => {
                     let aabbs = vk::AccelerationStructureGeometryAabbsDataKHR::default()
                         .data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.aabb_buffer.raw().0,
+                            device_address: m.aabb_buffer.address,
                         })
                         .stride(std::mem::size_of::<vk::AabbPositionsKHR>() as u64);
                     vk::AccelerationStructureGeometryKHR::default()
@@ -980,7 +980,7 @@ impl VulkanCommandBuffer {
         let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::default()
             .array_of_pointers(false)
             .data(vk::DeviceOrHostAddressConstKHR {
-                device_address: desc.instance_buffer.raw().0,
+                device_address: desc.instance_buffer.address,
             });
         let geometry = vk::AccelerationStructureGeometryKHR::default()
             .geometry_type(vk::GeometryTypeKHR::INSTANCES)

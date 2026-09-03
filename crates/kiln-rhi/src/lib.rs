@@ -5,7 +5,7 @@
 //! Core design principles:
 //! - One allocation model: optional CPU mapping + typed GPU pointer + byte length
 //! - Single root data pointer per draw/dispatch (no descriptor sets, no bind groups)
-//! - Global texture heap indexed by TextureId(u32)
+//! - Opaque shader handles for textures, samplers, and acceleration structures
 //! - Stage-only barriers (no per-resource state tracking)
 //! - Minimal PSO (topology + formats + MSAA + blend baked; separate DepthStencil)
 //! - Transient command buffers (create, record, submit, auto-reclaim)
@@ -82,7 +82,7 @@
 //!         tlas: AccelHandle,
 //!     }
 //! }
-//! // root.tlas = tlas_accel.handle();
+//! // root.tlas = tlas_accel.gpu();
 //! ```
 //!
 //! Slang lowers this to a 64-bit device address + `OpConvertUToAccelerationStructureKHR`

@@ -10,7 +10,7 @@ use crate::types::{BlasDesc, TlasDesc};
 /// Color attachment for dynamic rendering.
 #[derive(Clone, Debug)]
 pub struct ColorAttachment {
-    /// Index into swapchain images or a TextureId for offscreen.
+    /// Swapchain image or offscreen texture.
     pub target: RenderTarget,
     pub load_op: LoadOp,
     pub store_op: StoreOp,
@@ -28,12 +28,28 @@ pub struct DepthAttachment {
 }
 
 /// Render target reference.
-#[derive(Clone, Debug)]
-pub enum RenderTarget {
-    /// Swapchain image by index.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderTarget(RenderTargetKind);
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RenderTargetKind {
     SwapchainImage(u32),
-    /// Off-screen texture by TextureId.
     Texture(TextureId),
+}
+
+impl RenderTarget {
+    /// Select a swapchain image by index.
+    pub const fn swapchain_image(index: u32) -> Self {
+        Self(RenderTargetKind::SwapchainImage(index))
+    }
+
+    pub(crate) const fn texture(id: TextureId) -> Self {
+        Self(RenderTargetKind::Texture(id))
+    }
+
+    pub(crate) const fn kind(self) -> RenderTargetKind {
+        self.0
+    }
 }
 
 /// Load operation for attachments.
@@ -157,101 +173,93 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_depth_stencil_state(state))
     }
 
-    fn set_root_data(&mut self, root: GpuAddress) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_root_data(root))
+    fn set_root_data<T: ?Sized>(&mut self, root: GpuPtr<T>) {
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_root_data(root.cast()))
     }
 
-    fn set_compute_root(&mut self, root: GpuAddress) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_compute_root(root))
+    fn set_compute_root<T: ?Sized>(&mut self, root: GpuPtr<T>) {
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_compute_root(root.cast()))
     }
 
     /// Draw non-indexed geometry using `root` as the shared vertex/fragment root.
-    pub fn draw<R: Into<GpuAddress>>(
+    pub fn draw<R: ?Sized>(
         &mut self,
-        root: R,
+        root: GpuPtr<R>,
         vertex_count: u32,
         instance_count: u32,
         first_vertex: u32,
         first_instance: u32,
     ) {
-        self.set_root_data(root.into());
+        self.set_root_data(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd =>
             cmd.draw(vertex_count, instance_count, first_vertex, first_instance))
     }
 
     /// Draw indexed geometry.
-    pub fn draw_indexed<R: Into<GpuAddress>, I: Into<GpuAddress>>(
+    pub fn draw_indexed<R: ?Sized>(
         &mut self,
-        root: R,
-        indices: I,
+        root: GpuPtr<R>,
+        indices: GpuPtr<u32>,
         index_count: u32,
         instance_count: u32,
     ) {
-        self.set_root_data(root.into());
-        let indices = indices.into();
+        self.set_root_data(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd =>
-            cmd.draw_indexed(indices, index_count, instance_count))
+            cmd.draw_indexed(indices.cast(), index_count, instance_count))
     }
 
     /// Dispatch compute work.
-    pub fn dispatch<R: Into<GpuAddress>>(&mut self, root: R, x: u32, y: u32, z: u32) {
-        self.set_compute_root(root.into());
+    pub fn dispatch<R: ?Sized>(&mut self, root: GpuPtr<R>, x: u32, y: u32, z: u32) {
+        self.set_compute_root(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch(x, y, z))
     }
 
     /// Dispatch compute work from GPU arguments.
-    pub fn dispatch_indirect<R: Into<GpuAddress>, A: Into<GpuAddress>>(
+    pub fn dispatch_indirect<R: ?Sized>(
         &mut self,
-        root: R,
-        args: A,
+        root: GpuPtr<R>,
+        args: GpuPtr<DispatchIndirectArgs>,
     ) {
-        self.set_compute_root(root.into());
-        let args = args.into();
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch_indirect(args))
+        self.set_compute_root(root);
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch_indirect(args.cast()))
     }
 
     /// Draw indexed geometry from GPU arguments.
-    pub fn draw_indexed_indirect<R: Into<GpuAddress>, I: Into<GpuAddress>, A: Into<GpuAddress>>(
+    pub fn draw_indexed_indirect<R: ?Sized>(
         &mut self,
-        root: R,
-        indices: I,
-        args: A,
+        root: GpuPtr<R>,
+        indices: GpuPtr<u32>,
+        args: GpuPtr<DrawIndexedIndirectArgs>,
     ) {
-        self.set_root_data(root.into());
-        let indices = indices.into();
-        let args = args.into();
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indexed_indirect(indices, args))
+        self.set_root_data(root);
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indexed_indirect(indices.cast(), args.cast()))
     }
 
     /// Copy bytes between two GPU pointers.
-    pub fn memcpy<D: Into<GpuAddress>, S: Into<GpuAddress>>(&mut self, dst: D, src: S, size: u64) {
-        let dst = dst.into();
-        let src = src.into();
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.memcpy(dst, src, size))
+    pub fn memcpy<D: ?Sized, S: ?Sized>(&mut self, dst: GpuPtr<D>, src: GpuPtr<S>, size: u64) {
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.memcpy(dst.cast(), src.cast(), size))
     }
 
     /// Copy a tightly-packed buffer into the base mip and first layer of a texture.
-    pub fn copy_buffer_to_texture<S: Into<GpuAddress>>(
+    pub fn copy_buffer_to_texture<S: ?Sized>(
         &mut self,
-        src: S,
+        src: GpuPtr<S>,
         texture: &crate::texture::Texture,
     ) {
         self.assert_same_device(&texture._owner, "texture");
-        let src = src.into();
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_buffer_to_texture(texture.gpu(), src, texture))
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_buffer_to_texture(texture.gpu_address, src.cast(), texture))
     }
 
     /// Copy the base mip and first layer of a texture into a tightly-packed buffer.
     ///
     /// This is the common-case spelling and derives the placement address from `texture`.
-    pub fn copy_texture_to_buffer<D: Into<GpuAddress>>(
+    pub fn copy_texture_to_buffer<D: ?Sized>(
         &mut self,
         texture: &crate::texture::Texture,
-        dst: D,
+        dst: GpuPtr<D>,
     ) {
         self.assert_same_device(&texture._owner, "texture");
-        let dst = dst.into();
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_texture_to_buffer(dst, texture.gpu(), texture))
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_texture_to_buffer(dst.cast(), texture.gpu_address, texture))
     }
 
     /// Stage-only global barrier.
@@ -356,20 +364,19 @@ impl CommandBuffer {
     }
 
     /// Draw mesh tasks using the active mesh pipeline.
-    pub fn draw_meshlets<R: Into<GpuAddress>>(&mut self, root: R, x: u32, y: u32, z: u32) {
-        self.set_root_data(root.into());
+    pub fn draw_meshlets<R: ?Sized>(&mut self, root: GpuPtr<R>, x: u32, y: u32, z: u32) {
+        self.set_root_data(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets(x, y, z))
     }
 
     /// Draw mesh tasks from GPU arguments.
-    pub fn draw_meshlets_indirect<R: Into<GpuAddress>, A: Into<GpuAddress>>(
+    pub fn draw_meshlets_indirect<R: ?Sized>(
         &mut self,
-        root: R,
-        args: A,
+        root: GpuPtr<R>,
+        args: GpuPtr<DispatchIndirectArgs>,
     ) {
-        self.set_root_data(root.into());
-        let args = args.into();
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets_indirect(args))
+        self.set_root_data(root);
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets_indirect(args.cast()))
     }
 
     /// Build a BLAS. `accel` must come from `device.create_blas(desc)` with the same `desc`.

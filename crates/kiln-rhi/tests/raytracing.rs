@@ -118,7 +118,7 @@ fn ray_query_triangle_hit() {
         ],
         instance_custom_index_and_mask: 0xFF << 24, // mask = 0xFF
         instance_sbt_offset_and_flags: 0,
-        acceleration_structure_reference: blas.handle(),
+        acceleration_structure_reference: blas.gpu(),
     };
     device
         .write_tlas_instance(&instbuf, 0, &instance)
@@ -146,7 +146,7 @@ fn ray_query_triangle_hit() {
         .expect("root");
     root.upload(&Root {
         output: output.ptr(),
-        tlas: tlas.handle(),
+        tlas: tlas.gpu(),
     })
     .expect("upload root");
 

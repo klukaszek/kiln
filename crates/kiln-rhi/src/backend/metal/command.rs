@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::barrier::{HazardFlags, StageFlags};
-use crate::command::{LoadOp, RenderPassDesc, RenderTarget, StoreOp};
+use crate::command::{LoadOp, RenderPassDesc, RenderTargetKind, StoreOp};
 use crate::pipeline::{ComputePso, DepthStencilState, GraphicsPso, MeshletPso};
 use crate::texture::{Texture, bytes_per_pixel};
 use crate::types::*;
@@ -190,10 +190,10 @@ impl MetalCommandBuffer {
 
     fn resolve_buffer(
         &self,
-        addr: GpuAddress,
+        addr: GpuPtr<u8>,
         size: u64,
     ) -> (Retained<ProtocolObject<dyn MTLBuffer>>, u64) {
-        let addr_u64 = addr.0;
+        let addr_u64 = addr.address;
         let allocations = self.shared.allocations.borrow();
         if let Some((&base, alloc)) = allocations.range(..=addr_u64).next_back() {
             let offset = addr_u64 - base;
@@ -208,8 +208,8 @@ impl MetalCommandBuffer {
     /// element count is GPU-driven (indirect indexed draws) and the CPU
     /// cannot compute an exact length. Metal 4 consumes the GPU address directly, so
     /// non-indirect draws pass their addresses through without any lookup.
-    fn allocation_remaining(&self, addr: GpuAddress) -> u64 {
-        let addr_u64 = addr.0;
+    fn allocation_remaining(&self, addr: GpuPtr<u8>) -> u64 {
+        let addr_u64 = addr.address;
         let allocations = self.shared.allocations.borrow();
         if let Some((&base, alloc)) = allocations.range(..=addr_u64).next_back() {
             let offset = addr_u64 - base;
@@ -375,14 +375,14 @@ impl MetalCommandBuffer {
         for (i, color_att) in desc.color_attachments.iter().enumerate() {
             let attachment = unsafe { color_attachments.objectAtIndexedSubscript(i) };
 
-            match &color_att.target {
-                RenderTarget::SwapchainImage(_idx) => {
+            match color_att.target.kind() {
+                RenderTargetKind::SwapchainImage(_idx) => {
                     if let Some(tex) = self.drawable_slot.as_ref().and_then(|slot| slot.texture()) {
                         attachment.setTexture(Some(&tex));
                     }
                 }
-                RenderTarget::Texture(id) => {
-                    let tex = self.resolve_texture(*id);
+                RenderTargetKind::Texture(id) => {
+                    let tex = self.resolve_texture(id);
                     attachment.setTexture(Some(&tex));
                 }
             }
@@ -412,14 +412,14 @@ impl MetalCommandBuffer {
         if let Some(depth_att) = &desc.depth_attachment {
             let depth = pass_desc.depthAttachment();
 
-            match &depth_att.target {
-                RenderTarget::SwapchainImage(_) => {
+            match depth_att.target.kind() {
+                RenderTargetKind::SwapchainImage(_) => {
                     if let Some(depth_tex) = &self.depth_texture {
                         depth.setTexture(Some(depth_tex));
                     }
                 }
-                RenderTarget::Texture(id) => {
-                    let tex = self.resolve_texture(*id);
+                RenderTargetKind::Texture(id) => {
+                    let tex = self.resolve_texture(id);
                     depth.setTexture(Some(&tex));
                 }
             }
@@ -565,18 +565,18 @@ impl MetalCommandBuffer {
         self.current_depth_stencil = Some(current);
     }
 
-    pub fn set_root_data(&mut self, root: GpuAddress) {
+    pub fn set_root_data(&mut self, root: GpuPtr<u8>) {
         let (slot_addr, slot_ptr) = self.alloc_root_bytes(std::mem::size_of::<u64>());
         unsafe {
-            std::ptr::write_unaligned(slot_ptr as *mut u64, root.0);
+            std::ptr::write_unaligned(slot_ptr as *mut u64, root.address);
         }
         self.current_root_table = slot_addr;
     }
 
-    pub fn set_compute_root(&mut self, root: GpuAddress) {
+    pub fn set_compute_root(&mut self, root: GpuPtr<u8>) {
         let (slot_addr, slot_ptr) = self.alloc_root_bytes(std::mem::size_of::<u64>());
         unsafe {
-            std::ptr::write_unaligned(slot_ptr as *mut u64, root.0);
+            std::ptr::write_unaligned(slot_ptr as *mut u64, root.address);
         }
         self.bind_root_table(slot_addr);
     }
@@ -610,9 +610,9 @@ impl MetalCommandBuffer {
         }
     }
 
-    pub fn draw_indexed(&mut self, indices: GpuAddress, index_count: u32, instance_count: u32) {
+    pub fn draw_indexed(&mut self, indices: GpuPtr<u8>, index_count: u32, instance_count: u32) {
         // Indices are U32 and Metal 4 consumes the buffer as a raw GPU address.
-        let index_addr_gpu: MTLGPUAddress = indices.0;
+        let index_addr_gpu: MTLGPUAddress = indices.address;
         let index_len = (index_count as u64) * 4;
         let root_table = self.current_root_table;
         let topology = self.current_topology;
@@ -659,12 +659,12 @@ impl MetalCommandBuffer {
         encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, tg);
     }
 
-    pub fn dispatch_indirect(&mut self, args: GpuAddress) {
+    pub fn dispatch_indirect(&mut self, args: GpuPtr<u8>) {
         let encoder = self
             .compute_encoder
             .as_ref()
             .expect("No active compute encoder");
-        let arg_addr_gpu: MTLGPUAddress = args.0;
+        let arg_addr_gpu: MTLGPUAddress = args.address;
         let threads_per_group = self.current_threads_per_threadgroup;
         let tg = MTLSize {
             width: threads_per_group[0] as usize,
@@ -676,11 +676,11 @@ impl MetalCommandBuffer {
         }
     }
 
-    pub fn draw_indexed_indirect(&mut self, indices: GpuAddress, args: GpuAddress) {
-        let index_addr_gpu: MTLGPUAddress = indices.0;
+    pub fn draw_indexed_indirect(&mut self, indices: GpuPtr<u8>, args: GpuPtr<u8>) {
+        let index_addr_gpu: MTLGPUAddress = indices.address;
         // The GPU supplies the count, so bound the address range by the allocation remainder.
         let index_len = self.allocation_remaining(indices);
-        let arg_addr_gpu: MTLGPUAddress = args.0;
+        let arg_addr_gpu: MTLGPUAddress = args.address;
         let root_table = self.current_root_table;
         let topology = self.current_topology;
         self.bind_root_table(root_table);
@@ -703,7 +703,7 @@ impl MetalCommandBuffer {
         }
     }
 
-    pub fn memcpy(&mut self, dst: GpuAddress, src: GpuAddress, size: u64) {
+    pub fn memcpy(&mut self, dst: GpuPtr<u8>, src: GpuPtr<u8>, size: u64) {
         if size == 0 {
             return;
         }
@@ -727,8 +727,8 @@ impl MetalCommandBuffer {
 
     pub fn copy_buffer_to_texture(
         &mut self,
-        texture_gpu: GpuAddress,
-        src: GpuAddress,
+        texture_gpu: GpuPtr<u8>,
+        src: GpuPtr<u8>,
         texture: &Texture,
     ) {
         let (mtl_texture, buffer, offset, size, origin, bytes_per_row, bytes_per_image) =
@@ -754,8 +754,8 @@ impl MetalCommandBuffer {
 
     pub fn copy_texture_to_buffer(
         &mut self,
-        dst: GpuAddress,
-        texture_gpu: GpuAddress,
+        dst: GpuPtr<u8>,
+        texture_gpu: GpuPtr<u8>,
         texture: &Texture,
     ) {
         let (mtl_texture, buffer, offset, size, origin, bytes_per_row, bytes_per_image) =
@@ -784,8 +784,8 @@ impl MetalCommandBuffer {
     #[allow(clippy::type_complexity)]
     fn prepare_texture_copy(
         &self,
-        texture_gpu: GpuAddress,
-        buffer_gpu: GpuAddress,
+        texture_gpu: GpuPtr<u8>,
+        buffer_gpu: GpuPtr<u8>,
         texture: &Texture,
         op: &'static str,
     ) -> (
@@ -1074,7 +1074,7 @@ impl MetalCommandBuffer {
 
     /// Indirect mesh draw. Pipeline must be set via `set_meshlet_pipeline`.
     /// `args` points to one indirect mesh dispatch command.
-    pub fn draw_meshlets_indirect(&mut self, args: GpuAddress) {
+    pub fn draw_meshlets_indirect(&mut self, args: GpuPtr<u8>) {
         use objc2_metal::MTL4RenderCommandEncoder as _;
         let tg_obj = self.current_mesh_tpg_object;
         let tg_mesh = self.current_mesh_tpg_mesh;
@@ -1088,7 +1088,7 @@ impl MetalCommandBuffer {
             MTLRenderStages::Mesh | MTLRenderStages::Fragment,
         );
         encoder.drawMeshThreadgroupsWithIndirectBuffer_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
-            args.0,
+            args.address,
             tg_obj,
             tg_mesh,
         );
@@ -1160,7 +1160,7 @@ impl MetalCommandBuffer {
         let instance_desc = MTL4InstanceAccelerationStructureDescriptor::new();
         unsafe {
             instance_desc.setInstanceDescriptorBuffer(objc2_metal::MTL4BufferRange {
-                bufferAddress: desc.instance_buffer.raw().0,
+                bufferAddress: desc.instance_buffer.address,
                 // Metal uses its indirect instance layout, written by `Device::write_tlas_instance`.
                 length: (desc.instance_count as u64)
                     * std::mem::size_of::<

@@ -9,9 +9,9 @@ mod common;
 use kiln_rhi::gpu_struct;
 use kiln_rhi::{
     AllocationDesc, BumpAllocator, ColorAttachment, ColorTarget, ColorWriteMask, Cull, Device,
-    Format, GpuAddress, GraphicsPso, GraphicsPsoDesc, LoadOp, MemoryType, RenderPassDesc,
-    RenderTarget, SampleCount, ShaderModule, ShaderStage, StageFlags, StoreOp, TextureDesc,
-    TextureDimension, TextureUsage, Topology,
+    Format, GpuPtr, GraphicsPso, GraphicsPsoDesc, LoadOp, MemoryType, RenderPassDesc, SampleCount,
+    ShaderModule, ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension, TextureUsage,
+    Topology,
 };
 
 // Shared host/device root: a single colour, used by the pixel shader.
@@ -96,7 +96,7 @@ fn graphics_fullscreen_color() {
         .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let texture = device
-        .create_texture(&tex_desc, tex_mem.gpu())
+        .create_texture(&tex_desc, tex_mem.ptr())
         .expect("create_texture");
 
     // Root color and readback buffer.
@@ -115,7 +115,7 @@ fn graphics_fullscreen_color() {
         let mut cmd = device.create_command_buffer().expect("cmd");
         cmd.begin_render_pass(&RenderPassDesc {
             color_attachments: vec![ColorAttachment {
-                target: RenderTarget::Texture(texture.id()),
+                target: texture.target(),
                 load_op: LoadOp::Clear,
                 store_op: StoreOp::Store,
                 clear_color: [0.0, 0.0, 0.0, 1.0],
@@ -243,7 +243,7 @@ fn make_graphics_pso(
 fn render_draw(
     device: &Device,
     pso: &GraphicsPso,
-    root: GpuAddress,
+    root: GpuPtr<u8>,
     size: u32,
     vertex_count: u32,
     instance_count: u32,
@@ -265,7 +265,7 @@ fn render_draw(
         .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let texture = device
-        .create_texture(&tex_desc, tex_mem.gpu())
+        .create_texture(&tex_desc, tex_mem.ptr())
         .expect("create_texture");
     let readback = device
         .allocate((size * size * 4) as u64, MemoryType::Readback)
@@ -274,7 +274,7 @@ fn render_draw(
     let mut cmd = device.create_command_buffer().expect("cmd");
     cmd.begin_render_pass(&RenderPassDesc {
         color_attachments: vec![ColorAttachment {
-            target: RenderTarget::Texture(texture.id()),
+            target: texture.target(),
             load_op: LoadOp::Clear,
             store_op: StoreOp::Store,
             clear_color: [0.0, 0.0, 0.0, 1.0],
@@ -360,7 +360,7 @@ fn graphics_clip_space_is_y_up() {
 
     const SIZE: u32 = 128;
     let pixels = common::timed("graphics clip-space orientation · submit+wait", || {
-        render_draw(&device, &pso, GpuAddress::NULL, SIZE, 6, 1)
+        render_draw(&device, &pso, GpuPtr::NULL, SIZE, 6, 1)
     });
     common::save_rgba_png("graphics_clip_space_is_y_up", SIZE, SIZE, &pixels);
 
@@ -423,7 +423,7 @@ fn graphics_interpolated_triangle() {
 
     const SIZE: u32 = 128;
     let pixels = common::timed("graphics interpolated triangle · submit+wait", || {
-        render_draw(&device, &pso, GpuAddress::NULL, SIZE, 3, 1)
+        render_draw(&device, &pso, GpuPtr::NULL, SIZE, 3, 1)
     });
     common::save_rgba_png("graphics_interpolated_triangle", SIZE, SIZE, &pixels);
 

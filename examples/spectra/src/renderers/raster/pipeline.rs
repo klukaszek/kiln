@@ -3,7 +3,7 @@
 use glam::Vec4;
 use kiln_rhi::{
     ColorTarget, CommandBuffer, CompareOp, Cull, DepthFlags, DepthStencilState, Device, Format,
-    GpuAddress, MeshletPso, MeshletPsoDesc, SampleCount, ShaderStage, Topology, gpu_struct,
+    GpuPtr, MeshletPso, MeshletPsoDesc, SampleCount, ShaderStage, Topology, gpu_struct,
 };
 
 use super::scene::{GpuRasterMaterial, RasterVertex};
@@ -113,7 +113,7 @@ impl Pipeline {
         Ok(Self(pipeline))
     }
 
-    pub(super) fn record(&self, commands: &mut CommandBuffer, root: GpuAddress, triangles: u32) {
+    pub(super) fn record<T>(&self, commands: &mut CommandBuffer, root: GpuPtr<T>, triangles: u32) {
         commands.set_meshlet_pipeline(&self.0);
         commands.set_depth_stencil_state(&DepthStencilState {
             depth_mode: DepthFlags::READ | DepthFlags::WRITE,

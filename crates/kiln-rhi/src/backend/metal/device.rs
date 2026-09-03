@@ -109,21 +109,21 @@ fn shared_event_as_event(
 
 #[derive(Clone)]
 pub(crate) struct BufferAllocation {
-    pub base: GpuAddress,
+    pub base: GpuPtr<u8>,
     pub size: u64,
     pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub heap: Retained<ProtocolObject<dyn MTLHeap>>,
 }
 
 struct MappedAllocation {
-    gpu_base: GpuAddress,
+    gpu_base: GpuPtr<u8>,
     size: u64,
 }
 
 fn resolve_mapped_pointer(
     allocations: &BTreeMap<usize, MappedAllocation>,
     ptr: usize,
-) -> Option<GpuAddress> {
+) -> Option<GpuPtr<u8>> {
     let (&base, allocation) = allocations.range(..=ptr).next_back()?;
     let offset = (ptr - base) as u64;
     (offset < allocation.size).then(|| allocation.gpu_base.offset(offset))
@@ -669,7 +669,7 @@ impl MetalDevice {
         {
             let mut allocations = self.shared.allocations.borrow_mut();
             allocations.insert(
-                metal_buffer.gpu_address().0,
+                metal_buffer.gpu_address().address,
                 BufferAllocation {
                     base: metal_buffer.gpu_address(),
                     size: metal_buffer.size,
@@ -696,7 +696,7 @@ impl MetalDevice {
         })
     }
 
-    pub fn host_to_device_pointer(&self, cpu_ptr: *const u8) -> Option<GpuAddress> {
+    pub fn host_to_device_pointer(&self, cpu_ptr: *const u8) -> Option<GpuPtr<u8>> {
         if cpu_ptr.is_null() {
             return None;
         }
@@ -807,7 +807,7 @@ impl MetalDevice {
     pub fn create_texture(
         &self,
         desc: &TextureDesc,
-        texture_gpu: GpuAddress,
+        texture_gpu: GpuPtr<u8>,
     ) -> RhiResult<Texture> {
         if texture_gpu.is_null() {
             return Err(RhiError::TextureCreation(
@@ -823,28 +823,28 @@ impl MetalDevice {
         let (heap, heap_offset) = {
             let allocations = self.shared.allocations.borrow();
             let alloc = allocations
-                .range(..=texture_gpu.0)
+                .range(..=texture_gpu.address)
                 .next_back()
                 .map(|(_, alloc)| alloc)
-                .filter(|alloc| texture_gpu.0 - alloc.base.0 < alloc.size)
+                .filter(|alloc| texture_gpu.address - alloc.base.address < alloc.size)
                 .ok_or_else(|| {
                     RhiError::TextureCreation(format!(
                         "texture allocation address 0x{:x} was not returned by gpuMalloc",
-                        texture_gpu.0
+                        texture_gpu.address
                     ))
                 })?;
 
-            let offset = texture_gpu.0 - alloc.base.0;
+            let offset = texture_gpu.address - alloc.base.address;
             if !offset.is_multiple_of(size_align.align as u64) {
                 return Err(RhiError::TextureCreation(format!(
                     "texture allocation address 0x{:x} has heap offset {offset}, expected alignment {}",
-                    texture_gpu.0, size_align.align
+                    texture_gpu.address, size_align.align
                 )));
             }
             if size_align.size as u64 > alloc.size - offset {
                 return Err(RhiError::TextureCreation(format!(
                     "texture allocation address 0x{:x} has {} bytes available, needs {}",
-                    texture_gpu.0,
+                    texture_gpu.address,
                     alloc.size - offset,
                     size_align.size
                 )));
@@ -892,6 +892,8 @@ impl MetalDevice {
         Ok(Texture {
             id,
             gpu_address: texture_gpu,
+            handle: TextureHandle::from_raw(texture.gpuResourceID().to_raw()),
+            views: Vec::new(),
             desc: desc.clone(),
             _owner: None,
         })
@@ -938,7 +940,11 @@ impl MetalDevice {
             sampler.gpuResourceID().to_raw(),
         );
 
-        Ok(Sampler { id, _owner: None })
+        Ok(Sampler {
+            id,
+            handle: SamplerHandle::from_raw(sampler.gpuResourceID().to_raw()),
+            _owner: None,
+        })
     }
 
     pub fn create_shader_module(&self, desc: &ShaderModuleDesc) -> RhiResult<ShaderModule> {
@@ -1166,7 +1172,7 @@ impl MetalDevice {
         let instance_desc = MTL4InstanceAccelerationStructureDescriptor::new();
         unsafe {
             instance_desc.setInstanceDescriptorBuffer(objc2_metal::MTL4BufferRange {
-                bufferAddress: desc.instance_buffer.raw().0,
+                bufferAddress: desc.instance_buffer.address,
                 // The descriptor uses Metal's indirect instance layout; callers write it with
                 // `Device::write_tlas_instance`.
                 length: (desc.instance_count as u64) * self.tlas_instance_stride() as u64,
@@ -1195,7 +1201,7 @@ impl MetalDevice {
     /// Encode `inst` into `dst` in Metal's native indirect instance-descriptor layout.
     /// `dst` must have room for `tlas_instance_stride()` bytes.
     ///
-    /// `inst.acceleration_structure_reference` must be the BLAS handle (`blas.handle()`).
+    /// `inst.acceleration_structure_reference` must be the BLAS handle (`blas.gpu()`).
     pub fn write_tlas_instance(&self, dst: *mut u8, inst: &crate::types::TlasInstance) {
         use objc2_metal::{
             MTLAccelerationStructureInstanceOptions,
@@ -1446,7 +1452,7 @@ impl MetalDevice {
             AllocationInner::Metal(mtl) => {
                 {
                     let mut allocations = self.shared.allocations.borrow_mut();
-                    allocations.remove(&mtl.gpu_address().0);
+                    allocations.remove(&mtl.gpu_address().address);
                 }
                 if let Some(mapped_ptr) = mtl.mapped_ptr() {
                     self.mapped_allocations
@@ -1550,23 +1556,13 @@ impl MetalDevice {
     /// Value to store in a [`TextureHandle`](crate::TextureHandle) root field for sampled view
     /// `id`. On Metal a `DescriptorHandle<Texture2D>` is the texture's `gpuResourceID`, which the
     /// shader uses directly.
-    pub fn texture_handle_raw(&self, id: TextureId) -> GpuAddress {
+    pub fn texture_handle_raw(&self, id: TextureId) -> u64 {
         let textures = self.shared.textures.borrow();
         let texture = textures
             .get(id.0 as usize)
             .and_then(|t| t.as_ref())
             .expect("invalid TextureId");
-        GpuAddress(texture.gpuResourceID().to_raw())
-    }
-
-    /// Value to store in a [`SamplerHandle`](crate::SamplerHandle) root field for sampler `id`.
-    pub fn sampler_handle_raw(&self, id: crate::types::SamplerId) -> GpuAddress {
-        let samplers = self.shared.samplers.borrow();
-        let sampler = samplers
-            .get(id.0 as usize)
-            .and_then(|s| s.as_ref())
-            .expect("invalid SamplerId");
-        GpuAddress(sampler.gpuResourceID().to_raw())
+        texture.gpuResourceID().to_raw()
     }
 
     pub fn create_query_pool(&self, count: u32) -> RhiResult<QueryPool> {
@@ -1784,25 +1780,25 @@ mod tests {
         allocations.insert(
             0x1000,
             MappedAllocation {
-                gpu_base: GpuAddress(0x8000),
+                gpu_base: GpuPtr::from_addr(0x8000),
                 size: 0x20,
             },
         );
         allocations.insert(
             0x2000,
             MappedAllocation {
-                gpu_base: GpuAddress(0x9000),
+                gpu_base: GpuPtr::from_addr(0x9000),
                 size: 0x10,
             },
         );
 
         assert_eq!(
             resolve_mapped_pointer(&allocations, 0x100f),
-            Some(GpuAddress(0x800f))
+            Some(GpuPtr::from_addr(0x800f))
         );
         assert_eq!(
             resolve_mapped_pointer(&allocations, 0x200f),
-            Some(GpuAddress(0x900f))
+            Some(GpuPtr::from_addr(0x900f))
         );
         assert_eq!(resolve_mapped_pointer(&allocations, 0x1020), None);
         assert_eq!(resolve_mapped_pointer(&allocations, 0x1fff), None);

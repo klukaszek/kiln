@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use kiln_rhi::{
     AddressMode, Allocation, Device, FilterMode, Format, MemoryType, SampleCount, Sampler,
     SamplerDesc, SamplerHandle, StageFlags, Texture as RhiTexture, TextureDesc, TextureDimension,
-    TextureHandle, TextureId as RhiTextureId, TextureUsage, gpu_struct,
+    TextureHandle, TextureUsage, gpu_struct,
 };
 
 use crate::base::renderer::Result;
@@ -43,7 +43,7 @@ impl TextureResources {
             };
             bindings.push(GpuTextureBinding {
                 image: upload.images[texture.image.0].handle,
-                sampler: upload.device.sampler_handle(upload.samplers[sampler].id()),
+                sampler: upload.samplers[sampler].gpu(),
             });
         }
         upload.finish(bindings)
@@ -66,7 +66,6 @@ impl TextureResources {
 struct GpuImage {
     memory: Allocation,
     texture: RhiTexture,
-    view: RhiTextureId,
     handle: TextureHandle,
 }
 
@@ -89,31 +88,21 @@ impl GpuImage {
         };
         let size = device.texture_size_align(&desc)?;
         let memory = device.allocate_aligned(size.size, size.align, MemoryType::GpuOnly)?;
-        let texture = match device.create_texture(&desc, memory.gpu()) {
+        let texture = match device.create_texture(&desc, memory.ptr()) {
             Ok(texture) => texture,
             Err(error) => {
                 device.free(memory);
                 return Err(error.into());
             }
         };
-        let view = match device.create_sampled_view(&texture, &Default::default()) {
-            Ok(view) => view,
-            Err(error) => {
-                device.destroy_texture(texture);
-                device.free(memory);
-                return Err(error.into());
-            }
-        };
         Ok(Self {
-            handle: device.sampled_texture_handle(view),
+            handle: texture.gpu(),
             memory,
             texture,
-            view,
         })
     }
 
     fn destroy(self, device: &Device) {
-        device.destroy_texture_view(self.view);
         device.destroy_texture(self.texture);
         device.free(self.memory);
     }

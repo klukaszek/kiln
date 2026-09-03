@@ -97,22 +97,22 @@ fn bump_alloc_aligns_and_accounts() {
     assert_eq!(bump.capacity(), 64 * 1024, "capacity is the backing size");
     assert_eq!(bump.used(), 0, "fresh allocator has used nothing");
 
-    let mut prev_end = bump.gpu().0;
+    let mut prev_end = bump.gpu().addr();
     for align in [16u64, 64, 256, 4096] {
         let used_before = bump.used();
         let a = bump.alloc(100, align).expect("fits in a 64 KiB block");
         assert!(
             a.gpu.is_aligned_to(align),
             "gpu address {:#x} not aligned to {align}",
-            a.gpu.0
+            a.gpu.addr()
         );
         assert!(!a.cpu.is_null(), "Default memory must be CPU-mapped");
-        assert!(a.gpu.0 >= prev_end, "allocations must not overlap");
+        assert!(a.gpu.addr() >= prev_end, "allocations must not overlap");
         // used() == bumped offset == (aligned start - base) + size.
-        let start = a.gpu.0 - bump.gpu().0;
+        let start = a.gpu.addr() - bump.gpu().addr();
         assert_eq!(bump.used(), start + 100, "used() tracks the bump offset");
         assert!(bump.used() > used_before);
-        prev_end = a.gpu.0 + 100;
+        prev_end = a.gpu.addr() + 100;
     }
 
     device.destroy_allocation(bump.into_allocation());
@@ -138,7 +138,7 @@ fn bump_alloc_cpu_gpu_correspond() {
     assert_eq!(translated, a.gpu, "cpu and gpu must name the same memory");
     assert_eq!(
         a.gpu,
-        bump.gpu().offset(a.gpu.0 - bump.gpu().0),
+        bump.gpu().offset(a.gpu.addr() - bump.gpu().addr()),
         "gpu address is the base plus the bumped offset"
     );
 

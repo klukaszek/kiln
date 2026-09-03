@@ -1,6 +1,6 @@
 //! Sampler creation and descriptor registration.
 
-use crate::types::{AddressMode, CompareOp, FilterMode, SamplerId};
+use crate::types::{AddressMode, CompareOp, FilterMode, SamplerHandle, SamplerId};
 
 /// Description for creating a sampler.
 #[derive(Clone, Debug)]
@@ -41,12 +41,17 @@ impl Default for SamplerDesc {
 /// Opaque sampler object.
 pub struct Sampler {
     pub(crate) id: SamplerId,
+    pub(crate) handle: SamplerHandle,
     pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
 impl Sampler {
-    /// Get the SamplerId for use in shaders.
-    pub fn id(&self) -> SamplerId {
+    /// Opaque shader handle for this sampler.
+    pub fn gpu(&self) -> SamplerHandle {
+        self.handle
+    }
+
+    pub(crate) fn id(&self) -> SamplerId {
         self.id
     }
 }

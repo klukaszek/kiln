@@ -9,7 +9,7 @@
 
 use kiln_app::{Example, FrameCtx};
 use kiln_rhi::{
-    ColorTarget, CommandBuffer, Cull, Device, Format, GpuAddress, GraphicsPso, GraphicsPsoDesc,
+    ColorTarget, CommandBuffer, Cull, Device, Format, GpuPtr, GraphicsPso, GraphicsPsoDesc,
     SampleCount, ShaderStage, Topology,
 };
 
@@ -63,7 +63,7 @@ impl Example for TriangleGraphics {
 
     fn render(&mut self, _ctx: &FrameCtx, cmd: &mut CommandBuffer) {
         cmd.set_graphics_pipeline(&self.pso);
-        cmd.draw(GpuAddress::NULL, 3, 1, 0, 0);
+        cmd.draw(GpuPtr::<u8>::NULL, 3, 1, 0, 0);
     }
 }
 

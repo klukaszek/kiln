@@ -6,7 +6,7 @@
 
 use glam::{DMat4, DQuat, DVec3, EulerRot};
 
-use spectra::base::scene::NodeId;
+use spectra::scene::NodeId;
 
 use super::widgets;
 

@@ -3,8 +3,8 @@ use openusd::sdf::{self, Value};
 use openusd::usd::Stage;
 use std::collections::HashMap;
 
-use crate::base::scene::{
-    Illuminant, Image, Material, MaterialId, PrincipledBsdf, Surface, Texture,
+use crate::scene::{
+    Illuminant, Image, Material, MaterialId, PrincipledBsdf, ScalarMap, Surface, Texture,
 };
 
 use super::texture::TextureLibrary;
@@ -126,23 +126,27 @@ fn read_material(
             result.emission = Illuminant::luminance(color, 1.0);
         }
     }
-    if let Some(value) = read_f32(stage, &shader_path, "inputs:roughness")? {
-        surface.roughness = value;
-    }
-    if let Some(value) = read_f32(stage, &shader_path, "inputs:metallic")? {
-        surface.metallic = value;
-    }
+    read_scalar(
+        stage,
+        &shader_path,
+        "inputs:roughness",
+        textures,
+        &mut surface.roughness,
+        &mut surface.roughness_map,
+    )?;
+    read_scalar(
+        stage,
+        &shader_path,
+        "inputs:metallic",
+        textures,
+        &mut surface.metallic,
+        &mut surface.metallic_map,
+    )?;
     if let Some(value) = read_f32(stage, &shader_path, "inputs:ior")? {
         surface.ior = value;
     }
     result.surface = Surface::Principled(surface);
-    for input in [
-        "inputs:emissiveColor",
-        "inputs:emissionColor",
-        "inputs:roughness",
-        "inputs:metallic",
-        "inputs:ior",
-    ] {
+    for input in ["inputs:emissiveColor", "inputs:emissionColor", "inputs:ior"] {
         reject_connected_input(stage, &shader_path, input)?;
     }
     Ok(result)
@@ -158,10 +162,30 @@ fn read_base_color(
     let property = shader.append_property(input)?;
     if let Some(source) = connected_path(stage, property)? {
         surface.base_color = Vec3::ONE;
-        surface.base_color_texture = Some(textures.read(stage, input, &source)?);
+        surface.base_color_map = Some(textures.read(stage, input, &source)?.0);
     } else if let Some(color) = read_vec3(stage, shader, input)? {
         surface.base_color = color;
-        surface.base_color_texture = None;
+        surface.base_color_map = None;
+    }
+    Ok(())
+}
+
+/// A `UsdPreviewSurface` scalar is either authored inline or read from one channel of a texture.
+fn read_scalar(
+    stage: &Stage,
+    shader: &sdf::Path,
+    input: &str,
+    textures: &mut TextureLibrary,
+    value: &mut f32,
+    map: &mut Option<ScalarMap>,
+) -> Result<()> {
+    let property = shader.append_property(input)?;
+    if let Some(source) = connected_path(stage, property)? {
+        let (texture, channel) = textures.read(stage, input, &source)?;
+        *map = Some(ScalarMap { texture, channel });
+    } else if let Some(scalar) = read_f32(stage, shader, input)? {
+        *value = scalar;
+        *map = None;
     }
     Ok(())
 }
@@ -189,7 +213,7 @@ fn reject_connected_input(stage: &Stage, shader: &sdf::Path, input: &str) -> Res
     Ok(())
 }
 
-fn connected_path(stage: &Stage, property: sdf::Path) -> Result<Option<String>> {
+pub(super) fn connected_path(stage: &Stage, property: sdf::Path) -> Result<Option<String>> {
     let paths = match stage.field::<Value>(property, "connectionPaths")? {
         Some(Value::PathListOp(op)) => op.flatten(),
         Some(Value::PathVec(paths)) => paths,
@@ -224,7 +248,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::base::scene::TextureId;
+    use crate::scene::TextureId;
 
     #[test]
     fn loads_preview_surface_uv_texture() {
@@ -271,7 +295,7 @@ def Material "Mat" {
         let Surface::Principled(surface) = materials[material_id.0].surface else {
             panic!("expected principled material");
         };
-        assert_eq!(surface.base_color_texture, Some(TextureId(0)));
+        assert_eq!(surface.base_color_map, Some(TextureId(0)));
         assert_eq!(images.len(), 1);
         assert_eq!(textures.len(), 1);
         assert_eq!((images[0].width, images[0].height), (2, 2));

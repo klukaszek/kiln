@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use glam::UVec2;
 
-use spectra::renderers::spectral::{self as spectral_renderer, spectrum};
+use spectra::tracer::{self as tracer, spectrum};
 
 use super::Error;
 
@@ -14,13 +14,13 @@ const ASSETS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
 #[derive(Parser, Clone, Debug)]
 pub struct Config {
     /// Target samples per pixel for the progressive render
-    #[arg(long, default_value_t = spectral_renderer::DEFAULT_TARGET_SPP)]
+    #[arg(long, default_value_t = tracer::DEFAULT_TARGET_SPP)]
     pub spp: u32,
     /// Spatial tracing passes recorded per frame
     #[arg(
         long,
         visible_aliases = ["samples-per-frame", "spf"],
-        default_value_t = spectral_renderer::DEFAULT_PASSES_PER_FRAME
+        default_value_t = tracer::DEFAULT_PASSES_PER_FRAME
     )]
     pub passes_per_frame: u32,
     /// Render offscreen at WxH and write a PNG under target/test-images

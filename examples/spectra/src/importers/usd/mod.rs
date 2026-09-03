@@ -15,10 +15,10 @@ use openusd::schemas::lux::{
 use openusd::sdf;
 use openusd::usd::Stage;
 
-use glam::Vec3;
+use glam::{DMat4, DVec3, Vec3};
 
-use crate::base::scene::{
-    Camera, Illuminant, Light, LightKind, Projection, Scene, SceneData, build_scene_nodes,
+use crate::scene::{
+    Camera, Geometry, Illuminant, Light, LightKind, Projection, Scene, SceneData, build_scene_nodes,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -71,8 +71,8 @@ pub fn load(path: &Path) -> Result<Scene> {
     let textures = texture::TextureLibrary::new(path, &stage);
     let mut materials = material::MaterialLibrary::new(textures);
     let geometry = mesh::load(&stage, &prims.meshes, &mut materials)?;
-    let camera = load_camera(&stage, &prims.cameras)?;
     let up = transform::stage_up_axis(&stage)?;
+    let camera = load_camera(&stage, &prims.cameras, &geometry, up)?;
     let lights = load_lights(&stage, &lux_prims)?;
     let nodes = build_scene_nodes(&geometry.instances, &lights);
 
@@ -188,8 +188,17 @@ fn imported_light(
     })
 }
 
-fn load_camera(stage: &Stage, camera_paths: &[String]) -> Result<Camera> {
-    let camera_path = camera_paths.first().ok_or(Error::MissingCamera)?;
+/// The stage's first camera, or one framing the whole scene when it authors none. Plenty of
+/// published assets ship geometry without a camera; refusing to open them is not useful.
+fn load_camera(
+    stage: &Stage,
+    camera_paths: &[String],
+    geometry: &Geometry,
+    up: DVec3,
+) -> Result<Camera> {
+    let Some(camera_path) = camera_paths.first() else {
+        return Ok(framing_camera(geometry, up));
+    };
     let path = sdf::path(camera_path)?;
     let camera = read_camera(stage, &path)?
         .ok_or_else(|| Error::Invalid(format!("{camera_path} is not a readable camera")))?;
@@ -200,4 +209,32 @@ fn load_camera(stage: &Stage, camera_paths: &[String]) -> Result<Camera> {
             clipping_range: camera.clipping_range,
         },
     })
+}
+
+/// A three-quarter view backed off far enough to fit the scene's bounds in frame.
+fn framing_camera(geometry: &Geometry, up: DVec3) -> Camera {
+    const VERTICAL_FOV: f64 = std::f64::consts::FRAC_PI_4;
+
+    let (min, max) = geometry
+        .world_bounds()
+        .unwrap_or((DVec3::splat(-1.0), DVec3::splat(1.0)));
+    let center = (min + max) * 0.5;
+    let radius = ((max - min).length() * 0.5).max(1e-3);
+    let distance = radius / (VERTICAL_FOV * 0.5).sin();
+
+    // Look down slightly from one corner so depth reads better than a straight-on view.
+    let side = if up.abs().dot(DVec3::Y) > 0.5 {
+        DVec3::new(1.0, 0.4, 1.0)
+    } else {
+        DVec3::new(1.0, 1.0, 0.4)
+    };
+    let eye = center + side.normalize() * distance;
+
+    Camera {
+        world: DMat4::look_at_rh(eye, center, up).inverse(),
+        projection: Projection {
+            vertical_fov_rad: VERTICAL_FOV as f32,
+            clipping_range: [(radius * 1e-3) as f32, (distance + radius * 4.0) as f32],
+        },
+    }
 }

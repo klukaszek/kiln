@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use spectra::base::scene::{MaterialId, NodeId, Scene};
+use spectra::scene::{MaterialId, NodeId, Scene};
 
 use super::transform::TransformEditor;
 

@@ -1,13 +1,11 @@
 //! Headless render output: PNG previews and optional spectral captures.
 
-use std::fs::File;
-use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use glam::UVec2;
 use kiln_rhi::Device;
 
-use spectra::renderers::spectral::PathTracer;
+use spectra::tracer::PathTracer;
 
 use super::{Error, Result};
 
@@ -70,11 +68,7 @@ pub fn save_rgba_png(name: &str, width: u32, height: u32, rgba: &[u8]) -> Result
     let dir = workspace_target_dir().join("test-images");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{name}.png"));
-    let file = BufWriter::new(File::create(&path)?);
-    let mut encoder = png::Encoder::new(file, width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder.write_header()?.write_image_data(rgba)?;
+    image::save_buffer(&path, rgba, width, height, image::ExtendedColorType::Rgba8)?;
     Ok(path)
 }
 

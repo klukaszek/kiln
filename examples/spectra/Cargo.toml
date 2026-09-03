@@ -10,8 +10,8 @@ kiln-rhi = { path = "../../crates/kiln-rhi" }
 kiln-app = { path = "../../crates/kiln-app", default-features = false, features = ["egui"] }
 # Direct because the Example::ui implementation is compiled in this crate.
 egui = { version = "0.34", default-features = false, features = ["default_fonts"] }
-# `gpu_struct!` (shader interfaces and backend GPU scenes) expands to zerocopy derives that reference the
-# crate directly, so it must be a direct dependency (same 0.8 line as kiln-rhi, so cargo unifies).
+# `gpu_struct!` expands to zerocopy derives whose generated impls name `::zerocopy` at this
+# crate's root, so it must be a direct dependency (same 0.8 line as kiln-rhi, so cargo unifies).
 zerocopy = { version = "0.8", features = ["derive"] }
 glam = { version = "0.33.1", features = ["zerocopy"] }
 # Camera controls read winit event types directly (via the harness's `window_event` hook).
@@ -23,5 +23,5 @@ anyhow = "1"
 thiserror = "2"
 # Scene/render CLI; flattens kiln-app's `HarnessOpts`.
 clap = { version = "4.6.1", features = ["derive"] }
-png = "0.18.1"
+# Decodes USD texture assets and encodes the headless PNG output.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

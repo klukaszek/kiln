@@ -14,15 +14,15 @@ pub enum Error {
     #[error(transparent)]
     Rhi(#[from] kiln_rhi::RhiError),
     #[error(transparent)]
-    Render(#[from] spectra::base::renderer::Error),
+    Render(#[from] spectra::render::Error),
     #[error(transparent)]
     Usd(#[from] spectra::importers::usd::Error),
     #[error(transparent)]
-    Spectrum(#[from] spectra::renderers::spectral::spectrum::Error),
+    Spectrum(#[from] spectra::tracer::spectrum::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
-    Png(#[from] png::EncodingError),
+    Image(#[from] image::ImageError),
     #[error("invalid configuration: {0}")]
     Config(String),
     #[error("invalid output: {0}")]

@@ -10,7 +10,7 @@ use kiln_rhi::{
 
 gpu_struct! {
     pub struct Root {
-        output: GpuPtr<u32> as "uint*",
+        output: GpuPtr<u32>,
         tlas: AccelHandle,
     }
 }

@@ -16,8 +16,8 @@ mod widgets;
 use glam::{DMat4, DVec3, UVec2};
 use kiln_app::PerformanceStats;
 
-use spectra::base::scene::{Light, Material, MaterialId, Scene};
-use spectra::renderers::spectral::Settings;
+use spectra::scene::{Light, Material, MaterialId, Scene};
+use spectra::tracer::Settings;
 
 pub use state::{InspectorState, Tab};
 

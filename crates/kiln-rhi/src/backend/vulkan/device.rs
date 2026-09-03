@@ -1604,32 +1604,43 @@ impl VulkanDevice {
             MemoryType::Upload => vk::MemoryPropertyFlags::DEVICE_LOCAL,
             MemoryType::GpuOnly | MemoryType::Readback => vk::MemoryPropertyFlags::empty(),
         };
-        let mem_type_index = find_memorytype_index(
-            &mem_requirements,
-            &self.device_memory_properties,
-            mem_flags | preferred_flags,
-        )
-        .or_else(|| {
-            find_memorytype_index(&mem_requirements, &self.device_memory_properties, mem_flags)
-        })
-        .ok_or_else(|| RhiError::AllocationFailed("No suitable memory type".into()))?;
-
-        // Follows the memory type's real properties, not the requested `MemoryType`: on UMA one
-        // type serves both, and a block created by a `GpuOnly` buffer must still be mappable for
-        // a `Default` buffer landing in it later.
-        let host_visible = self.device_memory_properties.memory_types[mem_type_index as usize]
-            .property_flags
-            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
-        let suballocation = {
-            let mut pool = self.buffer_pool.lock().expect("buffer pool lock poisoned");
-            pool.allocate(
-                &self.device,
+        // The preferred type is tried first, then the bare requirement. `Upload` prefers a
+        // host-visible *device-local* heap, which is the resizable-BAR window: ideal for the small
+        // hot writes it mostly carries, but often only 256 MiB. Bulk staging fills it, so a failed
+        // allocation has to retry in plain host memory rather than give up.
+        let mut candidates = [
+            find_memorytype_index(
                 &mem_requirements,
-                mem_type_index,
-                host_visible,
-            )
-        };
-        let suballocation = match suballocation {
+                &self.device_memory_properties,
+                mem_flags | preferred_flags,
+            ),
+            find_memorytype_index(&mem_requirements, &self.device_memory_properties, mem_flags),
+        ];
+        if candidates[0] == candidates[1] {
+            candidates[1] = None;
+        }
+        if candidates.iter().all(Option::is_none) {
+            unsafe { self.device.destroy_buffer(buffer, None) };
+            return Err(RhiError::AllocationFailed("No suitable memory type".into()));
+        }
+
+        let mut attempt = Err(RhiError::AllocationFailed("No suitable memory type".into()));
+        let mut mem_type_index = 0;
+        for candidate in candidates.into_iter().flatten() {
+            mem_type_index = candidate;
+            // Follows the memory type's real properties, not the requested `MemoryType`: on UMA one
+            // type serves both, and a block created by a `GpuOnly` buffer must still be mappable
+            // for an `Upload` buffer landing in it later.
+            let host_visible = self.device_memory_properties.memory_types[candidate as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
+            let mut pool = self.buffer_pool.lock().expect("buffer pool lock poisoned");
+            attempt = pool.allocate(&self.device, &mem_requirements, candidate, host_visible);
+            if attempt.is_ok() {
+                break;
+            }
+        }
+        let suballocation = match attempt {
             Ok(suballocation) => suballocation,
             Err(error) => {
                 unsafe { self.device.destroy_buffer(buffer, None) };

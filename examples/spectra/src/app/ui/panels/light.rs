@@ -5,7 +5,7 @@
 
 use glam::DVec3;
 
-use spectra::base::scene::{LightKind, NodeId};
+use spectra::scene::{LightKind, NodeId};
 
 use super::super::theme;
 use super::super::transform::TransformEditor;

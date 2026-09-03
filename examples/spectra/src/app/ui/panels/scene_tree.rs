@@ -5,7 +5,7 @@
 
 use egui::{Rect, Sense, Stroke, pos2, vec2};
 
-use spectra::base::scene::NodeObject;
+use spectra::scene::NodeObject;
 
 use super::super::theme::{self, HAIRLINE, PALETTE, ROW_HEIGHT};
 use super::super::{Edit, Inspector, Tab};

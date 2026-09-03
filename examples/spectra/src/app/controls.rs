@@ -6,7 +6,7 @@
 //! restarts progressive accumulation by itself.
 //!
 //! Yaw/pitch live in a "levelled" local frame whose Y is the *stage's* up axis
-//! ([`spectra::base::scene::Scene::up`]) — a Z-up stage steered with Y-up controls yaws
+//! ([`spectra::scene::Scene::up`]) — a Z-up stage steered with Y-up controls yaws
 //! around the view axis (i.e. rolls) and starts at the gimbal pole, where
 //! decomposing the authored matrix turns numerical noise into a finite roll.
 //! The controller also never writes the camera until the first actual input, so
@@ -20,7 +20,7 @@ use glam::{DMat4, DQuat, DVec2, DVec3};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
-use spectra::base::scene::Scene;
+use spectra::scene::Scene;
 
 /// Base fly speed in scene units/second (the Cornell box is ~5.5 units tall).
 const FLY_SPEED: f64 = 2.5;

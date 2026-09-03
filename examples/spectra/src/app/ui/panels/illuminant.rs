@@ -5,8 +5,8 @@
 //! actually use. A USD scene lit by emissive geometry gets exactly the controls one lit by lux
 //! prims gets, which is the whole point of the shared type.
 
-use spectra::base::scene::{EmitterExtent, Illuminant, IntensityUnit, SpectrumSource};
-use spectra::renderers::spectral::spectrum;
+use spectra::scene::{EmitterExtent, Illuminant, IntensityUnit, SpectrumSource};
+use spectra::tracer::spectrum;
 
 use super::super::theme::{self, PALETTE};
 use super::super::widgets;

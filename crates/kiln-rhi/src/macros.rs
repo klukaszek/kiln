@@ -33,12 +33,19 @@ macro_rules! backend_expect {
 /// ```ignore
 /// gpu_struct! {
 ///     pub struct Material {
-///         albedo: u32,                // -> uint
-///         tint:   Vec4,               // -> float4
-///         data:   GpuPtr<Surface>,    // -> Surface*
+///         albedo: u32,                      // -> uint
+///         tint:   Vec4,                     // -> float4
+///         data:   GpuPtr<Surface>,          // -> Surface*
+///         table:  GpuPtr<f32, Read>,        // -> Ptr<float, Access.Read>
 ///     }
 /// }
 /// ```
+///
+/// A pointer's second parameter is a shader-side annotation, not a Rust type parameter: the field
+/// is a plain [`GpuPtr<T>`](crate::GpuPtr) either way. `Read` emits Slang's read-only pointer, which
+/// lets the compiler assume nothing writes through it; the default is a read-write `T*`. Access is a
+/// property of how *this* shader uses the buffer, so the same allocation can be `Read` in one root
+/// struct and read-write in another.
 #[macro_export]
 macro_rules! gpu_struct {
     (
@@ -81,24 +88,36 @@ macro_rules! __gpu_struct_parse {
         }
     };
 
-    // Typed device pointer with an explicit Slang spelling.
+    // Device pointer the shader only reads. Slang can then assume no aliasing writes.
     ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
-        $field:ident : GpuPtr<$pointee:tt> as $slang:literal, $($rest:tt)*) => {
+        $field:ident : GpuPtr<$pointee:tt, Read>, $($rest:tt)*) => {
         $crate::__gpu_struct_parse! {
             [$($meta)*] [$vis] [$name]
             [$($rust)* pub $field: $crate::GpuPtr<$pointee>,]
-            [$($out)* "    ", $slang, " ", stringify!($field), ";\n",]
+            [$($out)* "    Ptr<", $crate::gpu_slang_ty!($pointee), ", Access.Read> ",
+                stringify!($field), ";\n",]
             ; $($rest)*
         }
     };
 
-    // Typed device pointer whose Rust and Slang pointee names are identical.
+    // Device pointer the shader writes through, spelled out.
+    ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
+        $field:ident : GpuPtr<$pointee:tt, ReadWrite>, $($rest:tt)*) => {
+        $crate::__gpu_struct_parse! {
+            [$($meta)*] [$vis] [$name]
+            [$($rust)* pub $field: $crate::GpuPtr<$pointee>,]
+            [$($out)* "    ", $crate::gpu_slang_ty!($pointee), "* ", stringify!($field), ";\n",]
+            ; $($rest)*
+        }
+    };
+
+    // Device pointer, read-write by default.
     ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
         $field:ident : GpuPtr<$pointee:tt>, $($rest:tt)*) => {
         $crate::__gpu_struct_parse! {
             [$($meta)*] [$vis] [$name]
             [$($rust)* pub $field: $crate::GpuPtr<$pointee>,]
-            [$($out)* "    ", stringify!($pointee), "* ", stringify!($field), ";\n",]
+            [$($out)* "    ", $crate::gpu_slang_ty!($pointee), "* ", stringify!($field), ";\n",]
             ; $($rest)*
         }
     };
@@ -200,5 +219,10 @@ macro_rules! gpu_slang_ty {
     };
     ([f32; 16]) => {
         "float4x4"
+    };
+
+    // A `gpu_struct!` type, whose Slang declaration carries its Rust name.
+    ($other:tt) => {
+        stringify!($other)
     };
 }

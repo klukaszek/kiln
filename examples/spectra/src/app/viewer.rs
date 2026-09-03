@@ -12,13 +12,12 @@ use kiln_app::{Example, FrameCtx, PerformanceStats};
 use kiln_rhi::{CommandBuffer, Device, Format};
 use winit::event::WindowEvent;
 
-use spectra::base::renderer::{self, PresentRenderer, RenderFrame, Renderer};
-use spectra::base::scene::{
+use spectra::importers::usd;
+use spectra::render::RenderFrame;
+use spectra::scene::{
     Light, MaterialId, Mesh, NodeObject, Scene, SpectrumSource, build_scene_nodes,
 };
-use spectra::importers::usd;
-use spectra::renderers::raster::RasterRenderer;
-use spectra::renderers::spectral::{PathTracer, SceneUpdate, Settings, spectrum::Spd};
+use spectra::tracer::{PathTracer, SceneUpdate, Settings, spectrum::Spd};
 
 use super::Result;
 use super::config::Config;
@@ -37,7 +36,7 @@ pub fn run(config: Config) -> std::result::Result<(), Box<dyn std::error::Error>
 
 struct App {
     scene: Scene,
-    renderer: ActiveRenderer,
+    renderer: PathTracer,
     controls: super::controls::CameraController,
     settings: Settings,
     viewport_extent: UVec2,
@@ -52,7 +51,7 @@ struct App {
     emissive_areas: Vec<f32>,
     /// Smoothed inspector build time, which the harness's own CPU figure excludes.
     ui_ms: f64,
-    pending_scene_update: Option<SceneUpdate>,
+    pending_scene_update: SceneUpdate,
     settings_dirty: bool,
     /// Set while an edit is still being dragged, so the film resets once on release instead of on
     /// every frame of the drag.
@@ -82,7 +81,7 @@ impl App {
             pixel_stride: config.pixel_stride,
             spectral_capture: false,
         };
-        let renderer = create_renderer(device, color_format, &scene, &light_spectrum, settings)?;
+        let renderer = PathTracer::new(device, color_format, &scene, &light_spectrum, settings)?;
         let controls = super::controls::CameraController::new(scene.camera.world, scene.up);
         let selected = scene
             .nodes
@@ -101,7 +100,7 @@ impl App {
             light_spectrum,
             object_count,
             mesh_pivots,
-            pending_scene_update: None,
+            pending_scene_update: SceneUpdate::default(),
             settings_dirty: false,
             update_deferred: false,
             renderer_error: None,
@@ -166,7 +165,7 @@ impl App {
                 if renamed {
                     self.rename_light_node(index);
                 }
-                self.mark(SceneUpdate::light(index));
+                self.mark(SceneUpdate::emission());
             }
             Edit::InstanceTransform { index, transform } => {
                 let Some(instance) = self.scene.geometry.instances.get_mut(index) else {
@@ -174,7 +173,7 @@ impl App {
                 };
                 instance.transform = transform;
                 self.resummarize_materials();
-                self.mark(SceneUpdate::instance_transform(index));
+                self.mark(SceneUpdate::transforms());
             }
             Edit::Material { index, material } => {
                 let Some(target) = self.scene.materials.get_mut(index) else {
@@ -184,12 +183,12 @@ impl App {
                 let emission_changed = target.emission != material.emission;
                 *target = *material;
                 if surface_changed {
-                    self.mark(SceneUpdate::material_surface(index));
+                    self.mark(SceneUpdate::surfaces());
                 }
                 if emission_changed {
                     self.scene.refresh_emissive_components();
                     self.resummarize_materials();
-                    self.mark(SceneUpdate::material_emission(index));
+                    self.mark(SceneUpdate::emission());
                 }
             }
             Edit::AddMaterial => {
@@ -197,13 +196,13 @@ impl App {
                 self.inspector.selected_material = Some(id);
                 self.inspector.tab = ui::Tab::Material;
                 self.resummarize_materials();
-                self.mark(SceneUpdate::material(id.0));
+                self.mark(SceneUpdate::material());
             }
             Edit::DeleteMaterial(id) => {
                 if self.scene.remove_material(id).is_some() {
                     self.inspector.selected_material = Some(MaterialId::DEFAULT);
                     self.resummarize_materials();
-                    self.mark(SceneUpdate::material(MaterialId::DEFAULT.0));
+                    self.mark(SceneUpdate::material());
                 }
             }
         }
@@ -230,7 +229,7 @@ impl App {
             .find(|node| matches!(node.object, NodeObject::Light { light } if light == index))
             .map(|node| node.id);
         self.inspector.tab = ui::Tab::Object;
-        self.mark(SceneUpdate::light(index));
+        self.mark(SceneUpdate::emission());
     }
 
     /// Keep the tree's label in step with a renamed light. Nodes mirror the light array rather than
@@ -250,9 +249,7 @@ impl App {
     }
 
     fn mark(&mut self, update: SceneUpdate) {
-        self.pending_scene_update
-            .get_or_insert_with(SceneUpdate::default)
-            .merge(update);
+        self.pending_scene_update.merge(update);
     }
 
     /// Push queued settings and scene edits into the renderer.
@@ -269,20 +266,19 @@ impl App {
                 Err(error) => self.report(format!("failed to apply renderer settings: {error:#}")),
             }
         }
-        let Some(update) = self.pending_scene_update.take() else {
+        let update = std::mem::take(&mut self.pending_scene_update);
+        if update.is_empty() {
             return;
-        };
-        match self.renderer.update_scene(
-            ctx.device,
-            &self.scene,
-            &self.light_spectrum,
-            &update,
-            ctx.slot,
-        ) {
+        }
+        match self
+            .renderer
+            .update_scene(ctx.device, &self.scene, &self.light_spectrum, update)
+        {
             Ok(()) => self.renderer_error = None,
             Err(error) => {
                 self.report(format!("failed to apply scene update: {error:#}"));
-                self.pending_scene_update = Some(update);
+                // Keep it queued so the next frame retries rather than dropping the edit.
+                self.pending_scene_update = update;
             }
         }
     }
@@ -294,10 +290,6 @@ impl App {
 }
 
 impl Example for App {
-    fn depth_format(&self) -> Option<Format> {
-        self.renderer.depth_format()
-    }
-
     fn new(device: &Device, color_format: Format) -> Self {
         Self::try_new(device, color_format).unwrap_or_else(|error| {
             eprintln!("{error:#}");
@@ -349,7 +341,7 @@ impl Example for App {
             settings: self.settings,
             stats,
             ui_ms: self.ui_ms,
-            samples_drawn: self.renderer.samples_drawn(),
+            samples_drawn: Some(self.renderer.sample_count()),
             viewport_extent: self.viewport_extent,
             renderer_error: self.renderer_error.as_deref(),
             camera_position: self.controls.position(),
@@ -386,7 +378,10 @@ impl Example for App {
             extent: ctx.extent,
             slot: ctx.slot,
         };
-        if let Err(error) = self.renderer.encode(&frame, cmd, &self.scene.camera) {
+        if let Err(error) = self
+            .renderer
+            .record_iteration(&frame, cmd, &self.scene.camera)
+        {
             self.report(format!("renderer pre-render failed: {error:#}"));
         }
     }
@@ -397,7 +392,7 @@ impl Example for App {
             extent: ctx.extent,
             slot: ctx.slot,
         };
-        self.renderer.encode_present(&frame, cmd);
+        self.renderer.record_display(&frame, cmd);
     }
 
     fn wants_continuous_redraw(&self) -> bool {
@@ -426,110 +421,4 @@ fn mesh_pivot(mesh: &Mesh) -> DVec3 {
             (min.min(position), max.max(position))
         });
     (min + max) * 0.5
-}
-
-fn create_renderer(
-    device: &Device,
-    color_format: Format,
-    scene: &Scene,
-    light_spectrum: &Spd,
-    settings: Settings,
-) -> Result<ActiveRenderer> {
-    match PathTracer::new(device, color_format, scene, light_spectrum, settings) {
-        Ok(renderer) => Ok(ActiveRenderer::Spectral(Box::new(renderer))),
-        Err(error) => {
-            eprintln!("spectral path tracer unavailable; using raster renderer: {error:#}");
-            Ok(ActiveRenderer::Raster(Box::new(RasterRenderer::new(
-                device,
-                color_format,
-                scene,
-            )?)))
-        }
-    }
-}
-
-/// The renderer in use, with the raster backend as the fallback when the path tracer cannot build.
-enum ActiveRenderer {
-    Spectral(Box<PathTracer>),
-    Raster(Box<RasterRenderer>),
-}
-
-impl ActiveRenderer {
-    fn update_scene(
-        &mut self,
-        device: &Device,
-        scene: &Scene,
-        light_spectrum: &Spd,
-        update: &SceneUpdate,
-        frame_slot: usize,
-    ) -> renderer::Result<()> {
-        match self {
-            Self::Spectral(renderer) => {
-                renderer.update_scene(device, scene, light_spectrum, update, frame_slot)
-            }
-            Self::Raster(renderer) => renderer.update_scene(device, scene),
-        }
-    }
-
-    fn update_settings(&mut self, settings: Settings) -> renderer::Result<()> {
-        match self {
-            Self::Spectral(renderer) => renderer.update_settings(settings),
-            Self::Raster(_) => Ok(()),
-        }
-    }
-
-    fn samples_drawn(&self) -> Option<u32> {
-        match self {
-            Self::Spectral(renderer) => Some(renderer.sample_count()),
-            Self::Raster(_) => None,
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        match self {
-            Self::Spectral(renderer) => renderer.is_complete(),
-            Self::Raster(_) => true,
-        }
-    }
-
-    fn destroy(self, device: &Device) {
-        match self {
-            Self::Spectral(renderer) => Renderer::destroy(renderer, device),
-            Self::Raster(renderer) => Renderer::destroy(renderer, device),
-        }
-    }
-}
-
-impl PresentRenderer for ActiveRenderer {
-    fn depth_format(&self) -> Option<Format> {
-        match self {
-            Self::Spectral(renderer) => renderer.depth_format(),
-            Self::Raster(renderer) => renderer.depth_format(),
-        }
-    }
-
-    fn encode_present(&mut self, frame: &RenderFrame<'_>, commands: &mut CommandBuffer) {
-        match self {
-            Self::Spectral(renderer) => renderer.encode_present(frame, commands),
-            Self::Raster(renderer) => renderer.encode_present(frame, commands),
-        }
-    }
-}
-
-impl Renderer for ActiveRenderer {
-    fn encode(
-        &mut self,
-        frame: &RenderFrame<'_>,
-        commands: &mut CommandBuffer,
-        camera: &spectra::base::scene::Camera,
-    ) -> renderer::Result<()> {
-        match self {
-            Self::Spectral(renderer) => renderer.encode(frame, commands, camera),
-            Self::Raster(renderer) => renderer.encode(frame, commands, camera),
-        }
-    }
-
-    fn destroy(self: Box<Self>, device: &Device) {
-        (*self).destroy(device);
-    }
 }

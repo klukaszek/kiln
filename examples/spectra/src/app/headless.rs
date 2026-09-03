@@ -5,10 +5,10 @@ use std::time::Instant;
 use glam::UVec2;
 use kiln_rhi::{Device, DeviceDesc, Format};
 
-use spectra::base::renderer::{RenderFrame, Renderer};
-use spectra::base::scene::{Camera, SpectrumSource};
 use spectra::importers::usd;
-use spectra::renderers::spectral::{PathTracer, Settings};
+use spectra::render::RenderFrame;
+use spectra::scene::{Camera, SpectrumSource};
+use spectra::tracer::{PathTracer, Settings};
 
 use super::Result;
 use super::config::Config;
@@ -96,7 +96,6 @@ pub fn run(config: &Config, resolution: UVec2) -> Result<()> {
     result
 }
 
-/// Drive any finite progressive renderer without coupling the loop to its implementation.
 fn render_to_completion(
     renderer: &mut PathTracer,
     frame: &RenderFrame<'_>,
@@ -107,7 +106,7 @@ fn render_to_completion(
         // from retaining every encoder until process exit.
         kiln_rhi::frame_scope(|| -> Result<()> {
             let mut cmd = frame.device.create_command_buffer()?;
-            renderer.encode(frame, &mut cmd, camera)?;
+            renderer.record_iteration(frame, &mut cmd, camera)?;
             cmd.end();
             let queue = frame.device.queue();
             queue.submit(cmd)?;

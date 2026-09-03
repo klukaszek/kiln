@@ -3,7 +3,7 @@
 
 use egui::{Rect, Sense, Stroke, pos2, vec2};
 
-use spectra::base::scene::{
+use spectra::scene::{
     EmitterExtent, Illuminant, Material, MaterialId, PrincipledBsdf, Scene, Surface, TextureId,
 };
 
@@ -160,7 +160,7 @@ fn editor(inspector: &mut Inspector<'_>, ui: &mut egui::Ui, id: MaterialId, mate
 
     changed |= surface(ui, id, &mut edited.surface);
     if let Surface::Principled(PrincipledBsdf {
-        base_color_texture: Some(texture),
+        base_color_map: Some(texture),
         ..
     }) = edited.surface
     {

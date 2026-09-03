@@ -4,7 +4,7 @@ use openusd::sdf;
 use openusd::usd::Stage;
 use std::collections::HashMap;
 
-use crate::base::scene::{
+use crate::scene::{
     EmissiveComponent, Geometry, Instance, MaterialId, Mesh, MeshId, Primitive, Vertex,
 };
 
@@ -49,6 +49,7 @@ fn decode_mesh(
     let mut primitives = Vec::new();
     let mut vertex_map = HashMap::<ImportVertexKey, u32>::new();
     let mut corner_offset = 0usize;
+    let face_materials = subset_materials(stage, mesh, default_material, materials)?;
 
     for (face, &count) in mesh.face_vertex_counts.iter().enumerate() {
         let count = usize::try_from(count)
@@ -60,7 +61,7 @@ fn decode_mesh(
             ));
         }
         if count >= 3 {
-            let material_id = subset_material(stage, mesh, face, default_material, materials)?;
+            let material_id = face_materials[face];
             let start = indices.len();
             for fan in 1..count - 1 {
                 let corners = if mesh.orientation == Orientation::LeftHanded {
@@ -232,20 +233,35 @@ impl DisjointSet {
     }
 }
 
-fn subset_material(
+/// Resolve every face's material once, up front.
+///
+/// A `GeomSubset` lists the faces it covers, so asking "which subset owns this face?" per face
+/// rescans every list and turns mesh decoding quadratic. Inverting the lists costs one pass over
+/// the indices instead. First subset to claim a face keeps it, matching USD's binding order.
+fn subset_materials(
     stage: &Stage,
     mesh: &ReadMesh,
-    face: usize,
     default: MaterialId,
     materials: &mut MaterialLibrary,
-) -> Result<MaterialId> {
-    let face = i32::try_from(face)?;
+) -> Result<Vec<MaterialId>> {
+    let mut by_face = vec![default; mesh.face_vertex_counts.len()];
+    let mut claimed = vec![false; mesh.face_vertex_counts.len()];
     for subset in &mesh.subsets {
-        if subset.indices.contains(&face) {
-            return materials.id_for_prim(stage, &subset.path);
+        let id = materials.id_for_prim(stage, &subset.path)?;
+        for &face in &subset.indices {
+            let Ok(face) = usize::try_from(face) else {
+                continue;
+            };
+            let (Some(slot), Some(claimed)) = (by_face.get_mut(face), claimed.get_mut(face)) else {
+                continue;
+            };
+            if !*claimed {
+                *slot = id;
+                *claimed = true;
+            }
         }
     }
-    Ok(default)
+    Ok(by_face)
 }
 
 fn mesh_normal(mesh: &ReadMesh, face: usize, corner: usize, point: usize) -> Result<Option<Vec3>> {

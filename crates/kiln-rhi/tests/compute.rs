@@ -6,8 +6,8 @@ use kiln_rhi::{ComputePsoDesc, MemoryType, ShaderStage, StageFlags, gpu_struct};
 
 gpu_struct! {
     pub struct Data {
-        input: GpuPtr<u32> as "uint*",
-        output: GpuPtr<u32> as "uint*",
+        input: GpuPtr<u32>,
+        output: GpuPtr<u32>,
         count: u32,
         // Keep the host and Slang layouts identical.
         _pad: u32,

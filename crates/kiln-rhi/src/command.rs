@@ -30,7 +30,7 @@ pub struct DepthAttachment {
 #[derive(Clone, Copy, Debug)]
 pub struct RenderTarget(RenderTargetKind);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RenderTargetKind {
     SwapchainImage(u32),
     Texture(TextureId),
@@ -304,7 +304,8 @@ impl CommandBuffer {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_scissor(x, y, width, height))
     }
 
-    /// Must be outside a render pass.
+    /// Must be outside a render pass, after the previous GPU use of this pool has completed.
+    /// On Metal the reset happens immediately on the CPU, rather than at submission.
     pub fn reset_queries(&mut self, pool: &QueryPool) {
         self.assert_same_device(&pool._owner, "query pool");
         match (&mut self.inner, &pool.inner) {
@@ -313,7 +314,17 @@ impl CommandBuffer {
                 cmd.reset_queries(p.pool, 0, pool.count)
             }
             #[cfg(feature = "metal")]
-            (CommandBufferInner::Metal(_), QueryPoolInner::Metal(_)) => {}
+            (CommandBufferInner::Metal(_), QueryPoolInner::Metal(p)) => {
+                use objc2_metal::MTL4CounterHeap;
+                // Metal invalidation runs immediately on the CPU. The caller must
+                // have waited for the previous use of this pool before resetting it.
+                unsafe {
+                    p.heap.invalidateCounterRange(objc2_foundation::NSRange {
+                        location: 0,
+                        length: pool.count as usize,
+                    });
+                }
+            }
             #[allow(unreachable_patterns)]
             _ => unreachable!("query pool backend does not match command buffer backend"),
         }
@@ -322,6 +333,7 @@ impl CommandBuffer {
     /// Must be outside a render pass.
     pub fn write_timestamp(&mut self, pool: &QueryPool, query: u32) {
         self.assert_same_device(&pool._owner, "query pool");
+        assert!(query < pool.count, "timestamp query index out of range");
         match (&mut self.inner, &pool.inner) {
             #[cfg(feature = "vulkan")]
             (CommandBufferInner::Vulkan(cmd), QueryPoolInner::Vulkan(p)) => {

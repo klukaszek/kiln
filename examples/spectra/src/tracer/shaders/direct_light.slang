@@ -1,3 +1,36 @@
+[require(metal)]
+bool metal_shadow_occluded(RaytracingAccelerationStructure tlas,
+                           float3 origin, float3 direction, float tMin, float tMax)
+{
+    __requirePrelude(R"(
+        bool spectra_shadow_occluded(raytracing::instance_acceleration_structure tlas,
+                                      float3 origin, float3 direction, float tMin, float tMax) {
+            raytracing::intersection_params params;
+            params.set_geometry_cull_mode(raytracing::geometry_cull_mode::bounding_box);
+            params.force_opacity(raytracing::forced_opacity::opaque);
+            params.accept_any_intersection(true);
+            raytracing::intersection_query<raytracing::triangle_data, raytracing::instancing> query;
+            query.reset(raytracing::ray(origin, direction, tMin, tMax), tlas, 0xFF, params);
+            while (query.next()) {}
+            return query.get_committed_intersection_type() != raytracing::intersection_type::none;
+        }
+    )");
+    __intrinsic_asm "spectra_shadow_occluded($0, $1, $2, $3, $4)";
+}
+
+bool shadow_occluded(RaytracingAccelerationStructure tlas, RayDesc ray)
+{
+    __target_switch {
+    case metal:
+        return metal_shadow_occluded(tlas, ray.Origin, ray.Direction, ray.TMin, ray.TMax);
+    default:
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+        q.TraceRayInline(tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xFF, ray);
+        while (q.Proceed()) {}
+        return q.CommittedStatus() != COMMITTED_NOTHING;
+    }
+}
+
 float4 sample_direct_light(TraceRoot* r,
                            RaytracingAccelerationStructure tlas,
                            float3 p,
@@ -128,11 +161,7 @@ float4 sample_direct_light(TraceRoot* r,
     shadow.Direction = wi;
     shadow.TMin = 0.001;
     shadow.TMax = infinite ? 1e6 : max(dist - 0.004, 0.001);
-    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE> sq;
-    sq.TraceRayInline(
-        tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE, 0xFF, shadow);
-    while (sq.Proceed()) {}
-    if (sq.CommittedStatus() != COMMITTED_NOTHING) {
+    if (shadow_occluded(tlas, shadow)) {
         return float4(0.0);
     }
 

@@ -113,6 +113,9 @@ pub(crate) struct BufferAllocation {
     pub size: u64,
     pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub heap: Retained<ProtocolObject<dyn MTLHeap>>,
+    /// Where `base` sits inside `heap`. Placed textures are positioned against the heap, so an
+    /// allocation-relative offset would alias whatever else occupies that heap offset.
+    pub heap_offset: u64,
 }
 
 struct MappedAllocation {
@@ -667,6 +670,7 @@ impl MetalDevice {
                     size: metal_buffer.size,
                     buffer: metal_buffer.buffer.clone(),
                     heap: metal_buffer.heap.clone(),
+                    heap_offset: metal_buffer.heap_offset(),
                 },
             );
         }
@@ -830,9 +834,13 @@ impl MetalDevice {
                 })?;
 
             let offset = texture_gpu.address - alloc.base.address;
-            if !offset.is_multiple_of(size_align.align as u64) {
+            // `newTextureWithDescriptor:offset:` positions the texture within the heap, so the
+            // allocation's own placement has to be added in; otherwise every allocation that is
+            // not itself at heap offset 0 lands the texture on top of unrelated resources.
+            let heap_offset = alloc.heap_offset + offset;
+            if !heap_offset.is_multiple_of(size_align.align as u64) {
                 return Err(RhiError::TextureCreation(format!(
-                    "texture allocation address 0x{:x} has heap offset {offset}, expected alignment {}",
+                    "texture allocation address 0x{:x} has heap offset {heap_offset}, expected alignment {}",
                     texture_gpu.address, size_align.align
                 )));
             }
@@ -844,7 +852,7 @@ impl MetalDevice {
                     size_align.size
                 )));
             }
-            (alloc.heap.clone(), offset)
+            (alloc.heap.clone(), heap_offset)
         };
 
         let texture =
@@ -1056,6 +1064,22 @@ impl MetalDevice {
             .map_err(|e| {
                 RhiError::PipelineCreation(format!("Metal compute PSO creation failed: {e}"))
             })?;
+
+        // A threadgroup wider than the pipeline's register budget is undefined in Metal: the
+        // dispatch is dropped and the frame comes out black, with nothing raised anywhere. Vulkan
+        // rejects the same mistake at validation, so report it here rather than let it render.
+        let max_threads = {
+            use objc2_metal::MTLComputePipelineState;
+            pipeline_state.maxTotalThreadsPerThreadgroup()
+        };
+        let requested = tg.width * tg.height * tg.depth;
+        if requested > max_threads {
+            return Err(RhiError::PipelineCreation(format!(
+                "Metal compute PSO {:?} requested {requested} threads per threadgroup, but the \
+                 compiled shader's register use allows at most {max_threads}",
+                desc.label.as_deref().unwrap_or("<unlabelled>"),
+            )));
+        }
 
         Ok(ComputePso {
             inner: ComputePsoInner::Metal(Box::new(MetalComputePso {

@@ -27,6 +27,81 @@ void computeMain(uint3 tid : SV_DispatchThreadID, uniform Data* data)
 "#;
 
 #[test]
+fn compute_barrier_across_pipeline_switches() {
+    let Some((device, _gpu)) = common::device_or_skip() else {
+        return;
+    };
+    let src = format!("{}{}", Data::SLANG, COMPUTE_BODY);
+    let Some(module) = kiln_rhi::compiler::compile_or_skip(
+        &device,
+        &src,
+        "computeMain",
+        ShaderStage::Compute,
+        &[],
+    ) else {
+        return;
+    };
+    let desc = ComputePsoDesc {
+        threads_per_threadgroup: [64, 1, 1],
+        label: Some("pipeline-switch dependency".into()),
+    };
+    let pipelines = [
+        device
+            .create_compute_pso(&desc, &module)
+            .expect("first PSO"),
+        device
+            .create_compute_pso(&desc, &module)
+            .expect("second PSO"),
+    ];
+    const N: u32 = 65536;
+    let mut a = device
+        .allocate(u64::from(N) * 4, MemoryType::Readback)
+        .expect("a");
+    let b = device
+        .allocate(u64::from(N) * 4, MemoryType::Readback)
+        .expect("b");
+    a.as_mut_slice::<u32>().expect("mapped a").fill(1);
+    let mut roots = device
+        .allocate(2 * std::mem::size_of::<Data>() as u64, MemoryType::Upload)
+        .expect("roots");
+    roots
+        .upload_slice(&[
+            Data {
+                input: a.gpu().cast(),
+                output: b.gpu().cast(),
+                count: N,
+                _pad: 0,
+            },
+            Data {
+                input: b.gpu().cast(),
+                output: a.gpu().cast(),
+                count: N,
+                _pad: 0,
+            },
+        ])
+        .expect("upload roots");
+    let mut cmd = device.create_command_buffer().expect("cmd");
+    for pass in 0..16 {
+        let index = pass % 2;
+        cmd.set_pipeline(&pipelines[index]);
+        let root = roots.gpu().cast::<Data>().offset(index as u64);
+        cmd.dispatch(root, N / 64, 1, 1);
+        cmd.barrier(StageFlags::COMPUTE, StageFlags::COMPUTE);
+    }
+    device.queue().submit(cmd).expect("submit");
+    device.queue().wait_idle();
+    assert!(
+        a.as_slice::<u32>()
+            .expect("read a")
+            .iter()
+            .all(|&v| v == 1 << 16)
+    );
+    device.destroy(a);
+    device.destroy(b);
+    device.destroy(roots);
+}
+
+#[test]
 fn compute_doubles_buffer() {
     let Some((device, _gpu)) = common::device_or_skip() else {
         return;

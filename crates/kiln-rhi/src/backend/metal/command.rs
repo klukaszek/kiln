@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::barrier::{HazardFlags, StageFlags};
-use crate::command::{LoadOp, RenderPassDesc, RenderTargetKind, StoreOp};
+use crate::command::{LoadOp, RenderPassDesc, RenderTarget, RenderTargetKind, StoreOp};
 use crate::pipeline::{ComputePso, DepthStencilState, GraphicsPso, MeshletPso};
 use crate::texture::{Texture, bytes_per_pixel};
 use crate::types::*;
@@ -160,6 +160,9 @@ pub struct MetalCommandBuffer {
     current_mesh_tpg_mesh: MTLSize,
     pending_queue_barrier: Option<PendingQueueBarrier>,
     pending_split_barrier: Option<(StageFlags, HazardFlags)>,
+    /// Render targets already written by an earlier pass in this command buffer. Metal 4 tracks no
+    /// hazards of its own, so a second pass on the same attachment needs an explicit dependency.
+    written_targets: Vec<RenderTargetKind>,
     bound_root_table: MTLGPUAddress,
     bound_texture_heap: MTLGPUAddress,
     bound_sampler_heap: MTLGPUAddress,
@@ -346,6 +349,7 @@ impl MetalCommandBuffer {
             },
             pending_queue_barrier: None,
             pending_split_barrier: None,
+            written_targets: Vec::new(),
             bound_root_table: INVALID_TABLE_ADDRESS,
             bound_texture_heap: INVALID_TABLE_ADDRESS,
             bound_sampler_heap: INVALID_TABLE_ADDRESS,
@@ -360,6 +364,7 @@ impl MetalCommandBuffer {
 
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc) {
         self.end_active_encoders();
+        self.order_after_previous_writes(desc);
         self.current_depth_stencil = None;
         let pass_desc = MTL4RenderPassDescriptor::new();
 
@@ -457,6 +462,40 @@ impl MetalCommandBuffer {
         }
     }
 
+    /// Order a pass against the earlier passes in this command buffer that wrote the same
+    /// attachment. Metal 4 leaves every resource untracked, so two render encoders on one texture
+    /// are free to overlap: the second pass's `Load` can sample the pre-`Store` contents, or its
+    /// own `Store` can be overtaken by the first pass's. The Vulkan backend gets this ordering for
+    /// free from the attachment's layout transition; here it has to be stated.
+    ///
+    /// The barrier is merged into `pending_queue_barrier` rather than encoded directly, so it
+    /// lands on the new encoder alongside whatever the caller already asked for.
+    fn order_after_previous_writes(&mut self, desc: &RenderPassDesc) {
+        let targets = desc
+            .color_attachments
+            .iter()
+            .map(|attachment| attachment.target)
+            .chain(desc.depth_attachment.as_ref().map(|depth| depth.target))
+            .map(RenderTarget::kind);
+
+        let mut hazard = false;
+        for target in targets {
+            if self.written_targets.contains(&target) {
+                hazard = true;
+            } else {
+                self.written_targets.push(target);
+            }
+        }
+        if !hazard {
+            return;
+        }
+
+        // Attachment writes drain through the fragment stage, and `Device` visibility is what
+        // makes the stored pixels readable by the next pass's load.
+        let stages = to_mtl_stages(StageFlags::RASTER_COLOR_OUT | StageFlags::RASTER_DEPTH_OUT);
+        self.enqueue_queue_barrier(stages, stages, MTL4VisibilityOptions::Device);
+    }
+
     pub fn set_graphics_pipeline(&mut self, pso: &GraphicsPso) {
         let (pipeline, cull_mode, winding, topology) = match &pso.inner {
             crate::pipeline::GraphicsPsoInner::Metal(mtl_pso) => (
@@ -486,8 +525,14 @@ impl MetalCommandBuffer {
     pub fn set_compute_pipeline(&mut self, pso: &ComputePso) {
         let mtl_pso = backend_expect!(&pso.inner, crate::pipeline::ComputePsoInner::Metal);
 
-        self.end_active_encoders();
-        let encoder = self.begin_compute_encoder(mtl_pso.label.as_deref().unwrap_or("compute"));
+        // Pipeline binds do not delimit compute passes. Keep the encoder alive so
+        // encoder-scoped barriers continue to order dispatches across PSO changes.
+        let encoder = if let Some(encoder) = self.compute_encoder.take() {
+            encoder
+        } else {
+            self.end_active_encoders();
+            self.begin_compute_encoder(mtl_pso.label.as_deref().unwrap_or("compute"))
+        };
         encoder.setComputePipelineState(&mtl_pso.pipeline);
 
         self.current_threads_per_threadgroup = mtl_pso.threads_per_threadgroup;
@@ -817,7 +862,7 @@ impl MetalCommandBuffer {
     ) {
         assert_eq!(
             texture_gpu,
-            texture.gpu(),
+            texture.gpu_address,
             "{op} texture_gpu must match the address used to create the texture"
         );
         let mtl_texture = self.resolve_texture(texture.id());

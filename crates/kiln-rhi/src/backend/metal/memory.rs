@@ -40,6 +40,12 @@ impl MetalBuffer {
         GpuPtr::from_addr(self.buffer.gpuAddress())
     }
 
+    /// Byte offset of this suballocation within its `MTLHeap`. Placed resources are positioned
+    /// relative to the heap, not to the allocation, so texture placement needs this.
+    pub(crate) fn heap_offset(&self) -> u64 {
+        self.heap_offset
+    }
+
     /// Return this buffer's placement range to the pool after GPU retirement.
     pub(crate) fn release_to_pool(self) {
         self.pool

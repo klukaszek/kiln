@@ -51,6 +51,10 @@ struct App {
     emissive_areas: Vec<f32>,
     /// Smoothed inspector build time, which the harness's own CPU figure excludes.
     ui_ms: f64,
+    /// Sample count the inspector last painted. The harness builds the overlay before
+    /// [`Example::pre_render`] records the frame's trace batch, so the readout trails the renderer
+    /// by a frame; without one more redraw it would settle a batch short of the target.
+    displayed_samples: u32,
     pending_scene_update: SceneUpdate,
     settings_dirty: bool,
     /// Set while an edit is still being dragged, so the film resets once on release instead of on
@@ -105,6 +109,7 @@ impl App {
             update_deferred: false,
             renderer_error: None,
             ui_ms: 0.0,
+            displayed_samples: 0,
             inspector: InspectorState::new(selected),
         };
         app.resummarize_materials();
@@ -334,6 +339,7 @@ impl Example for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, stats: PerformanceStats) {
         let started = std::time::Instant::now();
+        self.displayed_samples = self.renderer.sample_count();
         // Built field by field rather than through a `&self` method so the inspector's own state
         // can be borrowed mutably alongside the read-only view of everything else.
         let view = ui::View {
@@ -341,7 +347,7 @@ impl Example for App {
             settings: self.settings,
             stats,
             ui_ms: self.ui_ms,
-            samples_drawn: Some(self.renderer.sample_count()),
+            samples_drawn: Some(self.displayed_samples),
             viewport_extent: self.viewport_extent,
             renderer_error: self.renderer_error.as_deref(),
             camera_position: self.controls.position(),
@@ -399,6 +405,9 @@ impl Example for App {
         !self.renderer.is_complete()
             || self.controls.needs_continuous_update()
             || self.update_deferred
+            // The overlay is a frame behind the renderer, so converging is not enough: keep going
+            // until the readout has caught up with what the film actually holds.
+            || self.displayed_samples != self.renderer.sample_count()
     }
 
     fn destroy(self, device: &Device) {

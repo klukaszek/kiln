@@ -290,9 +290,8 @@ impl PathTracer {
 
         cmd.set_pipeline(&self.pipelines.clear);
         cmd.dispatch(root, float_count.div_ceil(CLEAR_THREADS), 1, 1);
-        // Each pipeline switch opens a new compute encoder. Including the
-        // pixel stage forces a queue-scoped barrier, ordering both the trace
-        // and display work after the clear.
+        // Order both trace and display work after the clear, including when
+        // no trace batch follows and display is the next consumer.
         cmd.barrier(
             StageFlags::COMPUTE,
             StageFlags::COMPUTE | StageFlags::PIXEL_SHADER,

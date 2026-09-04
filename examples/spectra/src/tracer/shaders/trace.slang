@@ -59,8 +59,8 @@ void traceMain(uint3 tid : SV_DispatchThreadID, uniform TraceRoot* r)
                 queryRay.TMin = 0.001;
                 queryRay.TMax = 1000.0;
 
-                RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
-                q.TraceRayInline(tlas, RAY_FLAG_FORCE_OPAQUE, 0xFF, queryRay);
+                RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+                q.TraceRayInline(tlas, RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, 0xFF, queryRay);
                 while (q.Proceed()) {}
 
                 if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {

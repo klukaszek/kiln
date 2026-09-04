@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["vulkan"]
+default = ["metal"]
 vulkan = ["dep:ash", "dep:ash-window"]
 metal = ["dep:objc2-metal", "dep:objc2", "dep:objc2-foundation", "dep:objc2-quartz-core", "dep:objc2-core-foundation", "dep:dispatch2"]
 

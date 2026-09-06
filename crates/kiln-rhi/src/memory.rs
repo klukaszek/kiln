@@ -44,6 +44,33 @@ fn mapped_read<T: GpuPod>(ptr: Option<*mut u8>, capacity: u64) -> RhiResult<T> {
 
 /// Where an allocation lives. No default: `Upload` for memory the GPU reads hot is a silent
 /// bandwidth cost, not an error. (D3D12's `DEFAULT` is this `GpuOnly`.)
+/// Reinterpret `bytes` mapped bytes at `ptr` as `[T]`.
+///
+/// # Safety
+/// `ptr` must be valid for `bytes` over `'a`, and nothing may write those bytes while the
+/// returned slice lives.
+unsafe fn slice_from_raw<'a, T: GpuPod>(ptr: *mut u8, bytes: u64) -> RhiResult<&'a [T]> {
+    let len = usize::try_from(bytes).map_err(|_| {
+        RhiError::AllocationFailed("mapped region does not fit the host address space".into())
+    })?;
+    let raw = unsafe { std::slice::from_raw_parts(ptr.cast_const(), len) };
+    <[T]>::ref_from_bytes(raw)
+        .map_err(|_| RhiError::AllocationFailed("size is not a multiple of element size".into()))
+}
+
+/// Mutable counterpart of [`slice_from_raw`].
+///
+/// # Safety
+/// As [`slice_from_raw`], and the slice must have exclusive access for `'a`.
+unsafe fn slice_from_raw_mut<'a, T: GpuPod>(ptr: *mut u8, bytes: u64) -> RhiResult<&'a mut [T]> {
+    let len = usize::try_from(bytes).map_err(|_| {
+        RhiError::AllocationFailed("mapped region does not fit the host address space".into())
+    })?;
+    let raw = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+    <[T]>::mut_from_bytes(raw)
+        .map_err(|_| RhiError::AllocationFailed("size is not a multiple of element size".into()))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryType {
     /// Host-visible, coherent. Uniforms, staging, draw args, descriptors.
@@ -115,9 +142,9 @@ impl Allocation {
         self.base_gpu().byte_add(self.offset)
     }
 
-    /// Typed handle to the mapped bytes, or `None` for `GpuOnly`. Checked once here rather than
-    /// on every write.
-    pub fn mapped<T>(&self) -> Option<Mapped<'_, T>> {
+    /// Typed handle to the mapped bytes, or `None` for `GpuOnly`. The mutable borrow excludes
+    /// allocation reads while a writable handle is live.
+    pub fn mapped<T>(&mut self) -> Option<Mapped<'_, T>> {
         self.cpu().map(|cpu| Mapped {
             cpu,
             gpu: self.gpu().cast(),
@@ -149,16 +176,8 @@ impl Allocation {
         let ptr = self
             .cpu()
             .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
-        let size = usize::try_from(self.size).map_err(|_| {
-            RhiError::AllocationFailed(
-                "allocation size does not fit in the host address space".into(),
-            )
-        })?;
-        // SAFETY: `ptr` is valid for `self.size` bytes for the lifetime of `&self`.
-        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
-        <[T]>::ref_from_bytes(bytes).map_err(|_| {
-            RhiError::AllocationFailed("size is not a multiple of element size".into())
-        })
+        // SAFETY: valid for `self.size`; `&self` rules out a concurrent CPU writer.
+        unsafe { slice_from_raw(ptr, self.size) }
     }
 
     /// `&mut self` rules out CPU aliasing.
@@ -166,17 +185,8 @@ impl Allocation {
         let ptr = self
             .cpu()
             .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
-        let size = usize::try_from(self.size).map_err(|_| {
-            RhiError::AllocationFailed(
-                "allocation size does not fit in the host address space".into(),
-            )
-        })?;
-        // SAFETY: `ptr` is valid for `self.size` bytes; `&mut self` guarantees no other CPU
-        // reference aliases it.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
-        <[T]>::mut_from_bytes(bytes).map_err(|_| {
-            RhiError::AllocationFailed("size is not a multiple of element size".into())
-        })
+        // SAFETY: valid for `self.size`; `&mut self` rules out any other CPU reference.
+        unsafe { slice_from_raw_mut(ptr, self.size) }
     }
 }
 
@@ -237,20 +247,7 @@ impl<'a, T> Mapped<'a, T> {
     }
 }
 
-impl<'a, T> Mapped<'a, T> {
-    #[inline]
-    pub fn len(self) -> u64 {
-        match size_of::<T>() as u64 {
-            0 => 0,
-            stride => self.bytes / stride,
-        }
-    }
-
-    #[inline]
-    pub fn is_empty(self) -> bool {
-        self.len() == 0
-    }
-
+impl<T> Mapped<'_, T> {
     /// Advance both addresses by `count` elements.
     #[inline]
     pub fn offset(self, count: u64) -> Self {
@@ -273,28 +270,22 @@ impl<'a, T: GpuPod> Mapped<'a, T> {
         mapped_read(Some(self.cpu), self.bytes)
     }
 
-    pub fn as_slice(self) -> RhiResult<&'a [T]> {
-        let size = usize::try_from(self.bytes).map_err(|_| {
-            RhiError::AllocationFailed("mapped region does not fit the host address space".into())
-        })?;
-        // SAFETY: valid for `self.bytes` over this handle's borrow.
-        let bytes = unsafe { std::slice::from_raw_parts(self.cpu as *const u8, size) };
-        <[T]>::ref_from_bytes(bytes).map_err(|_| {
-            RhiError::AllocationFailed("size is not a multiple of element size".into())
-        })
+    /// Borrow the mapped bytes as a slice.
+    ///
+    /// # Safety
+    /// No mapped handle, raw pointer, or GPU command may write these bytes while the slice
+    /// is live. In particular, copies of this handle must not call `write` or `write_slice`.
+    pub unsafe fn as_slice(self) -> RhiResult<&'a [T]> {
+        unsafe { slice_from_raw(self.cpu, self.bytes) }
     }
 
-    /// `&mut self` stops one handle handing out two aliasing slices; overlapping handles are the
-    /// caller's business.
-    pub fn as_mut_slice(&mut self) -> RhiResult<&mut [T]> {
-        let size = usize::try_from(self.bytes).map_err(|_| {
-            RhiError::AllocationFailed("mapped region does not fit the host address space".into())
-        })?;
-        // SAFETY: valid for `self.bytes`; `&mut self` rules out a second slice.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(self.cpu, size) };
-        <[T]>::mut_from_bytes(bytes).map_err(|_| {
-            RhiError::AllocationFailed("size is not a multiple of element size".into())
-        })
+    /// Borrow the mapped bytes as a mutable slice.
+    ///
+    /// # Safety
+    /// The slice must have exclusive access to these bytes for its lifetime, including all
+    /// copies or overlapping offsets of this handle and GPU accesses.
+    pub unsafe fn as_mut_slice(&mut self) -> RhiResult<&mut [T]> {
+        unsafe { slice_from_raw_mut(self.cpu, self.bytes) }
     }
 }
 

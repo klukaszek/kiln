@@ -54,7 +54,7 @@ impl Example for TriangleMesh {
                     topology: Topology::TriangleList,
                     color_targets: vec![ColorTarget::new(color_format)],
                     depth_format: None,
-                    stencil_format: None,
+                    depth: Default::default(),
                     sample_count: SampleCount::S1,
                     alpha_to_coverage: false,
                     cull: Cull::None,

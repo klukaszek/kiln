@@ -2,39 +2,37 @@ use super::barrier::{to_vk_access_flags, to_vk_stage_flags};
 use super::device::{
     SharedAllocations, SharedTextures, build_accel_flags_to_vk, geometry_flags_to_vk,
 };
+use super::texture::texture_aspect;
 use crate::barrier::{HazardFlags, StageFlags};
 use crate::command::{
     DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectArgs, LoadOp, RenderPassDesc,
     RenderTargetKind, StoreOp,
 };
-use crate::pipeline::{
-    ComputePso, ComputePsoInner, DepthStencilState, GraphicsPso, GraphicsPsoInner, MeshletPso,
-};
-use crate::texture::{Texture, bytes_per_pixel};
-use crate::types::*;
+use crate::pipeline::{ComputePso, ComputePsoInner, GraphicsPso, GraphicsPsoInner, MeshletPso};
+use crate::texture::{ResolvedRegion, Texture, bytes_per_pixel};
+use crate::types::{BlasDesc, GeometryType, GpuPtr, TextureId, TlasDesc};
 use ash::{
     ext::{debug_utils, descriptor_buffer, mesh_shader as vk_mesh_shader},
     khr::acceleration_structure as vk_accel_structure,
     vk,
 };
 use smallvec::SmallVec;
-use std::sync::Arc;
+use std::rc::Rc;
 
 /// Vulkan command buffer wrapper.
 pub struct VulkanCommandBuffer {
     pub(crate) command_buffer: vk::CommandBuffer,
     pub(crate) device: ash::Device,
-    pub(crate) swapchain_image_views: Arc<[vk::ImageView]>,
-    pub(crate) swapchain_images: Arc<[vk::Image]>,
+    pub(crate) swapchain_image_views: Rc<[vk::ImageView]>,
+    pub(crate) swapchain_images: Rc<[vk::Image]>,
     pub(crate) depth_image_view: vk::ImageView,
     pub(crate) pipeline_layout: vk::PipelineLayout,
-    pub(crate) descriptor_buffer_loader: Option<descriptor_buffer::Device>,
-    pub(crate) descriptor_buffer_binding: Option<vk::DescriptorBufferBindingInfoEXT<'static>>,
+    pub(crate) descriptor_buffer_loader: descriptor_buffer::Device,
+    pub(crate) descriptor_buffer_binding: vk::DescriptorBufferBindingInfoEXT<'static>,
     pub(crate) push_constant_stages: vk::ShaderStageFlags,
     pub(crate) debug_labels: Option<debug_utils::Device>,
     /// Set when the open pass pushed a label region for `end_render_pass` to pop.
     pub(crate) in_labelled_pass: bool,
-    pub(crate) current_depth_stencil: Option<DepthStencilState>,
     pub(crate) pending_split_barrier: Option<(StageFlags, HazardFlags)>,
     pub(crate) allocations: SharedAllocations,
     pub(crate) textures: SharedTextures,
@@ -44,13 +42,14 @@ pub struct VulkanCommandBuffer {
     pub(crate) ended: bool,
 }
 
-// SAFETY: VulkanCommandBuffer is only used from one thread at a time.
-unsafe impl Send for VulkanCommandBuffer {}
-
 impl VulkanCommandBuffer {
     pub(crate) fn finish(&mut self) -> crate::error::RhiResult<()> {
         if self.ended {
             return Ok(());
+        }
+        // Here rather than in `submit_frame`, so it holds whether or not the caller ends first.
+        for index in std::mem::take(&mut self.rendered_swapchain_images) {
+            self.transition_to_present(index);
         }
         unsafe {
             self.device
@@ -66,14 +65,8 @@ impl VulkanCommandBuffer {
         bind_point: vk::PipelineBindPoint,
         pipeline_layout: vk::PipelineLayout,
     ) {
-        let loader = self
-            .descriptor_buffer_loader
-            .as_ref()
-            .expect("Vulkan descriptor-buffer loader missing");
-        let binding = self
-            .descriptor_buffer_binding
-            .as_ref()
-            .expect("Vulkan descriptor-buffer binding missing");
+        let loader = &self.descriptor_buffer_loader;
+        let binding = &self.descriptor_buffer_binding;
         unsafe {
             loader.cmd_bind_descriptor_buffers(self.command_buffer, std::slice::from_ref(binding));
             loader.cmd_set_descriptor_buffer_offsets(
@@ -89,7 +82,7 @@ impl VulkanCommandBuffer {
 
     fn resolve_buffer_bounds(&self, addr: GpuPtr<u8>) -> (vk::Buffer, u64, u64) {
         let addr_u64 = addr.address;
-        let allocations = self.allocations.lock().expect("allocations lock poisoned");
+        let allocations = self.allocations.borrow();
         if let Some((&base, alloc)) = allocations.range(..=addr_u64).next_back() {
             let offset = addr_u64 - base;
             if offset < alloc.size {
@@ -111,7 +104,7 @@ impl VulkanCommandBuffer {
     }
 
     fn resolve_texture_info(&self, id: TextureId) -> (vk::Image, vk::ImageView, vk::ImageLayout) {
-        let textures = self.textures.lock().expect("textures lock poisoned");
+        let textures = self.textures.borrow();
         let tex = textures
             .get(id.0 as usize)
             .and_then(|t| t.as_ref())
@@ -119,9 +112,8 @@ impl VulkanCommandBuffer {
         (tex.image, tex.image_view, tex.layout)
     }
 
-    pub fn begin_render_pass(&mut self, desc: &RenderPassDesc) {
+    pub fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) {
         let cmd = self.command_buffer;
-        self.current_depth_stencil = None;
 
         // Opened before the attachment transitions so the capture attributes them to this pass.
         self.in_labelled_pass = false;
@@ -133,7 +125,7 @@ impl VulkanCommandBuffer {
             self.in_labelled_pass = true;
         }
 
-        for ca in &desc.color_attachments {
+        for ca in desc.color_attachments {
             if let RenderTargetKind::SwapchainImage(idx) = ca.target.kind() {
                 let image = self.swapchain_images[idx as usize];
                 let first_pass = !self.rendered_swapchain_images.contains(&idx);
@@ -256,7 +248,7 @@ impl VulkanCommandBuffer {
                 .clear_value(vk::ClearValue {
                     depth_stencil: vk::ClearDepthStencilValue {
                         depth: da.clear_depth,
-                        stencil: da.clear_stencil as u32,
+                        stencil: 0,
                     },
                 })
         });
@@ -284,11 +276,6 @@ impl VulkanCommandBuffer {
         unsafe {
             self.device.cmd_begin_rendering(cmd, &rendering_info);
 
-            self.device.cmd_set_depth_test_enable(cmd, false);
-            self.device.cmd_set_depth_write_enable(cmd, false);
-            self.device
-                .cmd_set_depth_compare_op(cmd, vk::CompareOp::ALWAYS);
-            self.device.cmd_set_stencil_test_enable(cmd, false);
             self.device.cmd_set_depth_bias_enable(cmd, false);
         }
     }
@@ -341,89 +328,7 @@ impl VulkanCommandBuffer {
         self.bind_descriptor_buffer(bind_point, pipeline_layout);
     }
 
-    pub fn set_depth_stencil_state(&mut self, state: &DepthStencilState) {
-        if self.current_depth_stencil.as_ref() == Some(state) {
-            return;
-        }
-        let cmd = self.command_buffer;
-        let depth_test = state.depth_mode.contains(DepthFlags::READ);
-        let depth_write = state.depth_mode.contains(DepthFlags::WRITE);
-        let stencil_enable = state.stencil_enabled();
-
-        unsafe {
-            self.device.cmd_set_depth_test_enable(cmd, depth_test);
-            self.device.cmd_set_depth_write_enable(cmd, depth_write);
-            self.device
-                .cmd_set_depth_compare_op(cmd, compare_op_to_vk(state.depth_test));
-            self.device.cmd_set_stencil_test_enable(cmd, stencil_enable);
-
-            self.device.cmd_set_stencil_op(
-                cmd,
-                vk::StencilFaceFlags::FRONT,
-                stencil_op_to_vk(state.stencil_front.fail_op),
-                stencil_op_to_vk(state.stencil_front.pass_op),
-                stencil_op_to_vk(state.stencil_front.depth_fail_op),
-                compare_op_to_vk(state.stencil_front.test),
-            );
-            self.device.cmd_set_stencil_op(
-                cmd,
-                vk::StencilFaceFlags::BACK,
-                stencil_op_to_vk(state.stencil_back.fail_op),
-                stencil_op_to_vk(state.stencil_back.pass_op),
-                stencil_op_to_vk(state.stencil_back.depth_fail_op),
-                compare_op_to_vk(state.stencil_back.test),
-            );
-
-            self.device.cmd_set_stencil_compare_mask(
-                cmd,
-                vk::StencilFaceFlags::FRONT_AND_BACK,
-                state.stencil_read_mask as u32,
-            );
-            self.device.cmd_set_stencil_write_mask(
-                cmd,
-                vk::StencilFaceFlags::FRONT_AND_BACK,
-                state.stencil_write_mask as u32,
-            );
-
-            self.device.cmd_set_stencil_reference(
-                cmd,
-                vk::StencilFaceFlags::FRONT,
-                state.stencil_front.reference as u32,
-            );
-            self.device.cmd_set_stencil_reference(
-                cmd,
-                vk::StencilFaceFlags::BACK,
-                state.stencil_back.reference as u32,
-            );
-
-            let bias_active = state.depth_bias != 0.0 || state.depth_bias_slope_factor != 0.0;
-            self.device.cmd_set_depth_bias_enable(cmd, bias_active);
-            if bias_active {
-                self.device.cmd_set_depth_bias(
-                    cmd,
-                    state.depth_bias,
-                    state.depth_bias_clamp,
-                    state.depth_bias_slope_factor,
-                );
-            }
-        }
-        self.current_depth_stencil = Some(state.clone());
-    }
-
     pub fn set_root_data(&mut self, root: GpuPtr<u8>) {
-        let bytes = root.address.to_ne_bytes();
-        unsafe {
-            self.device.cmd_push_constants(
-                self.command_buffer,
-                self.pipeline_layout,
-                self.push_constant_stages,
-                0,
-                &bytes,
-            );
-        }
-    }
-
-    pub fn set_compute_root(&mut self, root: GpuPtr<u8>) {
         let bytes = root.address.to_ne_bytes();
         unsafe {
             self.device.cmd_push_constants(
@@ -497,7 +402,12 @@ impl VulkanCommandBuffer {
         }
     }
 
-    pub fn draw_indexed_indirect(&mut self, indices: GpuPtr<u8>, args: GpuPtr<u8>) {
+    pub fn draw_indexed_indirect(
+        &mut self,
+        indices: GpuPtr<u8>,
+        _max_index_count: u32,
+        args: GpuPtr<u8>,
+    ) {
         let (arg_buffer, arg_offset) =
             self.resolve_buffer(args, std::mem::size_of::<DrawIndexedIndirectArgs>() as u64);
         let (index_buffer, index_offset) = self.resolve_buffer(indices, 4);
@@ -540,34 +450,36 @@ impl VulkanCommandBuffer {
 
     pub fn copy_buffer_to_texture(
         &mut self,
-        texture_gpu: GpuPtr<u8>,
         src: GpuPtr<u8>,
         texture: &Texture,
+        region: ResolvedRegion,
     ) {
-        let (image, aspect, width, height, layout, src_buffer, src_offset) =
-            self.prepare_texture_copy(texture_gpu, src, texture, "copy_buffer_to_texture");
+        let (image, aspect, layout, src_buffer, src_offset) =
+            self.prepare_texture_copy(src, texture, region, "copy_buffer_to_texture");
         self.transition_texture(
             image,
             aspect,
+            region,
             layout,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::AccessFlags::TRANSFER_WRITE,
             vk::PipelineStageFlags::TRANSFER,
             false,
         );
-        let region = build_buffer_image_region(src_offset, aspect, width, height);
+        let copy = build_buffer_image_region(src_offset, aspect, region);
         unsafe {
             self.device.cmd_copy_buffer_to_image(
                 self.command_buffer,
                 src_buffer,
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                std::slice::from_ref(&region),
+                std::slice::from_ref(&copy),
             );
         }
         self.transition_texture(
             image,
             aspect,
+            region,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             layout,
             vk::AccessFlags::TRANSFER_WRITE,
@@ -579,33 +491,35 @@ impl VulkanCommandBuffer {
     pub fn copy_texture_to_buffer(
         &mut self,
         dst: GpuPtr<u8>,
-        texture_gpu: GpuPtr<u8>,
         texture: &Texture,
+        region: ResolvedRegion,
     ) {
-        let (image, aspect, width, height, layout, dst_buffer, dst_offset) =
-            self.prepare_texture_copy(texture_gpu, dst, texture, "copy_texture_to_buffer");
+        let (image, aspect, layout, dst_buffer, dst_offset) =
+            self.prepare_texture_copy(dst, texture, region, "copy_texture_to_buffer");
         self.transition_texture(
             image,
             aspect,
+            region,
             layout,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             vk::AccessFlags::TRANSFER_READ,
             vk::PipelineStageFlags::TRANSFER,
             false,
         );
-        let region = build_buffer_image_region(dst_offset, aspect, width, height);
+        let copy = build_buffer_image_region(dst_offset, aspect, region);
         unsafe {
             self.device.cmd_copy_image_to_buffer(
                 self.command_buffer,
                 image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 dst_buffer,
-                std::slice::from_ref(&region),
+                std::slice::from_ref(&copy),
             );
         }
         self.transition_texture(
             image,
             aspect,
+            region,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             layout,
             vk::AccessFlags::TRANSFER_READ,
@@ -614,49 +528,117 @@ impl VulkanCommandBuffer {
         );
     }
 
-    /// Validate the texture address, resolve the linear buffer, and return
+    pub fn copy_texture_to_texture(
+        &mut self,
+        src: &Texture,
+        src_region: ResolvedRegion,
+        dst: &Texture,
+        dst_region: ResolvedRegion,
+    ) {
+        let (src_image, src_view_layout, src_aspect) = {
+            let (image, _, layout) = self.resolve_texture_info(src.id());
+            (image, layout, texture_aspect(src.desc().format))
+        };
+        let (dst_image, dst_view_layout, dst_aspect) = {
+            let (image, _, layout) = self.resolve_texture_info(dst.id());
+            (image, layout, texture_aspect(dst.desc().format))
+        };
+        self.transition_texture(
+            src_image,
+            src_aspect,
+            src_region,
+            src_view_layout,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::AccessFlags::TRANSFER_READ,
+            vk::PipelineStageFlags::TRANSFER,
+            false,
+        );
+        self.transition_texture(
+            dst_image,
+            dst_aspect,
+            dst_region,
+            dst_view_layout,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::PipelineStageFlags::TRANSFER,
+            false,
+        );
+        let copy = vk::ImageCopy::default()
+            .src_subresource(subresource_layers(src_aspect, src_region))
+            .src_offset(to_vk_offset(src_region.origin))
+            .dst_subresource(subresource_layers(dst_aspect, dst_region))
+            .dst_offset(to_vk_offset(dst_region.origin))
+            .extent(to_vk_extent(src_region.extent));
+        unsafe {
+            self.device.cmd_copy_image(
+                self.command_buffer,
+                src_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&copy),
+            );
+        }
+        self.transition_texture(
+            src_image,
+            src_aspect,
+            src_region,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            src_view_layout,
+            vk::AccessFlags::TRANSFER_READ,
+            vk::PipelineStageFlags::TRANSFER,
+            true,
+        );
+        self.transition_texture(
+            dst_image,
+            dst_aspect,
+            dst_region,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            dst_view_layout,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::PipelineStageFlags::TRANSFER,
+            true,
+        );
+    }
+
+    /// Resolve the texture and linear buffer, and return
     /// `(image, aspect, w, h, current layout, buffer, offset)` for a copy command.
     fn prepare_texture_copy(
         &self,
-        texture_gpu: GpuPtr<u8>,
         buffer_gpu: GpuPtr<u8>,
         texture: &Texture,
+        region: ResolvedRegion,
         op: &'static str,
     ) -> (
         vk::Image,
         vk::ImageAspectFlags,
-        u32,
-        u32,
         vk::ImageLayout,
         vk::Buffer,
         u64,
     ) {
-        assert_eq!(
-            texture_gpu, texture.gpu_address,
-            "{op} texture_gpu must match the address used to create the texture"
-        );
         let (image, _view, layout) = self.resolve_texture_info(texture.id());
-        let width = texture.desc().width;
-        let height = texture.desc().height;
         let bpp = bytes_per_pixel(texture.desc().format)
             .unwrap_or_else(|| panic!("Unsupported texture format for {op}"));
-        let size = (width as u64) * (height as u64) * (bpp as u64);
+        let (_, bytes_per_image) = region.linear_strides(bpp);
+        let size = (bytes_per_image as u64) * (region.extent[2] as u64);
         let (buffer, offset) = self.resolve_buffer(buffer_gpu, size);
-        let aspect = if is_depth_format(texture.desc().format) {
-            vk::ImageAspectFlags::DEPTH
-        } else {
-            vk::ImageAspectFlags::COLOR
-        };
-        (image, aspect, width, height, layout, buffer, offset)
+        (
+            image,
+            texture_aspect(texture.desc().format),
+            layout,
+            buffer,
+            offset,
+        )
     }
 
-    /// Emit a single-mip, single-layer image layout transition. `reverse=true` swaps
-    /// pipeline stages and access masks so the same call can wrap a copy on both sides.
+    /// Transition just the mip and layer a copy touches. `reverse=true` swaps pipeline stages
+    /// and access masks so the same call can wrap a copy on both sides.
     #[allow(clippy::too_many_arguments)]
     fn transition_texture(
         &self,
         image: vk::Image,
         aspect: vk::ImageAspectFlags,
+        region: ResolvedRegion,
         old_layout: vk::ImageLayout,
         new_layout: vk::ImageLayout,
         transfer_access: vk::AccessFlags,
@@ -686,9 +668,9 @@ impl VulkanCommandBuffer {
             .image(image)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: aspect,
-                base_mip_level: 0,
+                base_mip_level: region.mip,
                 level_count: 1,
-                base_array_layer: 0,
+                base_array_layer: region.layer,
                 layer_count: 1,
             });
         unsafe {
@@ -826,7 +808,8 @@ impl VulkanCommandBuffer {
     }
 
     /// Transition a swapchain image to PRESENT_SRC_KHR layout.
-    pub fn transition_to_present(&mut self, swapchain_image_index: u32) {
+    /// Metal transitions on present, so this stays out of the public API.
+    fn transition_to_present(&mut self, swapchain_image_index: u32) {
         let image = self.swapchain_images[swapchain_image_index as usize];
         let barrier = vk::ImageMemoryBarrier::default()
             .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -1043,53 +1026,43 @@ impl VulkanCommandBuffer {
 fn build_buffer_image_region(
     buffer_offset: u64,
     aspect: vk::ImageAspectFlags,
-    width: u32,
-    height: u32,
+    region: ResolvedRegion,
 ) -> vk::BufferImageCopy {
+    // Zero row/image length means "tightly packed to the copy extent", which is the layout
+    // `ResolvedRegion::linear_strides` reports to the caller.
     vk::BufferImageCopy::default()
         .buffer_offset(buffer_offset)
-        .image_subresource(vk::ImageSubresourceLayers {
-            aspect_mask: aspect,
-            mip_level: 0,
-            base_array_layer: 0,
-            layer_count: 1,
-        })
-        .image_extent(vk::Extent3D {
-            width,
-            height,
-            depth: 1,
-        })
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(subresource_layers(aspect, region))
+        .image_offset(to_vk_offset(region.origin))
+        .image_extent(to_vk_extent(region.extent))
 }
 
-fn is_depth_format(format: Format) -> bool {
-    matches!(
-        format,
-        Format::D16Unorm | Format::D32Float | Format::D24UnormS8Uint | Format::D32FloatS8Uint
-    )
-}
-
-fn compare_op_to_vk(op: CompareOp) -> vk::CompareOp {
-    match op {
-        CompareOp::Never => vk::CompareOp::NEVER,
-        CompareOp::Less => vk::CompareOp::LESS,
-        CompareOp::Equal => vk::CompareOp::EQUAL,
-        CompareOp::LessOrEqual => vk::CompareOp::LESS_OR_EQUAL,
-        CompareOp::Greater => vk::CompareOp::GREATER,
-        CompareOp::NotEqual => vk::CompareOp::NOT_EQUAL,
-        CompareOp::GreaterOrEqual => vk::CompareOp::GREATER_OR_EQUAL,
-        CompareOp::Always => vk::CompareOp::ALWAYS,
+fn subresource_layers(
+    aspect: vk::ImageAspectFlags,
+    region: ResolvedRegion,
+) -> vk::ImageSubresourceLayers {
+    vk::ImageSubresourceLayers {
+        aspect_mask: aspect,
+        mip_level: region.mip,
+        base_array_layer: region.layer,
+        layer_count: 1,
     }
 }
 
-fn stencil_op_to_vk(op: StencilOp) -> vk::StencilOp {
-    match op {
-        StencilOp::Keep => vk::StencilOp::KEEP,
-        StencilOp::Zero => vk::StencilOp::ZERO,
-        StencilOp::Replace => vk::StencilOp::REPLACE,
-        StencilOp::IncrementClamp => vk::StencilOp::INCREMENT_AND_CLAMP,
-        StencilOp::DecrementClamp => vk::StencilOp::DECREMENT_AND_CLAMP,
-        StencilOp::Invert => vk::StencilOp::INVERT,
-        StencilOp::IncrementWrap => vk::StencilOp::INCREMENT_AND_WRAP,
-        StencilOp::DecrementWrap => vk::StencilOp::DECREMENT_AND_WRAP,
+fn to_vk_offset(origin: [u32; 3]) -> vk::Offset3D {
+    vk::Offset3D {
+        x: origin[0] as i32,
+        y: origin[1] as i32,
+        z: origin[2] as i32,
+    }
+}
+
+fn to_vk_extent(extent: [u32; 3]) -> vk::Extent3D {
+    vk::Extent3D {
+        width: extent[0],
+        height: extent[1],
+        depth: extent[2],
     }
 }

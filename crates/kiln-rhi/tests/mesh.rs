@@ -8,9 +8,9 @@ mod common;
 
 use kiln_rhi::gpu_struct;
 use kiln_rhi::{
-    AllocationDesc, BumpAllocator, ColorAttachment, ColorTarget, Cull, Device, Format, GpuPtr,
-    LoadOp, MemoryType, MeshletPso, MeshletPsoDesc, RenderPassDesc, SampleCount, ShaderModule,
-    ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension, TextureUsage, Topology,
+    ColorAttachment, ColorTarget, Cull, Device, Format, GpuPtr, LoadOp, MemoryType, MeshletPso,
+    MeshletPsoDesc, RenderPassDesc, SampleCount, ShaderModule, ShaderStage, StageFlags, StoreOp,
+    TextureDesc, TextureDimension, TextureUsage, Topology,
 };
 
 gpu_struct! {
@@ -44,65 +44,16 @@ const SIZE: u32 = 64;
 
 #[test]
 fn mesh_fullscreen_color() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
     let src = format!("{}{}", Root::SLANG, MESH_BODY);
-    let Some(ms) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "msMain", ShaderStage::Mesh, &[])
-    else {
-        return;
-    };
-    let Some(fs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
-    else {
-        return;
-    };
+    let ms = kiln_rhi::compiler::compile(&device, &src, "msMain", ShaderStage::Mesh, &[])
+        .expect("compile ms");
+    let fs = kiln_rhi::compiler::compile(&device, &src, "fsMain", ShaderStage::Pixel, &[])
+        .expect("compile fs");
 
-    let pso = match device.create_meshlet_pso(
-        &MeshletPsoDesc {
-            topology: Topology::TriangleList,
-            color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
-            depth_format: None,
-            stencil_format: None,
-            sample_count: SampleCount::S1,
-            alpha_to_coverage: false,
-            cull: Cull::None,
-            blendstate: None,
-            label: Some("mesh".into()),
-        },
-        &ms,
-        &fs,
-    ) {
-        Ok(pso) => pso,
-        Err(e) => {
-            eprintln!("skipping: mesh shaders unsupported on this device ({e})");
-            return;
-        }
-    };
+    let pso = make_meshlet_pso(&device, &ms, &fs, "mesh");
 
-    let tex_desc = TextureDesc {
-        width: SIZE,
-        height: SIZE,
-        depth: 1,
-        mip_levels: 1,
-        array_layers: 1,
-        format: Format::R8G8B8A8Unorm,
-        dimension: TextureDimension::D2,
-        sample_count: SampleCount::S1,
-        usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        label: Some("rt".into()),
-    };
-    let sa = device.texture_size_align(&tex_desc).expect("size_align");
-    let tex_mem = device
-        .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
-        .expect("rt mem");
-    let texture = device
-        .create_texture(&tex_desc, tex_mem.gpu())
-        .expect("create_texture");
-
-    // Root data is allocated directly; the other mesh tests use the bump allocator.
     let mut root = device
         .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Upload)
         .expect("root");
@@ -110,91 +61,44 @@ fn mesh_fullscreen_color() {
         color: [0.0, 1.0, 0.0, 1.0],
     })
     .expect("upload root");
-    let readback = device
-        .allocate((SIZE * SIZE * 4) as u64, MemoryType::Readback)
-        .expect("readback");
 
-    common::timed("mesh draw full-screen triangle · submit+wait", || {
-        let mut cmd = device.create_command_buffer().expect("cmd");
-        cmd.begin_render_pass(&RenderPassDesc {
-            color_attachments: vec![ColorAttachment {
-                target: texture.target(),
-                load_op: LoadOp::Clear,
-                store_op: StoreOp::Store,
-                clear_color: [0.0, 0.0, 0.0, 1.0],
-            }],
-            depth_attachment: None,
-            render_area: [0, 0, SIZE, SIZE],
-            label: Some("mesh test"),
-        });
-        cmd.set_pipeline(&pso);
-        cmd.set_viewport(0.0, 0.0, SIZE as f32, SIZE as f32, 0.0, 1.0);
-        cmd.set_scissor(0, 0, SIZE, SIZE);
-        cmd.draw_meshlets(root.gpu(), 1, 1, 1);
-        cmd.end_render_pass();
-
-        cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
-        cmd.copy_texture_to_buffer(&texture, readback.gpu());
-        cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
-        cmd.end();
-        let queue = device.queue();
-        queue.submit(cmd).expect("submit");
-        queue.wait_idle();
+    let pixels = common::timed("mesh draw full-screen triangle \u{b7} submit+wait", || {
+        render_meshlets(&device, &pso, root.gpu(), SIZE, [1, 1, 1])
     });
-
-    let pixels = readback.as_slice::<u8>().expect("read readback");
-    common::save_rgba_png("mesh_fullscreen_color", SIZE, SIZE, pixels);
-    for px in 0..(SIZE * SIZE) as usize {
-        let (r, g, b, a) = (
-            pixels[px * 4],
-            pixels[px * 4 + 1],
-            pixels[px * 4 + 2],
-            pixels[px * 4 + 3],
-        );
-        assert_eq!(
-            (r, g, b, a),
-            (0, 255, 0, 255),
-            "pixel {px} not green: ({r},{g},{b},{a})"
-        );
+    common::save_rgba_png("mesh_fullscreen_color", SIZE, SIZE, &pixels);
+    for (px, pixel) in pixels.chunks_exact(4).enumerate() {
+        assert_eq!(pixel, [0, 255, 0, 255], "pixel {px} not green: {pixel:?}");
     }
 
-    device.destroy(texture);
-    device.destroy(tex_mem);
     device.destroy(root);
-    device.destroy(readback);
 }
 
 // Shared helpers for the mesh-shader tests below.
 
-/// Build a meshlet PSO with one RGBA8 colour target and no culling, or `None`
-/// (skip) if the device doesn't support mesh shaders.
+/// Build a meshlet PSO with one RGBA8 colour target and no culling.
 fn make_meshlet_pso(
     device: &Device,
     ms: &ShaderModule,
     fs: &ShaderModule,
     label: &str,
-) -> Option<MeshletPso> {
-    match device.create_meshlet_pso(
-        &MeshletPsoDesc {
-            topology: Topology::TriangleList,
-            color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
-            depth_format: None,
-            stencil_format: None,
-            sample_count: SampleCount::S1,
-            alpha_to_coverage: false,
-            cull: Cull::None,
-            blendstate: None,
-            label: Some(label.into()),
-        },
-        ms,
-        fs,
-    ) {
-        Ok(pso) => Some(pso),
-        Err(e) => {
-            eprintln!("skipping: mesh shaders unsupported on this device ({e})");
-            None
-        }
-    }
+) -> MeshletPso {
+    device
+        .create_meshlet_pso(
+            &MeshletPsoDesc {
+                topology: Topology::TriangleList,
+                color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
+                depth_format: None,
+                depth: Default::default(),
+                sample_count: SampleCount::S1,
+                alpha_to_coverage: false,
+                cull: Cull::None,
+                blendstate: None,
+                label: Some(label.into()),
+            },
+            ms,
+            fs,
+        )
+        .expect("create_meshlet_pso")
 }
 
 /// Dispatch `groups` meshlet workgroups of `pso` into a fresh `size`×`size` RGBA8
@@ -233,7 +137,7 @@ fn render_meshlets(
 
     let mut cmd = device.create_command_buffer().expect("cmd");
     cmd.begin_render_pass(&RenderPassDesc {
-        color_attachments: vec![ColorAttachment {
+        color_attachments: &[ColorAttachment {
             target: texture.target(),
             load_op: LoadOp::Clear,
             store_op: StoreOp::Store,
@@ -250,7 +154,7 @@ fn render_meshlets(
     cmd.end_render_pass();
 
     cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
-    cmd.copy_texture_to_buffer(&texture, readback.gpu());
+    cmd.copy_texture_to_buffer(&texture, readback.gpu(), None);
     cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
     cmd.end();
     let queue = device.queue();
@@ -262,21 +166,6 @@ fn render_meshlets(
     device.destroy(texture);
     device.destroy(tex_mem);
     pixels
-}
-
-/// A per-test bump allocator over CPU-mapped memory — the doc's preferred source for
-/// transient per-draw arguments. Caller releases it with
-/// `device.destroy(bump.into_allocation())` after the draw has completed.
-fn test_bump(device: &Device) -> BumpAllocator {
-    let buffer = device
-        .create_allocation(&AllocationDesc {
-            size: 64 * 1024,
-            memory: MemoryType::Upload,
-            label: Some("test-bump".into()),
-            ..Default::default()
-        })
-        .expect("create_buffer");
-    BumpAllocator::new(buffer)
 }
 
 // Clip-space orientation: both backends use the RHI's Y-up NDC convention.
@@ -307,27 +196,13 @@ float4 fsMain(VOut i) : SV_Target { return float4(1.0, 1.0, 1.0, 1.0); }
 
 #[test]
 fn mesh_clip_space_is_y_up() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
-    let Some(ms) =
-        kiln_rhi::compiler::compile_or_skip(&device, ORIENT_BODY, "msMain", ShaderStage::Mesh, &[])
-    else {
-        return;
-    };
-    let Some(fs) = kiln_rhi::compiler::compile_or_skip(
-        &device,
-        ORIENT_BODY,
-        "fsMain",
-        ShaderStage::Pixel,
-        &[],
-    ) else {
-        return;
-    };
-    let Some(pso) = make_meshlet_pso(&device, &ms, &fs, "orient") else {
-        return;
-    };
+    let ms = kiln_rhi::compiler::compile(&device, ORIENT_BODY, "msMain", ShaderStage::Mesh, &[])
+        .expect("compile ms");
+    let fs = kiln_rhi::compiler::compile(&device, ORIENT_BODY, "fsMain", ShaderStage::Pixel, &[])
+        .expect("compile fs");
+    let pso = make_meshlet_pso(&device, &ms, &fs, "orient");
 
     const SIZE: u32 = 128;
     let pixels = common::timed("mesh clip-space orientation · submit+wait", || {
@@ -403,26 +278,16 @@ float4 fsMain(VOut i) : SV_Target { return i.color; }
 
 #[test]
 fn mesh_meshlet_grid() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
     let src = format!("{}{}", GridCfg::SLANG, GRID_BODY);
-    let Some(ms) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "msMain", ShaderStage::Mesh, &[])
-    else {
-        return;
-    };
-    let Some(fs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
-    else {
-        return;
-    };
-    let Some(pso) = make_meshlet_pso(&device, &ms, &fs, "grid") else {
-        return;
-    };
+    let ms = kiln_rhi::compiler::compile(&device, &src, "msMain", ShaderStage::Mesh, &[])
+        .expect("compile ms");
+    let fs = kiln_rhi::compiler::compile(&device, &src, "fsMain", ShaderStage::Pixel, &[])
+        .expect("compile fs");
+    let pso = make_meshlet_pso(&device, &ms, &fs, "grid");
 
-    let bump = test_bump(&device);
+    let bump = common::test_bump(&device);
     let cfg = bump
         .alloc(std::mem::size_of::<GridCfg>() as u64, 16)
         .expect("bump cfg");
@@ -484,23 +349,13 @@ float4 fsMain(VOut i) : SV_Target { return i.color; }
 
 #[test]
 fn mesh_interpolated_triangle() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
-    let Some(ms) =
-        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "msMain", ShaderStage::Mesh, &[])
-    else {
-        return;
-    };
-    let Some(fs) =
-        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "fsMain", ShaderStage::Pixel, &[])
-    else {
-        return;
-    };
-    let Some(pso) = make_meshlet_pso(&device, &ms, &fs, "tri") else {
-        return;
-    };
+    let ms = kiln_rhi::compiler::compile(&device, TRI_BODY, "msMain", ShaderStage::Mesh, &[])
+        .expect("compile ms");
+    let fs = kiln_rhi::compiler::compile(&device, TRI_BODY, "fsMain", ShaderStage::Pixel, &[])
+        .expect("compile fs");
+    let pso = make_meshlet_pso(&device, &ms, &fs, "tri");
 
     const SIZE: u32 = 128;
     let pixels = common::timed("interpolated triangle · submit+wait", || {

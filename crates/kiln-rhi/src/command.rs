@@ -2,13 +2,18 @@
 
 use crate::accel::AccelerationStructure;
 use crate::barrier::{HazardFlags, StageFlags};
-use crate::pipeline::{ComputePso, DepthStencilState, GraphicsPso, MeshletPso};
+use crate::pipeline::{ComputePso, GraphicsPso, MeshletPso};
 use crate::query::{QueryPool, QueryPoolInner};
-use crate::types::*;
-use crate::types::{BlasDesc, TlasDesc};
+use crate::texture::{ResolvedRegion, Texture, TextureRegion};
+use crate::types::{BlasDesc, GpuPtr, TextureId, TlasDesc};
+
+/// Fill in a caller's optional region against the texture it addresses.
+fn resolve_region(region: impl Into<Option<TextureRegion>>, texture: &Texture) -> ResolvedRegion {
+    region.into().unwrap_or_default().resolve(texture.desc())
+}
 
 /// Color attachment for dynamic rendering.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct ColorAttachment {
     pub target: RenderTarget,
     pub load_op: LoadOp,
@@ -17,13 +22,12 @@ pub struct ColorAttachment {
 }
 
 /// Depth attachment for dynamic rendering.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct DepthAttachment {
     pub target: RenderTarget,
     pub load_op: LoadOp,
     pub store_op: StoreOp,
     pub clear_depth: f32,
-    pub clear_stencil: u8,
 }
 
 /// Render target reference.
@@ -67,13 +71,15 @@ pub enum StoreOp {
 }
 
 /// Description for beginning dynamic rendering.
-#[derive(Clone, Debug, Default)]
-pub struct RenderPassDesc {
-    pub color_attachments: Vec<ColorAttachment>,
+///
+/// Borrowed rather than owned: a render pass is described once per pass per frame, so the
+/// attachments come straight off the caller's stack with no allocation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RenderPassDesc<'a> {
+    pub color_attachments: &'a [ColorAttachment],
     pub depth_attachment: Option<DepthAttachment>,
     pub render_area: [u32; 4], // x, y, width, height
     /// Pass name in a GPU capture. `&'static str` because this struct is rebuilt every frame.
-    /// Metal only for now; Vulkan needs a device-level `VK_EXT_debug_utils` loader.
     pub label: Option<&'static str>,
 }
 
@@ -114,11 +120,10 @@ pub trait Pipeline: crate::sealed::Sealed {
 }
 
 macro_rules! impl_pipeline {
-    ($($ty:ty => $kind:literal, $bind:ident),+ $(,)?) => {
+    ($($ty:ty => $bind:ident),+ $(,)?) => {
         $(
             impl Pipeline for $ty {
                 fn bind_to(&self, cmd: &mut CommandBuffer) {
-                    cmd.assert_same_device(&self._owner, $kind);
                     backend_dispatch!(&mut cmd.inner, CommandBufferInner, c => c.$bind(self))
                 }
             }
@@ -127,9 +132,9 @@ macro_rules! impl_pipeline {
 }
 
 impl_pipeline!(
-    GraphicsPso => "graphics pipeline", set_graphics_pipeline,
-    ComputePso => "compute pipeline", set_compute_pipeline,
-    MeshletPso => "meshlet pipeline", set_meshlet_pipeline,
+    GraphicsPso => set_graphics_pipeline,
+    ComputePso => set_compute_pipeline,
+    MeshletPso => set_meshlet_pipeline,
 );
 
 /// Transient command buffer. Created, recorded, submitted, auto-reclaimed.
@@ -146,20 +151,7 @@ pub(crate) enum CommandBufferInner {
 }
 
 impl CommandBuffer {
-    fn assert_same_device(
-        &self,
-        other: &Option<std::rc::Rc<crate::device::DeviceInner>>,
-        resource: &str,
-    ) {
-        let same = self
-            ._owner
-            .as_ref()
-            .zip(other.as_ref())
-            .is_some_and(|(command, resource)| std::rc::Rc::ptr_eq(command, resource));
-        assert!(same, "{resource} belongs to a different device");
-    }
-
-    pub fn begin_render_pass(&mut self, desc: &RenderPassDesc) {
+    pub fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.begin_render_pass(desc))
     }
 
@@ -172,16 +164,8 @@ impl CommandBuffer {
         pso.bind_to(self);
     }
 
-    pub fn set_depth_stencil_state(&mut self, state: &DepthStencilState) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_depth_stencil_state(state))
-    }
-
     fn set_root_data<T: ?Sized>(&mut self, root: GpuPtr<T>) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_root_data(root.cast()))
-    }
-
-    fn set_compute_root<T: ?Sized>(&mut self, root: GpuPtr<T>) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_compute_root(root.cast()))
     }
 
     /// `root` is shared by the vertex and pixel stages.
@@ -211,7 +195,7 @@ impl CommandBuffer {
     }
 
     pub fn dispatch<R: ?Sized>(&mut self, root: GpuPtr<R>, x: u32, y: u32, z: u32) {
-        self.set_compute_root(root);
+        self.set_root_data(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch(x, y, z))
     }
 
@@ -221,7 +205,7 @@ impl CommandBuffer {
         root: GpuPtr<R>,
         args: GpuPtr<DispatchIndirectArgs>,
     ) {
-        self.set_compute_root(root);
+        self.set_root_data(root);
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch_indirect(args.cast()))
     }
 
@@ -232,38 +216,63 @@ impl CommandBuffer {
     }
 
     /// Indirect indexed draw.
+    /// `max_index_count` bounds the index range the GPU may read. The draw count itself comes
+    /// from `args`; this is the upper bound Metal needs to size the index buffer binding, and the
+    /// caller already knows it — deriving it instead would mean an address lookup per draw.
     pub fn draw_indexed_indirect<R: ?Sized>(
         &mut self,
         root: GpuPtr<R>,
         indices: GpuPtr<u32>,
+        max_index_count: u32,
         args: GpuPtr<DrawIndexedIndirectArgs>,
     ) {
         self.set_root_data(root);
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indexed_indirect(indices.cast(), args.cast()))
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indexed_indirect(indices.cast(), max_index_count, args.cast()))
     }
 
     pub fn memcpy<D: ?Sized, S: ?Sized>(&mut self, dst: GpuPtr<D>, src: GpuPtr<S>, size: u64) {
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.memcpy(dst.cast(), src.cast(), size))
     }
 
-    /// Base mip and first layer only.
+    /// Upload tightly packed texels into one mip/layer of `texture`.
+    ///
+    /// `region` is `None` for the whole of mip 0, layer 0, or a [`TextureRegion`] to target a
+    /// specific subresource or sub-box. The source layout is tightly packed to the region's
+    /// extent: `region.extent[0] * bytes_per_pixel` per row, no padding between rows or slices.
     pub fn copy_buffer_to_texture<S: ?Sized>(
         &mut self,
         src: GpuPtr<S>,
-        texture: &crate::texture::Texture,
+        texture: &Texture,
+        region: impl Into<Option<TextureRegion>>,
     ) {
-        self.assert_same_device(&texture._owner, "texture");
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_buffer_to_texture(texture.gpu_address, src.cast(), texture))
+        let region = resolve_region(region, texture);
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_buffer_to_texture(src.cast(), texture, region))
     }
 
-    /// Base mip and first layer only.
+    /// Read one mip/layer of `texture` back into a tightly packed buffer. See
+    /// [`copy_buffer_to_texture`](Self::copy_buffer_to_texture) for the `region` and layout rules.
     pub fn copy_texture_to_buffer<D: ?Sized>(
         &mut self,
-        texture: &crate::texture::Texture,
+        texture: &Texture,
         dst: GpuPtr<D>,
+        region: impl Into<Option<TextureRegion>>,
     ) {
-        self.assert_same_device(&texture._owner, "texture");
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_texture_to_buffer(dst.cast(), texture.gpu_address, texture))
+        let region = resolve_region(region, texture);
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_texture_to_buffer(dst.cast(), texture, region))
+    }
+
+    /// Copy one mip/layer of `src` into one mip/layer of `dst`. The copied extent comes from
+    /// `src_region`; `dst_region`'s extent is ignored, only its mip, layer and origin apply.
+    pub fn copy_texture_to_texture(
+        &mut self,
+        src: &Texture,
+        src_region: impl Into<Option<TextureRegion>>,
+        dst: &Texture,
+        dst_region: impl Into<Option<TextureRegion>>,
+    ) {
+        let src_region = resolve_region(src_region, src);
+        let dst_region = resolve_region(dst_region, dst);
+        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_texture_to_texture(src, src_region, dst, dst_region))
     }
 
     pub fn barrier(&mut self, src: StageFlags, dst: StageFlags) {
@@ -307,7 +316,6 @@ impl CommandBuffer {
     /// Must be outside a render pass, after the previous GPU use of this pool has completed.
     /// On Metal the reset happens immediately on the CPU, rather than at submission.
     pub fn reset_queries(&mut self, pool: &QueryPool) {
-        self.assert_same_device(&pool._owner, "query pool");
         match (&mut self.inner, &pool.inner) {
             #[cfg(feature = "vulkan")]
             (CommandBufferInner::Vulkan(cmd), QueryPoolInner::Vulkan(p)) => {
@@ -332,7 +340,6 @@ impl CommandBuffer {
 
     /// Must be outside a render pass.
     pub fn write_timestamp(&mut self, pool: &QueryPool, query: u32) {
-        self.assert_same_device(&pool._owner, "query pool");
         assert!(query < pool.count, "timestamp query index out of range");
         match (&mut self.inner, &pool.inner) {
             #[cfg(feature = "vulkan")]
@@ -345,18 +352,6 @@ impl CommandBuffer {
             }
             #[allow(unreachable_patterns)]
             _ => unreachable!("query pool backend does not match command buffer backend"),
-        }
-    }
-
-    /// No-op on Metal, which transitions on present.
-    pub fn transition_to_present(&mut self, _swapchain_image_index: u32) {
-        match &mut self.inner {
-            #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => cmd.transition_to_present(_swapchain_image_index),
-            #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(_cmd) => {
-                // Metal handles presentation transitions automatically.
-            }
         }
     }
 
@@ -392,12 +387,10 @@ impl CommandBuffer {
 
     /// `accel` must come from `device.create_blas` with this same `desc`.
     pub fn build_blas(&mut self, accel: &AccelerationStructure, desc: &BlasDesc) {
-        self.assert_same_device(&accel._owner, "acceleration structure");
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.build_blas(accel, desc))
     }
 
     pub fn build_tlas(&mut self, accel: &AccelerationStructure, desc: &TlasDesc) {
-        self.assert_same_device(&accel._owner, "acceleration structure");
         backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.build_tlas(accel, desc))
     }
 }

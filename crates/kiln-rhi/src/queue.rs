@@ -8,12 +8,11 @@ use crate::sync::TimelineSemaphore;
 /// GPU queue for submission and presentation.
 pub struct Queue {
     pub(crate) inner: QueueInner,
-    pub(crate) device_id: usize,
 }
 
 pub(crate) enum QueueInner {
     #[cfg(feature = "vulkan")]
-    Vulkan(Box<crate::backend::vulkan::device::VulkanQueue>),
+    Vulkan(Box<crate::backend::vulkan::queue::VulkanQueue>),
     #[cfg(feature = "metal")]
     Metal(Box<crate::backend::metal::device::MetalQueue>),
 }
@@ -30,7 +29,6 @@ impl Queue {
     }
 
     pub fn submit_with_desc(&self, cmd: CommandBuffer, desc: &SubmitDesc<'_>) -> RhiResult<()> {
-        self.assert_owns(&cmd);
         match (&self.inner, cmd.inner) {
             #[cfg(feature = "vulkan")]
             (QueueInner::Vulkan(q), crate::command::CommandBufferInner::Vulkan(cmd)) => {
@@ -45,6 +43,9 @@ impl Queue {
         }
     }
 
+    /// Wait for the frame slot and acquire its image. If recording is abandoned before
+    /// submission, acquiring the same slot again reuses its outstanding image. Recreate the
+    /// swapchain to discard outstanding acquisitions (for example after a resize).
     pub fn acquire_image(
         &self,
         swapchain: &Swapchain,
@@ -72,7 +73,6 @@ impl Queue {
         frame_index: usize,
         image_index: u32,
     ) -> RhiResult<()> {
-        self.assert_owns(&cmd);
         match (&self.inner, cmd.inner, &swapchain.inner) {
             #[cfg(feature = "vulkan")]
             (
@@ -98,17 +98,5 @@ impl Queue {
             #[cfg(feature = "metal")]
             QueueInner::Metal(q) => q.wait_idle(),
         }
-    }
-
-    fn assert_owns(&self, cmd: &CommandBuffer) {
-        let command_device = cmd
-            ._owner
-            .as_ref()
-            .map(|owner| std::rc::Rc::as_ptr(owner) as usize);
-        assert_eq!(
-            command_device,
-            Some(self.device_id),
-            "command buffer belongs to a different device"
-        );
     }
 }

@@ -38,34 +38,27 @@ void rqMain(uint3 tid : SV_DispatchThreadID, uniform Root* data)
 
 #[test]
 fn ray_query_triangle_hit() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
     let src = format!("{}{}", Root::SLANG, RQ_BODY);
-    let Some(module) = kiln_rhi::compiler::compile_or_skip(
+    let module = kiln_rhi::compiler::compile(
         &device,
         &src,
         "rqMain",
         ShaderStage::Compute,
         &["spvRayQueryKHR"],
-    ) else {
-        return;
-    };
+    )
+    .expect("compile module");
 
-    let pso = match device.create_compute_pso(
-        &ComputePsoDesc {
-            threads_per_threadgroup: [1, 1, 1],
-            label: Some("ray-query".into()),
-        },
-        &module,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("skipping: compute PSO creation failed ({e})");
-            return;
-        }
-    };
+    let pso = device
+        .create_compute_pso(
+            &ComputePsoDesc {
+                threads_per_threadgroup: [1, 1, 1],
+                label: Some("ray-query".into()),
+            },
+            &module,
+        )
+        .expect("create_compute_pso");
 
     // Triangle at z=0, with the ray starting at z=-1.
     let verts: [[f32; 3]; 3] = [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]];
@@ -88,13 +81,7 @@ fn ray_query_triangle_hit() {
         }],
         flags: BuildAccelFlags::PREFER_FAST_TRACE,
     };
-    let blas = match device.create_blas(&blas_desc) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("skipping: ray tracing unsupported on this device ({e})");
-            return;
-        }
-    };
+    let blas = device.create_blas(&blas_desc).expect("create_blas");
 
     common::timed("build BLAS · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
@@ -107,7 +94,7 @@ fn ray_query_triangle_hit() {
 
     // Identity instance referencing the BLAS.
     let stride = device.tlas_instance_stride();
-    let instbuf = device
+    let mut instbuf = device
         .allocate(stride as u64, MemoryType::Upload)
         .expect("instance buffer");
     let instance = TlasInstance {
@@ -121,7 +108,7 @@ fn ray_query_triangle_hit() {
         acceleration_structure_reference: blas.gpu(),
     };
     device
-        .write_tlas_instance(&instbuf, 0, &instance)
+        .write_tlas_instance(&mut instbuf, 0, &instance)
         .expect("write instance");
 
     let tlas_desc = TlasDesc {

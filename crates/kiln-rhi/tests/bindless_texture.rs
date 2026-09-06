@@ -51,21 +51,13 @@ const TEXEL: [u8; 4] = [32, 64, 96, 255];
 
 #[test]
 fn bindless_texture_sample() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
     let src = format!("{}{}", Root::SLANG, BODY);
-    let Some(vs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex, &[])
-    else {
-        return;
-    };
-    let Some(fs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
-    else {
-        return;
-    };
+    let vs = kiln_rhi::compiler::compile(&device, &src, "vsMain", ShaderStage::Vertex, &[])
+        .expect("compile vs");
+    let fs = kiln_rhi::compiler::compile(&device, &src, "fsMain", ShaderStage::Pixel, &[])
+        .expect("compile fs");
 
     let pso = device
         .create_graphics_pso(
@@ -157,7 +149,7 @@ fn bindless_texture_sample() {
     common::timed("sample bindless texture · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
         // Make the upload and descriptor visible before sampling.
-        cmd.copy_buffer_to_texture(staging.gpu(), &texture);
+        cmd.copy_buffer_to_texture(staging.gpu(), &texture, None);
         cmd.barrier_with_hazard(
             StageFlags::TRANSFER,
             StageFlags::PIXEL_SHADER,
@@ -165,7 +157,7 @@ fn bindless_texture_sample() {
         );
 
         cmd.begin_render_pass(&RenderPassDesc {
-            color_attachments: vec![ColorAttachment {
+            color_attachments: &[ColorAttachment {
                 target: rt.target(),
                 load_op: LoadOp::Clear,
                 store_op: StoreOp::Store,
@@ -182,7 +174,7 @@ fn bindless_texture_sample() {
         cmd.end_render_pass();
 
         cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
-        cmd.copy_texture_to_buffer(&rt, readback.gpu());
+        cmd.copy_texture_to_buffer(&rt, readback.gpu(), None);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
         cmd.end();
         let queue = device.queue();

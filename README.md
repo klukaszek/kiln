@@ -162,9 +162,50 @@ cargo check --workspace
 cargo test --workspace
 ```
 
-The integration tests render to offscreen targets and cover the RHI end to end. Tests that need a
-physical GPU or `slangc` skip themselves when that dependency is missing, but a shader that fails
-to compile still fails the test.
+The integration tests render to offscreen targets and cover the RHI end to end. They need a GPU
+and `slangc`, and fail without them — this is a render hardware interface, so a machine that
+cannot run them is broken, not exempt. Tests enable validation by default; run with
+`-- --nocapture` to see the layer output. Select a backend explicitly with
+`--no-default-features --features metal` or `--features vulkan`.
 
-Set `KILN_VALIDATION=1`, or pass `--validation` to a windowed example, for Vulkan validation
-layers.
+Pass `--validation` to a windowed example for Vulkan validation layers.
+
+Metal API validation is configured before process startup through Xcode or `MTL_DEBUG_LAYER=1`,
+as described in [Apple's validation guide](https://developer.apple.com/documentation/xcode/validating-your-apps-metal-api-usage).
+`DeviceDesc.validation` controls Vulkan validation; it does not toggle Metal's process-wide layer.
+
+Writable `Allocation::mapped` handles and `Device::write_tlas_instance` require a mutable
+allocation borrow. Mapped handles remain copyable for pointer arithmetic and checked writes;
+their slice accessors are `unsafe` because copies can overlap. Prefer `Allocation::as_slice` /
+`as_mut_slice` for safe borrowed slices, and `Mapped::read` / `write` for individual values.
+
+## Resource lifetime
+
+`Device::destroy` is safe to call the moment you are done with a resource, including mid-frame and
+immediately after submitting work that reads it. The handle is consumed at once, but the storage
+and any bindless slot are held until every submission issued so far has retired, and reclaimed by
+the next submit, `acquire_image`, or `wait_idle`. You never need a fence of your own for this.
+
+`wait_idle` and `wait_for_frame` remain available for the cases that genuinely need a drain, such
+as resizing a swapchain.
+
+## Validation
+
+The RHI does not re-implement validation. Formats, usage flags, layouts and subresource ranges are
+checked by the Vulkan validation layers and Metal's API validation, which report them better than a
+hand-rolled layer could. What the RHI does check is the small set those validators structurally
+cannot see — chiefly mixing resources between devices — and only under `debug_assertions`.
+
+## Threading
+
+The RHI is single-threaded by design: `Device` is `Rc`-backed and neither it nor a `CommandBuffer`
+is `Send`. Both backends use `Rc`/`RefCell` internally to match, so there is no lock traffic on the
+record path. Parallel command recording would be a deliberate future change, not something the
+current types quietly allow.
+
+## Shader compilation
+
+The `slangc` feature (on by default) compiles Slang source at runtime by shelling out to a `slangc`
+binary on `PATH`, caching artifacts in the temp dir. That suits tests, examples and iteration. A
+shipping build should turn the feature off, compile shaders offline, and hand the bytes to
+`Device::create_shader_module`.

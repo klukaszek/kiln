@@ -187,9 +187,6 @@ mod tests {
     /// slangc is the only thing that can tell us the assembled sources are valid.
     #[test]
     fn assembled_sources_compile() {
-        if !compiler::slangc_available() {
-            return;
-        }
         check(&trace(), "traceMain", "compute", &["spvRayQueryKHR"]);
         check(&clear(), "clearMain", "compute", &[]);
         check(&display(), "displayVs", "vertex", &[]);

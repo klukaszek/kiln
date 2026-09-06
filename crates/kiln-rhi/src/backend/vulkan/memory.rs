@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use crate::backend::suballoc::FreeRanges;
 use crate::error::{RhiError, RhiResult};
@@ -20,11 +21,6 @@ pub struct VulkanBuffer {
     pub(crate) block_offset: u64,
     pub(crate) block_range: u64,
 }
-
-// SAFETY: VulkanBuffer's raw pointer is only used for CPU-side uploads
-// and the underlying Vulkan memory is externally synchronized.
-unsafe impl Send for VulkanBuffer {}
-unsafe impl Sync for VulkanBuffer {}
 
 impl VulkanBuffer {
     pub fn mapped_ptr(&self) -> Option<*mut u8> {
@@ -63,11 +59,7 @@ pub(crate) struct VulkanBufferPool {
     buffer_image_granularity: u64,
 }
 
-// SAFETY: the mapped pointers are owned by the pool and only handed out behind the same external
-// synchronization that guards every other device resource.
-unsafe impl Send for VulkanBufferPool {}
-
-pub(crate) type SharedBufferPool = Arc<Mutex<VulkanBufferPool>>;
+pub(crate) type SharedBufferPool = Rc<RefCell<VulkanBufferPool>>;
 
 impl VulkanBufferPool {
     pub(crate) fn new(buffer_image_granularity: u64) -> Self {
@@ -267,5 +259,49 @@ mod tests {
     #[test]
     fn overflowing_padding_is_rejected_rather_than_wrapping() {
         assert_eq!(granularity_padded(1, u64::MAX, 4096), None);
+    }
+}
+
+/// Create a buffer, back it with memory of `properties`, bind it, and return its device address.
+/// The `DEVICE_ADDRESS` allocate flag is required for any buffer whose address is taken and is
+/// easy to omit, so every such allocation goes through here.
+pub(crate) fn allocate_bound_buffer(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    size: u64,
+    usage: vk::BufferUsageFlags,
+    properties: vk::MemoryPropertyFlags,
+    what: &str,
+) -> RhiResult<(vk::Buffer, vk::DeviceMemory, u64)> {
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    unsafe {
+        let buffer = device
+            .create_buffer(&buffer_info, None)
+            .map_err(|e| RhiError::AllocationFailed(format!("{what}: {e}")))?;
+        let reqs = device.get_buffer_memory_requirements(buffer);
+        let memory_type = crate::backend::vulkan::device::find_memorytype_index(
+            &reqs,
+            memory_properties,
+            properties,
+        )
+        .ok_or_else(|| RhiError::AllocationFailed(format!("No memory type for {what}")))?;
+        let mut flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(memory_type)
+            .push_next(&mut flags);
+        let memory = device
+            .allocate_memory(&alloc_info, None)
+            .map_err(|e| RhiError::AllocationFailed(format!("{what}: {e}")))?;
+        device
+            .bind_buffer_memory(buffer, memory, 0)
+            .map_err(|e| RhiError::AllocationFailed(format!("{what}: {e}")))?;
+        let address = device
+            .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer));
+        Ok((buffer, memory, address))
     }
 }

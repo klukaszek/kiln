@@ -28,19 +28,11 @@ void computeMain(uint3 tid : SV_DispatchThreadID, uniform Data* data)
 
 #[test]
 fn compute_barrier_across_pipeline_switches() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
     let src = format!("{}{}", Data::SLANG, COMPUTE_BODY);
-    let Some(module) = kiln_rhi::compiler::compile_or_skip(
-        &device,
-        &src,
-        "computeMain",
-        ShaderStage::Compute,
-        &[],
-    ) else {
-        return;
-    };
+    let module =
+        kiln_rhi::compiler::compile(&device, &src, "computeMain", ShaderStage::Compute, &[])
+            .expect("compile module");
     let desc = ComputePsoDesc {
         threads_per_threadgroup: [64, 1, 1],
         label: Some("pipeline-switch dependency".into()),
@@ -103,20 +95,12 @@ fn compute_barrier_across_pipeline_switches() {
 
 #[test]
 fn compute_doubles_buffer() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
     let src = format!("{}{}", Data::SLANG, COMPUTE_BODY);
-    let Some(module) = kiln_rhi::compiler::compile_or_skip(
-        &device,
-        &src,
-        "computeMain",
-        ShaderStage::Compute,
-        &[],
-    ) else {
-        return;
-    };
+    let module =
+        kiln_rhi::compiler::compile(&device, &src, "computeMain", ShaderStage::Compute, &[])
+            .expect("compile module");
 
     let pso = common::timed("create_compute_pso", || {
         device

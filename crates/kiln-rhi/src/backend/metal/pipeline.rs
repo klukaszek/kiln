@@ -5,16 +5,48 @@ use objc2_metal::{
     MTL4AlphaToCoverageState, MTL4BlendState, MTL4Compiler, MTL4IndirectCommandBufferSupportState,
     MTL4LibraryFunctionDescriptor, MTL4PipelineDescriptor,
     MTL4RenderPipelineColorAttachmentDescriptor, MTL4RenderPipelineDescriptor, MTLBlendFactor,
-    MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLLibrary, MTLPrimitiveType,
+    MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLDevice, MTLLibrary, MTLPrimitiveType,
     MTLRenderPipelineState, MTLWinding,
 };
 
 use crate::error::{RhiError, RhiResult};
-use crate::pipeline::{BlendAttachment, BlendState};
-use crate::types::{BlendFactor, BlendOp, ColorWriteMask};
+use crate::pipeline::{BlendAttachment, BlendState, DepthState};
+use crate::types::{BlendFactor, BlendOp, ColorWriteMask, CompareOp, DepthFlags};
+
+pub(crate) fn make_depth_stencil_state(
+    device: &ProtocolObject<dyn MTLDevice>,
+    depth: DepthState,
+) -> Retained<ProtocolObject<dyn objc2_metal::MTLDepthStencilState>> {
+    let desc = objc2_metal::MTLDepthStencilDescriptor::new();
+    desc.setDepthCompareFunction(if depth.mode.contains(DepthFlags::READ) {
+        compare_op_to_mtl(depth.compare)
+    } else {
+        objc2_metal::MTLCompareFunction::Always
+    });
+    desc.setDepthWriteEnabled(depth.mode.contains(DepthFlags::WRITE));
+    device
+        .newDepthStencilStateWithDescriptor(&desc)
+        .expect("Failed to create Metal depth/stencil state")
+}
+
+pub(crate) fn compare_op_to_mtl(op: CompareOp) -> objc2_metal::MTLCompareFunction {
+    use objc2_metal::MTLCompareFunction as F;
+    match op {
+        CompareOp::Never => F::Never,
+        CompareOp::Less => F::Less,
+        CompareOp::Equal => F::Equal,
+        CompareOp::LessOrEqual => F::LessEqual,
+        CompareOp::Greater => F::Greater,
+        CompareOp::NotEqual => F::NotEqual,
+        CompareOp::GreaterOrEqual => F::GreaterEqual,
+        CompareOp::Always => F::Always,
+    }
+}
 
 pub struct MetalGraphicsPso {
     pub(crate) pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    pub(crate) depth_stencil: Retained<ProtocolObject<dyn objc2_metal::MTLDepthStencilState>>,
+    pub(crate) depth_bias: (f32, f32, f32),
     pub(crate) cull_mode: MTLCullMode,
     pub(crate) winding: MTLWinding,
     pub(crate) topology: MTLPrimitiveType,
@@ -64,7 +96,7 @@ impl MetalGraphicsPso {
         for (i, fmt) in color_formats.iter().enumerate() {
             let att = unsafe { color_attachments.objectAtIndexedSubscript(i) };
             att.setPixelFormat(*fmt);
-            let blend_att = blend.attachments.get(i).cloned().unwrap_or_default();
+            let blend_att = blend.attachments.get(i).copied().unwrap_or_default();
             let write_mask = color_write_masks
                 .get(i)
                 .copied()
@@ -161,5 +193,7 @@ fn blend_op_to_mtl(op: BlendOp) -> MTLBlendOperation {
 pub struct MetalMeshletPso {
     pub(crate) cull_mode: MTLCullMode,
     pub(crate) winding: MTLWinding,
+    pub(crate) depth_stencil: Retained<ProtocolObject<dyn objc2_metal::MTLDepthStencilState>>,
+    pub(crate) depth_bias: (f32, f32, f32),
     pub(crate) default_pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
 }

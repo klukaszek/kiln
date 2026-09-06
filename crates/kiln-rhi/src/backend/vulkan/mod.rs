@@ -5,6 +5,8 @@ pub mod device;
 pub mod memory;
 pub mod pipeline;
 pub mod query;
+pub mod queue;
+pub mod sampler;
 pub mod shader;
 pub mod surface;
 pub mod swapchain;

@@ -10,11 +10,11 @@ use crate::pipeline::{
 use crate::query::QueryPool;
 use crate::queue::Queue;
 use crate::sampler::{Sampler, SamplerDesc};
-use crate::shader::{ShaderModule, ShaderModuleDesc, ShaderModuleInner, ShaderStage};
+use crate::shader::{ShaderModule, ShaderModuleDesc, ShaderModuleInner};
 use crate::surface::{Surface, SurfaceDesc};
 use crate::swapchain::{Swapchain, SwapchainDesc};
 use crate::sync::TimelineSemaphore;
-use crate::texture::{Texture, TextureDesc, TextureSizeAlign, TextureViewDesc};
+use crate::texture::{Texture, TextureDesc, TextureSizeAlign};
 use crate::types::{BlasDesc, GpuPtr, TlasDesc, TlasInstance};
 use std::rc::Rc;
 
@@ -39,14 +39,16 @@ pub enum BindlessMode {
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Backend::Vulkan => write!(f, "Vulkan"),
-            Backend::Metal => write!(f, "Metal"),
+            Self::Vulkan => write!(f, "Vulkan"),
+            Self::Metal => write!(f, "Metal"),
         }
     }
 }
 
 /// Description for creating a device.
 pub struct DeviceDesc {
+    /// Enable Vulkan validation. Metal validation is configured at process launch through
+    /// Xcode or `MTL_DEBUG_LAYER=1`; this flag cannot toggle Metal's process-wide layer.
     pub validation: bool,
     pub label: Option<String>,
     /// Preferred backend. `None` uses the default for the platform.
@@ -76,8 +78,11 @@ pub(crate) enum DeviceInner {
     Metal(Box<crate::backend::metal::device::MetalDevice>),
 }
 
+/// Resources hold an `Rc` to the device that made them, so a `Device` handle can be dropped while
+/// its resources are still alive. Nothing reads it back; it exists to keep `DeviceInner` alive.
+/// `Option` only because a backend cannot hand out an `Rc` to the device that owns it during
+/// construction; every public `create_*` stamps it before the resource escapes.
 trait DeviceOwned {
-    fn owner(&self) -> &Option<Rc<DeviceInner>>;
     fn owner_mut(&mut self) -> &mut Option<Rc<DeviceInner>>;
 }
 
@@ -85,10 +90,6 @@ macro_rules! impl_device_owned {
     ($($ty:ty),+ $(,)?) => {
         $(
             impl DeviceOwned for $ty {
-                fn owner(&self) -> &Option<Rc<DeviceInner>> {
-                    &self._owner
-                }
-
                 fn owner_mut(&mut self) -> &mut Option<Rc<DeviceInner>> {
                     &mut self._owner
                 }
@@ -115,50 +116,21 @@ impl_device_owned!(
 
 use crate::sealed;
 
-/// A resource released through [`Device::destroy`].
-///
-/// [`Allocation`], [`Texture`], [`Sampler`] and [`QueryPool`] hold storage and heap slots the RHI
-/// reclaims only here, so dropping one leaks. The rest free on drop; `destroy` just pins when.
+/// A resource whose storage the RHI reclaims only on [`Device::destroy`]: dropping one leaks its
+/// memory, heap slot, or bindless ID. Everything else in the RHI frees on `Drop` like normal Rust.
 pub trait DeviceResource: sealed::Sealed + Sized {
     #[doc(hidden)]
     fn destroy_on(self, device: &Device);
 }
 
-/// Freed by their own `Drop`; `destroy` only checks provenance and pins the release point.
-macro_rules! impl_destroy_by_drop {
-    ($($ty:ty => $kind:literal),+ $(,)?) => {
-        $(
-            impl DeviceResource for $ty {
-                fn destroy_on(self, device: &Device) {
-                    device.assert_owns(&self, $kind);
-                }
-            }
-        )+
-    };
-}
-
-impl_destroy_by_drop!(
-    AccelerationStructure => "acceleration structure",
-    CommandBuffer => "command buffer",
-    ComputePso => "compute pipeline",
-    GraphicsPso => "graphics pipeline",
-    MeshletPso => "meshlet pipeline",
-    ShaderModule => "shader module",
-    Surface => "surface",
-    Swapchain => "swapchain",
-    TimelineSemaphore => "timeline semaphore",
-);
-
 impl DeviceResource for Allocation {
     fn destroy_on(self, device: &Device) {
-        device.assert_owns(&self, "allocation");
         backend_dispatch!(device.inner.as_ref(), DeviceInner, d => d.destroy_allocation(self))
     }
 }
 
 impl DeviceResource for Texture {
     fn destroy_on(mut self, device: &Device) {
-        device.assert_owns(&self, "texture");
         for id in self.views.drain(..) {
             backend_dispatch!(device.inner.as_ref(), DeviceInner, d => d.destroy_texture_view(id));
         }
@@ -168,14 +140,12 @@ impl DeviceResource for Texture {
 
 impl DeviceResource for Sampler {
     fn destroy_on(self, device: &Device) {
-        device.assert_owns(&self, "sampler");
         backend_dispatch!(device.inner.as_ref(), DeviceInner, d => d.destroy_sampler(self))
     }
 }
 
 impl DeviceResource for QueryPool {
     fn destroy_on(self, device: &Device) {
-        device.assert_owns(&self, "query pool");
         backend_dispatch!(device.inner.as_ref(), DeviceInner, d => d.destroy_query_pool(self))
     }
 }
@@ -183,7 +153,7 @@ impl DeviceResource for QueryPool {
 impl Device {
     /// Selects `desc.preferred_backend`, else Vulkan if compiled in, else Metal.
     pub fn new(desc: &DeviceDesc) -> RhiResult<Self> {
-        let backend = desc.preferred_backend.unwrap_or(Self::default_backend());
+        let backend = desc.preferred_backend.unwrap_or_else(Self::default_backend);
 
         match backend {
             #[cfg(feature = "vulkan")]
@@ -198,61 +168,20 @@ impl Device {
             }
             #[allow(unreachable_patterns)]
             _ => Err(crate::error::RhiError::Unsupported(format!(
-                "Backend '{}' is not compiled in. Enable the corresponding feature.",
-                backend
+                "Backend '{backend}' is not compiled in. Enable the corresponding feature."
             ))),
         }
     }
 
     fn from_inner(inner: DeviceInner) -> Self {
-        let mut inner = Rc::new(inner);
-        let device_id = Rc::as_ptr(&inner) as usize;
-        match Rc::get_mut(&mut inner).expect("new device Rc unexpectedly shared") {
-            #[cfg(feature = "vulkan")]
-            DeviceInner::Vulkan(device) => device.set_device_id(device_id),
-            #[cfg(feature = "metal")]
-            DeviceInner::Metal(device) => device.set_device_id(device_id),
+        Self {
+            inner: Rc::new(inner),
         }
-        Self { inner }
     }
 
     fn own<T: DeviceOwned>(&self, mut resource: T) -> T {
         *resource.owner_mut() = Some(Rc::clone(&self.inner));
         resource
-    }
-
-    fn ensure_owns<T: DeviceOwned>(&self, resource: &T, kind: &str) -> RhiResult<()> {
-        if resource
-            .owner()
-            .as_ref()
-            .is_some_and(|owner| Rc::ptr_eq(owner, &self.inner))
-        {
-            Ok(())
-        } else {
-            Err(RhiError::Backend(format!(
-                "{kind} belongs to a different device"
-            )))
-        }
-    }
-
-    fn assert_owns<T: DeviceOwned>(&self, resource: &T, kind: &str) {
-        assert!(
-            self.ensure_owns(resource, kind).is_ok(),
-            "{kind} belongs to a different device"
-        );
-    }
-
-    /// Both backends key entry points by name alone, so a module in the wrong slot otherwise
-    /// fails deep inside pipeline compilation without naming the mistake.
-    fn ensure_stage(module: &ShaderModule, expected: ShaderStage) -> RhiResult<()> {
-        if module.stage == expected {
-            Ok(())
-        } else {
-            Err(RhiError::PipelineCreation(format!(
-                "expected a {expected:?} shader module, got {:?}",
-                module.stage
-            )))
-        }
     }
 
     /// The default backend for this build.
@@ -295,7 +224,6 @@ impl Device {
         surface: &Surface,
         desc: &SwapchainDesc,
     ) -> RhiResult<Swapchain> {
-        self.ensure_owns(surface, "surface")?;
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_swapchain(surface, desc))
             .map(|resource| self.own(resource))
     }
@@ -306,7 +234,6 @@ impl Device {
         swapchain: &mut Swapchain,
         desc: &SwapchainDesc,
     ) -> RhiResult<()> {
-        self.ensure_owns(swapchain, "swapchain")?;
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.recreate_swapchain(swapchain, desc))
     }
 
@@ -399,10 +326,6 @@ impl Device {
         vertex: &ShaderModule,
         pixel: &ShaderModule,
     ) -> RhiResult<GraphicsPso> {
-        self.ensure_owns(vertex, "vertex shader")?;
-        self.ensure_owns(pixel, "pixel shader")?;
-        Self::ensure_stage(vertex, ShaderStage::Vertex)?;
-        Self::ensure_stage(pixel, ShaderStage::Pixel)?;
         let result = match (self.inner.as_ref(), &vertex.inner, &pixel.inner) {
             #[cfg(feature = "vulkan")]
             (
@@ -425,8 +348,6 @@ impl Device {
         desc: &ComputePsoDesc,
         compute: &ShaderModule,
     ) -> RhiResult<ComputePso> {
-        self.ensure_owns(compute, "compute shader")?;
-        Self::ensure_stage(compute, ShaderStage::Compute)?;
         let result = match (self.inner.as_ref(), &compute.inner) {
             #[cfg(feature = "vulkan")]
             (DeviceInner::Vulkan(d), ShaderModuleInner::Vulkan(c)) => d.create_compute_pso(desc, c),
@@ -444,10 +365,6 @@ impl Device {
         mesh: &ShaderModule,
         pixel: &ShaderModule,
     ) -> RhiResult<MeshletPso> {
-        self.ensure_owns(mesh, "mesh shader")?;
-        self.ensure_owns(pixel, "pixel shader")?;
-        Self::ensure_stage(mesh, ShaderStage::Mesh)?;
-        Self::ensure_stage(pixel, ShaderStage::Pixel)?;
         let result = match (self.inner.as_ref(), &mesh.inner, &pixel.inner) {
             #[cfg(feature = "vulkan")]
             (
@@ -489,11 +406,10 @@ impl Device {
     /// indirect descriptor). Size the buffer as `instance_count * tlas_instance_stride()`.
     pub fn write_tlas_instance(
         &self,
-        dst: &Allocation,
+        dst: &mut Allocation,
         index: usize,
         instance: &TlasInstance,
     ) -> RhiResult<()> {
-        self.ensure_owns(dst, "TLAS instance buffer")?;
         let stride = self.tlas_instance_stride() as u64;
         let base = dst.mapped::<u8>().ok_or_else(|| {
             RhiError::AllocationFailed("instance buffer is not CPU-mapped".into())
@@ -519,7 +435,6 @@ impl Device {
         swapchain: &Swapchain,
         frame_index: usize,
     ) -> RhiResult<CommandBuffer> {
-        self.ensure_owns(swapchain, "swapchain")?;
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.create_command_buffer_for_swapchain(swapchain, frame_index))
             .map(|resource| self.own(resource))
     }
@@ -544,7 +459,6 @@ impl Device {
 
     /// Valid once the writing GPU work has completed.
     pub fn read_timestamps(&self, pool: &QueryPool) -> RhiResult<Vec<u64>> {
-        self.ensure_owns(pool, "query pool")?;
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.read_timestamps(pool))
     }
 
@@ -567,12 +481,13 @@ impl Device {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.wait_idle())
     }
 
-    /// Release a resource, freeing its storage immediately.
+    /// Release a resource. Safe to call at any point, including mid-frame.
     ///
-    /// The RHI tracks no lifetimes: the caller guarantees the GPU is done, via
-    /// [`wait_idle`](Self::wait_idle), [`wait_for_frame`](Self::wait_for_frame), or the swapchain
-    /// fence. Destroying a resource an in-flight submission references is a use-after-free, and
-    /// a texture's shader handles are recycled at once. Panics on a foreign device.
+    /// The handle is consumed and stops resolving right away, but the storage and any bindless
+    /// slot are held until every submission issued so far has retired, then reclaimed by the next
+    /// [`Queue::submit`](crate::Queue::submit), [`acquire_image`](crate::Queue::acquire_image) or
+    /// [`wait_idle`](Self::wait_idle). No fence of your own is required. Panics on a foreign
+    /// device.
     pub fn destroy<R: DeviceResource>(&self, resource: R) {
         resource.destroy_on(self);
     }
@@ -581,75 +496,6 @@ impl Device {
     pub fn wait_for_frame(&self, frame_index: usize) {
         backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.wait_for_frame(frame_index))
     }
-}
-
-pub(crate) fn validate_texture_view(
-    source: &Texture,
-    view: &TextureViewDesc,
-    required_usage: crate::texture::TextureUsage,
-) -> RhiResult<()> {
-    use crate::texture::{ALL_LAYERS, ALL_MIPS};
-
-    if !source.desc().usage.contains(required_usage) {
-        return Err(RhiError::Unsupported(format!(
-            "texture view requires source usage {required_usage:?}"
-        )));
-    }
-    if let Some(format) = view.format
-        && format != source.desc().format
-    {
-        let source_format = source.desc().format;
-        if !crate::texture::formats_are_view_compatible(source_format, format) {
-            return Err(RhiError::Unsupported(format!(
-                "texture view format {format:?} does not reinterpret {source_format:?}: the two \
-                 must share a channel layout and bit depth, and depth/stencil formats never \
-                 reinterpret"
-            )));
-        }
-        if !source
-            .desc()
-            .usage
-            .contains(crate::texture::TextureUsage::FORMAT_VIEW)
-        {
-            return Err(RhiError::Unsupported(
-                "a format-reinterpreting view requires TextureUsage::FORMAT_VIEW on the source \
-                 texture, which must be set when the texture is created"
-                    .into(),
-            ));
-        }
-    }
-
-    let base_mip = u32::from(view.base_mip);
-    let mip_count = if view.mip_count == ALL_MIPS {
-        source.desc().mip_levels.saturating_sub(base_mip)
-    } else {
-        u32::from(view.mip_count)
-    };
-    if base_mip >= source.desc().mip_levels
-        || mip_count == 0
-        || mip_count > source.desc().mip_levels - base_mip
-    {
-        return Err(RhiError::Unsupported(
-            "texture view mip range is outside the source texture".into(),
-        ));
-    }
-
-    let base_layer = u32::from(view.base_layer);
-    let layer_count = if view.layer_count == ALL_LAYERS {
-        source.desc().array_layers.saturating_sub(base_layer)
-    } else {
-        u32::from(view.layer_count)
-    };
-    if base_layer >= source.desc().array_layers
-        || layer_count == 0
-        || layer_count > source.desc().array_layers - base_layer
-    {
-        return Err(RhiError::Unsupported(
-            "texture view layer range is outside the source texture".into(),
-        ));
-    }
-
-    Ok(())
 }
 
 fn aligned_backing_size(size: u64, align: u64) -> RhiResult<u64> {

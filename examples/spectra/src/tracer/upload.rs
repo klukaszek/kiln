@@ -92,7 +92,7 @@ impl<'a> GpuUploadBatch<'a> {
     pub(crate) fn upload_texture(&mut self, rgba8: &[u8], texture: &Texture) -> Result<()> {
         let staging = self.device.upload_slice(rgba8)?;
         self.commands()
-            .copy_buffer_to_texture(staging.gpu(), texture);
+            .copy_buffer_to_texture(staging.gpu(), texture, None);
         self.stage(staging)
     }
 

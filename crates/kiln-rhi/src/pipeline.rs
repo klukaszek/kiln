@@ -1,6 +1,9 @@
 //! Pipeline state objects: graphics, compute, and mesh-shader PSOs.
 
-use crate::types::*;
+use crate::types::{
+    BlendFactor, BlendOp, ColorWriteMask, CompareOp, Cull, DepthFlags, Format, SampleCount,
+    Topology,
+};
 
 /// Per-color-attachment entry in a graphics PSO.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -21,18 +24,16 @@ impl ColorTarget {
 
 /// Description for creating a rasterization pipeline state object.
 ///
-/// Minimal PSO — topology, formats, MSAA, cull, write masks and blend baked. DepthStencil stays
-/// dynamic (`set_depth_stencil_state`); blend cannot, since both backends bake it in. Shaders are
-/// arguments to `create_graphics_pso` / `create_meshlet_pso`. The vertex and mesh paths take the
-/// same raster state, hence the [`GraphicsPsoDesc`] / [`MeshletPsoDesc`] aliases.
+/// Minimal PSO — topology, formats, MSAA, cull, write masks, blend and depth all baked. Shaders
+/// are arguments to `create_graphics_pso` / `create_meshlet_pso`; the vertex and mesh paths share
+/// this state, hence the [`GraphicsPsoDesc`] / [`MeshletPsoDesc`] aliases.
 #[derive(Clone, Debug)]
 pub struct RasterPsoDesc {
     pub topology: Topology,
     pub color_targets: Vec<ColorTarget>,
-    /// `None` = no depth.
+    /// `None` = no depth attachment and no depth test.
     pub depth_format: Option<Format>,
-    /// Separate from `depth_format`; `None` = no stencil.
-    pub stencil_format: Option<Format>,
+    pub depth: DepthState,
     pub sample_count: SampleCount,
     pub alpha_to_coverage: bool,
     pub cull: Cull,
@@ -55,10 +56,10 @@ impl Default for RasterPsoDesc {
             topology: Topology::TriangleList,
             color_targets: vec![ColorTarget::new(Format::B8G8R8A8Srgb)],
             depth_format: Some(Format::D32Float),
+            depth: DepthState::default(),
             sample_count: SampleCount::S1,
             alpha_to_coverage: false,
             cull: Cull::None,
-            stencil_format: None,
             blendstate: None,
             label: None,
         }
@@ -108,71 +109,43 @@ pub(crate) enum ComputePsoInner {
     Metal(Box<crate::backend::metal::pipeline::MetalComputePso>),
 }
 
-/// Per-face stencil operation descriptor.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct StencilDesc {
-    pub test: CompareOp,
-    pub fail_op: StencilOp,
-    /// Stencil passed, depth passed.
-    pub pass_op: StencilOp,
-    /// Stencil passed, depth failed.
-    pub depth_fail_op: StencilOp,
-    pub reference: u8,
+/// Depth test and bias, baked into the pipeline.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DepthState {
+    /// Empty = disabled; `READ` = test only; `READ | WRITE` = both.
+    pub mode: DepthFlags,
+    pub compare: CompareOp,
+    pub bias: f32,
+    pub bias_slope: f32,
+    pub bias_clamp: f32,
 }
 
-impl Default for StencilDesc {
+impl Default for DepthState {
     fn default() -> Self {
         Self {
-            test: CompareOp::Always,
-            fail_op: StencilOp::Keep,
-            pass_op: StencilOp::Keep,
-            depth_fail_op: StencilOp::Keep,
-            reference: 0,
+            mode: DepthFlags::empty(),
+            compare: CompareOp::Always,
+            bias: 0.0,
+            bias_slope: 0.0,
+            bias_clamp: 0.0,
         }
     }
 }
 
-/// Dynamic depth-stencil state, set via `set_depth_stencil_state`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DepthStencilState {
-    /// Empty = disabled; `READ` = test only; `READ|WRITE` = both.
-    pub depth_mode: DepthFlags,
-    pub depth_test: CompareOp,
-    pub depth_bias: f32,
-    pub depth_bias_slope_factor: f32,
-    pub depth_bias_clamp: f32,
-    /// Stencil is off entirely while both masks are zero.
-    pub stencil_read_mask: u8,
-    pub stencil_write_mask: u8,
-    pub stencil_front: StencilDesc,
-    pub stencil_back: StencilDesc,
-}
-
-impl Default for DepthStencilState {
-    fn default() -> Self {
+impl DepthState {
+    /// Depth test enabled, writing enabled, `compare` as given.
+    pub fn read_write(compare: CompareOp) -> Self {
         Self {
-            depth_mode: DepthFlags::empty(),
-            depth_test: CompareOp::Always,
-            depth_bias: 0.0,
-            depth_bias_slope_factor: 0.0,
-            depth_bias_clamp: 0.0,
-            stencil_read_mask: 0,
-            stencil_write_mask: 0,
-            stencil_front: StencilDesc::default(),
-            stencil_back: StencilDesc::default(),
+            mode: DepthFlags::READ | DepthFlags::WRITE,
+            compare,
+            ..Default::default()
         }
-    }
-}
-
-impl DepthStencilState {
-    pub fn stencil_enabled(&self) -> bool {
-        self.stencil_read_mask != 0 || self.stencil_write_mask != 0
     }
 }
 
 /// Per-attachment blend descriptor. The write mask lives on [`ColorTarget`], so it applies
 /// whether or not blending is enabled.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlendAttachment {
     pub blend_enable: bool,
     pub src_color: BlendFactor,

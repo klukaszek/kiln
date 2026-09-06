@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["metal"]
+default = ["metal", "slangc"]
 vulkan = ["dep:ash", "dep:ash-window"]
+# Compile Slang source at runtime by shelling out to `slangc` on PATH, caching artifacts in the
+# temp dir. Convenient for tests, examples and iteration; a shipping build should compile shaders
+# offline and hand `Device::create_shader_module` the bytes instead.
+slangc = []
 metal = ["dep:objc2-metal", "dep:objc2", "dep:objc2-foundation", "dep:objc2-quartz-core", "dep:objc2-core-foundation", "dep:dispatch2"]
 
 [dependencies]

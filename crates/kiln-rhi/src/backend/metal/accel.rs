@@ -79,6 +79,7 @@ impl MetalBlasGeometryDescriptor {
 }
 
 pub(crate) struct MetalBlasGeometryDescriptors {
+    /// Never read: `array` holds unretained references into these, so they must outlive it.
     #[allow(dead_code)]
     descriptors: Vec<MetalBlasGeometryDescriptor>,
     pub(crate) array: Retained<NSArray<MTL4AccelerationStructureGeometryDescriptor>>,
@@ -133,8 +134,10 @@ pub(crate) fn make_blas_geometry_descriptors(desc: &BlasDesc) -> MetalBlasGeomet
         descriptors.push(descriptor);
     }
 
-    let geo_base_refs: Vec<&MTL4AccelerationStructureGeometryDescriptor> =
-        descriptors.iter().map(|g| g.as_base()).collect();
+    let geo_base_refs: Vec<&MTL4AccelerationStructureGeometryDescriptor> = descriptors
+        .iter()
+        .map(MetalBlasGeometryDescriptor::as_base)
+        .collect();
     let array = NSArray::from_slice(&geo_base_refs);
 
     MetalBlasGeometryDescriptors { descriptors, array }

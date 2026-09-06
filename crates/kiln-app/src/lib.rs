@@ -127,7 +127,7 @@ pub trait Example {
 /// (on by default). Build with `--no-default-features` for an egui-free harness.
 #[derive(clap::Parser, Debug, Default, Clone)]
 pub struct HarnessOpts {
-    /// Enable RHI validation layers (also honoured via the `KILN_VALIDATION` env var).
+    /// Enable RHI validation layers.
     #[arg(long)]
     pub validation: bool,
 
@@ -176,7 +176,7 @@ pub fn run_with<E: Example + 'static>(
     clear: [f32; 4],
     opts: HarnessOpts,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let validation = opts.validation || std::env::var_os("KILN_VALIDATION").is_some();
+    let validation = opts.validation;
     if validation {
         install_stderr_logger();
     }
@@ -308,6 +308,7 @@ impl<E: Example> App<E> {
         let queue = self.device.queue();
 
         // `acquire_image` waits on this slot's fence, so the slot's resources are free.
+        #[cfg(feature = "egui")]
         let acquire_start = Instant::now();
         let image = match queue.acquire_image(swapchain, frame_index) {
             Ok(image) => image,
@@ -355,7 +356,7 @@ impl<E: Example> App<E> {
 
         example.pre_render(&ctx, &mut cmd);
         cmd.begin_render_pass(&RenderPassDesc {
-            color_attachments: vec![ColorAttachment {
+            color_attachments: &[ColorAttachment {
                 target: RenderTarget::swapchain_image(image.index),
                 load_op: LoadOp::Clear,
                 store_op: StoreOp::Store,
@@ -366,7 +367,6 @@ impl<E: Example> App<E> {
                 load_op: LoadOp::Clear,
                 store_op: StoreOp::DontCare, // depth is transient; never read back
                 clear_depth: 1.0,
-                clear_stencil: 0,
             }),
             render_area: [0, 0, extent.x, extent.y],
             label: Some("example"),
@@ -383,7 +383,7 @@ impl<E: Example> App<E> {
         #[cfg(feature = "egui")]
         if let (Some(egui), Some(frame)) = (self.egui.as_mut(), egui_frame.as_ref()) {
             cmd.begin_render_pass(&RenderPassDesc {
-                color_attachments: vec![ColorAttachment {
+                color_attachments: &[ColorAttachment {
                     target: RenderTarget::swapchain_image(image.index),
                     load_op: LoadOp::Load,
                     store_op: StoreOp::Store,
@@ -411,7 +411,6 @@ impl<E: Example> App<E> {
             cmd.write_timestamp(&egui.query_pools[frame_index], 1);
         }
 
-        cmd.transition_to_present(image.index);
         cmd.end();
 
         queue

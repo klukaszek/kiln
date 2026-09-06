@@ -1,15 +1,15 @@
 //! Shared helpers for the headless RHI integration tests.
 #![allow(dead_code)]
 
-//! Tests use the real backend without a window or swapchain and skip when no device is available.
+//! Tests drive the real backend without a window or swapchain.
 
-use kiln_rhi::{Device, DeviceDesc};
+use kiln_rhi::{AllocationDesc, BumpAllocator, Device, DeviceDesc, MemoryType};
 
 /// Serializes GPU access across test threads in the same binary.
 pub type GpuGuard = std::sync::MutexGuard<'static, ()>;
 
 /// Route `log` records (including the Vulkan validation callback) to stderr, once per process.
-/// Only used when `KILN_VALIDATION` is set; run with `-- --nocapture` to see the output.
+/// Run with `-- --nocapture` to see the output.
 fn install_stderr_logger() {
     use std::sync::Once;
     static INIT: Once = Once::new();
@@ -29,28 +29,36 @@ fn install_stderr_logger() {
     });
 }
 
-pub fn device_or_skip() -> Option<(Device, GpuGuard)> {
+/// A validation-enabled headless device. Panics if the machine has no usable GPU: this is a
+/// render hardware interface, so that is a broken environment, not a reason to pass.
+pub fn device() -> (Device, GpuGuard) {
     use std::sync::Mutex;
     static GPU_LOCK: Mutex<()> = Mutex::new(());
     let guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let validation = std::env::var_os("KILN_VALIDATION").is_some();
-    if validation {
-        install_stderr_logger();
-    }
+    install_stderr_logger();
 
-    let desc = DeviceDesc {
-        validation,
+    let device = Device::new(&DeviceDesc {
+        validation: true,
         label: Some("rhi-headless-tests".into()),
         ..Default::default()
-    };
-    match Device::new(&desc) {
-        Ok(device) => Some((device, guard)),
-        Err(e) => {
-            eprintln!("skipping: no headless GPU device available ({e})");
-            None
-        }
-    }
+    })
+    .expect("no headless GPU device available");
+    (device, guard)
+}
+
+/// A per-test bump allocator over CPU-mapped memory — the doc's preferred source for transient
+/// per-draw arguments. Release with `device.destroy(bump.into_allocation())` after the draw.
+pub fn test_bump(device: &Device) -> BumpAllocator {
+    let buffer = device
+        .create_allocation(&AllocationDesc {
+            size: 64 * 1024,
+            memory: MemoryType::Upload,
+            label: Some("test-bump".into()),
+            ..Default::default()
+        })
+        .expect("create_buffer");
+    BumpAllocator::new(buffer)
 }
 
 use std::time::{Duration, Instant};

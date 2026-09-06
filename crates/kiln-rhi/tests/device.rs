@@ -9,17 +9,12 @@ use kiln_rhi::{AllocationDesc, Device, DeviceDesc, MemoryType};
 #[test]
 fn device_creation_and_properties() {
     let start = std::time::Instant::now();
-    let device = match Device::new(&DeviceDesc {
+    let device = Device::new(&DeviceDesc {
         validation: false,
         label: Some("rhi-timing".into()),
         ..Default::default()
-    }) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("skipping: no headless GPU device available ({e})");
-            return;
-        }
-    };
+    })
+    .expect("no headless GPU device available");
     eprintln!("    ⏱  Device::new: {}", common::fmt_dur(start.elapsed()));
     eprintln!(
         "    backend={}  bindless={:?}",
@@ -33,9 +28,7 @@ fn device_creation_and_properties() {
 /// destructors call through an already-destroyed native device.
 #[test]
 fn resources_may_outlive_the_device_handle() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
     let allocation = device
         .create_allocation(&AllocationDesc {

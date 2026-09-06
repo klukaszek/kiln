@@ -1,4 +1,8 @@
-//! Slang shader compiler with a file-based binary cache.
+//! Slang shader compiler with a file-based binary cache. Behind the `slangc` feature.
+//!
+//! This shells out to a `slangc` binary on `PATH` at runtime, which suits tests, examples and
+//! iteration but not a shipped application. For that, compile offline and pass the bytes to
+//! [`Device::create_shader_module`] directly — the RHI needs nothing from this module.
 //!
 //! Provides a single canonical path for compiling Slang source to the active
 //! backend's format (SPIR-V or metallib) and loading the result as a
@@ -45,11 +49,6 @@ impl Drop for TempShaderFiles {
     }
 }
 
-/// Returns `true` if `slangc` is reachable on `PATH`.
-pub fn slangc_available() -> bool {
-    slangc_version_hash_raw().is_some()
-}
-
 /// Compile `src`'s `entry` point for the device's backend. `capabilities` takes extra Slang
 /// capabilities (e.g. `"spvRayQueryKHR"`), `&[]` for none. Cached in the temp dir.
 pub fn compile(
@@ -62,25 +61,6 @@ pub fn compile(
     let (target, ext) = backend_target(device);
     let code = get_or_compile(src, entry, stage, target, ext, capabilities)?;
     make_module(device, &code, entry, stage)
-}
-
-/// Like [`compile`], but returns `None` when `slangc` is missing, for tests that skip rather than
-/// fail. A compile *error* still panics: that is a shader bug, not an environment issue.
-pub fn compile_or_skip(
-    device: &Device,
-    src: &str,
-    entry: &str,
-    stage: ShaderStage,
-    capabilities: &[&str],
-) -> Option<ShaderModule> {
-    if !slangc_available() {
-        eprintln!("skipping: slangc not found on PATH");
-        return None;
-    }
-    Some(
-        compile(device, src, entry, stage, capabilities)
-            .unwrap_or_else(|error| panic!("slangc failed: {error}")),
-    )
 }
 
 /// Cache directory, created once per process.
@@ -228,7 +208,12 @@ fn invoke_slangc(
         // Reserve set 0 for the bindless heap.
         cmd.args(["-fvk-bind-globals", "0", "1"]);
     }
+    // `spv*` capabilities are SPIR-V-only. Slang accepts them silently on a metallib compile,
+    // so filter here rather than making every caller branch on the backend.
     for cap in capabilities {
+        if target != "spirv" && cap.starts_with("spv") {
+            continue;
+        }
         cmd.args(["-capability", cap]);
     }
     cmd.arg("-o").arg(&files.output);

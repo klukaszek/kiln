@@ -7,7 +7,7 @@ use kiln_rhi::{
     ALL_LAYERS, ALL_MIPS, AddressMode, ColorAttachment, ColorTarget, Cull, FilterMode, Format,
     GraphicsPsoDesc, HazardFlags, LoadOp, MemoryType, RenderPassDesc, SampleCount, SamplerDesc,
     SamplerHandle, ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension, TextureHandle,
-    TextureUsage, TextureViewDesc, Topology, ViewKind,
+    TextureRegion, TextureUsage, TextureViewDesc, Topology, ViewKind,
 };
 
 const W: u32 = 64;
@@ -35,9 +35,7 @@ fn test_texture_desc() -> TextureDesc {
 /// Placement-allocate a texture, then register sampled + storage bindless views.
 #[test]
 fn texture_create_and_views() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
     let desc = test_texture_desc();
 
     let size_align = common::timed("texture_size_align", || {
@@ -84,9 +82,7 @@ fn texture_create_and_views() {
 /// Texture upload and readback with a GPU round-trip and CPU verification.
 #[test]
 fn texture_copy_roundtrip() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
     let desc = test_texture_desc();
     let size_align = device.texture_size_align(&desc).expect("size_align");
     let mem = device
@@ -115,9 +111,9 @@ fn texture_copy_roundtrip() {
 
     common::timed("upload→texture→readback · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
-        cmd.copy_buffer_to_texture(src.gpu(), &texture);
+        cmd.copy_buffer_to_texture(src.gpu(), &texture, None);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::TRANSFER);
-        cmd.copy_texture_to_buffer(&texture, dst.gpu());
+        cmd.copy_texture_to_buffer(&texture, dst.gpu(), None);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
         cmd.end();
         let queue = device.queue();
@@ -189,21 +185,13 @@ fn srgb_to_linear_u8(value: u8) -> u8 {
 /// back materially darker.
 #[test]
 fn srgb_texture_view_reinterprets_the_same_texels() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
     let src = format!("{}{}", ViewRoot::SLANG, VIEW_BODY);
-    let Some(vs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex, &[])
-    else {
-        return;
-    };
-    let Some(fs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
-    else {
-        return;
-    };
+    let vs = kiln_rhi::compiler::compile(&device, &src, "vsMain", ShaderStage::Vertex, &[])
+        .expect("compile vs");
+    let fs = kiln_rhi::compiler::compile(&device, &src, "fsMain", ShaderStage::Pixel, &[])
+        .expect("compile fs");
 
     const TEX: u32 = 4;
     const TEXEL: [u8; 4] = [32, 64, 96, 255];
@@ -304,14 +292,14 @@ fn srgb_texture_view_reinterprets_the_same_texels() {
 
     common::timed("sample through both views · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
-        cmd.copy_buffer_to_texture(staging.gpu(), &texture);
+        cmd.copy_buffer_to_texture(staging.gpu(), &texture, None);
         cmd.barrier_with_hazard(
             StageFlags::TRANSFER,
             StageFlags::PIXEL_SHADER,
             HazardFlags::DESCRIPTORS,
         );
         cmd.begin_render_pass(&RenderPassDesc {
-            color_attachments: vec![ColorAttachment {
+            color_attachments: &[ColorAttachment {
                 target: rt.target(),
                 load_op: LoadOp::Clear,
                 store_op: StoreOp::Store,
@@ -327,7 +315,7 @@ fn srgb_texture_view_reinterprets_the_same_texels() {
         cmd.draw(root.gpu(), 3, 1, 0, 0);
         cmd.end_render_pass();
         cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
-        cmd.copy_texture_to_buffer(&rt, readback.gpu());
+        cmd.copy_texture_to_buffer(&rt, readback.gpu(), None);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
         cmd.end();
         let queue = device.queue();
@@ -379,4 +367,104 @@ fn srgb_texture_view_reinterprets_the_same_texels() {
     device.destroy(rt);
     device.destroy(rt_mem);
     device.destroy(sampler);
+}
+
+/// Every mip and array layer round-trips independently, and a sub-box copy touches only its own
+/// texels. Without a subresource on the copy calls, only mip 0 layer 0 was ever reachable.
+#[test]
+fn texture_subresource_copy_roundtrip() {
+    let (device, _gpu) = common::device();
+    const MIPS: u32 = 4;
+    const LAYERS: u32 = 3;
+    let desc = TextureDesc {
+        mip_levels: MIPS,
+        array_layers: LAYERS,
+        dimension: TextureDimension::D2Array,
+        ..test_texture_desc()
+    };
+    let size_align = device.texture_size_align(&desc).expect("size_align");
+    let mem = device
+        .allocate_aligned(size_align.size, size_align.align, MemoryType::GpuOnly)
+        .expect("texture backing");
+    let texture = device
+        .create_texture(&desc, mem.gpu())
+        .expect("create_texture");
+
+    // One distinct byte pattern per (mip, layer), sized to that mip.
+    let staging_bytes = (W as usize) * (H as usize) * BPP;
+    let mut src = device
+        .allocate(staging_bytes as u64, MemoryType::Upload)
+        .expect("upload");
+    let dst = device
+        .allocate(staging_bytes as u64, MemoryType::Readback)
+        .expect("readback");
+
+    let pattern = |mip: u32, layer: u32, i: usize| -> u8 {
+        (i as u8)
+            .wrapping_mul(17)
+            .wrapping_add((mip as u8).wrapping_mul(53))
+            .wrapping_add((layer as u8).wrapping_mul(101))
+    };
+
+    for mip in 0..MIPS {
+        for layer in 0..LAYERS {
+            let region = TextureRegion {
+                mip,
+                layer,
+                ..Default::default()
+            };
+            let mip_w = (W >> mip).max(1) as usize;
+            let mip_h = (H >> mip).max(1) as usize;
+            let len = mip_w * mip_h * BPP;
+
+            for (i, b) in src.as_mut_slice::<u8>().expect("src slice")[..len]
+                .iter_mut()
+                .enumerate()
+            {
+                *b = pattern(mip, layer, i);
+            }
+
+            let mut cmd = device.create_command_buffer().expect("cmd");
+            cmd.copy_buffer_to_texture(src.gpu(), &texture, region);
+            cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
+            cmd.end();
+            device.queue().submit(cmd).expect("submit");
+            device.queue().wait_idle();
+        }
+    }
+
+    // Read every subresource back and confirm nothing bled across mips or layers.
+    for mip in 0..MIPS {
+        for layer in 0..LAYERS {
+            let region = TextureRegion {
+                mip,
+                layer,
+                ..Default::default()
+            };
+            let mip_w = (W >> mip).max(1) as usize;
+            let mip_h = (H >> mip).max(1) as usize;
+            let len = mip_w * mip_h * BPP;
+
+            let mut cmd = device.create_command_buffer().expect("cmd");
+            cmd.copy_texture_to_buffer(&texture, dst.gpu(), region);
+            cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
+            cmd.end();
+            device.queue().submit(cmd).expect("submit");
+            device.queue().wait_idle();
+
+            let got = dst.as_slice::<u8>().expect("dst slice");
+            for (i, &b) in got[..len].iter().enumerate() {
+                assert_eq!(
+                    b,
+                    pattern(mip, layer, i),
+                    "mip {mip} layer {layer} byte {i} mismatch"
+                );
+            }
+        }
+    }
+
+    device.destroy(src);
+    device.destroy(dst);
+    device.destroy(texture);
+    device.destroy(mem);
 }

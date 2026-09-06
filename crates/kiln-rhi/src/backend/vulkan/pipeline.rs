@@ -2,8 +2,33 @@ use ash::vk;
 
 use super::device::format_to_vk;
 use crate::error::{RhiError, RhiResult};
-use crate::pipeline::{BlendAttachment, BlendState, ColorTarget};
-use crate::types::{BlendFactor, BlendOp, ColorWriteMask, Cull, SampleCount, Topology};
+use crate::pipeline::{BlendAttachment, BlendState, ColorTarget, DepthState};
+use crate::types::{
+    BlendFactor, BlendOp, ColorWriteMask, CompareOp, Cull, DepthFlags, SampleCount, Topology,
+};
+
+/// Depth state is baked into the pipeline on both backends; see `RasterPsoDesc`.
+fn depth_stencil_create_info(
+    depth: DepthState,
+) -> vk::PipelineDepthStencilStateCreateInfo<'static> {
+    vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(depth.mode.contains(DepthFlags::READ))
+        .depth_write_enable(depth.mode.contains(DepthFlags::WRITE))
+        .depth_compare_op(compare_op_to_vk(depth.compare))
+}
+
+fn compare_op_to_vk(op: CompareOp) -> vk::CompareOp {
+    match op {
+        CompareOp::Never => vk::CompareOp::NEVER,
+        CompareOp::Less => vk::CompareOp::LESS,
+        CompareOp::Equal => vk::CompareOp::EQUAL,
+        CompareOp::LessOrEqual => vk::CompareOp::LESS_OR_EQUAL,
+        CompareOp::Greater => vk::CompareOp::GREATER,
+        CompareOp::NotEqual => vk::CompareOp::NOT_EQUAL,
+        CompareOp::GreaterOrEqual => vk::CompareOp::GREATER_OR_EQUAL,
+        CompareOp::Always => vk::CompareOp::ALWAYS,
+    }
+}
 
 /// Vulkan graphics pipeline state.
 pub struct VulkanGraphicsPso {
@@ -18,8 +43,6 @@ pub struct VulkanGraphicsPso {
 pub struct VulkanComputePso {
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) pipeline_layout: vk::PipelineLayout,
-    #[allow(dead_code)]
-    pub(crate) threads_per_threadgroup: [u32; 3],
     pub(crate) device: ash::Device,
 }
 
@@ -45,12 +68,121 @@ pub struct VulkanGraphicsPsoDesc {
     pub(crate) sample_count: SampleCount,
     pub(crate) alpha_to_coverage: bool,
     pub(crate) cull: Cull,
-    pub(crate) stencil_format: vk::Format,
+    pub(crate) depth: DepthState,
+}
+
+/// Raster state shared by the vertex and mesh pipeline paths.
+struct RasterState<'a> {
+    color_targets: &'a [ColorTarget],
+    depth_format: Option<vk::Format>,
+    depth: DepthState,
+    sample_count: SampleCount,
+    alpha_to_coverage: bool,
+    cull: Cull,
+}
+
+/// Build a raster pipeline. `topology` is `Some` for the vertex path, which also needs vertex-input
+/// and input-assembly state; the mesh path passes `None` and supplies neither.
+fn create_raster_pipeline(
+    device: &ash::Device,
+    cache: vk::PipelineCache,
+    layout: vk::PipelineLayout,
+    stages: &[vk::PipelineShaderStageCreateInfo<'_>],
+    topology: Option<Topology>,
+    state: &RasterState<'_>,
+    blend: &BlendState,
+    what: &str,
+) -> RhiResult<vk::Pipeline> {
+    let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
+    let input_assembly =
+        vk::PipelineInputAssemblyStateCreateInfo::default().topology(match topology {
+            Some(Topology::TriangleStrip) => vk::PrimitiveTopology::TRIANGLE_STRIP,
+            _ => vk::PrimitiveTopology::TRIANGLE_LIST,
+        });
+
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+
+    let (cull_mode, front_face) = cull_to_vk(state.cull);
+    let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .line_width(1.0)
+        .cull_mode(cull_mode)
+        .front_face(front_face);
+
+    let samples = match state.sample_count {
+        SampleCount::S1 => vk::SampleCountFlags::TYPE_1,
+        SampleCount::S2 => vk::SampleCountFlags::TYPE_2,
+        SampleCount::S4 => vk::SampleCountFlags::TYPE_4,
+        SampleCount::S8 => vk::SampleCountFlags::TYPE_8,
+        SampleCount::S16 => vk::SampleCountFlags::TYPE_16,
+    };
+    let mut multisampling =
+        vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(samples);
+    if state.alpha_to_coverage {
+        multisampling = multisampling.alpha_to_coverage_enable(true);
+    }
+
+    let depth_stencil = depth_stencil_create_info(state.depth);
+
+    let color_blend_attachments: Vec<vk::PipelineColorBlendAttachmentState> = state
+        .color_targets
+        .iter()
+        .enumerate()
+        .map(|(i, target)| {
+            let att = blend.attachments.get(i).copied().unwrap_or_default();
+            blend_attachment_to_vk(att, target.write_mask)
+        })
+        .collect();
+    let color_blending =
+        vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
+
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state_info =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+    let color_attachment_formats: Vec<vk::Format> = state
+        .color_targets
+        .iter()
+        .map(|t| format_to_vk(t.format))
+        .collect();
+    let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+        .color_attachment_formats(&color_attachment_formats)
+        .depth_attachment_format(state.depth_format.unwrap_or(vk::Format::UNDEFINED))
+        .stencil_attachment_format(vk::Format::UNDEFINED);
+
+    // The bindless set uses descriptor buffers, so the pipeline must opt in too.
+    let mut pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .flags(vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT)
+        .stages(stages)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterizer)
+        .multisample_state(&multisampling)
+        .depth_stencil_state(&depth_stencil)
+        .color_blend_state(&color_blending)
+        .dynamic_state(&dynamic_state_info)
+        .layout(layout)
+        .push_next(&mut rendering_info);
+    if topology.is_some() {
+        pipeline_info = pipeline_info
+            .vertex_input_state(&vertex_input_info)
+            .input_assembly_state(&input_assembly);
+    }
+
+    let pipelines = unsafe {
+        device
+            .create_graphics_pipelines(cache, &[pipeline_info], None)
+            .map_err(|(_, e)| {
+                RhiError::PipelineCreation(format!("Vulkan {what} pipeline creation: {e:?}"))
+            })?
+    };
+    Ok(pipelines[0])
 }
 
 impl VulkanGraphicsPso {
     pub(crate) fn create_pipeline(&self, blend: &BlendState) -> RhiResult<vk::Pipeline> {
-        let shader_stages = [
+        let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.desc.vert_module)
@@ -60,113 +192,23 @@ impl VulkanGraphicsPso {
                 .module(self.desc.frag_module)
                 .name(&self.desc.frag_entry),
         ];
-
-        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(
-            match self.desc.topology {
-                Topology::TriangleList => vk::PrimitiveTopology::TRIANGLE_LIST,
-                Topology::TriangleStrip => vk::PrimitiveTopology::TRIANGLE_STRIP,
+        create_raster_pipeline(
+            &self.device,
+            self.pipeline_cache,
+            self.pipeline_layout,
+            &stages,
+            Some(self.desc.topology),
+            &RasterState {
+                color_targets: &self.desc.color_targets,
+                depth_format: self.desc.depth_format,
+                depth: self.desc.depth,
+                sample_count: self.desc.sample_count,
+                alpha_to_coverage: self.desc.alpha_to_coverage,
+                cull: self.desc.cull,
             },
-        );
-
-        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-            .viewport_count(1)
-            .scissor_count(1);
-
-        let (cull_mode, front_face) = cull_to_vk(self.desc.cull);
-
-        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(vk::PolygonMode::FILL)
-            .line_width(1.0)
-            .cull_mode(cull_mode)
-            .front_face(front_face);
-
-        let samples = match self.desc.sample_count {
-            SampleCount::S1 => vk::SampleCountFlags::TYPE_1,
-            SampleCount::S2 => vk::SampleCountFlags::TYPE_2,
-            SampleCount::S4 => vk::SampleCountFlags::TYPE_4,
-            SampleCount::S8 => vk::SampleCountFlags::TYPE_8,
-            SampleCount::S16 => vk::SampleCountFlags::TYPE_16,
-        };
-        let mut multisampling =
-            vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(samples);
-        if self.desc.alpha_to_coverage {
-            multisampling = multisampling.alpha_to_coverage_enable(true);
-        }
-
-        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(true)
-            .depth_write_enable(true)
-            .depth_compare_op(vk::CompareOp::LESS);
-
-        let color_blend_attachments: Vec<vk::PipelineColorBlendAttachmentState> = self
-            .desc
-            .color_targets
-            .iter()
-            .enumerate()
-            .map(|(i, target)| {
-                let att = blend.attachments.get(i).cloned().unwrap_or_default();
-                blend_attachment_to_vk(att, target.write_mask)
-            })
-            .collect();
-
-        let color_blending =
-            vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
-
-        let dynamic_states = [
-            vk::DynamicState::VIEWPORT,
-            vk::DynamicState::SCISSOR,
-            vk::DynamicState::DEPTH_TEST_ENABLE,
-            vk::DynamicState::DEPTH_WRITE_ENABLE,
-            vk::DynamicState::DEPTH_COMPARE_OP,
-            vk::DynamicState::STENCIL_TEST_ENABLE,
-            vk::DynamicState::STENCIL_OP,
-            vk::DynamicState::STENCIL_COMPARE_MASK,
-            vk::DynamicState::STENCIL_WRITE_MASK,
-            vk::DynamicState::STENCIL_REFERENCE,
-            vk::DynamicState::DEPTH_BIAS_ENABLE,
-            vk::DynamicState::DEPTH_BIAS,
-        ];
-        let dynamic_state_info =
-            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-
-        let color_attachment_formats: Vec<vk::Format> = self
-            .desc
-            .color_targets
-            .iter()
-            .map(|t| format_to_vk(t.format))
-            .collect();
-        let depth_format = self.desc.depth_format.unwrap_or(vk::Format::UNDEFINED);
-
-        let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format)
-            .stencil_attachment_format(self.desc.stencil_format);
-
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-            // The bindless set uses descriptor buffers, so the pipeline must opt in too.
-            .flags(vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT)
-            .stages(&shader_stages)
-            .vertex_input_state(&vertex_input_info)
-            .input_assembly_state(&input_assembly)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&rasterizer)
-            .multisample_state(&multisampling)
-            .depth_stencil_state(&depth_stencil)
-            .color_blend_state(&color_blending)
-            .dynamic_state(&dynamic_state_info)
-            .layout(self.pipeline_layout)
-            .push_next(&mut rendering_info);
-
-        let pipelines = unsafe {
-            self.device
-                .create_graphics_pipelines(self.pipeline_cache, &[pipeline_info], None)
-                .map_err(|(_, e)| {
-                    RhiError::PipelineCreation(format!("Vulkan graphics pipeline creation: {e:?}"))
-                })?
-        };
-
-        Ok(pipelines[0])
+            blend,
+            "graphics",
+        )
     }
 }
 
@@ -273,7 +315,7 @@ pub struct VulkanMeshletPsoDesc {
     pub(crate) frag_entry: std::ffi::CString,
     pub(crate) color_targets: Vec<ColorTarget>,
     pub(crate) depth_format: Option<vk::Format>,
-    pub(crate) stencil_format: vk::Format,
+    pub(crate) depth: DepthState,
     pub(crate) sample_count: SampleCount,
     pub(crate) alpha_to_coverage: bool,
     pub(crate) cull: Cull,
@@ -281,108 +323,33 @@ pub struct VulkanMeshletPsoDesc {
 
 impl VulkanMeshletPso {
     pub(crate) fn create_pipeline(&self, blend: &BlendState) -> RhiResult<vk::Pipeline> {
-        let mesh_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::MESH_EXT)
-            .module(self.desc.mesh_module)
-            .name(&self.desc.mesh_entry);
-        let frag_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(self.desc.frag_module)
-            .name(&self.desc.frag_entry);
-        let stages = [mesh_stage, frag_stage];
-
-        let (cull_mode, front_face) = cull_to_vk(self.desc.cull);
-        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(vk::PolygonMode::FILL)
-            .line_width(1.0)
-            .cull_mode(cull_mode)
-            .front_face(front_face);
-
-        let samples = match self.desc.sample_count {
-            SampleCount::S1 => vk::SampleCountFlags::TYPE_1,
-            SampleCount::S2 => vk::SampleCountFlags::TYPE_2,
-            SampleCount::S4 => vk::SampleCountFlags::TYPE_4,
-            SampleCount::S8 => vk::SampleCountFlags::TYPE_8,
-            SampleCount::S16 => vk::SampleCountFlags::TYPE_16,
-        };
-        let mut multisampling =
-            vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(samples);
-        if self.desc.alpha_to_coverage {
-            multisampling = multisampling.alpha_to_coverage_enable(true);
-        }
-
-        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(true)
-            .depth_write_enable(true)
-            .depth_compare_op(vk::CompareOp::LESS);
-
-        let color_blend_attachments: Vec<vk::PipelineColorBlendAttachmentState> = self
-            .desc
-            .color_targets
-            .iter()
-            .enumerate()
-            .map(|(i, target)| {
-                let att = blend.attachments.get(i).cloned().unwrap_or_default();
-                blend_attachment_to_vk(att, target.write_mask)
-            })
-            .collect();
-        let color_blending =
-            vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
-
-        let dynamic_states = [
-            vk::DynamicState::VIEWPORT,
-            vk::DynamicState::SCISSOR,
-            vk::DynamicState::DEPTH_TEST_ENABLE,
-            vk::DynamicState::DEPTH_WRITE_ENABLE,
-            vk::DynamicState::DEPTH_COMPARE_OP,
-            vk::DynamicState::STENCIL_TEST_ENABLE,
-            vk::DynamicState::STENCIL_OP,
-            vk::DynamicState::STENCIL_COMPARE_MASK,
-            vk::DynamicState::STENCIL_WRITE_MASK,
-            vk::DynamicState::STENCIL_REFERENCE,
-            vk::DynamicState::DEPTH_BIAS_ENABLE,
-            vk::DynamicState::DEPTH_BIAS,
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::MESH_EXT)
+                .module(self.desc.mesh_module)
+                .name(&self.desc.mesh_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(self.desc.frag_module)
+                .name(&self.desc.frag_entry),
         ];
-        let dynamic_state_info =
-            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-
-        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-            .viewport_count(1)
-            .scissor_count(1);
-
-        let color_attachment_formats: Vec<vk::Format> = self
-            .desc
-            .color_targets
-            .iter()
-            .map(|t| format_to_vk(t.format))
-            .collect();
-        let depth_format = self.desc.depth_format.unwrap_or(vk::Format::UNDEFINED);
-        let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format)
-            .stencil_attachment_format(self.desc.stencil_format);
-
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-            // The bindless set uses descriptor buffers, so the pipeline must opt in too.
-            .flags(vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT)
-            .stages(&stages)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&rasterizer)
-            .multisample_state(&multisampling)
-            .depth_stencil_state(&depth_stencil)
-            .color_blend_state(&color_blending)
-            .dynamic_state(&dynamic_state_info)
-            .layout(self.pipeline_layout)
-            .push_next(&mut rendering_info);
-
-        let pipelines = unsafe {
-            self.device
-                .create_graphics_pipelines(self.pipeline_cache, &[pipeline_info], None)
-                .map_err(|(_, e)| {
-                    RhiError::PipelineCreation(format!("Vulkan meshlet pipeline creation: {e:?}"))
-                })?
-        };
-        Ok(pipelines[0])
+        create_raster_pipeline(
+            &self.device,
+            self.pipeline_cache,
+            self.pipeline_layout,
+            &stages,
+            None,
+            &RasterState {
+                color_targets: &self.desc.color_targets,
+                depth_format: self.desc.depth_format,
+                depth: self.desc.depth,
+                sample_count: self.desc.sample_count,
+                alpha_to_coverage: self.desc.alpha_to_coverage,
+                cull: self.desc.cull,
+            },
+            blend,
+            "meshlet",
+        )
     }
 }
 

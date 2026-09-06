@@ -281,19 +281,6 @@ bitflags::bitflags! {
     }
 }
 
-/// Stencil operation applied when a stencil test passes or fails.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum StencilOp {
-    Keep,
-    Zero,
-    Replace,
-    IncrementClamp,
-    DecrementClamp,
-    Invert,
-    IncrementWrap,
-    DecrementWrap,
-}
-
 /// Cull mode. Front face is always CCW; the variant names the winding culled.
 ///
 /// - `Cw` — back-face culling (the common case) · `Ccw` — front-face · `All` · `None`

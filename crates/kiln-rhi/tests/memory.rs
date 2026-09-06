@@ -8,9 +8,7 @@ use kiln_rhi::{AllocationDesc, BumpAllocator, MemoryType};
 /// straight back (the dual-pointer model the whole RHI is built on).
 #[test]
 fn default_memory_is_cpu_mapped_roundtrip() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
     const N: usize = 4096;
     let mut allocation = common::timed("allocate 4 KiB (Default)", || {
@@ -45,11 +43,9 @@ fn default_memory_is_cpu_mapped_roundtrip() {
 /// the matching GPU address.
 #[test]
 fn host_to_device_pointer_translates_with_offset() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
-    let allocation = device
+    let mut allocation = device
         .allocate(256, MemoryType::Upload)
         .expect("allocate(Default) should succeed");
     let cpu = allocation
@@ -91,9 +87,7 @@ fn bump(device: &kiln_rhi::Device, size: u64) -> BumpAllocator {
 /// a distinct, aligned, non-overlapping address and `used()` tracks the bumped offset.
 #[test]
 fn bump_alloc_aligns_and_accounts() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
     let bump = bump(&device, 64 * 1024);
 
     assert_eq!(bump.capacity(), 64 * 1024, "capacity is the backing size");
@@ -125,9 +119,7 @@ fn bump_alloc_aligns_and_accounts() {
 /// through `cpu` must read straight back.
 #[test]
 fn bump_alloc_cpu_gpu_correspond() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
     let bump = bump(&device, 4096);
 
     // Bump past offset 0 so the correspondence is exercised at a non-base address.
@@ -159,9 +151,7 @@ fn bump_alloc_cpu_gpu_correspond() {
 /// oversized request and exhausting the capacity fail gracefully.
 #[test]
 fn bump_full_returns_none() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
     let bump = bump(&device, 256);
 
     assert!(
@@ -188,9 +178,7 @@ fn bump_full_returns_none() {
 /// which is the whole point of a per-frame bump allocator.
 #[test]
 fn bump_reset_reuses_space() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
     let mut bump = bump(&device, 4096);
 
     let first = bump.alloc(128, 16).expect("first");

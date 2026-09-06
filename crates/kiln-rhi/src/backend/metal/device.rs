@@ -9,12 +9,10 @@ use objc2_core_foundation::CGSize;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandQueue, MTL4Compiler,
-    MTL4CompilerDescriptor, MTL4ComputePipelineDescriptor, MTL4CounterHeap,
-    MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTL4LibraryFunctionDescriptor,
+    MTL4CompilerDescriptor, MTL4ComputePipelineDescriptor, MTL4LibraryFunctionDescriptor,
     MTL4PipelineDescriptor, MTLBuffer, MTLCreateSystemDefaultDevice, MTLCullMode, MTLDevice,
     MTLDrawable, MTLEvent, MTLHeap, MTLPixelFormat, MTLResidencySet, MTLResidencySetDescriptor,
-    MTLSamplerDescriptor, MTLSamplerState, MTLSharedEvent, MTLStorageMode, MTLTexture,
-    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage as MtlTextureUsage, MTLWinding,
+    MTLSamplerState, MTLSharedEvent, MTLTexture, MTLWinding,
 };
 use objc2_quartz_core::CAMetalLayer;
 use raw_window_handle::RawWindowHandle;
@@ -24,16 +22,19 @@ use crate::command::CommandBuffer;
 use crate::device::{BindlessMode, DeviceDesc};
 use crate::error::{RhiError, RhiResult};
 use crate::memory::{Allocation, AllocationDesc, AllocationInner};
-use crate::pipeline::*;
-use crate::query::{QueryPool, QueryPoolInner};
+use crate::pipeline::{
+    ComputePso, ComputePsoDesc, ComputePsoInner, GraphicsPso, GraphicsPsoDesc, GraphicsPsoInner,
+    MeshletPso, MeshletPsoDesc,
+};
 use crate::queue::{Queue, QueueInner, SubmitDesc};
-use crate::sampler::{Sampler, SamplerDesc};
 use crate::shader::{ShaderModule, ShaderModuleDesc};
 use crate::surface::{Surface, SurfaceDesc, SurfaceInner};
 use crate::swapchain::{AcquiredImage, Swapchain, SwapchainDesc, SwapchainInner};
 use crate::sync::{TimelineSemaphore, TimelineSemaphoreInner};
-use crate::texture::{Texture, TextureDesc, TextureSizeAlign, TextureUsage};
-use crate::types::*;
+use crate::types::{
+    BlasDesc, Cull, GpuPtr, InstanceFlags, MAX_BINDLESS_TEXTURES, MAX_FRAMES_IN_FLIGHT,
+    SampleCount, SamplerId, TextureId, TlasDesc, Topology,
+};
 
 use super::as_allocation;
 use super::command::{
@@ -42,7 +43,6 @@ use super::command::{
 };
 use super::memory::{MetalBuffer, MetalBufferPool, SharedMetalBufferPool};
 use super::pipeline::{MetalComputePso, MetalGraphicsPso};
-use super::query::MetalQueryPool;
 use super::shader::MetalShaderModule;
 use super::surface::MetalSurface;
 use super::swapchain::{MetalDrawableSlot, MetalSwapchain};
@@ -54,8 +54,8 @@ type InFlightFrameCommands = Rc<RefCell<Vec<Option<MetalCommandBuffer>>>>;
 type PendingSubmissions = Rc<RefCell<VecDeque<(u64, MetalCommandBuffer)>>>;
 
 /// Fixed capacities of the bindless descriptor heaps; one `gpuResourceID` per entry.
-const METAL_BINDLESS_TEXTURE_CAPACITY: usize = MAX_BINDLESS_TEXTURES as usize;
-const METAL_BINDLESS_SAMPLER_CAPACITY: usize = 256;
+pub(crate) const METAL_BINDLESS_TEXTURE_CAPACITY: usize = MAX_BINDLESS_TEXTURES as usize;
+pub(crate) const METAL_BINDLESS_SAMPLER_CAPACITY: usize = 256;
 /// Bindless slot tables, indexed by `TextureId`/`SamplerId`. A slot is `None` once its resource
 /// is destroyed and before the ID is handed out again.
 type TextureSlots = RefCell<Vec<Option<Retained<ProtocolObject<dyn MTLTexture>>>>>;
@@ -118,7 +118,7 @@ pub(crate) struct BufferAllocation {
     pub heap_offset: u64,
 }
 
-struct MappedAllocation {
+pub(crate) struct MappedAllocation {
     gpu_base: GpuPtr<u8>,
     size: u64,
 }
@@ -133,21 +133,21 @@ fn resolve_mapped_pointer(
 }
 
 pub struct MetalDevice {
-    shared: Rc<MetalShared>,
+    pub(crate) shared: Rc<MetalShared>,
     /// `MTL4Compiler` owns a compilation context, so it is built once rather than per PSO.
-    compiler: Retained<ProtocolObject<dyn MTL4Compiler>>,
-    buffer_pool: SharedMetalBufferPool,
-    rhi_queue: Queue,
-    texture_view_flags: RefCell<Vec<bool>>,
-    mapped_allocations: SharedMappedAllocations,
+    pub(crate) compiler: Retained<ProtocolObject<dyn MTL4Compiler>>,
+    pub(crate) buffer_pool: SharedMetalBufferPool,
+    pub(crate) rhi_queue: Queue,
+    pub(crate) texture_view_flags: RefCell<Vec<bool>>,
+    pub(crate) mapped_allocations: SharedMappedAllocations,
     /// Per-frame fence values for swapchain acquisition.
-    frame_fence_values: FrameFenceValues,
+    pub(crate) frame_fence_values: FrameFenceValues,
     /// Shared event for per-frame synchronization.
-    frame_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
-    frame_table_slots: SharedFrameTableSlots,
+    pub(crate) frame_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    pub(crate) frame_table_slots: SharedFrameTableSlots,
     /// Free list of table slots for non-swapchain command buffers.
-    table_slot_pool: SharedTableSlotPool,
-    bindless_mode: BindlessMode,
+    pub(crate) table_slot_pool: SharedTableSlotPool,
+    pub(crate) bindless_mode: BindlessMode,
 }
 
 pub struct MetalQueue {
@@ -158,16 +158,43 @@ pub struct MetalQueue {
     frame_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     in_flight_frame_commands: InFlightFrameCommands,
     pending_submissions: PendingSubmissions,
+    /// Resources destroyed by the app, each tagged with the fence value that must retire before
+    /// its storage and its bindless slot can be reused. See `MetalQueue::release_resource`.
+    retired_resources: RefCell<VecDeque<(u64, MetalRetiredResource)>>,
 }
 
 impl MetalQueue {
-    pub fn submit(&self, cmd: MetalCommandBuffer) -> RhiResult<()> {
-        self.submit_with_desc(cmd, &SubmitDesc::default())
+    /// Hold a resource until every submission issued so far has retired.
+    pub(crate) fn release_resource(&self, resource: MetalRetiredResource) {
+        let pending_until = self.frame_fence_next.get();
+        if pending_until == 0 {
+            self.free_resource(resource);
+            return;
+        }
+        self.retired_resources
+            .borrow_mut()
+            .push_back((pending_until, resource));
     }
 
-    /// Release a resource's storage immediately. The caller guarantees the GPU is done with it
-    /// (see `Device::destroy`); the freed slot is reusable by the next create.
-    pub(crate) fn release_resource(&self, resource: MetalRetiredResource) {
+    /// Values are pushed in issue order, so a prefix drain is enough.
+    fn collect_retired(&self, completed: u64) {
+        loop {
+            let Some(resource) = ({
+                let mut retired = self.retired_resources.borrow_mut();
+                match retired.front() {
+                    Some((value, _)) if *value <= completed => {
+                        retired.pop_front().map(|(_, resource)| resource)
+                    }
+                    _ => None,
+                }
+            }) else {
+                return;
+            };
+            self.free_resource(resource);
+        }
+    }
+
+    fn free_resource(&self, resource: MetalRetiredResource) {
         match &resource {
             MetalRetiredResource::Buffer(buffer) => {
                 self.shared
@@ -202,31 +229,15 @@ impl MetalQueue {
         cmd: MetalCommandBuffer,
         desc: &SubmitDesc<'_>,
     ) -> RhiResult<()> {
-        for (semaphore, _) in desc.wait_semaphores.iter().chain(desc.signal_semaphores) {
-            if !matches!(&semaphore.inner, TimelineSemaphoreInner::Metal(_)) {
-                return Err(RhiError::SyncError(
-                    "Timeline semaphore backend mismatch on Metal queue submit".into(),
-                ));
-            }
-        }
         if self.shared.residency_dirty.replace(false) {
             self.shared.residency_set.commit();
         }
         self.reclaim_completed_submissions();
 
         for (semaphore, value) in desc.wait_semaphores {
-            match &semaphore.inner {
-                TimelineSemaphoreInner::Metal(mtl_semaphore) => {
-                    self.queue
-                        .waitForEvent_value(shared_event_as_event(&mtl_semaphore.event), *value);
-                }
-                #[allow(unreachable_patterns)]
-                _ => {
-                    return Err(RhiError::SyncError(
-                        "Timeline wait semaphore backend mismatch on Metal queue submit".into(),
-                    ));
-                }
-            }
+            let event = backend_expect!(&semaphore.inner, TimelineSemaphoreInner::Metal);
+            self.queue
+                .waitForEvent_value(shared_event_as_event(&event.event), *value);
         }
 
         let mut cmd = cmd;
@@ -234,18 +245,9 @@ impl MetalQueue {
         self.commit_single(&cmd.command_buffer);
 
         for (semaphore, value) in desc.signal_semaphores {
-            match &semaphore.inner {
-                TimelineSemaphoreInner::Metal(mtl_semaphore) => {
-                    self.queue
-                        .signalEvent_value(shared_event_as_event(&mtl_semaphore.event), *value);
-                }
-                #[allow(unreachable_patterns)]
-                _ => {
-                    return Err(RhiError::SyncError(
-                        "Timeline signal semaphore backend mismatch on Metal queue submit".into(),
-                    ));
-                }
-            }
+            let event = backend_expect!(&semaphore.inner, TimelineSemaphoreInner::Metal);
+            self.queue
+                .signalEvent_value(shared_event_as_event(&event.event), *value);
         }
 
         let value = self.next_fence_value();
@@ -298,11 +300,7 @@ impl MetalQueue {
         }
         sc.drawable.release();
 
-        let mut frame_cmds = self.in_flight_frame_commands.borrow_mut();
-        if frame_cmds[frame_index].is_some() {
-            log::warn!("Overwriting in-flight Metal frame command before completion");
-        }
-        frame_cmds[frame_index] = Some(cmd);
+        self.in_flight_frame_commands.borrow_mut()[frame_index] = Some(cmd);
 
         Ok(())
     }
@@ -312,22 +310,17 @@ impl MetalQueue {
         sc: &MetalSwapchain,
         frame_index: usize,
     ) -> RhiResult<AcquiredImage> {
-        if frame_index >= self.frame_fence_values.borrow().len()
-            || frame_index >= self.in_flight_frame_commands.borrow().len()
-        {
-            return Err(RhiError::Backend("invalid Metal frame index".into()));
-        }
         self.reclaim_completed_submissions();
 
         let value = self.frame_fence_values.borrow()[frame_index];
         if value != 0 {
-            let _ = self
-                .frame_event
-                .waitUntilSignaledValue_timeoutMS(value, u64::MAX);
+            assert!(
+                self.frame_event
+                    .waitUntilSignaledValue_timeoutMS(value, u64::MAX),
+                "Failed to wait for Metal frame completion"
+            );
         }
-        if frame_index < self.in_flight_frame_commands.borrow().len() {
-            self.in_flight_frame_commands.borrow_mut()[frame_index] = None;
-        }
+        self.in_flight_frame_commands.borrow_mut()[frame_index] = None;
 
         // No `nextDrawable` here: everything below comes from the layer's configuration, so the
         // drawable stays in the pool until the frame encodes into it. See `MetalDrawableSlot`.
@@ -343,13 +336,16 @@ impl MetalQueue {
         let value = self.next_fence_value();
         self.queue
             .signalEvent_value(shared_event_as_event(&self.frame_event), value);
-        let _ = self
-            .frame_event
-            .waitUntilSignaledValue_timeoutMS(value, u64::MAX);
+        assert!(
+            self.frame_event
+                .waitUntilSignaledValue_timeoutMS(value, u64::MAX),
+            "Failed to wait for Metal queue idle"
+        );
         self.pending_submissions.borrow_mut().clear();
         for slot in self.in_flight_frame_commands.borrow_mut().iter_mut() {
             *slot = None;
         }
+        self.collect_retired(value);
     }
 
     fn next_fence_value(&self) -> u64 {
@@ -359,24 +355,29 @@ impl MetalQueue {
     }
 
     fn reclaim_completed_submissions(&self) {
-        let completed = self.frame_event.signaledValue();
-        let mut pending = self.pending_submissions.borrow_mut();
-        while pending
-            .front()
-            .is_some_and(|(value, _)| *value <= completed)
+        if self.pending_submissions.borrow().is_empty()
+            && self.retired_resources.borrow().is_empty()
         {
-            pending
-                .pop_front()
-                .expect("pending submission queue front disappeared");
+            return;
         }
+        let completed = self.frame_event.signaledValue();
+        {
+            let mut pending = self.pending_submissions.borrow_mut();
+            while pending
+                .front()
+                .is_some_and(|(value, _)| *value <= completed)
+            {
+                pending.pop_front();
+            }
+        }
+        self.collect_retired(completed);
     }
 
     fn commit_single(&self, cmd: &Retained<ProtocolObject<dyn MTL4CommandBuffer>>) {
         let cmd_ptr = NonNull::from(cmd.as_ref());
         let mut bufs = [cmd_ptr];
         unsafe {
-            let ptr =
-                NonNull::new(bufs.as_mut_ptr()).expect("command buffer array pointer is null");
+            let ptr = NonNull::from(&mut bufs[0]);
             self.queue.commit_count(ptr, 1);
         }
     }
@@ -399,6 +400,9 @@ impl MetalDevice {
         let device = MTLCreateSystemDefaultDevice().ok_or(RhiError::NoSuitableGpu)?;
 
         let residency_desc = MTLResidencySetDescriptor::new();
+        if let Some(label) = &desc.label {
+            residency_desc.setLabel(Some(&NSString::from_str(label)));
+        }
         unsafe {
             residency_desc.setInitialCapacity(1024);
         }
@@ -475,8 +479,8 @@ impl MetalDevice {
                 frame_event: frame_event.clone(),
                 in_flight_frame_commands,
                 pending_submissions,
+                retired_resources: RefCell::new(VecDeque::new()),
             })),
-            device_id: 0,
         };
 
         let compiler_desc = MTL4CompilerDescriptor::new();
@@ -507,10 +511,6 @@ impl MetalDevice {
         &self.rhi_queue
     }
 
-    pub(crate) fn set_device_id(&mut self, device_id: usize) {
-        self.rhi_queue.device_id = device_id;
-    }
-
     pub fn bindless_mode(&self) -> BindlessMode {
         self.bindless_mode
     }
@@ -523,26 +523,17 @@ impl MetalDevice {
     }
 
     pub fn wait_for_frame(&self, frame_index: usize) {
-        let Some(value) = self.frame_fence_values.borrow().get(frame_index).copied() else {
-            log::warn!("Ignoring invalid Metal frame index {frame_index}");
-            return;
-        };
+        let value = self.frame_fence_values.borrow()[frame_index];
         if value != 0 {
-            let _ = self
-                .frame_event
-                .waitUntilSignaledValue_timeoutMS(value, u64::MAX);
+            assert!(
+                self.frame_event
+                    .waitUntilSignaledValue_timeoutMS(value, u64::MAX),
+                "Failed to wait for Metal frame completion"
+            );
         }
-        match &self.rhi_queue.inner {
-            #[cfg(feature = "metal")]
-            QueueInner::Metal(q) => {
-                if frame_index < q.in_flight_frame_commands.borrow().len() {
-                    q.in_flight_frame_commands.borrow_mut()[frame_index] = None;
-                }
-                q.reclaim_completed_submissions();
-            }
-            #[cfg(feature = "vulkan")]
-            QueueInner::Vulkan(_) => {}
-        }
+        let q = backend_expect!(&self.rhi_queue.inner, QueueInner::Metal);
+        q.in_flight_frame_commands.borrow_mut()[frame_index] = None;
+        q.reclaim_completed_submissions();
     }
 
     pub fn create_surface(&self, desc: &SurfaceDesc) -> RhiResult<Surface> {
@@ -701,258 +692,22 @@ impl MetalDevice {
         resolve_mapped_pointer(&allocations, ptr)
     }
 
-    /// Build the native `MTLTextureDescriptor` for a `TextureDesc`. Shared by
-    /// `texture_size_align` and `create_texture` so the mapping lives in one place.
-    fn build_texture_descriptor(&self, desc: &TextureDesc) -> Retained<MTLTextureDescriptor> {
-        let mtl_desc = MTLTextureDescriptor::new();
-
-        let texture_type = match desc.dimension {
-            TextureDimension::D1 => MTLTextureType::Type1D,
-            TextureDimension::D2 => MTLTextureType::Type2D,
-            TextureDimension::D2Array => MTLTextureType::Type2DArray,
-            TextureDimension::D3 => MTLTextureType::Type3D,
-            TextureDimension::Cube => MTLTextureType::TypeCube,
-            TextureDimension::CubeArray => MTLTextureType::TypeCubeArray,
-        };
-
-        let sample_count = match desc.sample_count {
-            SampleCount::S1 => 1usize,
-            SampleCount::S2 => 2,
-            SampleCount::S4 => 4,
-            SampleCount::S8 => 8,
-            SampleCount::S16 => 16,
-        };
-
-        let mut usage = MtlTextureUsage::empty();
-        if desc.usage.contains(TextureUsage::SAMPLED) {
-            usage |= MtlTextureUsage::ShaderRead;
-        }
-        if desc.usage.contains(TextureUsage::STORAGE) {
-            usage |= MtlTextureUsage::ShaderRead | MtlTextureUsage::ShaderWrite;
-        }
-        if desc.usage.contains(TextureUsage::COLOR_ATTACHMENT) {
-            usage |= MtlTextureUsage::RenderTarget;
-        }
-        if desc.usage.contains(TextureUsage::DEPTH_STENCIL_ATTACHMENT) {
-            usage |= MtlTextureUsage::RenderTarget;
-        }
-        if desc.usage.contains(TextureUsage::FORMAT_VIEW) {
-            usage |= MtlTextureUsage::PixelFormatView;
-        }
-
-        unsafe {
-            mtl_desc.setPixelFormat(format_to_mtl(desc.format));
-            mtl_desc.setWidth(desc.width as usize);
-            mtl_desc.setHeight(desc.height as usize);
-            mtl_desc.setDepth(desc.depth as usize);
-            mtl_desc.setMipmapLevelCount(desc.mip_levels as usize);
-            mtl_desc.setArrayLength(desc.array_layers as usize);
-            mtl_desc.setTextureType(texture_type);
-            mtl_desc.setSampleCount(sample_count);
-            mtl_desc.setUsage(usage);
-            mtl_desc.setStorageMode(MTLStorageMode::Private);
-        }
-
-        mtl_desc
-    }
-
-    pub fn texture_size_align(&self, desc: &TextureDesc) -> RhiResult<TextureSizeAlign> {
-        let mtl_desc = self.build_texture_descriptor(desc);
-        let size_align = self
-            .shared
-            .device
-            .heapTextureSizeAndAlignWithDescriptor(&mtl_desc);
-        Ok(TextureSizeAlign {
-            size: size_align.size as u64,
-            align: size_align.align as u64,
-        })
-    }
-
-    fn allocate_texture_id(&self) -> RhiResult<TextureId> {
-        if let Some(id) = self.shared.free_texture_ids.borrow_mut().pop() {
-            return Ok(id);
-        }
-        let next = self.shared.textures.borrow().len();
-        if next >= METAL_BINDLESS_TEXTURE_CAPACITY {
-            return Err(RhiError::TextureCreation(
-                "Metal bindless texture heap exhausted".into(),
-            ));
-        }
-        Ok(TextureId(next as u32))
-    }
-
-    fn allocate_sampler_id(&self) -> RhiResult<SamplerId> {
-        if let Some(id) = self.shared.free_sampler_ids.borrow_mut().pop() {
-            return Ok(id);
-        }
-        let next = self.shared.samplers.borrow().len();
-        if next >= METAL_BINDLESS_SAMPLER_CAPACITY {
-            return Err(RhiError::Backend(
-                "Metal bindless sampler heap exhausted".into(),
-            ));
-        }
-        Ok(SamplerId(next as u32))
-    }
-
     /// Write `resource_id` into a bindless heap slot. Destroyed resources leave their slot stale
     /// rather than zeroed; an in-flight frame may still legitimately read it.
-    fn write_heap_slot(heap: &ProtocolObject<dyn MTLBuffer>, index: usize, resource_id: u64) {
+    pub(crate) fn write_heap_slot(
+        heap: &ProtocolObject<dyn MTLBuffer>,
+        index: usize,
+        resource_id: u64,
+    ) {
         unsafe {
             let base = heap.contents().as_ptr() as *mut u64;
             base.add(index).write(resource_id);
         }
     }
 
-    pub fn create_texture(
-        &self,
-        desc: &TextureDesc,
-        texture_gpu: GpuPtr<u8>,
-    ) -> RhiResult<Texture> {
-        if texture_gpu.is_null() {
-            return Err(RhiError::TextureCreation(
-                "create_texture requires a non-null texture allocation address".into(),
-            ));
-        }
-
-        let mtl_desc = self.build_texture_descriptor(desc);
-        let size_align = self
-            .shared
-            .device
-            .heapTextureSizeAndAlignWithDescriptor(&mtl_desc);
-        let (heap, heap_offset) = {
-            let allocations = self.shared.allocations.borrow();
-            let alloc = allocations
-                .range(..=texture_gpu.address)
-                .next_back()
-                .map(|(_, alloc)| alloc)
-                .filter(|alloc| texture_gpu.address - alloc.base.address < alloc.size)
-                .ok_or_else(|| {
-                    RhiError::TextureCreation(format!(
-                        "texture allocation address 0x{:x} was not returned by gpuMalloc",
-                        texture_gpu.address
-                    ))
-                })?;
-
-            let offset = texture_gpu.address - alloc.base.address;
-            // `newTextureWithDescriptor:offset:` positions the texture within the heap, so the
-            // allocation's own placement has to be added in; otherwise every allocation that is
-            // not itself at heap offset 0 lands the texture on top of unrelated resources.
-            let heap_offset = alloc.heap_offset + offset;
-            if !heap_offset.is_multiple_of(size_align.align as u64) {
-                return Err(RhiError::TextureCreation(format!(
-                    "texture allocation address 0x{:x} has heap offset {heap_offset}, expected alignment {}",
-                    texture_gpu.address, size_align.align
-                )));
-            }
-            if size_align.size as u64 > alloc.size - offset {
-                return Err(RhiError::TextureCreation(format!(
-                    "texture allocation address 0x{:x} has {} bytes available, needs {}",
-                    texture_gpu.address,
-                    alloc.size - offset,
-                    size_align.size
-                )));
-            }
-            (alloc.heap.clone(), heap_offset)
-        };
-
-        let texture =
-            unsafe { heap.newTextureWithDescriptor_offset(&mtl_desc, heap_offset as usize) }
-                .ok_or_else(|| {
-                    RhiError::TextureCreation("Metal placed texture allocation failed".into())
-                })?;
-
-        // Track the buffer for Metal 4 residency.
-        self.shared
-            .residency_set
-            .addAllocation(as_allocation(&texture));
-        self.shared.residency_dirty.set(true);
-
-        if let Some(label) = &desc.label {
-            use objc2_metal::MTLResource;
-            let ns_label = NSString::from_str(label);
-            texture.setLabel(Some(&ns_label));
-        }
-
-        let id = self.allocate_texture_id()?;
-        let idx = id.0 as usize;
-        let mut textures = self.shared.textures.borrow_mut();
-        if textures.len() <= idx {
-            textures.resize_with(idx + 1, || None);
-        }
-        textures[idx] = Some(texture.clone());
-        drop(textures);
-        let mut view_flags = self.texture_view_flags.borrow_mut();
-        if view_flags.len() <= idx {
-            view_flags.resize(idx + 1, false);
-        }
-        view_flags[idx] = false;
-        Self::write_heap_slot(
-            &self.shared.texture_heap,
-            idx,
-            texture.gpuResourceID().to_raw(),
-        );
-
-        Ok(Texture {
-            id,
-            gpu_address: texture_gpu,
-            handle: TextureHandle::from_raw(texture.gpuResourceID().to_raw()),
-            views: Vec::new(),
-            desc: desc.clone(),
-            _owner: None,
-        })
-    }
-
-    pub fn create_sampler(&self, desc: &SamplerDesc) -> RhiResult<Sampler> {
-        let mtl_desc = MTLSamplerDescriptor::new();
-
-        mtl_desc.setMinFilter(filter_to_mtl(desc.min_filter));
-        mtl_desc.setMagFilter(filter_to_mtl(desc.mag_filter));
-        mtl_desc.setMipFilter(mip_filter_to_mtl(desc.mip_filter));
-        mtl_desc.setSAddressMode(address_to_mtl(desc.address_u));
-        mtl_desc.setTAddressMode(address_to_mtl(desc.address_v));
-        mtl_desc.setRAddressMode(address_to_mtl(desc.address_w));
-        mtl_desc.setLodMinClamp(desc.min_lod);
-        mtl_desc.setLodMaxClamp(desc.max_lod);
-
-        if let Some(aniso) = desc.max_anisotropy {
-            mtl_desc.setMaxAnisotropy(aniso as usize);
-        }
-
-        if let Some(cmp) = desc.compare {
-            mtl_desc.setCompareFunction(compare_op_to_mtl(cmp));
-        }
-        mtl_desc.setSupportArgumentBuffers(true);
-
-        let sampler = self
-            .shared
-            .device
-            .newSamplerStateWithDescriptor(&mtl_desc)
-            .ok_or_else(|| RhiError::Backend("Failed to create Metal sampler".into()))?;
-
-        let id = self.allocate_sampler_id()?;
-        let idx = id.0 as usize;
-        let mut samplers = self.shared.samplers.borrow_mut();
-        if samplers.len() <= idx {
-            samplers.resize_with(idx + 1, || None);
-        }
-        samplers[idx] = Some(sampler.clone());
-        drop(samplers);
-        Self::write_heap_slot(
-            &self.shared.sampler_heap,
-            idx,
-            sampler.gpuResourceID().to_raw(),
-        );
-
-        Ok(Sampler {
-            id,
-            handle: SamplerHandle::from_raw(sampler.gpuResourceID().to_raw()),
-            _owner: None,
-        })
-    }
-
     pub fn create_shader_module(&self, desc: &ShaderModuleDesc) -> RhiResult<ShaderModule> {
         // For Metal, `code` should be a compiled .metallib binary.
-        let ptr = std::ptr::NonNull::new(desc.code.as_ptr() as *mut std::ffi::c_void)
+        let ptr = std::ptr::NonNull::new(desc.code.as_ptr().cast::<std::ffi::c_void>().cast_mut())
             .expect("shader code pointer is null");
         let dispatch_data = unsafe {
             dispatch2::DispatchData::new(ptr, desc.code.len(), None, std::ptr::null_mut())
@@ -997,7 +752,7 @@ impl MetalDevice {
             SampleCount::S16 => 16,
         };
 
-        let blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
+        let blend = desc.blendstate.clone().unwrap_or_default();
         let pipeline_state = MetalGraphicsPso::compile_pipeline_state(
             self.compiler.as_ref(),
             vert_module.library.as_ref(),
@@ -1022,6 +777,15 @@ impl MetalDevice {
         Ok(GraphicsPso {
             inner: GraphicsPsoInner::Metal(Box::new(MetalGraphicsPso {
                 pipeline: pipeline_state,
+                depth_stencil: super::pipeline::make_depth_stencil_state(
+                    self.shared.device.as_ref(),
+                    desc.depth,
+                ),
+                depth_bias: (
+                    desc.depth.bias,
+                    desc.depth.bias_slope,
+                    desc.depth.bias_clamp,
+                ),
                 cull_mode,
                 winding,
                 topology,
@@ -1133,11 +897,11 @@ impl MetalDevice {
             }
         }
 
-        let blend = desc.blendstate.as_ref().cloned().unwrap_or_default();
+        let blend = desc.blendstate.clone().unwrap_or_default();
         for (i, target) in desc.color_targets.iter().enumerate() {
             let att = unsafe { pipeline_desc.colorAttachments().objectAtIndexedSubscript(i) };
             att.setPixelFormat(super::texture::format_to_mtl(target.format));
-            let blend_att = blend.attachments.get(i).cloned().unwrap_or_default();
+            let blend_att = blend.attachments.get(i).copied().unwrap_or_default();
             super::pipeline::apply_blend_to_attachment(att.as_ref(), blend_att, target.write_mask);
         }
 
@@ -1153,6 +917,15 @@ impl MetalDevice {
             inner: crate::pipeline::MeshletPsoInner::Metal(Box::new(MetalMeshletPso {
                 cull_mode,
                 winding,
+                depth_stencil: super::pipeline::make_depth_stencil_state(
+                    self.shared.device.as_ref(),
+                    desc.depth,
+                ),
+                depth_bias: (
+                    desc.depth.bias,
+                    desc.depth.bias_slope,
+                    desc.depth.bias_clamp,
+                ),
                 default_pipeline,
             })),
             _owner: None,
@@ -1230,8 +1003,10 @@ impl MetalDevice {
             y: t[1][c],
             z: t[2][c],
         };
-        let resource_id: MTLResourceID =
-            unsafe { std::mem::transmute(inst.acceleration_structure_reference.0) };
+        // SAFETY: the handle came from `MTLAccelerationStructure::gpuResourceID().to_raw()`
+        // in `create_blas` / `create_tlas`, so it is a live resource ID for this device.
+        let resource_id =
+            unsafe { MTLResourceID::from_raw(inst.acceleration_structure_reference.0) };
 
         let instance_flags =
             InstanceFlags::from_bits_retain((inst.instance_sbt_offset_and_flags >> 24) as u8);
@@ -1469,308 +1244,6 @@ impl MetalDevice {
             #[cfg(feature = "vulkan")]
             AllocationInner::Vulkan(_) => {}
         }
-    }
-
-    pub fn destroy_texture(&self, texture: Texture) {
-        let retired = {
-            let mut textures = self.shared.textures.borrow_mut();
-            let idx = texture.id.0 as usize;
-            if idx < textures.len() {
-                textures[idx].take()
-            } else {
-                None
-            }
-        };
-        if let Some(tex) = retired {
-            if let Some(is_view) = self
-                .texture_view_flags
-                .borrow_mut()
-                .get_mut(texture.id.0 as usize)
-            {
-                *is_view = false;
-            }
-            backend_expect!(&self.rhi_queue.inner, QueueInner::Metal).release_resource(
-                MetalRetiredResource::Texture {
-                    id: texture.id,
-                    texture: tex,
-                },
-            );
-        }
-    }
-
-    pub fn destroy_texture_view(&self, id: TextureId) {
-        // Claim the view in one borrow, mirroring the Vulkan path.
-        let was_view = self
-            .texture_view_flags
-            .borrow_mut()
-            .get_mut(id.0 as usize)
-            .is_some_and(|flag| std::mem::replace(flag, false));
-        if !was_view {
-            return;
-        }
-        let retired = self
-            .shared
-            .textures
-            .borrow_mut()
-            .get_mut(id.0 as usize)
-            .and_then(Option::take);
-        if let Some(texture) = retired {
-            backend_expect!(&self.rhi_queue.inner, QueueInner::Metal)
-                .release_resource(MetalRetiredResource::Texture { id, texture });
-        }
-    }
-
-    pub fn destroy_sampler(&self, sampler: Sampler) {
-        let sampler_id = sampler.id();
-        let retired = {
-            let mut samplers = self.shared.samplers.borrow_mut();
-            let idx = sampler_id.0 as usize;
-            if idx < samplers.len() {
-                samplers[idx].take()
-            } else {
-                None
-            }
-        };
-        if let Some(sampler) = retired {
-            backend_expect!(&self.rhi_queue.inner, QueueInner::Metal).release_resource(
-                MetalRetiredResource::Sampler {
-                    id: sampler_id,
-                    sampler,
-                },
-            );
-        }
-    }
-
-    pub fn create_sampled_view(
-        &self,
-        source: &Texture,
-        view: &crate::texture::TextureViewDesc,
-    ) -> RhiResult<TextureId> {
-        self.create_view_internal(source, view)
-    }
-
-    pub fn create_storage_view(
-        &self,
-        source: &Texture,
-        view: &crate::texture::TextureViewDesc,
-    ) -> RhiResult<TextureId> {
-        self.create_view_internal(source, view)
-    }
-
-    /// Value to store in a [`TextureHandle`](crate::TextureHandle) root field for sampled view
-    /// `id`. On Metal a `DescriptorHandle<Texture2D>` is the texture's `gpuResourceID`, which the
-    /// shader uses directly.
-    pub fn texture_handle_raw(&self, id: TextureId) -> u64 {
-        let textures = self.shared.textures.borrow();
-        let texture = textures
-            .get(id.0 as usize)
-            .and_then(|t| t.as_ref())
-            .expect("invalid TextureId");
-        texture.gpuResourceID().to_raw()
-    }
-
-    pub fn create_query_pool(&self, count: u32) -> RhiResult<QueryPool> {
-        use objc2_foundation::NSRange;
-
-        let desc = MTL4CounterHeapDescriptor::new();
-        desc.setType(MTL4CounterHeapType::Timestamp);
-        // SAFETY: count is the heap entry count; not bounds-checked by the API.
-        unsafe { desc.setCount(count as usize) };
-        let heap = self
-            .shared
-            .device
-            .newCounterHeapWithDescriptor_error(&desc)
-            .map_err(|e| RhiError::Backend(format!("newCounterHeapWithDescriptor: {e}")))?;
-        // Invalidate the new heap so unwritten slots resolve to zero.
-        unsafe {
-            heap.invalidateCounterRange(NSRange {
-                location: 0,
-                length: count as usize,
-            })
-        };
-        Ok(QueryPool {
-            inner: QueryPoolInner::Metal(MetalQueryPool { heap }),
-            count,
-            _owner: None,
-        })
-    }
-
-    pub fn destroy_query_pool(&self, _pool: QueryPool) {}
-
-    pub fn timestamp_period_ns(&self) -> f64 {
-        let freq = self.shared.device.queryTimestampFrequency();
-        if freq == 0 { 0.0 } else { 1.0e9 / freq as f64 }
-    }
-
-    pub fn read_timestamps(&self, pool: &QueryPool) -> RhiResult<Vec<u64>> {
-        use objc2::rc::autoreleasepool;
-        use objc2_foundation::NSRange;
-
-        // MTL4CounterHeap::resolveCounterRange returns a newly allocated autoreleased NSData.
-        // The window event loop does not guarantee a pool around every render callback, so keep
-        // the resolve and byte copy inside an explicit pool; otherwise the HUD's App Memory grows
-        // once per frame even though Metal residency remains flat.
-        autoreleasepool(|_| {
-            let heap = match &pool.inner {
-                QueryPoolInner::Metal(p) => &p.heap,
-                #[allow(unreachable_patterns)]
-                _ => unreachable!("query pool backend does not match device backend"),
-            };
-            // The writing frame has completed, so resolve the timestamp heap directly.
-            let range = NSRange {
-                location: 0,
-                length: pool.count as usize,
-            };
-            let data = unsafe { heap.resolveCounterRange(range) }
-                .ok_or_else(|| RhiError::Backend("resolveCounterRange returned nil".into()))?;
-            let mut out = vec![0u64; pool.count as usize];
-            // `NSData::as_bytes_unchecked` is safe here: `data` remains alive and immutable for
-            // the whole copy, and Metal returns exactly one packed u64 per counter slot.
-            for (slot, chunk) in out
-                .iter_mut()
-                .zip(unsafe { data.as_bytes_unchecked() }.chunks_exact(8))
-            {
-                *slot =
-                    u64::from_ne_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
-            }
-            Ok(out)
-        })
-    }
-
-    fn create_view_internal(
-        &self,
-        source: &Texture,
-        view: &crate::texture::TextureViewDesc,
-    ) -> RhiResult<TextureId> {
-        use crate::texture::{ALL_LAYERS, ALL_MIPS};
-        use objc2_foundation::NSRange;
-
-        let textures_borrow = self.shared.textures.borrow();
-        let src_texture = textures_borrow
-            .get(source.id.0 as usize)
-            .and_then(|t| t.as_ref())
-            .ok_or_else(|| {
-                RhiError::TextureCreation("create texture view: invalid source TextureId".into())
-            })?
-            .clone();
-        drop(textures_borrow);
-
-        let src_format = super::texture::format_to_mtl(view.format.unwrap_or(source.desc().format));
-        let src_type = match source.desc().dimension {
-            TextureDimension::D1 => objc2_metal::MTLTextureType::Type1D,
-            TextureDimension::D2 => {
-                if source.desc().array_layers > 1 {
-                    objc2_metal::MTLTextureType::Type2DArray
-                } else {
-                    objc2_metal::MTLTextureType::Type2D
-                }
-            }
-            TextureDimension::D2Array => objc2_metal::MTLTextureType::Type2DArray,
-            TextureDimension::D3 => objc2_metal::MTLTextureType::Type3D,
-            TextureDimension::Cube => objc2_metal::MTLTextureType::TypeCube,
-            TextureDimension::CubeArray => objc2_metal::MTLTextureType::TypeCubeArray,
-        };
-
-        let src_mips = source.desc().mip_levels;
-        let src_layers = source.desc().array_layers;
-
-        let mip_start = view.base_mip as usize;
-        let mip_count = if view.mip_count == ALL_MIPS {
-            (src_mips as usize).saturating_sub(mip_start)
-        } else {
-            view.mip_count as usize
-        };
-        let layer_start = view.base_layer as usize;
-        let layer_count = if view.layer_count == ALL_LAYERS {
-            (src_layers as usize).saturating_sub(layer_start)
-        } else {
-            view.layer_count as usize
-        };
-
-        let level_range = NSRange::new(mip_start, mip_count);
-        let slice_range = NSRange::new(layer_start, layer_count);
-
-        let view_texture = unsafe {
-            src_texture
-                .newTextureViewWithPixelFormat_textureType_levels_slices(
-                    src_format,
-                    src_type,
-                    level_range,
-                    slice_range,
-                )
-                .ok_or_else(|| {
-                    RhiError::TextureCreation("Metal texture view creation failed".into())
-                })?
-        };
-
-        // Views share the source allocation but still need residency tracking.
-        self.shared
-            .residency_set
-            .addAllocation(as_allocation(&view_texture));
-        self.shared.residency_dirty.set(true);
-
-        let id = match self.allocate_texture_id() {
-            Ok(id) => id,
-            Err(err) => {
-                self.shared
-                    .residency_set
-                    .removeAllocation(as_allocation(&view_texture));
-                self.shared.residency_dirty.set(true);
-                return Err(err);
-            }
-        };
-        let idx = id.0 as usize;
-        let resource_id = view_texture.gpuResourceID().to_raw();
-        let mut textures = self.shared.textures.borrow_mut();
-        if textures.len() <= idx {
-            textures.resize_with(idx + 1, || None);
-        }
-        textures[idx] = Some(view_texture);
-        drop(textures);
-        let mut view_flags = self.texture_view_flags.borrow_mut();
-        if view_flags.len() <= idx {
-            view_flags.resize(idx + 1, false);
-        }
-        view_flags[idx] = true;
-        Self::write_heap_slot(&self.shared.texture_heap, idx, resource_id);
-
-        Ok(id)
-    }
-}
-
-fn filter_to_mtl(f: crate::types::FilterMode) -> objc2_metal::MTLSamplerMinMagFilter {
-    match f {
-        FilterMode::Nearest => objc2_metal::MTLSamplerMinMagFilter::Nearest,
-        FilterMode::Linear => objc2_metal::MTLSamplerMinMagFilter::Linear,
-    }
-}
-
-fn mip_filter_to_mtl(f: crate::types::FilterMode) -> objc2_metal::MTLSamplerMipFilter {
-    match f {
-        FilterMode::Nearest => objc2_metal::MTLSamplerMipFilter::Nearest,
-        FilterMode::Linear => objc2_metal::MTLSamplerMipFilter::Linear,
-    }
-}
-
-fn address_to_mtl(a: crate::types::AddressMode) -> objc2_metal::MTLSamplerAddressMode {
-    match a {
-        AddressMode::Repeat => objc2_metal::MTLSamplerAddressMode::Repeat,
-        AddressMode::MirroredRepeat => objc2_metal::MTLSamplerAddressMode::MirrorRepeat,
-        AddressMode::ClampToEdge => objc2_metal::MTLSamplerAddressMode::ClampToEdge,
-        AddressMode::ClampToBorder => objc2_metal::MTLSamplerAddressMode::ClampToBorderColor,
-    }
-}
-
-fn compare_op_to_mtl(op: CompareOp) -> objc2_metal::MTLCompareFunction {
-    match op {
-        CompareOp::Never => objc2_metal::MTLCompareFunction::Never,
-        CompareOp::Less => objc2_metal::MTLCompareFunction::Less,
-        CompareOp::Equal => objc2_metal::MTLCompareFunction::Equal,
-        CompareOp::LessOrEqual => objc2_metal::MTLCompareFunction::LessEqual,
-        CompareOp::Greater => objc2_metal::MTLCompareFunction::Greater,
-        CompareOp::NotEqual => objc2_metal::MTLCompareFunction::NotEqual,
-        CompareOp::GreaterOrEqual => objc2_metal::MTLCompareFunction::GreaterEqual,
-        CompareOp::Always => objc2_metal::MTLCompareFunction::Always,
     }
 }
 

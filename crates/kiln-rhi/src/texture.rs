@@ -1,7 +1,7 @@
 //! Texture creation, view descriptors, and bindless heap registration.
 
 use crate::device::DeviceInner;
-use crate::types::{Format, GpuPtr, SampleCount, TextureDimension, TextureHandle, TextureId};
+use crate::types::{Format, SampleCount, TextureDimension, TextureHandle, TextureId};
 
 /// Sentinel for `TextureViewDesc::mip_count`: include all remaining mip levels.
 pub const ALL_MIPS: u8 = 0xFF;
@@ -56,6 +56,64 @@ impl Default for TextureDesc {
     }
 }
 
+/// One mip level and array layer of a texture, optionally a sub-box within it. Copy entry points
+/// take `impl Into<Option<Self>>`; `None` is the whole of mip 0, layer 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TextureRegion {
+    pub mip: u32,
+    /// Array layer, or cube face for a cube texture.
+    pub layer: u32,
+    /// Texel offset within the mip. `z` indexes depth slices of a 3D texture.
+    pub origin: [u32; 3],
+    /// Texel extent measured from `origin`. `None` runs to the edge of the mip.
+    pub extent: Option<[u32; 3]>,
+}
+
+impl TextureRegion {
+    pub(crate) fn resolve(self, desc: &TextureDesc) -> ResolvedRegion {
+        let at_mip = |extent: u32| (extent >> self.mip).max(1);
+        let full = [
+            at_mip(desc.width),
+            at_mip(desc.height),
+            match desc.dimension {
+                TextureDimension::D3 => at_mip(desc.depth),
+                _ => 1,
+            },
+        ];
+        let extent = self.extent.unwrap_or_else(|| {
+            [
+                full[0].saturating_sub(self.origin[0]),
+                full[1].saturating_sub(self.origin[1]),
+                full[2].saturating_sub(self.origin[2]),
+            ]
+        });
+        ResolvedRegion {
+            mip: self.mip,
+            layer: self.layer,
+            origin: self.origin,
+            extent,
+        }
+    }
+}
+
+/// A [`TextureRegion`] with its extent filled in against a concrete texture.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct ResolvedRegion {
+    pub mip: u32,
+    pub layer: u32,
+    pub origin: [u32; 3],
+    pub extent: [u32; 3],
+}
+
+impl ResolvedRegion {
+    /// Tightly packed linear layout of this region: `(bytes per row, bytes per image)`.
+    pub fn linear_strides(&self, bytes_per_texel: usize) -> (usize, usize) {
+        let bytes_per_row = self.extent[0] as usize * bytes_per_texel;
+        (bytes_per_row, bytes_per_row * self.extent[1] as usize)
+    }
+}
+
 /// Size and alignment required for a placed texture allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TextureSizeAlign {
@@ -66,7 +124,6 @@ pub struct TextureSizeAlign {
 /// A texture backed by caller-owned GPU memory.
 pub struct Texture {
     pub(crate) id: TextureId,
-    pub(crate) gpu_address: GpuPtr<u8>,
     pub(crate) handle: TextureHandle,
     pub(crate) views: Vec<TextureId>,
     pub(crate) desc: TextureDesc,
@@ -88,7 +145,12 @@ impl Texture {
         crate::command::RenderTarget::texture(self.id)
     }
 
-    /// Subresource view; released with this texture. The source must carry `kind`'s usage.
+    /// Subresource view; released with this texture.
+    ///
+    /// The source must carry `kind`'s usage, the mip/layer range must sit inside the texture, and
+    /// a format change needs [`TextureUsage::FORMAT_VIEW`] plus a compatible layout (see
+    /// [`formats_are_view_compatible`]). Breaking any of those is reported by the backend's own
+    /// validation, not re-checked here.
     pub fn view(
         &mut self,
         kind: ViewKind,
@@ -99,11 +161,10 @@ impl Texture {
 
     fn create_view(&mut self, view: &TextureViewDesc, kind: ViewKind) -> crate::RhiResult<u64> {
         let storage = kind == ViewKind::Storage;
-        crate::device::validate_texture_view(self, view, kind.required_usage())?;
         let owner = self
             ._owner
             .clone()
-            .ok_or_else(|| crate::RhiError::Backend("texture has no owning device".into()))?;
+            .expect("texture reached create_view without an owning device");
         let id = if storage {
             backend_dispatch!(owner.as_ref(), DeviceInner, d => d.create_storage_view(self, view))?
         } else {
@@ -126,15 +187,6 @@ pub enum ViewKind {
     Sampled,
     /// Read-write storage image.
     Storage,
-}
-
-impl ViewKind {
-    fn required_usage(self) -> TextureUsage {
-        match self {
-            ViewKind::Sampled => TextureUsage::SAMPLED,
-            ViewKind::Storage => TextureUsage::STORAGE,
-        }
-    }
 }
 
 /// A non-default sampled or storage view.

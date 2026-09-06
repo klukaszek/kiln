@@ -9,6 +9,9 @@
 //! - Stage-only barriers (no per-resource state tracking)
 //! - Minimal PSO (topology + formats + MSAA + blend baked; separate DepthStencil)
 //! - Transient command buffers (create, record, submit, auto-reclaim)
+//! - `destroy` whenever you are done: releases are held until the work referencing them retires
+//! - Single-threaded: `Device` and `CommandBuffer` are `Rc`-backed and deliberately not `Send`
+//! - Validation is left to the backends; the RHI only checks what they cannot see
 //! - Timeline semaphores for cross-submit ordering; frame pacing uses the swapchain fence
 //! - Enum dispatch for zero-cost backend selection
 //! - Mesh shader pipelines ([`Device::create_meshlet_pso`], [`CommandBuffer::draw_meshlets`])
@@ -64,18 +67,12 @@ mod sealed {
     }
 
     impl_sealed!(
-        crate::accel::AccelerationStructure,
-        crate::command::CommandBuffer,
         crate::memory::Allocation,
         crate::pipeline::ComputePso,
         crate::pipeline::GraphicsPso,
         crate::pipeline::MeshletPso,
         crate::query::QueryPool,
         crate::sampler::Sampler,
-        crate::shader::ShaderModule,
-        crate::surface::Surface,
-        crate::swapchain::Swapchain,
-        crate::sync::TimelineSemaphore,
         crate::texture::Texture,
     );
 }
@@ -84,6 +81,7 @@ pub mod accel;
 pub(crate) mod backend;
 pub mod barrier;
 pub mod command;
+#[cfg(feature = "slangc")]
 pub mod compiler;
 pub mod device;
 pub mod error;
@@ -141,7 +139,7 @@ pub use surface::{Surface, SurfaceDesc};
 pub use swapchain::{AcquiredImage, Swapchain, SwapchainDesc};
 pub use sync::TimelineSemaphore;
 pub use texture::{
-    ALL_LAYERS, ALL_MIPS, Texture, TextureDesc, TextureUsage, TextureViewDesc, ViewKind,
-    bytes_per_pixel, formats_are_view_compatible,
+    ALL_LAYERS, ALL_MIPS, Texture, TextureDesc, TextureRegion, TextureUsage, TextureViewDesc,
+    ViewKind, bytes_per_pixel, formats_are_view_compatible,
 };
 pub use types::*;

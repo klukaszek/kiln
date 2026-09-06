@@ -6,9 +6,7 @@ use std::time::Instant;
 
 #[test]
 fn timestamps_bracket_transfers() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
     const SIZE: u64 = 16 * 1024 * 1024;
     let src = device.allocate(SIZE, MemoryType::Upload).expect("src");
     let dst = device.allocate(SIZE, MemoryType::GpuOnly).expect("dst");

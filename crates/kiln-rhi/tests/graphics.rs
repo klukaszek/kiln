@@ -47,60 +47,17 @@ const SIZE: u32 = 64;
 
 #[test]
 fn graphics_fullscreen_color() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
     let src = format!("{}{}", Root::SLANG, GFX_BODY);
-    let Some(vs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex, &[])
-    else {
-        return;
-    };
-    let Some(fs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
-    else {
-        return;
-    };
-
+    let vs = kiln_rhi::compiler::compile(&device, &src, "vsMain", ShaderStage::Vertex, &[])
+        .expect("compile vs");
+    let fs = kiln_rhi::compiler::compile(&device, &src, "fsMain", ShaderStage::Pixel, &[])
+        .expect("compile fs");
     let pso = common::timed("create_graphics_pso", || {
-        device
-            .create_graphics_pso(
-                &GraphicsPsoDesc {
-                    topology: Topology::TriangleList,
-                    color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
-                    depth_format: None,
-                    sample_count: SampleCount::S1,
-                    cull: Cull::None,
-                    ..Default::default()
-                },
-                &vs,
-                &fs,
-            )
-            .expect("create_graphics_pso")
+        make_graphics_pso(&device, &vs, &fs, "fullscreen")
     });
 
-    let tex_desc = TextureDesc {
-        width: SIZE,
-        height: SIZE,
-        depth: 1,
-        mip_levels: 1,
-        array_layers: 1,
-        format: Format::R8G8B8A8Unorm,
-        dimension: TextureDimension::D2,
-        sample_count: SampleCount::S1,
-        usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        label: Some("rt".into()),
-    };
-    let sa = device.texture_size_align(&tex_desc).expect("size_align");
-    let tex_mem = device
-        .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
-        .expect("rt mem");
-    let texture = device
-        .create_texture(&tex_desc, tex_mem.gpu())
-        .expect("create_texture");
-
-    // Root color and readback buffer.
     let mut root = device
         .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Upload)
         .expect("root");
@@ -108,77 +65,27 @@ fn graphics_fullscreen_color() {
         color: [1.0, 0.0, 0.0, 1.0],
     })
     .expect("upload root");
-    let readback = device
-        .allocate((SIZE * SIZE * 4) as u64, MemoryType::Readback)
-        .expect("readback");
 
-    common::timed("render full-screen triangle · submit+wait", || {
-        let mut cmd = device.create_command_buffer().expect("cmd");
-        cmd.begin_render_pass(&RenderPassDesc {
-            color_attachments: vec![ColorAttachment {
-                target: texture.target(),
-                load_op: LoadOp::Clear,
-                store_op: StoreOp::Store,
-                clear_color: [0.0, 0.0, 0.0, 1.0],
-            }],
-            depth_attachment: None,
-            render_area: [0, 0, SIZE, SIZE],
-            label: Some("graphics test"),
-        });
-        cmd.set_pipeline(&pso);
-        cmd.set_viewport(0.0, 0.0, SIZE as f32, SIZE as f32, 0.0, 1.0);
-        cmd.set_scissor(0, 0, SIZE, SIZE);
-        cmd.draw(root.gpu(), 3, 1, 0, 0);
-        cmd.end_render_pass();
-
-        cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
-        cmd.copy_texture_to_buffer(&texture, readback.gpu());
-        cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
-        cmd.end();
-        let queue = device.queue();
-        queue.submit(cmd).expect("submit");
-        queue.wait_idle();
+    let pixels = common::timed("render full-screen triangle \u{b7} submit+wait", || {
+        render_draw(&device, &pso, root.gpu(), SIZE, 3, 1)
     });
-
-    let pixels = readback.as_slice::<u8>().expect("read readback");
-    common::save_rgba_png("graphics_fullscreen_color", SIZE, SIZE, pixels);
-    for px in 0..(SIZE * SIZE) as usize {
-        let (r, g, b, a) = (
-            pixels[px * 4],
-            pixels[px * 4 + 1],
-            pixels[px * 4 + 2],
-            pixels[px * 4 + 3],
-        );
-        assert_eq!(
-            (r, g, b, a),
-            (255, 0, 0, 255),
-            "pixel {px} not red: ({r},{g},{b},{a})"
-        );
+    common::save_rgba_png("graphics_fullscreen_color", SIZE, SIZE, &pixels);
+    for (px, pixel) in pixels.chunks_exact(4).enumerate() {
+        assert_eq!(pixel, [255, 0, 0, 255], "pixel {px} not red: {pixel:?}");
     }
 
     device.destroy(root);
-    device.destroy(readback);
-    device.destroy(texture);
-    device.destroy(tex_mem);
 }
 
 #[test]
 fn graphics_static_color_write_mask() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
     let src = format!("{}{}", Root::SLANG, GFX_BODY);
-    let Some(vs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex, &[])
-    else {
-        return;
-    };
-    let Some(fs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
-    else {
-        return;
-    };
+    let vs = kiln_rhi::compiler::compile(&device, &src, "vsMain", ShaderStage::Vertex, &[])
+        .expect("compile vs");
+    let fs = kiln_rhi::compiler::compile(&device, &src, "fsMain", ShaderStage::Pixel, &[])
+        .expect("compile fs");
 
     let pso = device
         .create_graphics_pso(
@@ -250,6 +157,24 @@ fn render_draw(
     vertex_count: u32,
     instance_count: u32,
 ) -> Vec<u8> {
+    render(
+        device,
+        pso,
+        size,
+        false,
+        &[(root, vertex_count, instance_count)],
+    )
+}
+
+/// Render `draws` into a fresh `size`×`size` RGBA8 texture (cleared to opaque black) and read it
+/// back. `depth` adds a cleared D32 attachment, which the PSO must match.
+fn render(
+    device: &Device,
+    pso: &GraphicsPso,
+    size: u32,
+    depth: bool,
+    draws: &[(GpuPtr<u8>, u32, u32)],
+) -> Vec<u8> {
     let tex_desc = TextureDesc {
         width: size,
         height: size,
@@ -273,26 +198,52 @@ fn render_draw(
         .allocate((size * size * 4) as u64, MemoryType::Readback)
         .expect("readback");
 
+    let depth_buf = depth.then(|| {
+        let desc = TextureDesc {
+            width: size,
+            height: size,
+            format: Format::D32Float,
+            usage: TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+            label: Some("depth".into()),
+            ..Default::default()
+        };
+        let sa = device.texture_size_align(&desc).expect("depth size_align");
+        let mem = device
+            .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
+            .expect("depth mem");
+        let tex = device.create_texture(&desc, mem.gpu()).expect("depth tex");
+        (tex, mem)
+    });
+
     let mut cmd = device.create_command_buffer().expect("cmd");
     cmd.begin_render_pass(&RenderPassDesc {
-        color_attachments: vec![ColorAttachment {
+        color_attachments: &[ColorAttachment {
             target: texture.target(),
             load_op: LoadOp::Clear,
             store_op: StoreOp::Store,
             clear_color: [0.0, 0.0, 0.0, 1.0],
         }],
-        depth_attachment: None,
+        depth_attachment: depth_buf
+            .as_ref()
+            .map(|(tex, _)| kiln_rhi::DepthAttachment {
+                target: tex.target(),
+                load_op: LoadOp::Clear,
+                store_op: StoreOp::Store,
+                clear_depth: 1.0,
+            }),
         render_area: [0, 0, size, size],
         label: Some("graphics test"),
     });
     cmd.set_pipeline(pso);
     cmd.set_viewport(0.0, 0.0, size as f32, size as f32, 0.0, 1.0);
     cmd.set_scissor(0, 0, size, size);
-    cmd.draw(root, vertex_count, instance_count, 0, 0);
+    for &(root, vertex_count, instance_count) in draws {
+        cmd.draw(root, vertex_count, instance_count, 0, 0);
+    }
     cmd.end_render_pass();
 
     cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
-    cmd.copy_texture_to_buffer(&texture, readback.gpu());
+    cmd.copy_texture_to_buffer(&texture, readback.gpu(), None);
     cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
     cmd.end();
     let queue = device.queue();
@@ -303,22 +254,11 @@ fn render_draw(
     device.destroy(readback);
     device.destroy(texture);
     device.destroy(tex_mem);
+    if let Some((tex, mem)) = depth_buf {
+        device.destroy(tex);
+        device.destroy(mem);
+    }
     pixels
-}
-
-/// A per-test bump allocator over CPU-mapped memory — the doc's preferred source for
-/// transient per-draw arguments (root structs, configs). Caller releases it with
-/// `device.destroy(bump.into_allocation())` after the draw has completed.
-fn test_bump(device: &Device) -> BumpAllocator {
-    let buffer = device
-        .create_allocation(&AllocationDesc {
-            size: 64 * 1024,
-            memory: MemoryType::Upload,
-            label: Some("test-bump".into()),
-            ..Default::default()
-        })
-        .expect("create_buffer");
-    BumpAllocator::new(buffer)
 }
 
 // Clip-space orientation: both backends use the RHI's Y-up NDC convention.
@@ -345,28 +285,12 @@ float4 fsMain(VOut i) : SV_Target { return float4(1.0, 1.0, 1.0, 1.0); }
 
 #[test]
 fn graphics_clip_space_is_y_up() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
-    let Some(vs) = kiln_rhi::compiler::compile_or_skip(
-        &device,
-        ORIENT_BODY,
-        "vsMain",
-        ShaderStage::Vertex,
-        &[],
-    ) else {
-        return;
-    };
-    let Some(fs) = kiln_rhi::compiler::compile_or_skip(
-        &device,
-        ORIENT_BODY,
-        "fsMain",
-        ShaderStage::Pixel,
-        &[],
-    ) else {
-        return;
-    };
+    let vs = kiln_rhi::compiler::compile(&device, ORIENT_BODY, "vsMain", ShaderStage::Vertex, &[])
+        .expect("compile vs");
+    let fs = kiln_rhi::compiler::compile(&device, ORIENT_BODY, "fsMain", ShaderStage::Pixel, &[])
+        .expect("compile fs");
     let pso = make_graphics_pso(&device, &vs, &fs, "orient");
 
     const SIZE: u32 = 128;
@@ -416,20 +340,12 @@ float4 fsMain(VOut i) : SV_Target { return i.color; }
 
 #[test]
 fn graphics_interpolated_triangle() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
-    let Some(vs) =
-        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "vsMain", ShaderStage::Vertex, &[])
-    else {
-        return;
-    };
-    let Some(fs) =
-        kiln_rhi::compiler::compile_or_skip(&device, TRI_BODY, "fsMain", ShaderStage::Pixel, &[])
-    else {
-        return;
-    };
+    let vs = kiln_rhi::compiler::compile(&device, TRI_BODY, "vsMain", ShaderStage::Vertex, &[])
+        .expect("compile vs");
+    let fs = kiln_rhi::compiler::compile(&device, TRI_BODY, "fsMain", ShaderStage::Pixel, &[])
+        .expect("compile fs");
     let pso = make_graphics_pso(&device, &vs, &fs, "tri");
 
     const SIZE: u32 = 128;
@@ -529,24 +445,16 @@ float4 fsMain(VOut i) : SV_Target { return i.color; }
 
 #[test]
 fn graphics_instanced_grid() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
     let src = format!("{}{}", GridCfg::SLANG, GRID_BODY);
-    let Some(vs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex, &[])
-    else {
-        return;
-    };
-    let Some(fs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
-    else {
-        return;
-    };
+    let vs = kiln_rhi::compiler::compile(&device, &src, "vsMain", ShaderStage::Vertex, &[])
+        .expect("compile vs");
+    let fs = kiln_rhi::compiler::compile(&device, &src, "fsMain", ShaderStage::Pixel, &[])
+        .expect("compile fs");
     let pso = make_graphics_pso(&device, &vs, &fs, "grid");
 
-    let bump = test_bump(&device);
+    let bump = common::test_bump(&device);
     let cfg = bump
         .alloc(std::mem::size_of::<GridCfg>() as u64, 16)
         .expect("bump cfg");
@@ -585,21 +493,13 @@ fn graphics_instanced_grid() {
 
 #[test]
 fn graphics_root_from_bump_allocator() {
-    let Some((device, _gpu)) = common::device_or_skip() else {
-        return;
-    };
+    let (device, _gpu) = common::device();
 
     let src = format!("{}{}", Root::SLANG, GFX_BODY);
-    let Some(vs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "vsMain", ShaderStage::Vertex, &[])
-    else {
-        return;
-    };
-    let Some(fs) =
-        kiln_rhi::compiler::compile_or_skip(&device, &src, "fsMain", ShaderStage::Pixel, &[])
-    else {
-        return;
-    };
+    let vs = kiln_rhi::compiler::compile(&device, &src, "vsMain", ShaderStage::Vertex, &[])
+        .expect("compile vs");
+    let fs = kiln_rhi::compiler::compile(&device, &src, "fsMain", ShaderStage::Pixel, &[])
+        .expect("compile fs");
     let pso = make_graphics_pso(&device, &vs, &fs, "bump-root");
 
     // The root is a transient sub-allocation from one CPU-mapped buffer.
@@ -638,6 +538,105 @@ fn graphics_root_from_bump_allocator() {
             (r, g, b, a),
             (0, 0, 255, 255),
             "pixel {px} not blue: ({r},{g},{b},{a})"
+        );
+    }
+
+    device.destroy(bump.into_allocation());
+}
+
+// Depth test/write, baked into the PSO. Two full-screen triangles at fixed depths: the near one is
+// drawn first, the far one second. With depth testing on, the far draw must be rejected. This is
+// the first coverage depth has had — it was unreachable before the state moved into the PSO.
+
+const DEPTH_BODY: &str = /*slang*/
+    r#"
+struct VOut { float4 pos : SV_Position; };
+
+[shader("vertex")]
+VOut vsMain(uint vid : SV_VertexID, uniform DepthRoot* r)
+{
+    float2 p = float2(float((vid << 1) & 2), float(vid & 2));
+    VOut o;
+    o.pos = float4(p * 2.0 - 1.0, r.depth, 1.0);
+    return o;
+}
+
+[shader("fragment")]
+float4 fsMain(VOut i, uniform DepthRoot* r) : SV_Target
+{
+    return r.color;
+}
+"#;
+
+gpu_struct! {
+    pub struct DepthRoot {
+        color: [f32; 4],
+        depth: f32,
+        _pad: [f32; 3],
+    }
+}
+
+#[test]
+fn depth_test_rejects_farther_geometry() {
+    let (device, _gpu) = common::device();
+
+    let src = format!("{}{}", DepthRoot::SLANG, DEPTH_BODY);
+    let vs = kiln_rhi::compiler::compile(&device, &src, "vsMain", ShaderStage::Vertex, &[])
+        .expect("compile vs");
+    let fs = kiln_rhi::compiler::compile(&device, &src, "fsMain", ShaderStage::Pixel, &[])
+        .expect("compile fs");
+
+    let pso = device
+        .create_graphics_pso(
+            &GraphicsPsoDesc {
+                topology: Topology::TriangleList,
+                color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
+                depth_format: Some(Format::D32Float),
+                depth: kiln_rhi::DepthState::read_write(kiln_rhi::CompareOp::LessOrEqual),
+                sample_count: SampleCount::S1,
+                cull: Cull::None,
+                label: Some("depth".into()),
+                ..Default::default()
+            },
+            &vs,
+            &fs,
+        )
+        .expect("create_graphics_pso");
+
+    let bump = common::test_bump(&device);
+    let near = bump
+        .alloc(std::mem::size_of::<DepthRoot>() as u64, 16)
+        .unwrap();
+    near.cast::<DepthRoot>()
+        .write(&DepthRoot {
+            color: [0.0, 1.0, 0.0, 1.0], // green, near
+            depth: 0.25,
+            _pad: [0.0; 3],
+        })
+        .unwrap();
+    let far = bump
+        .alloc(std::mem::size_of::<DepthRoot>() as u64, 16)
+        .unwrap();
+    far.cast::<DepthRoot>()
+        .write(&DepthRoot {
+            color: [1.0, 0.0, 0.0, 1.0], // red, far — must lose
+            depth: 0.75,
+            _pad: [0.0; 3],
+        })
+        .unwrap();
+
+    let pixels = render(
+        &device,
+        &pso,
+        SIZE,
+        true,
+        &[(near.gpu(), 3, 1), (far.gpu(), 3, 1)],
+    );
+    for (i, px) in pixels.chunks_exact(4).enumerate() {
+        assert_eq!(
+            (px[0], px[1]),
+            (0, 255),
+            "pixel {i}: farther draw overwrote nearer one, depth test is not active"
         );
     }
 

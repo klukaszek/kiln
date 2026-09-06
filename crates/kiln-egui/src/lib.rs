@@ -222,18 +222,13 @@ impl EguiRenderer {
     }
 
     /// Free textures egui dropped. Drains the GPU first: destruction is immediate and the frame
-    /// just submitted may still be sampling them. `free` is empty on almost every frame.
+    /// `free` is empty on almost every frame. The RHI holds each texture until the frames that
+    /// reference it retire, so this does not stall.
     pub fn free_textures(&mut self, device: &Device, free: &[egui::TextureId]) {
-        let doomed: Vec<_> = free
-            .iter()
-            .filter_map(|id| self.textures.remove(id))
-            .collect();
-        if doomed.is_empty() {
-            return;
-        }
-        device.wait_idle();
-        for m in doomed {
-            m.destroy(device);
+        for id in free {
+            if let Some(m) = self.textures.remove(id) {
+                m.destroy(device);
+            }
         }
     }
 
@@ -290,9 +285,9 @@ impl EguiRenderer {
             "egui-root",
         )?;
 
-        let vtx = frame.vtx.as_ref().unwrap();
-        let idx = frame.idx.as_ref().unwrap();
-        let root = frame.root.as_ref().unwrap();
+        let vtx = frame.vtx.as_mut().unwrap();
+        let idx = frame.idx.as_mut().unwrap();
+        let root = frame.root.as_mut().unwrap();
         let vtx = mapped::<EguiVertex>(vtx);
         let idx = mapped::<u32>(idx);
         let root = mapped::<u8>(root);
@@ -406,8 +401,7 @@ impl EguiRenderer {
                 .is_none_or(|m| m.width as usize != pw || m.height as usize != ph);
             if recreate {
                 if let Some(old) = self.textures.remove(&id) {
-                    // An in-flight frame may still be sampling the old atlas.
-                    device.wait_idle();
+                    // In-flight frames may still be sampling the old atlas; the RHI holds it.
                     old.destroy(device);
                 }
                 let m = create_texture(device, pw as u32, ph as u32, patch.to_vec())?;
@@ -431,7 +425,7 @@ fn is_srgb(format: Format) -> bool {
 }
 
 /// CPU-mapped base pointer of a `Default` buffer (always mapped; panics otherwise — a bug).
-fn mapped<T>(buf: &Allocation) -> kiln_rhi::Mapped<'_, T> {
+fn mapped<T>(buf: &mut Allocation) -> kiln_rhi::Mapped<'_, T> {
     buf.mapped()
         .expect("egui geometry buffer must be CPU-mapped")
 }
@@ -518,17 +512,15 @@ fn create_texture(
     })
 }
 
-/// Upload a managed texture's full CPU shadow to the GPU synchronously. egui texture changes are
-/// infrequent, so a submit+wait here keeps the painter simple without stalling steady-state frames.
+/// Upload a managed texture's full CPU shadow to the GPU. The staging buffer is destroyed right
+/// after submission; the RHI holds its storage until the copy retires.
 fn upload_full(device: &Device, m: &ManagedTexture) -> RhiResult<()> {
     let staging = device.upload_slice(&m.shadow)?;
     let mut cmd = device.create_command_buffer()?;
-    cmd.copy_buffer_to_texture(staging.gpu(), &m.texture);
+    cmd.copy_buffer_to_texture(staging.gpu(), &m.texture, None);
     cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
     cmd.end();
-    let queue = device.queue();
-    queue.submit(cmd)?;
-    queue.wait_idle();
+    device.queue().submit(cmd)?;
     device.destroy(staging);
     Ok(())
 }

@@ -63,7 +63,7 @@ impl SceneAccel {
                 "changing geometry instance topology requires renderer preparation",
             ));
         }
-        let tlas = build_tlas(device, &self.blases, scene, &self.instance_buffer)?;
+        let tlas = build_tlas(device, &self.blases, scene, &mut self.instance_buffer)?;
         self.tlas = tlas;
         Ok(())
     }
@@ -161,7 +161,7 @@ fn build_into(
     partial.instance_buffer = Some(device.allocate(instance_buffer_size, MemoryType::Upload)?);
     let instance_buffer = partial
         .instance_buffer
-        .as_ref()
+        .as_mut()
         .expect("just set the instance buffer");
     let tlas = build_tlas(device, &partial.blases, scene, instance_buffer)?;
 
@@ -221,7 +221,7 @@ fn build_tlas(
     device: &Device,
     blases: &[AccelerationStructure],
     scene: &Scene,
-    instance_buffer: &Allocation,
+    instance_buffer: &mut Allocation,
 ) -> render::Result<AccelerationStructure> {
     for (index, instance) in scene.geometry.instances.iter().enumerate() {
         device.write_tlas_instance(

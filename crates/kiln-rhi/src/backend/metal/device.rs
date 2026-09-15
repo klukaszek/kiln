@@ -19,7 +19,7 @@ use raw_window_handle::RawWindowHandle;
 
 use crate::accel::{AccelInner, AccelerationStructure};
 use crate::command::CommandBuffer;
-use crate::device::{BindlessMode, DeviceDesc};
+use crate::device::DeviceDesc;
 use crate::error::{RhiError, RhiResult};
 use crate::memory::{Allocation, AllocationDesc, AllocationInner};
 use crate::pipeline::{
@@ -32,7 +32,8 @@ use crate::surface::{Surface, SurfaceDesc, SurfaceInner};
 use crate::swapchain::{AcquiredImage, Swapchain, SwapchainDesc, SwapchainInner};
 use crate::sync::{TimelineSemaphore, TimelineSemaphoreInner};
 use crate::types::{
-    BlasDesc, Cull, GpuPtr, InstanceFlags, MAX_BINDLESS_TEXTURES, MAX_FRAMES_IN_FLIGHT,
+    BlasDesc, Cull, GpuPtr, InstanceFlags, MAX_BINDLESS_SAMPLERS, MAX_BINDLESS_TEXTURES,
+    MAX_FRAMES_IN_FLIGHT,
     SampleCount, SamplerId, TextureId, TlasDesc, Topology,
 };
 
@@ -55,10 +56,10 @@ type PendingSubmissions = Rc<RefCell<VecDeque<(u64, MetalCommandBuffer)>>>;
 
 /// Fixed capacities of the bindless descriptor heaps; one `gpuResourceID` per entry.
 pub(crate) const METAL_BINDLESS_TEXTURE_CAPACITY: usize = MAX_BINDLESS_TEXTURES as usize;
-pub(crate) const METAL_BINDLESS_SAMPLER_CAPACITY: usize = 256;
+pub(crate) const METAL_BINDLESS_SAMPLER_CAPACITY: usize = MAX_BINDLESS_SAMPLERS as usize;
 /// Bindless slot tables, indexed by `TextureId`/`SamplerId`. A slot is `None` once its resource
 /// is destroyed and before the ID is handed out again.
-type TextureSlots = RefCell<Vec<Option<Retained<ProtocolObject<dyn MTLTexture>>>>>;
+type TextureSlots = RefCell<Vec<Option<super::texture::MetalTexture>>>;
 type SamplerSlots = RefCell<Vec<Option<Retained<ProtocolObject<dyn MTLSamplerState>>>>>;
 
 /// Reverse index for CPU-mapped allocations, used by the public pointer bridge.
@@ -70,7 +71,8 @@ pub(crate) struct MetalShared {
     pub(crate) device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub(crate) residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
     /// Set when the residency set gains or loses an allocation; committed at the next submit.
-    pub(crate) residency_dirty: Cell<bool>,
+    /// Shared with the buffer pool, which tracks residency once per heap.
+    pub(crate) residency_dirty: Rc<Cell<bool>>,
     /// Texture views live here alongside textures; both consume `TextureId`s.
     pub(crate) textures: TextureSlots,
     pub(crate) samplers: SamplerSlots,
@@ -89,6 +91,9 @@ pub(crate) enum MetalRetiredResource {
     Texture {
         id: TextureId,
         texture: Retained<ProtocolObject<dyn MTLTexture>>,
+        /// Views are the only textures held in the residency set individually: a placed texture
+        /// is covered by its heap, but a view is created from another texture, not from a heap.
+        is_view: bool,
     },
     Sampler {
         id: SamplerId,
@@ -138,7 +143,6 @@ pub struct MetalDevice {
     pub(crate) compiler: Retained<ProtocolObject<dyn MTL4Compiler>>,
     pub(crate) buffer_pool: SharedMetalBufferPool,
     pub(crate) rhi_queue: Queue,
-    pub(crate) texture_view_flags: RefCell<Vec<bool>>,
     pub(crate) mapped_allocations: SharedMappedAllocations,
     /// Per-frame fence values for swapchain acquisition.
     pub(crate) frame_fence_values: FrameFenceValues,
@@ -147,7 +151,6 @@ pub struct MetalDevice {
     pub(crate) frame_table_slots: SharedFrameTableSlots,
     /// Free list of table slots for non-swapchain command buffers.
     pub(crate) table_slot_pool: SharedTableSlotPool,
-    pub(crate) bindless_mode: BindlessMode,
 }
 
 pub struct MetalQueue {
@@ -196,18 +199,20 @@ impl MetalQueue {
 
     fn free_resource(&self, resource: MetalRetiredResource) {
         match &resource {
-            MetalRetiredResource::Buffer(buffer) => {
-                self.shared
-                    .residency_set
-                    .removeAllocation(as_allocation(&buffer.buffer));
-                self.shared.residency_dirty.set(true);
-            }
-            MetalRetiredResource::Texture { texture, .. } => {
+            // Covered by its heap's residency entry; nothing to remove.
+            MetalRetiredResource::Buffer(_) => {}
+            MetalRetiredResource::Texture {
+                texture,
+                is_view: true,
+                ..
+            } => {
                 self.shared
                     .residency_set
                     .removeAllocation(as_allocation(texture));
                 self.shared.residency_dirty.set(true);
             }
+            // Placed textures are covered by their heap's residency entry.
+            MetalRetiredResource::Texture { .. } => {}
             // Samplers aren't MTLAllocations, so they never entered the residency set.
             MetalRetiredResource::Sampler { sampler, .. } => {
                 let _ = sampler;
@@ -418,11 +423,18 @@ impl MetalDevice {
 
         queue.addResidencySet(&residency_set);
 
+        // Shared with the buffer pool so heap-level residency changes reach the same commit.
+        let residency_dirty = Rc::new(Cell::new(true));
+
         let frame_event = device
             .newSharedEvent()
             .ok_or_else(|| RhiError::DeviceCreation("Failed to create MTLSharedEvent".into()))?;
         let buffer_pool: SharedMetalBufferPool =
-            Rc::new(RefCell::new(MetalBufferPool::new(device.clone())));
+            Rc::new(RefCell::new(MetalBufferPool::new(
+                device.clone(),
+                residency_set.clone(),
+                residency_dirty.clone(),
+            )));
         let frame_fence_values: FrameFenceValues =
             Rc::new(RefCell::new([0u64; MAX_FRAMES_IN_FLIGHT]));
         let frame_fence_next = Rc::new(Cell::new(0u64));
@@ -436,7 +448,6 @@ impl MetalDevice {
 
         log::info!("Metal device created: {}", device.name());
 
-        let bindless_mode = BindlessMode::ArgumentTable;
 
         let create_heap = |len: usize, label: &str| {
             let heap = device
@@ -460,7 +471,7 @@ impl MetalDevice {
         let shared = Rc::new(MetalShared {
             device: device.clone(),
             residency_set,
-            residency_dirty: Cell::new(true),
+            residency_dirty,
             textures: RefCell::new(Vec::new()),
             samplers: RefCell::new(Vec::new()),
             free_texture_ids: RefCell::new(Vec::new()),
@@ -495,13 +506,11 @@ impl MetalDevice {
             compiler,
             buffer_pool,
             rhi_queue,
-            texture_view_flags: RefCell::new(Vec::new()),
             mapped_allocations: Rc::new(RefCell::new(BTreeMap::new())),
             frame_fence_values,
             frame_event,
             frame_table_slots,
             table_slot_pool: Rc::new(RefCell::new(Vec::new())),
-            bindless_mode,
         };
 
         Ok(device)
@@ -509,10 +518,6 @@ impl MetalDevice {
 
     pub fn queue(&self) -> &Queue {
         &self.rhi_queue
-    }
-
-    pub fn bindless_mode(&self) -> BindlessMode {
-        self.bindless_mode
     }
 
     pub fn wait_idle(&self) {
@@ -639,12 +644,6 @@ impl MetalDevice {
         })?;
         let metal_buffer =
             MetalBufferPool::allocate_shared(&self.buffer_pool, length, desc.memory)?;
-
-        // Track the texture for Metal 4 residency.
-        self.shared
-            .residency_set
-            .addAllocation(as_allocation(&metal_buffer.buffer));
-        self.shared.residency_dirty.set(true);
 
         if let Some(label) = &desc.label {
             use objc2_metal::MTLResource;

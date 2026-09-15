@@ -41,6 +41,28 @@ macro_rules! backend_expect {
 /// }
 /// ```
 ///
+/// # Padding
+///
+/// The struct is memcpy'd into GPU memory, so every byte has to be initialized and the layout has
+/// to match the Slang declaration exactly. That rules out compiler-inserted padding, and the
+/// derive rejects it with the exact byte count when it would occur, so declare it:
+///
+/// ```ignore
+/// gpu_struct! {
+///     pub struct DrawRoot {
+///         vertices: GpuPtr<Vertex>,   // 8 bytes
+///         count: u32,                 // 4 bytes
+///         pad: u32,                  // 4, so the struct is a multiple of its 8-byte alignment
+///     }
+/// }
+/// ```
+///
+/// Padding is written out at every construction site, like any other field. That is deliberate:
+/// the alternative is a zeroed base (`..Self::new_zeroed()`, available since `FromZeros` is
+/// derived), which also silently fills any *real* field you leave out, turning a forgotten pointer
+/// into a null address instead of a compile error. Naming the bytes keeps the layout visible and
+/// keeps the compiler checking omissions.
+///
 /// A pointer's second parameter is a shader-side annotation, not a Rust type parameter: the field
 /// is a plain [`GpuPtr<T>`](crate::GpuPtr) either way. `Read` emits Slang's read-only pointer, which
 /// lets the compiler assume nothing writes through it; the default is a read-write `T*`. Access is a
@@ -122,6 +144,20 @@ macro_rules! __gpu_struct_parse {
         }
     };
 
+    // An acceleration-structure handle. The two backends reach one differently, so the field is
+    // emitted through `KILN_ACCEL_FIELD`, which the RHI's Slang compiler defines per backend.
+    // Shader code just reads the field and gets a `RaytracingAccelerationStructure`.
+    ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
+        $field:ident : AccelHandle, $($rest:tt)*) => {
+        $crate::__gpu_struct_parse! {
+            [$($meta)*] [$vis] [$name]
+            [$($rust)* pub $field: AccelHandle,]
+            [$($out)* "    KILN_ACCEL_FIELD(", stringify!($field), ")
+",]
+            ; $($rest)*
+        }
+    };
+
     // Ordinary field with an explicit Slang spelling.
     ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
         $field:ident : $ty:tt as $slang:literal, $($rest:tt)*) => {
@@ -156,9 +192,6 @@ macro_rules! gpu_slang_ty {
         $slang
     };
 
-    (AccelHandle) => {
-        "DescriptorHandle<RaytracingAccelerationStructure>"
-    };
     (TextureHandle) => {
         "DescriptorHandle<Texture2D>"
     };

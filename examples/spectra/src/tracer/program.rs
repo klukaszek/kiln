@@ -180,59 +180,38 @@ impl Pipelines {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
+    use kiln_rhi::{Device, DeviceDesc, ShaderStage};
 
     use super::*;
 
-    /// slangc is the only thing that can tell us the assembled sources are valid.
+    /// Compiling is the only thing that can tell us the assembled sources are valid, and it has
+    /// to go through the RHI so the test exercises the same flags, capabilities and heap stride
+    /// the renderer actually ships with.
     #[test]
     fn assembled_sources_compile() {
-        check(&trace(), "traceMain", "compute", &["spvRayQueryKHR"]);
-        check(&clear(), "clearMain", "compute", &[]);
-        check(&display(), "displayVs", "vertex", &[]);
-        check(&display(), "displayFs", "fragment", &[]);
+        let device = Device::new(&DeviceDesc {
+            validation: false,
+            label: Some("spectra-shader-check".into()),
+            ..Default::default()
+        })
+        .expect("no headless GPU device available");
+
+        check(&device, &trace(), "traceMain", ShaderStage::Compute, &["spvRayQueryKHR"]);
+        check(&device, &clear(), "clearMain", ShaderStage::Compute, &[]);
+        check(&device, &display(), "displayVs", ShaderStage::Vertex, &[]);
+        check(&device, &display(), "displayFs", ShaderStage::Pixel, &[]);
     }
 
-    fn check(source: &str, entry: &str, stage: &str, capabilities: &[&str]) {
-        let stem = format!("spectra_shader_test_{}_{}", std::process::id(), entry);
-        let source_path = std::env::temp_dir().join(format!("{stem}.slang"));
-        let output_path = std::env::temp_dir().join(format!("{stem}.spv"));
-        std::fs::write(&source_path, source).expect("write shader source");
-
-        let mut command = Command::new("slangc");
-        command.args([
-            source_path
-                .to_str()
-                .expect("temporary source path is UTF-8"),
-            "-target",
-            "spirv",
-            "-entry",
-            entry,
-            "-stage",
-            stage,
-            "-O2",
-            "-fvk-use-entrypoint-name",
-            "-fvk-bind-globals",
-            "0",
-            "1",
-        ]);
-        for capability in capabilities {
-            command.args(["-capability", capability]);
+    fn check(
+        device: &Device,
+        source: &str,
+        entry: &str,
+        stage: ShaderStage,
+        capabilities: &[&str],
+    ) {
+        if let Err(error) = kiln_rhi::compiler::compile(device, source, entry, stage, capabilities)
+        {
+            panic!("compiling {entry} failed: {error}");
         }
-        command.args([
-            "-o",
-            output_path
-                .to_str()
-                .expect("temporary output path is UTF-8"),
-        ]);
-
-        let result = command.output().expect("run slangc");
-        let _ = std::fs::remove_file(&source_path);
-        let _ = std::fs::remove_file(&output_path);
-        assert!(
-            result.status.success(),
-            "slangc failed compiling {entry}: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
     }
 }

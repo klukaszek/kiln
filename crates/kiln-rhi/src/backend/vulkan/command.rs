@@ -1,6 +1,6 @@
 use super::barrier::{to_vk_access_flags, to_vk_stage_flags};
 use super::device::{
-    SharedAllocations, SharedTextures, build_accel_flags_to_vk, geometry_flags_to_vk,
+    IMAGE_LAYOUT, SharedTextures, build_accel_flags_to_vk, geometry_flags_to_vk,
 };
 use super::texture::texture_aspect;
 use crate::barrier::{HazardFlags, StageFlags};
@@ -12,12 +12,25 @@ use crate::pipeline::{ComputePso, ComputePsoInner, GraphicsPso, GraphicsPsoInner
 use crate::texture::{ResolvedRegion, Texture, bytes_per_pixel};
 use crate::types::{BlasDesc, GeometryType, GpuPtr, TextureId, TlasDesc};
 use ash::{
-    ext::{debug_utils, descriptor_buffer, mesh_shader as vk_mesh_shader},
-    khr::acceleration_structure as vk_accel_structure,
+    ext::{debug_utils, descriptor_heap, mesh_shader as vk_mesh_shader},
+    khr::{acceleration_structure as vk_accel_structure, device_address_commands},
     vk,
 };
 use smallvec::SmallVec;
 use std::rc::Rc;
+
+/// A pipeline kept alive for as long as a command buffer references it.
+///
+/// The handles are never read back; holding the `Rc` is the entire point, so that dropping the
+/// application's `GraphicsPso`/`ComputePso`/`MeshletPso` mid-recording cannot destroy a
+/// `VkPipeline` the command buffer still refers to.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) enum RetainedPipeline {
+    Graphics(Rc<super::pipeline::VulkanGraphicsPso>),
+    Compute(Rc<super::pipeline::VulkanComputePso>),
+    Meshlet(Rc<super::pipeline::VulkanMeshletPso>),
+}
 
 /// Vulkan command buffer wrapper.
 pub struct VulkanCommandBuffer {
@@ -26,19 +39,20 @@ pub struct VulkanCommandBuffer {
     pub(crate) swapchain_image_views: Rc<[vk::ImageView]>,
     pub(crate) swapchain_images: Rc<[vk::Image]>,
     pub(crate) depth_image_view: vk::ImageView,
-    pub(crate) pipeline_layout: vk::PipelineLayout,
-    pub(crate) descriptor_buffer_loader: descriptor_buffer::Device,
-    pub(crate) descriptor_buffer_binding: vk::DescriptorBufferBindingInfoEXT<'static>,
-    pub(crate) push_constant_stages: vk::ShaderStageFlags,
+    pub(crate) descriptor_heap_loader: descriptor_heap::Device,
+    pub(crate) address_commands: device_address_commands::Device,
     pub(crate) debug_labels: Option<debug_utils::Device>,
     /// Set when the open pass pushed a label region for `end_render_pass` to pop.
     pub(crate) in_labelled_pass: bool,
     pub(crate) pending_split_barrier: Option<(StageFlags, HazardFlags)>,
-    pub(crate) allocations: SharedAllocations,
     pub(crate) textures: SharedTextures,
-    pub(crate) mesh_shader: Option<vk_mesh_shader::Device>,
-    pub(crate) acceleration_structure: Option<vk_accel_structure::Device>,
+    pub(crate) mesh_shader: vk_mesh_shader::Device,
+    pub(crate) acceleration_structure: vk_accel_structure::Device,
     pub(crate) rendered_swapchain_images: SmallVec<[u32; 4]>,
+    /// Pipelines bound into this buffer. A pipeline dropped by the application while still
+    /// referenced here must not be destroyed until the submission retires, which matches Metal,
+    /// where the command buffer holds its own reference.
+    pub(crate) retained_pipelines: SmallVec<[RetainedPipeline; 4]>,
     pub(crate) ended: bool,
 }
 
@@ -60,56 +74,33 @@ impl VulkanCommandBuffer {
         Ok(())
     }
 
-    fn bind_descriptor_buffer(
-        &self,
-        bind_point: vk::PipelineBindPoint,
-        pipeline_layout: vk::PipelineLayout,
-    ) {
-        let loader = &self.descriptor_buffer_loader;
-        let binding = &self.descriptor_buffer_binding;
-        unsafe {
-            loader.cmd_bind_descriptor_buffers(self.command_buffer, std::slice::from_ref(binding));
-            loader.cmd_set_descriptor_buffer_offsets(
-                self.command_buffer,
-                bind_point,
-                pipeline_layout,
-                0,
-                &[0],
-                &[0],
-            );
-        }
+    /// An address range for an address-taking command. Nothing resolves back to a `VkBuffer`:
+    /// the address is the resource.
+    fn range(addr: GpuPtr<u8>, size: u64) -> vk::DeviceAddressRangeKHR {
+        vk::DeviceAddressRangeKHR::default()
+            .address(addr.address)
+            .size(size)
     }
 
-    fn resolve_buffer_bounds(&self, addr: GpuPtr<u8>) -> (vk::Buffer, u64, u64) {
-        let addr_u64 = addr.address;
-        let allocations = self.allocations.borrow();
-        if let Some((&base, alloc)) = allocations.range(..=addr_u64).next_back() {
-            let offset = addr_u64 - base;
-            if offset < alloc.size {
-                return (alloc.buffer, offset, alloc.size - offset);
-            }
-        }
-        panic!("GPU address {addr_u64:#x} not found in allocation registry");
+    /// Same, for the indirect-argument commands, which also carry a stride.
+    fn strided_range(
+        addr: GpuPtr<u8>,
+        size: u64,
+        stride: u64,
+    ) -> vk::StridedDeviceAddressRangeKHR {
+        vk::StridedDeviceAddressRangeKHR::default()
+            .address(addr.address)
+            .size(size)
+            .stride(stride)
     }
 
-    fn resolve_buffer(&self, addr: GpuPtr<u8>, size: u64) -> (vk::Buffer, u64) {
-        let (buffer, offset, remaining) = self.resolve_buffer_bounds(addr);
-        if size > remaining {
-            panic!(
-                "GPU address {:#x} size {} exceeds allocation bounds (remaining {})",
-                addr.address, size, remaining
-            );
-        }
-        (buffer, offset)
-    }
-
-    fn resolve_texture_info(&self, id: TextureId) -> (vk::Image, vk::ImageView, vk::ImageLayout) {
+    fn resolve_texture_info(&self, id: TextureId) -> (vk::Image, vk::ImageView) {
         let textures = self.textures.borrow();
         let tex = textures
             .get(id.0 as usize)
             .and_then(|t| t.as_ref())
             .expect("Invalid texture ID");
-        (tex.image, tex.image_view, tex.layout)
+        (tex.image, tex.image_view)
     }
 
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) {
@@ -138,23 +129,25 @@ impl VulkanCommandBuffer {
                     };
                     (
                         old,
-                        vk::PipelineStageFlags::TOP_OF_PIPE,
-                        vk::AccessFlags::empty(),
-                        vk::AccessFlags::empty(),
+                        vk::PipelineStageFlags2::NONE,
+                        vk::AccessFlags2::NONE,
+                        vk::AccessFlags2::NONE,
                     )
                 } else {
                     (
-                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                        vk::AccessFlags::COLOR_ATTACHMENT_READ,
+                        IMAGE_LAYOUT,
+                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                        vk::AccessFlags2::COLOR_ATTACHMENT_READ,
                     )
                 };
-                let barrier = vk::ImageMemoryBarrier::default()
+                let barrier = vk::ImageMemoryBarrier2::default()
                     .old_layout(old_layout)
-                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(IMAGE_LAYOUT)
+                    .src_stage_mask(src_stage)
                     .src_access_mask(src_access)
-                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE | extra_dst_access)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | extra_dst_access)
                     .image(image)
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -164,14 +157,10 @@ impl VulkanCommandBuffer {
                         layer_count: 1,
                     });
                 unsafe {
-                    self.device.cmd_pipeline_barrier(
+                    self.device.cmd_pipeline_barrier2(
                         cmd,
-                        src_stage,
-                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        &[barrier],
+                        &vk::DependencyInfo::default()
+                            .image_memory_barriers(std::slice::from_ref(&barrier)),
                     );
                 }
                 if first_pass {
@@ -184,15 +173,11 @@ impl VulkanCommandBuffer {
             .color_attachments
             .iter()
             .map(|ca| {
-                let (image_view, image_layout) = match ca.target.kind() {
-                    RenderTargetKind::SwapchainImage(idx) => (
-                        self.swapchain_image_views[idx as usize],
-                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    ),
-                    RenderTargetKind::Texture(id) => {
-                        let (_, image_view, image_layout) = self.resolve_texture_info(id);
-                        (image_view, image_layout)
+                let image_view = match ca.target.kind() {
+                    RenderTargetKind::SwapchainImage(idx) => {
+                        self.swapchain_image_views[idx as usize]
                     }
+                    RenderTargetKind::Texture(id) => self.resolve_texture_info(id).1,
                 };
 
                 let load_op = match ca.load_op {
@@ -207,7 +192,7 @@ impl VulkanCommandBuffer {
 
                 vk::RenderingAttachmentInfo::default()
                     .image_view(image_view)
-                    .image_layout(image_layout)
+                    .image_layout(IMAGE_LAYOUT)
                     .load_op(load_op)
                     .store_op(store_op)
                     .clear_value(vk::ClearValue {
@@ -219,15 +204,9 @@ impl VulkanCommandBuffer {
             .collect();
 
         let depth_attachment = desc.depth_attachment.as_ref().map(|da| {
-            let (image_view, image_layout) = match da.target.kind() {
-                RenderTargetKind::SwapchainImage(_) => (
-                    self.depth_image_view,
-                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                ),
-                RenderTargetKind::Texture(id) => {
-                    let (_, image_view, image_layout) = self.resolve_texture_info(id);
-                    (image_view, image_layout)
-                }
+            let image_view = match da.target.kind() {
+                RenderTargetKind::SwapchainImage(_) => self.depth_image_view,
+                RenderTargetKind::Texture(id) => self.resolve_texture_info(id).1,
             };
 
             let load_op = match da.load_op {
@@ -242,7 +221,7 @@ impl VulkanCommandBuffer {
 
             vk::RenderingAttachmentInfo::default()
                 .image_view(image_view)
-                .image_layout(image_layout)
+                .image_layout(IMAGE_LAYOUT)
                 .load_op(load_op)
                 .store_op(store_op)
                 .clear_value(vk::ClearValue {
@@ -294,50 +273,33 @@ impl VulkanCommandBuffer {
 
     pub fn set_graphics_pipeline(&mut self, pso: &GraphicsPso) {
         let vk_pso = backend_expect!(&pso.inner, GraphicsPsoInner::Vulkan);
-        self.bind_pipeline(
-            vk::PipelineBindPoint::GRAPHICS,
-            vk_pso.pipeline,
-            vk_pso.pipeline_layout,
-            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-        );
+        self.retained_pipelines
+            .push(RetainedPipeline::Graphics(vk_pso.clone()));
+        self.bind_pipeline(vk::PipelineBindPoint::GRAPHICS, vk_pso.pipeline);
     }
 
     pub fn set_compute_pipeline(&mut self, pso: &ComputePso) {
         let vk_pso = backend_expect!(&pso.inner, ComputePsoInner::Vulkan);
-        self.bind_pipeline(
-            vk::PipelineBindPoint::COMPUTE,
-            vk_pso.pipeline,
-            vk_pso.pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-        );
+        self.retained_pipelines
+            .push(RetainedPipeline::Compute(vk_pso.clone()));
+        self.bind_pipeline(vk::PipelineBindPoint::COMPUTE, vk_pso.pipeline);
     }
 
-    fn bind_pipeline(
-        &mut self,
-        bind_point: vk::PipelineBindPoint,
-        pipeline: vk::Pipeline,
-        pipeline_layout: vk::PipelineLayout,
-        push_constant_stages: vk::ShaderStageFlags,
-    ) {
-        self.pipeline_layout = pipeline_layout;
-        self.push_constant_stages = push_constant_stages;
+    fn bind_pipeline(&mut self, bind_point: vk::PipelineBindPoint, pipeline: vk::Pipeline) {
         unsafe {
             self.device
                 .cmd_bind_pipeline(self.command_buffer, bind_point, pipeline);
         }
-        self.bind_descriptor_buffer(bind_point, pipeline_layout);
     }
 
     pub fn set_root_data(&mut self, root: GpuPtr<u8>) {
         let bytes = root.address.to_ne_bytes();
+        let info = vk::PushDataInfoEXT::default()
+            .offset(0)
+            .data(vk::HostAddressRangeConstEXT::default().address(&bytes));
         unsafe {
-            self.device.cmd_push_constants(
-                self.command_buffer,
-                self.pipeline_layout,
-                self.push_constant_stages,
-                0,
-                &bytes,
-            );
+            self.descriptor_heap_loader
+                .cmd_push_data(self.command_buffer, &info);
         }
     }
 
@@ -360,14 +322,12 @@ impl VulkanCommandBuffer {
     }
 
     pub fn draw_indexed(&mut self, indices: GpuPtr<u8>, index_count: u32, instance_count: u32) {
-        let (index_buffer, offset) = self.resolve_buffer(indices, index_count as u64 * 4);
+        let info = vk::BindIndexBuffer3InfoKHR::default()
+            .address_range(Self::range(indices, index_count as u64 * 4))
+            .index_type(vk::IndexType::UINT32);
         unsafe {
-            self.device.cmd_bind_index_buffer(
-                self.command_buffer,
-                index_buffer,
-                offset,
-                vk::IndexType::UINT32,
-            );
+            self.address_commands
+                .cmd_bind_index_buffer3(self.command_buffer, &info);
             self.device
                 .cmd_draw_indexed(self.command_buffer, index_count, instance_count, 0, 0, 0);
         }
@@ -380,25 +340,22 @@ impl VulkanCommandBuffer {
     }
 
     pub fn dispatch_indirect(&mut self, args: GpuPtr<u8>) {
-        let (arg_buffer, arg_offset) =
-            self.resolve_buffer(args, std::mem::size_of::<DispatchIndirectArgs>() as u64);
+        let info = vk::DispatchIndirect2InfoKHR::default()
+            .address_range(Self::range(args, size_of::<DispatchIndirectArgs>() as u64));
         unsafe {
-            self.device
-                .cmd_dispatch_indirect(self.command_buffer, arg_buffer, arg_offset);
+            self.address_commands
+                .cmd_dispatch_indirect2(self.command_buffer, &info);
         }
     }
 
     pub fn draw_indirect(&mut self, args: GpuPtr<u8>) {
-        let (arg_buffer, arg_offset) =
-            self.resolve_buffer(args, std::mem::size_of::<DrawIndirectArgs>() as u64);
+        let stride = size_of::<DrawIndirectArgs>() as u64;
+        let info = vk::DrawIndirect2InfoKHR::default()
+            .address_range(Self::strided_range(args, stride, stride))
+            .draw_count(1);
         unsafe {
-            self.device.cmd_draw_indirect(
-                self.command_buffer,
-                arg_buffer,
-                arg_offset,
-                1,
-                std::mem::size_of::<DrawIndirectArgs>() as u32,
-            );
+            self.address_commands
+                .cmd_draw_indirect2(self.command_buffer, &info);
         }
     }
 
@@ -408,23 +365,18 @@ impl VulkanCommandBuffer {
         _max_index_count: u32,
         args: GpuPtr<u8>,
     ) {
-        let (arg_buffer, arg_offset) =
-            self.resolve_buffer(args, std::mem::size_of::<DrawIndexedIndirectArgs>() as u64);
-        let (index_buffer, index_offset) = self.resolve_buffer(indices, 4);
+        let stride = size_of::<DrawIndexedIndirectArgs>() as u64;
+        let index_info = vk::BindIndexBuffer3InfoKHR::default()
+            .address_range(Self::range(indices, _max_index_count.max(1) as u64 * 4))
+            .index_type(vk::IndexType::UINT32);
+        let draw_info = vk::DrawIndirect2InfoKHR::default()
+            .address_range(Self::strided_range(args, stride, stride))
+            .draw_count(1);
         unsafe {
-            self.device.cmd_bind_index_buffer(
-                self.command_buffer,
-                index_buffer,
-                index_offset,
-                vk::IndexType::UINT32,
-            );
-            self.device.cmd_draw_indexed_indirect(
-                self.command_buffer,
-                arg_buffer,
-                arg_offset,
-                1,
-                std::mem::size_of::<DrawIndexedIndirectArgs>() as u32,
-            );
+            self.address_commands
+                .cmd_bind_index_buffer3(self.command_buffer, &index_info);
+            self.address_commands
+                .cmd_draw_indexed_indirect2(self.command_buffer, &draw_info);
         }
     }
 
@@ -432,19 +384,13 @@ impl VulkanCommandBuffer {
         if size == 0 {
             return;
         }
-        let (src_buffer, src_offset) = self.resolve_buffer(src, size);
-        let (dst_buffer, dst_offset) = self.resolve_buffer(dst, size);
-        let region = vk::BufferCopy::default()
-            .src_offset(src_offset)
-            .dst_offset(dst_offset)
-            .size(size);
+        let region = vk::DeviceMemoryCopyKHR::default()
+            .src_range(Self::range(src, size))
+            .dst_range(Self::range(dst, size));
+        let info = vk::CopyDeviceMemoryInfoKHR::default().regions(std::slice::from_ref(&region));
         unsafe {
-            self.device.cmd_copy_buffer(
-                self.command_buffer,
-                src_buffer,
-                dst_buffer,
-                std::slice::from_ref(&region),
-            );
+            self.address_commands
+                .cmd_copy_memory(self.command_buffer, &info);
         }
     }
 
@@ -454,38 +400,21 @@ impl VulkanCommandBuffer {
         texture: &Texture,
         region: ResolvedRegion,
     ) {
-        let (image, aspect, layout, src_buffer, src_offset) =
+        let (image, aspect, src_range) =
             self.prepare_texture_copy(src, texture, region, "copy_buffer_to_texture");
-        self.transition_texture(
-            image,
+        let copy = build_memory_image_region(
+            src_range,
             aspect,
             region,
-            layout,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::PipelineStageFlags::TRANSFER,
-            false,
+            IMAGE_LAYOUT,
         );
-        let copy = build_buffer_image_region(src_offset, aspect, region);
+        let info = vk::CopyDeviceMemoryImageInfoKHR::default()
+            .image(image)
+            .regions(std::slice::from_ref(&copy));
         unsafe {
-            self.device.cmd_copy_buffer_to_image(
-                self.command_buffer,
-                src_buffer,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                std::slice::from_ref(&copy),
-            );
+            self.address_commands
+                .cmd_copy_memory_to_image(self.command_buffer, &info);
         }
-        self.transition_texture(
-            image,
-            aspect,
-            region,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            layout,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::PipelineStageFlags::TRANSFER,
-            true,
-        );
     }
 
     pub fn copy_texture_to_buffer(
@@ -494,38 +423,21 @@ impl VulkanCommandBuffer {
         texture: &Texture,
         region: ResolvedRegion,
     ) {
-        let (image, aspect, layout, dst_buffer, dst_offset) =
+        let (image, aspect, dst_range) =
             self.prepare_texture_copy(dst, texture, region, "copy_texture_to_buffer");
-        self.transition_texture(
-            image,
+        let copy = build_memory_image_region(
+            dst_range,
             aspect,
             region,
-            layout,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::AccessFlags::TRANSFER_READ,
-            vk::PipelineStageFlags::TRANSFER,
-            false,
+            IMAGE_LAYOUT,
         );
-        let copy = build_buffer_image_region(dst_offset, aspect, region);
+        let info = vk::CopyDeviceMemoryImageInfoKHR::default()
+            .image(image)
+            .regions(std::slice::from_ref(&copy));
         unsafe {
-            self.device.cmd_copy_image_to_buffer(
-                self.command_buffer,
-                image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                dst_buffer,
-                std::slice::from_ref(&copy),
-            );
+            self.address_commands
+                .cmd_copy_image_to_memory(self.command_buffer, &info);
         }
-        self.transition_texture(
-            image,
-            aspect,
-            region,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            layout,
-            vk::AccessFlags::TRANSFER_READ,
-            vk::PipelineStageFlags::TRANSFER,
-            true,
-        );
     }
 
     pub fn copy_texture_to_texture(
@@ -535,33 +447,13 @@ impl VulkanCommandBuffer {
         dst: &Texture,
         dst_region: ResolvedRegion,
     ) {
-        let (src_image, src_view_layout, src_aspect) = {
-            let (image, _, layout) = self.resolve_texture_info(src.id());
-            (image, layout, texture_aspect(src.desc().format))
-        };
-        let (dst_image, dst_view_layout, dst_aspect) = {
-            let (image, _, layout) = self.resolve_texture_info(dst.id());
-            (image, layout, texture_aspect(dst.desc().format))
-        };
-        self.transition_texture(
-            src_image,
-            src_aspect,
-            src_region,
-            src_view_layout,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::AccessFlags::TRANSFER_READ,
-            vk::PipelineStageFlags::TRANSFER,
-            false,
+        let (src_image, src_aspect) = (
+            self.resolve_texture_info(src.id()).0,
+            texture_aspect(src.desc().format),
         );
-        self.transition_texture(
-            dst_image,
-            dst_aspect,
-            dst_region,
-            dst_view_layout,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::PipelineStageFlags::TRANSFER,
-            false,
+        let (dst_image, dst_aspect) = (
+            self.resolve_texture_info(dst.id()).0,
+            texture_aspect(dst.desc().format),
         );
         let copy = vk::ImageCopy::default()
             .src_subresource(subresource_layers(src_aspect, src_region))
@@ -573,36 +465,16 @@ impl VulkanCommandBuffer {
             self.device.cmd_copy_image(
                 self.command_buffer,
                 src_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                IMAGE_LAYOUT,
                 dst_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                IMAGE_LAYOUT,
                 std::slice::from_ref(&copy),
             );
         }
-        self.transition_texture(
-            src_image,
-            src_aspect,
-            src_region,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            src_view_layout,
-            vk::AccessFlags::TRANSFER_READ,
-            vk::PipelineStageFlags::TRANSFER,
-            true,
-        );
-        self.transition_texture(
-            dst_image,
-            dst_aspect,
-            dst_region,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            dst_view_layout,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::PipelineStageFlags::TRANSFER,
-            true,
-        );
     }
 
-    /// Resolve the texture and linear buffer, and return
-    /// `(image, aspect, w, h, current layout, buffer, offset)` for a copy command.
+    /// Resolve the texture and the linear memory backing the copy, returning
+    /// `(image, aspect, current layout, address range)`.
     fn prepare_texture_copy(
         &self,
         buffer_gpu: GpuPtr<u8>,
@@ -612,78 +484,18 @@ impl VulkanCommandBuffer {
     ) -> (
         vk::Image,
         vk::ImageAspectFlags,
-        vk::ImageLayout,
-        vk::Buffer,
-        u64,
+        vk::DeviceAddressRangeKHR,
     ) {
-        let (image, _view, layout) = self.resolve_texture_info(texture.id());
+        let image = self.resolve_texture_info(texture.id()).0;
         let bpp = bytes_per_pixel(texture.desc().format)
             .unwrap_or_else(|| panic!("Unsupported texture format for {op}"));
         let (_, bytes_per_image) = region.linear_strides(bpp);
         let size = (bytes_per_image as u64) * (region.extent[2] as u64);
-        let (buffer, offset) = self.resolve_buffer(buffer_gpu, size);
         (
             image,
             texture_aspect(texture.desc().format),
-            layout,
-            buffer,
-            offset,
+            Self::range(buffer_gpu, size),
         )
-    }
-
-    /// Transition just the mip and layer a copy touches. `reverse=true` swaps pipeline stages
-    /// and access masks so the same call can wrap a copy on both sides.
-    #[allow(clippy::too_many_arguments)]
-    fn transition_texture(
-        &self,
-        image: vk::Image,
-        aspect: vk::ImageAspectFlags,
-        region: ResolvedRegion,
-        old_layout: vk::ImageLayout,
-        new_layout: vk::ImageLayout,
-        transfer_access: vk::AccessFlags,
-        transfer_stage: vk::PipelineStageFlags,
-        reverse: bool,
-    ) {
-        let (src_stage, dst_stage, src_access, dst_access) = if reverse {
-            (
-                transfer_stage,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                transfer_access,
-                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-            )
-        } else {
-            (
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                transfer_stage,
-                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-                transfer_access,
-            )
-        };
-        let barrier = vk::ImageMemoryBarrier::default()
-            .old_layout(old_layout)
-            .new_layout(new_layout)
-            .src_access_mask(src_access)
-            .dst_access_mask(dst_access)
-            .image(image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: aspect,
-                base_mip_level: region.mip,
-                level_count: 1,
-                base_array_layer: region.layer,
-                layer_count: 1,
-            });
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                self.command_buffer,
-                src_stage,
-                dst_stage,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-        }
     }
 
     /// The no-hazard case: `to_vk_access_flags(empty)` is `NONE` and the descriptor-buffer path
@@ -693,8 +505,8 @@ impl VulkanCommandBuffer {
     }
 
     pub fn barrier_with_hazard(&mut self, src: StageFlags, dst: StageFlags, hazard: HazardFlags) {
-        let use_descriptor_buffer_hazard = hazard.contains(HazardFlags::DESCRIPTORS);
-        let hazard_for_access = if use_descriptor_buffer_hazard {
+        let use_descriptor_heap_hazard = hazard.contains(HazardFlags::DESCRIPTORS);
+        let hazard_for_access = if use_descriptor_heap_hazard {
             hazard & !HazardFlags::DESCRIPTORS
         } else {
             hazard
@@ -710,15 +522,16 @@ impl VulkanCommandBuffer {
             | vk::AccessFlags2::MEMORY_WRITE
             | to_vk_access_flags(hazard_for_access, false);
 
-        if use_descriptor_buffer_hazard {
-            // Descriptor-buffer reads are not covered by MEMORY_READ.
+        if use_descriptor_heap_hazard {
+            // Descriptor heap reads are not covered by MEMORY_READ.
             src_stage |= vk::PipelineStageFlags2::VERTEX_SHADER
                 | vk::PipelineStageFlags2::FRAGMENT_SHADER
                 | vk::PipelineStageFlags2::COMPUTE_SHADER;
             dst_stage |= vk::PipelineStageFlags2::VERTEX_SHADER
                 | vk::PipelineStageFlags2::FRAGMENT_SHADER
                 | vk::PipelineStageFlags2::COMPUTE_SHADER;
-            dst_access |= vk::AccessFlags2::DESCRIPTOR_BUFFER_READ_EXT;
+            dst_access |= vk::AccessFlags2::RESOURCE_HEAP_READ_EXT
+                | vk::AccessFlags2::SAMPLER_HEAP_READ_EXT;
         }
 
         let memory_barrier = vk::MemoryBarrier2::default()
@@ -811,11 +624,13 @@ impl VulkanCommandBuffer {
     /// Metal transitions on present, so this stays out of the public API.
     fn transition_to_present(&mut self, swapchain_image_index: u32) {
         let image = self.swapchain_images[swapchain_image_index as usize];
-        let barrier = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        let barrier = vk::ImageMemoryBarrier2::default()
+            .old_layout(IMAGE_LAYOUT)
             .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::empty())
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+            .dst_access_mask(vk::AccessFlags2::NONE)
             .image(image)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -825,53 +640,42 @@ impl VulkanCommandBuffer {
                 layer_count: 1,
             });
         unsafe {
-            self.device.cmd_pipeline_barrier(
+            self.device.cmd_pipeline_barrier2(
                 self.command_buffer,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
+                &vk::DependencyInfo::default()
+                    .image_memory_barriers(std::slice::from_ref(&barrier)),
             );
         }
     }
 
     pub fn set_meshlet_pipeline(&mut self, pso: &MeshletPso) {
         let vk_pso = backend_expect!(&pso.inner, crate::pipeline::MeshletPsoInner::Vulkan);
-        self.bind_pipeline(
-            vk::PipelineBindPoint::GRAPHICS,
-            vk_pso.pipeline,
-            vk_pso.pipeline_layout,
-            vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::FRAGMENT,
-        );
+        self.retained_pipelines
+            .push(RetainedPipeline::Meshlet(vk_pso.clone()));
+        self.bind_pipeline(vk::PipelineBindPoint::GRAPHICS, vk_pso.pipeline);
     }
 
     pub fn draw_meshlets(&mut self, x: u32, y: u32, z: u32) {
-        let Some(loader) = self.mesh_shader.as_ref() else {
-            return;
-        };
         unsafe {
-            loader.cmd_draw_mesh_tasks(self.command_buffer, x, y, z);
+            self.mesh_shader
+                .cmd_draw_mesh_tasks(self.command_buffer, x, y, z);
         }
     }
 
     /// `args` points to one `VkDrawMeshTasksIndirectCommandEXT` (x, y, z: u32 = 12 bytes).
     pub fn draw_meshlets_indirect(&mut self, args: GpuPtr<u8>) {
-        let Some(loader) = self.mesh_shader.as_ref() else {
-            return;
-        };
-        let stride = 12u32;
-        let (buffer, offset) = self.resolve_buffer(args, stride as u64);
+        let stride = 12u64;
+        let info = vk::DrawIndirect2InfoKHR::default()
+            .address_range(Self::strided_range(args, stride, stride))
+            .draw_count(1);
         unsafe {
-            loader.cmd_draw_mesh_tasks_indirect(self.command_buffer, buffer, offset, 1, stride);
+            self.address_commands
+                .cmd_draw_mesh_tasks_indirect2(self.command_buffer, &info);
         }
     }
 
     pub fn build_blas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &BlasDesc) {
-        let Some((accel_loader, vk_as, scratch_address)) = self.resolve_accel(accel) else {
-            return;
-        };
+        let (accel_loader, vk_as, scratch_address) = self.resolve_accel(accel);
 
         let geometries: Vec<vk::AccelerationStructureGeometryKHR> = desc
             .meshes
@@ -946,8 +750,9 @@ impl VulkanCommandBuffer {
                 transform_offset: 0,
             })
             .collect();
-        let range_infos_ref: &[vk::AccelerationStructureBuildRangeInfoKHR] = &range_infos;
-        let build_range_infos: &[&[vk::AccelerationStructureBuildRangeInfoKHR]] =
+        let range_infos_ref: Option<&[vk::AccelerationStructureBuildRangeInfoKHR]> =
+            Some(&range_infos);
+        let build_range_infos: &[Option<&[vk::AccelerationStructureBuildRangeInfoKHR]>] =
             std::slice::from_ref(&range_infos_ref);
 
         unsafe {
@@ -960,9 +765,7 @@ impl VulkanCommandBuffer {
     }
 
     pub fn build_tlas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &TlasDesc) {
-        let Some((accel_loader, vk_as, scratch_address)) = self.resolve_accel(accel) else {
-            return;
-        };
+        let (accel_loader, vk_as, scratch_address) = self.resolve_accel(accel);
 
         let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::default()
             .array_of_pointers(false)
@@ -992,7 +795,8 @@ impl VulkanCommandBuffer {
             first_vertex: 0,
             transform_offset: 0,
         }];
-        let build_range_infos: &[&[vk::AccelerationStructureBuildRangeInfoKHR]] = &[&range_info];
+        let build_range_infos: &[Option<&[vk::AccelerationStructureBuildRangeInfoKHR]>] =
+            &[Some(&range_info)];
 
         unsafe {
             accel_loader.cmd_build_acceleration_structures(
@@ -1006,35 +810,34 @@ impl VulkanCommandBuffer {
     fn resolve_accel(
         &self,
         accel: &crate::accel::AccelerationStructure,
-    ) -> Option<(
+    ) -> (
         vk_accel_structure::Device,
         vk::AccelerationStructureKHR,
         u64,
-    )> {
-        let loader = self.acceleration_structure.as_ref()?;
-        match &accel.inner {
-            #[cfg(feature = "vulkan")]
-            crate::accel::AccelInner::Vulkan(a) => {
-                Some((loader.clone(), a.acceleration_structure, a.scratch_address))
-            }
-            #[allow(unreachable_patterns)]
-            _ => None,
-        }
+    ) {
+        let a = backend_expect!(&accel.inner, crate::accel::AccelInner::Vulkan);
+        (
+            self.acceleration_structure.clone(),
+            a.acceleration_structure,
+            a.scratch_address,
+        )
     }
 }
 
-fn build_buffer_image_region(
-    buffer_offset: u64,
+fn build_memory_image_region(
+    address_range: vk::DeviceAddressRangeKHR,
     aspect: vk::ImageAspectFlags,
     region: ResolvedRegion,
-) -> vk::BufferImageCopy {
+    image_layout: vk::ImageLayout,
+) -> vk::DeviceMemoryImageCopyKHR<'static> {
     // Zero row/image length means "tightly packed to the copy extent", which is the layout
     // `ResolvedRegion::linear_strides` reports to the caller.
-    vk::BufferImageCopy::default()
-        .buffer_offset(buffer_offset)
-        .buffer_row_length(0)
-        .buffer_image_height(0)
+    vk::DeviceMemoryImageCopyKHR::default()
+        .address_range(address_range)
+        .address_row_length(0)
+        .address_image_height(0)
         .image_subresource(subresource_layers(aspect, region))
+        .image_layout(image_layout)
         .image_offset(to_vk_offset(region.origin))
         .image_extent(to_vk_extent(region.extent))
 }

@@ -14,12 +14,12 @@ gpu_struct! {
         roughness: f32,
         metallic: f32,
         ior: f32,
-        _pad: f32,
+        pad: f32,
         // Texture-binding index, or NO_MAP. Scalar maps pack their channel into the high byte.
         base_color_map: u32,
         roughness_map: u32,
         metallic_map: u32,
-        _pad2: u32,
+        pad2: u32,
     }
 }
 
@@ -64,9 +64,9 @@ gpu_struct! {
 gpu_struct! {
     pub(crate) struct GpuInstance {
         triangle_base: u32,
-        _pad: u32,
-        _pad2: u32,
-        _pad3: u32,
+        pad: u32,
+        pad2: u32,
+        pad3: u32,
         // Columns of the inverse-transpose normal matrix.
         normal_x: Vec4,
         normal_y: Vec4,

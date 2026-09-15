@@ -21,19 +21,10 @@ use std::rc::Rc;
 /// Which GPU backend to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
-    /// Vulkan 1.3+.
+    /// Vulkan 1.4, with the descriptor-heap and device-address command extensions.
     Vulkan,
     /// Metal 4 (Apple platforms only).
     Metal,
-}
-
-/// Bindless implementation mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BindlessMode {
-    /// GPU-addressable descriptor heap (Vulkan descriptor buffer extension).
-    DescriptorBuffer,
-    /// Metal 4 argument tables (`MTL4ArgumentTable`).
-    ArgumentTable,
 }
 
 impl std::fmt::Display for Backend {
@@ -207,11 +198,6 @@ impl Device {
             #[cfg(feature = "metal")]
             DeviceInner::Metal(_) => Backend::Metal,
         }
-    }
-
-    /// Determined by the backend.
-    pub fn bindless_mode(&self) -> BindlessMode {
-        backend_dispatch!(self.inner.as_ref(), DeviceInner, d => d.bindless_mode())
     }
 
     pub fn create_surface(&self, desc: &SurfaceDesc) -> RhiResult<Surface> {

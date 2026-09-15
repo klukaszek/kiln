@@ -162,6 +162,7 @@ impl MetalCommandBuffer {
             .get(id.0 as usize)
             .and_then(|t| t.as_ref())
             .expect("Invalid texture ID")
+            .texture
             .clone()
     }
 

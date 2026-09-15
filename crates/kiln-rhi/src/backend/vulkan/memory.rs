@@ -1,17 +1,41 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::backend::suballoc::FreeRanges;
+use crate::backend::suballoc::{BLOCK_SIZE, FreeRanges};
 use crate::error::{RhiError, RhiResult};
 use crate::types::GpuPtr;
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 
-/// Matches the Metal pool's block size, so both backends fragment the same way.
-const MEMORY_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
+/// The one buffer spanning each block declares every use an allocation carved from it might be
+/// put to.
+///
+/// Deliberately narrow. Shaders reach buffer data through device addresses, not storage-buffer
+/// descriptors, and vertices are pulled through pointers rather than bound, so neither
+/// `STORAGE_BUFFER` nor `VERTEX_BUFFER` belongs here. Keeping `STORAGE_BUFFER` off also keeps
+/// the address-taking commands free of `VkAddressCommandFlagsKHR` usage bits, which only exist to
+/// name buffer usages that overlap a range.
+pub(crate) const BLOCK_BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw()
+        | vk::BufferUsageFlags::INDEX_BUFFER.as_raw()
+        | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_DST.as_raw()
+        | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR.as_raw()
+        | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR.as_raw(),
+);
 
-/// Vulkan buffer with buffer_device_address support.
+/// Acceleration-structure build scratch is the one thing the spec insists come from a buffer
+/// created with `STORAGE_BUFFER`. It gets its own blocks so that bit never lands on ordinary
+/// allocations, which would in turn force every address-taking command to declare it.
+pub(crate) const SCRATCH_BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    BLOCK_BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::STORAGE_BUFFER.as_raw(),
+);
+
+/// A suballocation of a pooled block. Under `VK_KHR_device_address_commands` nothing takes a
+/// `VkBuffer`, so an allocation is just an address, an optional CPU pointer, and the block range
+/// to hand back. `memory` is retained only because images still bind to `VkDeviceMemory`.
 pub struct VulkanBuffer {
-    pub(crate) buffer: vk::Buffer,
     pub(crate) memory: vk::DeviceMemory,
     pub(crate) size: u64,
     pub(crate) mapped_ptr: Option<*mut u8>,
@@ -35,6 +59,13 @@ impl VulkanBuffer {
 /// One `VkDeviceMemory` allocation, subdivided between many buffers.
 struct MemoryBlock {
     memory: vk::DeviceMemory,
+    /// Blocks are keyed by usage as well as memory type: one buffer spans the block, so every
+    /// allocation inside it inherits exactly these usage flags.
+    usage: vk::BufferUsageFlags,
+    /// One buffer spans the whole block, purely to give the block a device address. Every
+    /// allocation inside it is `base_address + offset`.
+    buffer: vk::Buffer,
+    base_address: u64,
     memory_type_index: u32,
     /// Vulkan permits one mapping per `VkDeviceMemory`, so the block owns it and buffers point
     /// into it.
@@ -49,6 +80,8 @@ pub(crate) struct BlockSuballocation {
     pub(crate) offset: u64,
     pub(crate) range: u64,
     pub(crate) mapped_ptr: Option<*mut u8>,
+    /// Device address of this suballocation: the block's base plus `offset`.
+    pub(crate) address: u64,
 }
 
 /// Block allocator for buffer memory. `maxMemoryAllocationCount` (commonly 4096) makes one
@@ -77,6 +110,7 @@ impl VulkanBufferPool {
         requirements: &vk::MemoryRequirements,
         memory_type_index: u32,
         host_visible: bool,
+        usage: vk::BufferUsageFlags,
     ) -> RhiResult<BlockSuballocation> {
         let (align, range) = granularity_padded(
             requirements.alignment,
@@ -91,7 +125,7 @@ impl VulkanBufferPool {
             .enumerate()
             .find_map(|(index, slot)| {
                 let block = slot.as_mut()?;
-                (block.memory_type_index == memory_type_index)
+                (block.memory_type_index == memory_type_index && block.usage == usage)
                     .then(|| block.free_ranges.allocate(range, align))
                     .flatten()
                     .map(|offset| (index, offset))
@@ -100,7 +134,7 @@ impl VulkanBufferPool {
             Some(found) => found,
             None => {
                 let block_index =
-                    self.create_block(device, range, memory_type_index, host_visible)?;
+                    self.create_block(device, range, memory_type_index, host_visible, usage)?;
                 let offset = self.blocks[block_index]
                     .as_mut()
                     .expect("freshly created block")
@@ -125,6 +159,7 @@ impl VulkanBufferPool {
             offset,
             range,
             mapped_ptr,
+            address: block.base_address + offset,
         })
     }
 
@@ -134,25 +169,50 @@ impl VulkanBufferPool {
         required_size: u64,
         memory_type_index: u32,
         host_visible: bool,
+        usage: vk::BufferUsageFlags,
     ) -> RhiResult<usize> {
-        let size = required_size.max(MEMORY_BLOCK_SIZE);
+        let size = required_size.max(BLOCK_SIZE);
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe {
+            device
+                .create_buffer(&buffer_info, None)
+                .map_err(|e| RhiError::AllocationFailed(e.to_string()))?
+        };
         let mut alloc_flags_info =
             vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(size)
             .memory_type_index(memory_type_index)
-            .push_next(&mut alloc_flags_info);
-        let memory = unsafe {
-            device
-                .allocate_memory(&alloc_info, None)
-                .map_err(|e| RhiError::AllocationFailed(e.to_string()))?
+            .push(&mut alloc_flags_info);
+        let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { device.destroy_buffer(buffer, None) };
+                return Err(RhiError::AllocationFailed(error.to_string()));
+            }
+        };
+        if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+            return Err(RhiError::AllocationFailed(error.to_string()));
+        }
+        let base_address = unsafe {
+            device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
         };
 
         let mapped_ptr = if host_visible {
             match unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) } {
                 Ok(ptr) => Some(ptr as *mut u8),
                 Err(error) => {
-                    unsafe { device.free_memory(memory, None) };
+                    unsafe {
+                        device.destroy_buffer(buffer, None);
+                        device.free_memory(memory, None);
+                    }
                     return Err(RhiError::AllocationFailed(error.to_string()));
                 }
             }
@@ -162,6 +222,9 @@ impl VulkanBufferPool {
 
         let block = MemoryBlock {
             memory,
+            usage,
+            buffer,
+            base_address,
             memory_type_index,
             mapped_ptr,
             free_ranges: FreeRanges::full(size),
@@ -179,14 +242,15 @@ impl VulkanBufferPool {
     }
 
     /// Return a range to its block. Never frees the block — see [`Self::trim`]. This runs on the
-    /// per-frame retire path, and any request over `MEMORY_BLOCK_SIZE` gets a dedicated block, so
+    /// per-frame retire path, and any request over `BLOCK_SIZE` gets a dedicated block, so
     /// freeing here would put a `vkAllocateMemory` on the critical path per large transient.
     pub(crate) fn release(&mut self, block_index: usize, offset: u64, range: u64) {
-        let Some(block) = self.blocks.get_mut(block_index).and_then(Option::as_mut) else {
-            debug_assert!(false, "Vulkan memory block disappeared");
-            return;
-        };
-        block.free_ranges.release(offset, range);
+        // `trim` only reclaims empty blocks, so a block still holding this range is present.
+        self.blocks[block_index]
+            .as_mut()
+            .expect("memory block outlives its suballocations")
+            .free_ranges
+            .release(offset, range);
     }
 
     /// Free empty blocks, keeping one per memory type so usage oscillating around a block boundary
@@ -221,6 +285,7 @@ impl VulkanBufferPool {
             if block.mapped_ptr.is_some() {
                 device.unmap_memory(block.memory);
             }
+            device.destroy_buffer(block.buffer, None);
             device.free_memory(block.memory, None);
         }
     }
@@ -236,31 +301,6 @@ fn granularity_padded(alignment: u64, size: u64, granularity: u64) -> Option<(u6
     Some((align, range))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::granularity_padded;
-
-    #[test]
-    fn granularity_of_one_costs_nothing() {
-        assert_eq!(granularity_padded(256, 1000, 1), Some((256, 1000)));
-    }
-
-    #[test]
-    fn allocations_are_widened_to_whole_granularity_pages() {
-        assert_eq!(granularity_padded(256, 1000, 4096), Some((4096, 4096)));
-        assert_eq!(granularity_padded(256, 4097, 4096), Some((4096, 8192)));
-    }
-
-    #[test]
-    fn a_stricter_resource_alignment_still_wins() {
-        assert_eq!(granularity_padded(65536, 1000, 4096), Some((65536, 4096)));
-    }
-
-    #[test]
-    fn overflowing_padding_is_rejected_rather_than_wrapping() {
-        assert_eq!(granularity_padded(1, u64::MAX, 4096), None);
-    }
-}
 
 /// Create a buffer, back it with memory of `properties`, bind it, and return its device address.
 /// The `DEVICE_ADDRESS` allocate flag is required for any buffer whose address is taken and is
@@ -293,7 +333,7 @@ pub(crate) fn allocate_bound_buffer(
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(reqs.size)
             .memory_type_index(memory_type)
-            .push_next(&mut flags);
+            .push(&mut flags);
         let memory = device
             .allocate_memory(&alloc_info, None)
             .map_err(|e| RhiError::AllocationFailed(format!("{what}: {e}")))?;
@@ -303,5 +343,31 @@ pub(crate) fn allocate_bound_buffer(
         let address = device
             .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer));
         Ok((buffer, memory, address))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::granularity_padded;
+
+    #[test]
+    fn granularity_of_one_costs_nothing() {
+        assert_eq!(granularity_padded(256, 1000, 1), Some((256, 1000)));
+    }
+
+    #[test]
+    fn allocations_are_widened_to_whole_granularity_pages() {
+        assert_eq!(granularity_padded(256, 1000, 4096), Some((4096, 4096)));
+        assert_eq!(granularity_padded(256, 4097, 4096), Some((4096, 8192)));
+    }
+
+    #[test]
+    fn a_stricter_resource_alignment_still_wins() {
+        assert_eq!(granularity_padded(65536, 1000, 4096), Some((65536, 4096)));
+    }
+
+    #[test]
+    fn overflowing_padding_is_rejected_rather_than_wrapping() {
+        assert_eq!(granularity_padded(1, u64::MAX, 4096), None);
     }
 }

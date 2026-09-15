@@ -6,6 +6,10 @@
 
 use std::collections::BTreeMap;
 
+/// Size of one backing block, shared by both backends so they fragment identically. A block is an
+/// `MTLHeap` on Metal and a `VkDeviceMemory` plus its spanning buffer on Vulkan.
+pub(crate) const BLOCK_SIZE: u64 = 4 * 1024 * 1024;
+
 /// Address-ordered free ranges within one block. Allocation is first-fit; freeing merges adjacent
 /// ranges so long-lived resource churn does not permanently fragment a block.
 #[derive(Default, Debug)]

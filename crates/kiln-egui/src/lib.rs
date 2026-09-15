@@ -47,7 +47,7 @@ gpu_struct! {
         verts: GpuPtr<EguiVertex>,
         screen_size: [f32; 2],
         flags: u32,
-        _pad: u32,
+        pad: u32,
         tex: TextureHandle,
         smp: SamplerHandle,
     }
@@ -339,7 +339,7 @@ impl EguiRenderer {
                 verts: verts.gpu(),
                 screen_size,
                 flags,
-                _pad: 0,
+                pad: 0,
                 tex: managed.handle,
                 smp: self.sampler_handle,
             })?;

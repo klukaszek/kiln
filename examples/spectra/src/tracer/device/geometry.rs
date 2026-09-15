@@ -95,9 +95,9 @@ fn build_gpu_instance(layout: InstanceLayout, transform: glam::DMat4) -> GpuInst
     let normal = transform.inverse().transpose();
     GpuInstance {
         triangle_base: layout.triangle_start as u32,
-        _pad: 0,
-        _pad2: 0,
-        _pad3: 0,
+        pad: 0,
+        pad2: 0,
+        pad3: 0,
         normal_x: normal.x_axis.truncate().as_vec3().extend(0.0),
         normal_y: normal.y_axis.truncate().as_vec3().extend(0.0),
         normal_z_determinant: normal

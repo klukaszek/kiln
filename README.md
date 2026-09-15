@@ -4,14 +4,14 @@ Kiln is a Rust render hardware interface for Vulkan and Metal that skips the des
 You write a struct, upload it, and hand its GPU address to the draw call:
 
 ```rust
-cmd.set_graphics_pipeline(&pipeline);
+cmd.set_pipeline(&pipeline);
 cmd.draw(root.gpu(), vertex_count, 1, 0, 0);
 ```
 
 That struct is the root. It carries every address and handle the shader needs. No bind groups, no
 descriptor set layouts, no per-resource state tracking in the application.
 
-Both APIs have supported this for years: buffer device address on Vulkan, argument buffers on
+Both APIs have supported this for years: buffer device address on Vulkan, argument tables on
 Metal. Most portable RHIs still put bind groups on top anyway, because that's the common
 denominator across everything they target. Kiln only targets two, and both are modern, so I wanted
 to see what the interface looks like if you just assume addresses from the start.
@@ -30,18 +30,45 @@ This is a personal research project. Expect the API to move.
 | `triangle-graphics` | Smallest windowed graphics pipeline. |
 | `triangle-mesh` | Same, through a mesh shader. |
 | `egui-demo` | egui overlay. |
-| `spectra` | USD importer with progressive spectral path tracing and a raster fallback. |
+| `spectra` | USD importer with progressive spectral path tracing. |
+
+## Requirements
+
+Kiln targets two modern backends and nothing else. There is no fallback path and no capability
+branching, by design, so the floor is high and stated exactly:
+
+| | Vulkan | Metal |
+| --- | --- | --- |
+| **GPU** | NVIDIA Turing or newer (GeForce RTX 20-series and up), or any GPU whose driver exposes the extensions below | Apple silicon, M1 or newer |
+| **OS** | Windows or Linux with a current driver | macOS 26.0 or newer |
+| **API** | Vulkan 1.4 | Metal 4 |
+
+The Vulkan backend additionally requires these device extensions. A GPU missing any of them is
+skipped during adapter selection, so the failure surfaces as `RhiError::NoSuitableGpu` rather than
+as a later crash:
+
+| Extension | Why |
+| --- | --- |
+| `VK_EXT_descriptor_heap` | app-owned heaps, layout-free pipelines, `vkCmdPushDataEXT` |
+| `VK_KHR_device_address_commands` | every command takes an address range |
+| `VK_KHR_shader_untyped_pointers` | the descriptor-heap SPIR-V path needs it |
+| `VK_KHR_unified_image_layouts` | every image stays in `GENERAL`, so nothing tracks layouts |
+| `VK_EXT_mesh_shader` | mesh pipelines |
+| `VK_KHR_acceleration_structure`, `VK_KHR_ray_query`, `VK_KHR_ray_tracing_maintenance1`, `VK_KHR_deferred_host_operations` | BLAS/TLAS and inline ray queries |
+
+These are recent extensions, so a current driver matters as much as the hardware.
+`vulkaninfo | grep descriptor_heap` is the quickest way to check a Vulkan machine.
 
 ## Quick start
 
-You need Rust with the 2024 edition, `slangc` on `PATH`, and either a Vulkan 1.3 driver or an Apple
-platform with Metal 4.
+You need Rust with the 2024 edition, and `slangc` new enough to lower `DescriptorHandle<T>` onto
+`SPV_EXT_descriptor_heap` (2026.14.1 or later) on `PATH`.
 
-Metal is the default feature. Vulkan is opt-in:
+Pick a backend explicitly:
 
 ```bash
-cargo build
 cargo build --no-default-features --features vulkan
+cargo build --no-default-features --features metal
 ```
 
 Then run something:
@@ -53,9 +80,8 @@ cargo run -p egui-demo
 cargo run -p spectra
 ```
 
-Spectra is the interesting one. It opens the bundled Cornell box and path traces it progressively,
-falling back to raster if the spectral backend won't initialize. Camera is `WASD` plus left-drag to
-look. It also renders headless to a PNG:
+Spectra is the interesting one. It opens the bundled Cornell box and path traces it progressively.
+Camera is `WASD` plus left-drag to look. It also renders headless to a PNG:
 
 ```bash
 cargo run --release -p spectra -- --scene cornell-box --spp 64 --headless 1024x1024
@@ -80,35 +106,69 @@ Structs must be padding-free, hence the explicit tail padding:
 ```rust
 gpu_struct! {
     pub struct DrawRoot {
-        vertices: GpuAddress as "Vertex*",
+        vertices: GpuPtr<Vertex>,
         count: u32,
-        _pad: u32,
+        pad: u32,
     }
 }
 ```
 
-Per-frame roots come from a mapped `BumpAllocator` instead of individual allocations. Allocating is
-a pointer bump, and the whole arena gets reclaimed at once:
+That emits the Rust type and `DrawRoot::SLANG`:
+
+```slang
+struct DrawRoot {
+    Vertex* vertices;
+    uint count;
+    uint pad;
+};
+```
+
+A root is just an upload-visible allocation, so the direct path is the whole story:
 
 ```rust
-let buffer = device.create_buffer(&BufferDesc {
-    size: 64 * 1024,
-    memory: MemoryType::Default,
-    label: Some("frame-roots".into()),
+let mut root = device.create_allocation(&AllocationDesc {
+    size: size_of::<DrawRoot>() as u64,
+    memory: MemoryType::Upload,
+    label: Some("draw-root".into()),
+    ..Default::default()
 })?;
-let mut frame_arena = BumpAllocator::new(buffer);
+root.upload(&DrawRoot {
+    vertices: vertex_buffer.gpu().cast(),
+    count: vertex_count,
+    pad: 0,
+})?;
+
+cmd.draw(root.gpu(), vertex_count, 1, 0, 0);
+```
+
+Padding is written out like any other field. A zeroed base would spare the keystrokes and also
+silently fill any real field you left out, so the bytes are named instead and the compiler keeps
+checking omissions.
+
+An allocation per root is fine for anything long-lived. For per-frame roots a mapped
+`BumpAllocator` amortises it. Allocating counts as a pointer bump, and the whole arena is reclaimed at
+once:
+
+```rust
+let mut frame_arena = BumpAllocator::new(device.create_allocation(&AllocationDesc {
+    size: 64 * 1024,
+    memory: MemoryType::Upload,
+    label: Some("frame-roots".into()),
+    ..Default::default()
+})?);
 
 frame_arena.reset();
 let root = frame_arena
-    .alloc(std::mem::size_of::<DrawRoot>() as u64, 16)
-    .expect("frame arena exhausted");
-root.upload(&DrawRoot {
-    vertices: vertex_buffer.gpu(),
+    .alloc(size_of::<DrawRoot>() as u64, 16)
+    .expect("frame arena exhausted")
+    .cast::<DrawRoot>();
+root.write(&DrawRoot {
+    vertices: vertex_buffer.gpu().cast(),
     count: vertex_count,
-    _pad: 0,
+    pad: 0,
 })?;
 
-cmd.draw(root.gpu, vertex_count, 1, 0, 0);
+cmd.draw(root.gpu(), vertex_count, 1, 0, 0);
 ```
 
 Keep one arena per in-flight frame slot. `reset()` is only safe once that slot's previous GPU work
@@ -118,9 +178,14 @@ you.
 ### Bindless resources
 
 Sampled and storage views go into a global heap and travel through roots as small handles like
-`TextureHandle`, `SamplerHandle`, and `AccelHandle`, which `gpu_struct!` spells as Slang
-`DescriptorHandle<T>`. Vulkan backs the heap with descriptor buffers, Metal with argument tables,
-and neither shows through.
+`TextureHandle` and `SamplerHandle`, which `gpu_struct!` spells as Slang `DescriptorHandle<T>`.
+Vulkan backs the heap with `VK_EXT_descriptor_heap`, Metal with argument tables, and neither shows
+through. The heaps are bound once per command buffer and never rebound.
+
+`AccelHandle` is the one exception. Metal reaches an acceleration structure through the same
+bindless table as everything else, while Vulkan passes its device address and converts, so
+`gpu_struct!` emits a `RaytracingAccelerationStructure` property instead. Shader code still just
+reads the field.
 
 ### Barriers name stages, not resources
 
@@ -131,14 +196,15 @@ cmd.barrier(StageFlags::COMPUTE, StageFlags::VERTEX_SHADER);
 A producer stage and a consumer stage. Hazard flags cover the cases that need an extra cache or
 argument-buffer dependency. Nothing on the application side tracks per-resource layout.
 
-Timeline semaphores handle frame pacing and cross-queue work. Command buffers are transient and go
-back to the pool after submission.
+Timeline semaphores order work across submissions; frame pacing waits on the swapchain's
+per-frame fence. Command buffers are transient and go back to the pool after submission.
 
 ### Shaders
 
 Everything is authored in Slang and compiled to SPIR-V or metallib. Root data arrives as a pointer
-parameter to the entry point. Set 0 belongs to the RHI's bindless heap, so application shaders
-can't claim it.
+parameter to the entry point. There are no descriptor sets to collide with: pipelines are created
+without a layout on both backends. Declaring root data as a module-scope `uniform` is the one thing
+to avoid, since Slang collapses those into a `$Globals` cbuffer that has nowhere to bind.
 
 Clip space is Y-up on both backends. Projection matrices and shader code don't need a
 backend-specific vertical flip.
@@ -148,11 +214,15 @@ backend-specific vertical flip.
 The public types dispatch over whichever backend is compiled in. What works today:
 
 - graphics, compute, and mesh shader pipelines
-- bindless textures, dynamic rendering, MSAA, depth/stencil
+- bindless textures, dynamic rendering, depth buffering
 - indirect dispatch, indexed draws, and meshlet draws
 - BLAS/TLAS ray tracing with inline ray queries in compute
 
-The backend-specific handles are still reachable if you need to drop through to them.
+`SampleCount` reaches the pipeline's multisample state, but nothing resolves a multisampled target
+yet and nothing exercises it, so treat anything above `S1` as unimplemented.
+
+The backends are private. Everything goes through the public types, and there is no escape hatch to
+a raw `VkDevice` or `MTLDevice`.
 
 ## Development
 
@@ -166,7 +236,7 @@ The integration tests render to offscreen targets and cover the RHI end to end. 
 and `slangc`, and fail without them — this is a render hardware interface, so a machine that
 cannot run them is broken, not exempt. Tests enable validation by default; run with
 `-- --nocapture` to see the layer output. Select a backend explicitly with
-`--no-default-features --features metal` or `--features vulkan`.
+`--no-default-features --features metal` or `--no-default-features --features vulkan`.
 
 Pass `--validation` to a windowed example for Vulkan validation layers.
 
@@ -189,13 +259,6 @@ the next submit, `acquire_image`, or `wait_idle`. You never need a fence of your
 `wait_idle` and `wait_for_frame` remain available for the cases that genuinely need a drain, such
 as resizing a swapchain.
 
-## Validation
-
-The RHI does not re-implement validation. Formats, usage flags, layouts and subresource ranges are
-checked by the Vulkan validation layers and Metal's API validation, which report them better than a
-hand-rolled layer could. What the RHI does check is the small set those validators structurally
-cannot see — chiefly mixing resources between devices — and only under `debug_assertions`.
-
 ## Threading
 
 The RHI is single-threaded by design: `Device` is `Rc`-backed and neither it nor a `CommandBuffer`
@@ -205,7 +268,5 @@ current types quietly allow.
 
 ## Shader compilation
 
-The `slangc` feature (on by default) compiles Slang source at runtime by shelling out to a `slangc`
-binary on `PATH`, caching artifacts in the temp dir. That suits tests, examples and iteration. A
-shipping build should turn the feature off, compile shaders offline, and hand the bytes to
-`Device::create_shader_module`.
+`kiln_rhi::compiler` compiles Slang source at runtime by shelling out to a `slangc` binary on
+`PATH`, caching artifacts in the temp dir. That suits tests, examples and iteration.

@@ -4,3 +4,4 @@ Cargo.lock
 imgui.ini
 captures/
 tools/
+ash/

@@ -6,8 +6,7 @@ materials, frames in flight. Most of the RHI changes I've made started with some
 here.
 
 The tracer carries radiance in wavelength bands instead of RGB, so changing the light actually
-changes the image instead of being a white balance multiply at the end. There's also a raster
-backend that reads the same scene, for when I just want to see the geometry.
+changes the image instead of being a white balance multiply at the end.
 
 Run everything from the workspace root. Build and backend requirements are in the
 [root README](../../README.md).
@@ -20,8 +19,7 @@ With `slangc` on `PATH`:
 cargo run -p spectra
 ```
 
-That opens the bundled Cornell box and traces toward 1024 spp. If the spectral backend won't
-initialize it prints why and falls back to raster.
+That opens the bundled Cornell box and traces toward 1024 spp.
 
 Camera is `WASD`, `Q`/`E` for down and up, `Shift` to move faster, left-drag to look, `R` to go
 back to the authored camera.
@@ -76,7 +74,7 @@ cargo run --release -p spectra -- \
 The film keeps `SPECTRAL_BINS` band-integrated radiance estimates per pixel, spread uniformly from
 360 to 830 nm. Right now that's 4, so each bin is 117.5 nm wide. That's coarse. It's really a memory
 knob (`width * height * bins * 4` bytes) and I've kept it low while the transport is still moving
-around. Raising it is a one-line change in `renderers/spectral/spectrum/mod.rs`.
+around. Raising it is a one-line change in `tracer/spectrum/mod.rs`.
 
 Probe one pixel to stderr, or dump the whole film as a little-endian float32 `.npy`:
 
@@ -91,33 +89,26 @@ The dump is shape `(height, width, SPECTRAL_BINS)` and loads with `numpy.load`.
 
 ## How it's laid out
 
-Organized by who owns the data, not by demo mode:
+Organized by who owns the data:
 
 ```text
 src/
-  base/
-    scene/                  generic scene data and the Scene<S> storage contract
-    renderer.rs             renderer and frame contracts
-    gpu/                    shared GPU upload/resource helpers
+  scene/                    imported scene data: geometry, meshes, materials, lights, nodes
   importers/
     usd/                    USD loading and conversion
-  renderers/
-    raster/                 raster GPU scene and meshlet renderer
-    spectral/               progressive spectral path tracer
-      spectrum/             wavelengths, colorimetry, illuminants, reflectance fitting
-  app/                      CLI, windowed viewer, headless output, controls
+  tracer/                   progressive spectral path tracer
+    device/                 GPU-side scene: geometry, materials, records
+    shaders/                Slang sources for the trace, shading and display passes
+    spectrum/               wavelengths, colorimetry, illuminants, reflectance fitting
+  app/                      CLI, windowed viewer, headless output, controls, egui panels
 ```
 
-The importer gives you `Scene<CpuStorage>`. Each renderer calls `prepare::<Storage>` to turn that
-into its own storage type, which stays private to that renderer's module. Scene construction is
-shared, and anything a backend has an opinion about (acceleration structures, GPU layout, material
-lowering) stays inside the backend that owns it.
+The importer produces the CPU-side `scene`, and `tracer` turns that into its own GPU
+representation. Anything the GPU has an opinion about — acceleration structures, buffer layout,
+material lowering — stays inside `tracer/device`.
 
-Raster isn't a second scene model. It reads the same imported scene and owns only the GPU side of
-drawing it.
-
-Inside the spectral renderer, `spectrum/` is the physics with no GPU knowledge in it. Everything
-above it is the tracer: acceleration, sampling, film accumulation, and the GPU passes.
+`spectrum/` is the physics, with no GPU knowledge in it. Everything above it is the tracer:
+acceleration, sampling, film accumulation, and the GPU passes.
 
 ## Assets
 

@@ -72,13 +72,13 @@ fn pack_material(material: &Material) -> render::Result<GpuMaterial> {
         roughness: surface.roughness,
         metallic: surface.metallic,
         ior: surface.ior,
-        _pad: 0.0,
+        pad: 0.0,
         base_color_map: surface
             .base_color_map
             .map_or(NO_MAP, |texture| texture.0 as u32),
         roughness_map: pack_scalar_map(surface.roughness_map),
         metallic_map: pack_scalar_map(surface.metallic_map),
-        _pad2: 0,
+        pad2: 0,
     })
 }
 

@@ -3,7 +3,10 @@
 use ash::khr::acceleration_structure as vk_accel_structure;
 use ash::vk;
 
-use super::device::{VulkanDevice, build_accel_flags_to_vk, geometry_flags_to_vk};
+use super::device::{
+    VulkanDevice, build_accel_flags_to_vk, find_memorytype_index, geometry_flags_to_vk,
+};
+use super::memory::SharedBufferPool;
 
 use crate::accel::{AccelInner, AccelerationStructure};
 use crate::error::{RhiError, RhiResult};
@@ -11,12 +14,12 @@ use crate::types::{BlasDesc, GeometryType, TlasDesc};
 
 /// Vulkan acceleration structure entry (BLAS or TLAS).
 ///
-/// `acceleration_structure` is an opaque `VkAccelerationStructureKHR`.
-/// `buffer` / `buffer_memory` hold the backing storage for the AS data.
+/// `acceleration_structure` is an opaque `VkAccelerationStructureKHR`. Its storage and its build
+/// scratch are ordinary pool suballocations, addressed rather than bound, so neither owns a
+/// `VkBuffer` of its own.
 pub struct VulkanAccelerationStructure {
     pub(crate) acceleration_structure: vk::AccelerationStructureKHR,
-    pub(crate) buffer: vk::Buffer,
-    pub(crate) buffer_memory: vk::DeviceMemory,
+    pub(crate) backing: BlockRange,
     /// The GPU-visible address of this acceleration structure.
     /// Use this value in `TlasInstance::acceleration_structure_reference`
     /// and in root structs where the shader accesses it via `TraceRayInline`.
@@ -25,12 +28,19 @@ pub struct VulkanAccelerationStructure {
     /// `build_blas`/`build_tlas` only *record* the build into a command buffer that
     /// executes later, so the scratch must stay alive until then. `scratch_address`
     /// is aligned to the device's `minAccelerationStructureScratchOffsetAlignment`.
-    pub(crate) scratch_buffer: vk::Buffer,
-    pub(crate) scratch_memory: vk::DeviceMemory,
+    pub(crate) scratch: BlockRange,
     pub(crate) scratch_address: u64,
+    pub(crate) buffer_pool: SharedBufferPool,
     /// Extension loader for `VK_KHR_acceleration_structure`.
     pub(crate) accel_loader: ash::khr::acceleration_structure::Device,
-    pub(crate) device: ash::Device,
+}
+
+/// A range handed back to the pool when its owner dies.
+#[derive(Clone, Copy)]
+pub(crate) struct BlockRange {
+    pub(crate) block_index: usize,
+    pub(crate) offset: u64,
+    pub(crate) range: u64,
 }
 
 impl Drop for VulkanAccelerationStructure {
@@ -39,17 +49,17 @@ impl Drop for VulkanAccelerationStructure {
         unsafe {
             self.accel_loader
                 .destroy_acceleration_structure(self.acceleration_structure, None);
-            self.device.destroy_buffer(self.buffer, None);
-            self.device.free_memory(self.buffer_memory, None);
-            self.device.destroy_buffer(self.scratch_buffer, None);
-            self.device.free_memory(self.scratch_memory, None);
+        }
+        let mut pool = self.buffer_pool.borrow_mut();
+        for r in [self.backing, self.scratch] {
+            pool.release(r.block_index, r.offset, r.range);
         }
     }
 }
 
 impl VulkanDevice {
     pub fn create_blas(&self, desc: &BlasDesc) -> RhiResult<AccelerationStructure> {
-        let accel_loader = self.require_accel_loader()?;
+        let accel_loader = &self.acceleration_structure;
 
         let geometries: Vec<vk::AccelerationStructureGeometryKHR> = desc
             .meshes
@@ -118,7 +128,7 @@ impl VulkanDevice {
             accel_loader.get_acceleration_structure_build_sizes(
                 vk::AccelerationStructureBuildTypeKHR::DEVICE,
                 &build_info,
-                &primitive_counts,
+                Some(&primitive_counts),
                 &mut size_info,
             );
         }
@@ -143,7 +153,7 @@ impl VulkanDevice {
     }
 
     pub fn create_tlas(&self, desc: &TlasDesc) -> RhiResult<AccelerationStructure> {
-        let accel_loader = self.require_accel_loader()?;
+        let accel_loader = &self.acceleration_structure;
 
         let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::default()
             .array_of_pointers(false)
@@ -169,7 +179,7 @@ impl VulkanDevice {
             accel_loader.get_acceleration_structure_build_sizes(
                 vk::AccelerationStructureBuildTypeKHR::DEVICE,
                 &build_info,
-                &[desc.instance_count],
+                Some(&[desc.instance_count]),
                 &mut size_info,
             );
         }
@@ -193,14 +203,20 @@ impl VulkanDevice {
         scratch_size: u64,
         ty: vk::AccelerationStructureTypeKHR,
     ) -> RhiResult<AccelerationStructure> {
-        let (buffer, memory) = self.allocate_accel_buffer(size)?;
-        let create_info = vk::AccelerationStructureCreateInfoKHR::default()
-            .buffer(buffer)
-            .size(size)
+        // `create_acceleration_structure2` takes an address range, so the storage is an ordinary
+        // suballocation rather than a dedicated buffer.
+        let (backing, backing_address) =
+            self.allocate_accel_range(size, super::memory::BLOCK_BUFFER_USAGE)?;
+        let create_info = vk::AccelerationStructureCreateInfo2KHR::default()
+            .address_range(
+                vk::DeviceAddressRangeKHR::default()
+                    .address(backing_address)
+                    .size(size),
+            )
             .ty(ty);
         let acceleration_structure = unsafe {
-            accel_loader
-                .create_acceleration_structure(&create_info, None)
+            self.address_commands_loader
+                .create_acceleration_structure2(&create_info, None)
                 .map_err(|e| RhiError::AllocationFailed(e.to_string()))?
         };
         let device_address = unsafe {
@@ -210,54 +226,57 @@ impl VulkanDevice {
             )
         };
 
+
         // Leave enough headroom to align the scratch address as required by Vulkan.
         let scratch_align = self.accel_scratch_alignment();
-        let (scratch_buffer, scratch_memory, scratch_base) =
-            self.allocate_scratch_buffer(scratch_size + scratch_align)?;
+        let (scratch, scratch_base) = self.allocate_accel_range(
+            scratch_size + scratch_align,
+            super::memory::SCRATCH_BUFFER_USAGE,
+        )?;
         let scratch_address = scratch_base.next_multiple_of(scratch_align);
 
         Ok(AccelerationStructure {
             inner: AccelInner::Vulkan(Box::new(VulkanAccelerationStructure {
                 acceleration_structure,
-                buffer,
-                buffer_memory: memory,
+                backing,
                 device_address,
-                scratch_buffer,
-                scratch_memory,
+                scratch,
                 scratch_address,
+                buffer_pool: self.buffer_pool.clone(),
                 accel_loader: accel_loader.clone(),
-                device: self.device.clone(),
             })),
             _owner: None,
         })
     }
 
-    pub(crate) fn allocate_scratch_buffer(
+    /// Device-local storage for an acceleration structure or its build scratch, carved from the
+    /// ordinary buffer pool.
+    fn allocate_accel_range(
         &self,
         size: u64,
-    ) -> RhiResult<(vk::Buffer, vk::DeviceMemory, u64)> {
-        super::memory::allocate_bound_buffer(
-            &self.device,
+        usage: vk::BufferUsageFlags,
+    ) -> RhiResult<(BlockRange, u64)> {
+        let requirements = self.buffer_requirements(size, usage)?;
+        let memory_type = find_memorytype_index(
+            &requirements,
             &self.device_memory_properties,
-            size,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            "AS scratch",
         )
-    }
-
-    pub(crate) fn allocate_accel_buffer(
-        &self,
-        size: u64,
-    ) -> RhiResult<(vk::Buffer, vk::DeviceMemory)> {
-        let (buffer, memory, _) = super::memory::allocate_bound_buffer(
+        .ok_or_else(|| RhiError::AllocationFailed("no device-local memory type".into()))?;
+        let sub = self.buffer_pool.borrow_mut().allocate(
             &self.device,
-            &self.device_memory_properties,
-            size,
-            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            "AS storage",
+            &requirements,
+            memory_type,
+            false,
+            usage,
         )?;
-        Ok((buffer, memory))
+        Ok((
+            BlockRange {
+                block_index: sub.block_index,
+                offset: sub.offset,
+                range: sub.range,
+            },
+            sub.address,
+        ))
     }
 }

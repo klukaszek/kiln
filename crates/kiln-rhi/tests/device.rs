@@ -16,11 +16,7 @@ fn device_creation_and_properties() {
     })
     .expect("no headless GPU device available");
     eprintln!("    ⏱  Device::new: {}", common::fmt_dur(start.elapsed()));
-    eprintln!(
-        "    backend={}  bindless={:?}",
-        device.backend(),
-        device.bindless_mode(),
-    );
+    eprintln!("    backend={}", device.backend());
     assert!(matches!(device.backend(), Backend::Vulkan | Backend::Metal));
 }
 

@@ -150,6 +150,9 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::Backend(e.to_string()))?
         };
 
+        // Nothing may reference the images about to be destroyed.
+        self.flush_setup_barriers()?;
+
         let sc = backend_expect!(&mut swapchain.inner, SwapchainInner::Vulkan);
 
         let old_swapchain = sc.swapchain;
@@ -418,7 +421,12 @@ impl VulkanDevice {
                 .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?;
         }
 
-        self.transition_depth_image(depth_image)?;
+        self.initialize_image_layout(depth_image, vk::ImageAspectFlags::DEPTH, 1, 1)?;
+        // Submit straight away rather than batching: this image is destroyed on the next
+        // swapchain rebuild, which would invalidate the setup buffer while it still held this
+        // barrier. Batching only pays off for the many images of a scene load, not for one depth
+        // buffer per swapchain.
+        self.flush_setup_barriers()?;
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(depth_image)

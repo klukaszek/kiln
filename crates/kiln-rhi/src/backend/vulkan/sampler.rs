@@ -7,7 +7,7 @@ use super::queue::VulkanRetiredResource;
 use crate::error::{RhiError, RhiResult};
 use crate::queue::QueueInner;
 use crate::sampler::{Sampler, SamplerDesc};
-use crate::types::{FilterMode, SamplerHandle, SamplerId};
+use crate::types::{FilterMode, MAX_BINDLESS_SAMPLERS, SamplerHandle, SamplerId};
 
 impl VulkanDevice {
     fn allocate_sampler_id(&self) -> RhiResult<SamplerId> {
@@ -15,10 +15,13 @@ impl VulkanDevice {
             return Ok(id);
         }
         let mut next = self.next_sampler_id.borrow_mut();
+        if *next >= MAX_BINDLESS_SAMPLERS {
+            return Err(RhiError::Backend(
+                "Vulkan bindless sampler heap exhausted".into(),
+            ));
+        }
         let id = SamplerId(*next);
-        *next = next
-            .checked_add(1)
-            .ok_or_else(|| RhiError::Backend("Vulkan sampler ID space exhausted".into()))?;
+        *next += 1;
         Ok(id)
     }
 
@@ -62,32 +65,11 @@ impl VulkanDevice {
                 .compare_op(compare_op_to_vk(compare));
         }
 
-        let sampler = unsafe {
-            self.device
-                .create_sampler(&sampler_info, None)
-                .map_err(|e| RhiError::Backend(format!("Sampler creation: {e}")))?
-        };
-
-        let id = match self.allocate_sampler_id() {
-            Ok(id) => id,
-            Err(err) => {
-                unsafe { self.device.destroy_sampler(sampler, None) };
-                return Err(err);
-            }
-        };
-
-        if let Err(err) = self.write_sampler_descriptor(id, sampler) {
-            unsafe { self.device.destroy_sampler(sampler, None) };
+        let id = self.allocate_sampler_id()?;
+        if let Err(err) = self.write_sampler_descriptor(id, &sampler_info) {
             self.recycle_sampler_id(id);
             return Err(err);
         }
-
-        let idx = id.0 as usize;
-        let mut samplers = self.samplers.borrow_mut();
-        if samplers.len() <= idx {
-            samplers.resize_with(idx + 1, || None);
-        }
-        samplers[idx] = Some(sampler);
 
         Ok(Sampler {
             id,
@@ -97,49 +79,28 @@ impl VulkanDevice {
     }
 
     pub fn destroy_sampler(&self, sampler: Sampler) {
-        let sampler_id = sampler.id();
-        let retired = self
-            .samplers
-            .borrow_mut()
-            .get_mut(sampler_id.0 as usize)
-            .and_then(Option::take);
-        if let Some(sampler) = retired {
-            backend_expect!(&self.queue.inner, QueueInner::Vulkan).release_resource(
-                VulkanRetiredResource::Sampler {
-                    id: sampler_id,
-                    sampler,
-                },
-            );
-        }
+        backend_expect!(&self.queue.inner, QueueInner::Vulkan)
+            .release_resource(VulkanRetiredResource::Sampler { id: sampler.id() });
     }
 
+    /// Write one sampler descriptor into the sampler heap at slot `id`. The descriptor is built
+    /// straight from the create-info; there is no `VkSampler` object under descriptor heaps.
     pub(crate) fn write_sampler_descriptor(
         &self,
         id: SamplerId,
-        sampler: vk::Sampler,
+        info: &vk::SamplerCreateInfo<'_>,
     ) -> RhiResult<()> {
-        let heap = &self.descriptor_buffer_heap;
-        let loader = &self.descriptor_buffer_loader;
-
-        let offset = heap.sampler_offset + (id.0 as u64) * heap.sampler_stride;
-        if offset + heap.sampler_stride > heap.size {
-            return Err(RhiError::Backend("Sampler descriptor heap overflow".into()));
-        }
-
-        let get_info = vk::DescriptorGetInfoEXT::default()
-            .ty(vk::DescriptorType::SAMPLER)
-            .data(vk::DescriptorDataEXT {
-                p_sampler: &sampler,
-            });
+        let heap = &self.descriptor_heaps.sampler;
+        let slot = heap.slot(id.0);
 
         unsafe {
-            let dst = std::slice::from_raw_parts_mut(
-                heap.mapped_ptr.add(offset as usize),
-                heap.sampler_stride as usize,
-            );
-            loader.get_descriptor(&get_info, dst);
+            let dst = std::slice::from_raw_parts_mut(heap.mapped_ptr.add(slot.start), slot.len());
+            self.descriptor_heap_loader
+                .write_sampler_descriptors(
+                    std::slice::from_ref(info),
+                    &[vk::HostAddressRangeEXT::default().address(dst)],
+                )
+                .map_err(|e| RhiError::Backend(format!("write sampler descriptor: {e}")))
         }
-
-        Ok(())
     }
 }

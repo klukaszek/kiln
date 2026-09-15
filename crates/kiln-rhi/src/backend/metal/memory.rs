@@ -1,18 +1,19 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLDevice, MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLResourceOptions,
+    MTLBuffer, MTLDevice, MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLResidencySet,
+    MTLResourceOptions,
 };
 
-use crate::backend::suballoc::FreeRanges;
+use super::as_allocation;
+
+use crate::backend::suballoc::{BLOCK_SIZE, FreeRanges};
 use crate::error::{RhiError, RhiResult};
 use crate::memory::MemoryType;
 use crate::types::GpuPtr;
-
-const BUFFER_HEAP_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
 
 pub(crate) type SharedMetalBufferPool = Rc<RefCell<MetalBufferPool>>;
 
@@ -62,15 +63,23 @@ struct MetalHeapBlock {
 }
 
 pub(crate) struct MetalBufferPool {
+    residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    residency_dirty: Rc<Cell<bool>>,
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     /// Emptied, never removed, so a buffer's `block_index` stays valid for its whole life.
     blocks: Vec<Option<MetalHeapBlock>>,
 }
 
 impl MetalBufferPool {
-    pub(crate) fn new(device: Retained<ProtocolObject<dyn MTLDevice>>) -> Self {
+    pub(crate) fn new(
+        device: Retained<ProtocolObject<dyn MTLDevice>>,
+        residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+        residency_dirty: Rc<Cell<bool>>,
+    ) -> Self {
         Self {
             device,
+            residency_set,
+            residency_dirty,
             blocks: Vec::new(),
         }
     }
@@ -157,7 +166,7 @@ impl MetalBufferPool {
         required_size: u64,
         options: MTLResourceOptions,
     ) -> RhiResult<usize> {
-        let size = required_size.max(BUFFER_HEAP_BLOCK_SIZE);
+        let size = required_size.max(BLOCK_SIZE);
         let heap_desc = MTLHeapDescriptor::new();
         heap_desc.setType(MTLHeapType::Placement);
         heap_desc.setSize(usize::try_from(size).map_err(|_| {
@@ -170,6 +179,11 @@ impl MetalBufferPool {
             .ok_or_else(|| {
                 RhiError::BufferCreation("Metal buffer heap allocation failed".into())
             })?;
+        // Residency is tracked once per heap: everything placed inside it is covered, so
+        // individual buffers and textures never touch the residency set.
+        self.residency_set.addAllocation(as_allocation(&heap));
+        self.residency_dirty.set(true);
+
         let block = MetalHeapBlock {
             heap,
             memory,
@@ -188,14 +202,15 @@ impl MetalBufferPool {
     }
 
     /// Return a range to its block. Never frees the block — see [`Self::trim`]. This runs on the
-    /// per-frame retire path, and any request over `BUFFER_HEAP_BLOCK_SIZE` gets a dedicated
+    /// per-frame retire path, and any request over `BLOCK_SIZE` gets a dedicated
     /// block, so freeing here would destroy and recreate a heap for every large transient.
     pub(crate) fn release(&mut self, block_index: usize, offset: u64, size: u64) {
-        let Some(block) = self.blocks.get_mut(block_index).and_then(Option::as_mut) else {
-            debug_assert!(false, "Metal buffer pool block disappeared");
-            return;
-        };
-        block.free_ranges.release(offset, size);
+        // `trim` only reclaims empty blocks, so a block still holding this range is present.
+        self.blocks[block_index]
+            .as_mut()
+            .expect("heap block outlives its suballocations")
+            .free_ranges
+            .release(offset, size);
     }
 
     /// Release empty blocks, keeping one per memory type so usage oscillating around a block
@@ -208,6 +223,8 @@ impl MetalBufferPool {
                 continue;
             }
             if kept_empty.contains(&block.memory) {
+                self.residency_set.removeAllocation(as_allocation(&block.heap));
+                self.residency_dirty.set(true);
                 *slot = None;
             } else {
                 kept_empty.push(block.memory);

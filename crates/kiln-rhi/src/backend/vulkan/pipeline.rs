@@ -1,4 +1,5 @@
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 
 use super::device::format_to_vk;
 use crate::error::{RhiError, RhiResult};
@@ -33,7 +34,6 @@ fn compare_op_to_vk(op: CompareOp) -> vk::CompareOp {
 /// Vulkan graphics pipeline state.
 pub struct VulkanGraphicsPso {
     pub(crate) pipeline: vk::Pipeline,
-    pub(crate) pipeline_layout: vk::PipelineLayout,
     pub(crate) device: ash::Device,
     pub(crate) pipeline_cache: vk::PipelineCache,
     pub(crate) desc: VulkanGraphicsPsoDesc,
@@ -42,7 +42,6 @@ pub struct VulkanGraphicsPso {
 /// Vulkan compute pipeline state.
 pub struct VulkanComputePso {
     pub(crate) pipeline: vk::Pipeline,
-    pub(crate) pipeline_layout: vk::PipelineLayout,
     pub(crate) device: ash::Device,
 }
 
@@ -51,8 +50,6 @@ impl Drop for VulkanComputePso {
     fn drop(&mut self) {
         unsafe {
             self.device.destroy_pipeline(self.pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
         }
     }
 }
@@ -86,13 +83,14 @@ struct RasterState<'a> {
 fn create_raster_pipeline(
     device: &ash::Device,
     cache: vk::PipelineCache,
-    layout: vk::PipelineLayout,
     stages: &[vk::PipelineShaderStageCreateInfo<'_>],
     topology: Option<Topology>,
     state: &RasterState<'_>,
     blend: &BlendState,
     what: &str,
 ) -> RhiResult<vk::Pipeline> {
+    // Always empty: vertex data is read through pointers in the shader, never bound. The
+    // struct is still required for a pipeline that has a vertex stage.
     let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
     let input_assembly =
         vk::PipelineInputAssemblyStateCreateInfo::default().topology(match topology {
@@ -152,9 +150,11 @@ fn create_raster_pipeline(
         .depth_attachment_format(state.depth_format.unwrap_or(vk::Format::UNDEFINED))
         .stencil_attachment_format(vk::Format::UNDEFINED);
 
-    // The bindless set uses descriptor buffers, so the pipeline must opt in too.
+    // Bindless goes through the descriptor heap, so the pipeline opts in and carries no layout.
+    // The bit only exists on `PipelineCreateFlags2`, hence the pNext rather than `.flags()`.
+    let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default()
+        .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT);
     let mut pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-        .flags(vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT)
         .stages(stages)
         .viewport_state(&viewport_state)
         .rasterization_state(&rasterizer)
@@ -162,8 +162,9 @@ fn create_raster_pipeline(
         .depth_stencil_state(&depth_stencil)
         .color_blend_state(&color_blending)
         .dynamic_state(&dynamic_state_info)
-        .layout(layout)
-        .push_next(&mut rendering_info);
+        .layout(vk::PipelineLayout::null())
+        .push(&mut rendering_info)
+        .push(&mut flags2);
     if topology.is_some() {
         pipeline_info = pipeline_info
             .vertex_input_state(&vertex_input_info)
@@ -195,7 +196,6 @@ impl VulkanGraphicsPso {
         create_raster_pipeline(
             &self.device,
             self.pipeline_cache,
-            self.pipeline_layout,
             &stages,
             Some(self.desc.topology),
             &RasterState {
@@ -217,8 +217,6 @@ impl Drop for VulkanGraphicsPso {
     fn drop(&mut self) {
         unsafe {
             self.device.destroy_pipeline(self.pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
         }
     }
 }
@@ -302,7 +300,6 @@ fn blend_op_to_vk(op: BlendOp) -> vk::BlendOp {
 /// vertex or geometry stage, since the mesh stage replaces both.
 pub struct VulkanMeshletPso {
     pub(crate) pipeline: vk::Pipeline,
-    pub(crate) pipeline_layout: vk::PipelineLayout,
     pub(crate) device: ash::Device,
     pub(crate) pipeline_cache: vk::PipelineCache,
     pub(crate) desc: VulkanMeshletPsoDesc,
@@ -336,7 +333,6 @@ impl VulkanMeshletPso {
         create_raster_pipeline(
             &self.device,
             self.pipeline_cache,
-            self.pipeline_layout,
             &stages,
             None,
             &RasterState {
@@ -358,8 +354,6 @@ impl Drop for VulkanMeshletPso {
     fn drop(&mut self) {
         unsafe {
             self.device.destroy_pipeline(self.pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
         }
     }
 }

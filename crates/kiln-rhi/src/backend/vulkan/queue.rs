@@ -7,6 +7,7 @@ use ash::khr::swapchain;
 use ash::{Device, vk};
 use smallvec::SmallVec;
 
+use super::command::RetainedPipeline;
 use super::memory::{SharedBufferPool, VulkanBuffer};
 use super::swapchain::VulkanSwapchain;
 use super::texture::VulkanTexture;
@@ -30,7 +31,9 @@ pub struct VulkanQueue {
     /// Generic command buffers are returned to the pool once their queue timeline value is
     /// complete. Swapchain command buffers have their own frame fences and are intentionally not
     /// placed in this list.
-    pub(crate) pending_commands: RefCell<VecDeque<(vk::CommandBuffer, u64)>>,
+    /// Submitted buffers awaiting their timeline value, each holding the pipelines it bound so
+    /// they outlive the GPU work even if the application dropped them.
+    pub(crate) pending_commands: RefCell<VecDeque<PendingCommand>>,
     pub(crate) available_commands: RefCell<Vec<vk::CommandBuffer>>,
     pub(crate) completion_semaphore: vk::Semaphore,
     pub(crate) next_completion_value: RefCell<u64>,
@@ -46,16 +49,23 @@ pub struct VulkanQueue {
     pub(crate) free_sampler_ids: SharedSamplerFreeIds,
 }
 
+pub(crate) struct PendingCommand {
+    pub(crate) command_buffer: vk::CommandBuffer,
+    pub(crate) completion_value: u64,
+    /// Held, never read: released when this entry is reclaimed.
+    #[allow(dead_code)]
+    pub(crate) retained_pipelines: SmallVec<[RetainedPipeline; 4]>,
+}
+
 pub(crate) enum VulkanRetiredResource {
     Buffer(VulkanBuffer),
     Texture {
         id: TextureId,
         texture: VulkanTexture,
     },
-    Sampler {
-        id: SamplerId,
-        sampler: vk::Sampler,
-    },
+    /// No Vulkan object to free: under `VK_EXT_descriptor_heap` a sampler is only a descriptor
+    /// in the heap, so retirement exists purely to keep an in-flight slot from being reused.
+    Sampler { id: SamplerId },
 }
 
 impl VulkanQueue {
@@ -122,8 +132,8 @@ impl VulkanQueue {
         unsafe {
             match &resource {
                 // The block owns the mapping and the memory; the buffer only returns its range.
+                // Nothing to destroy: the range simply returns to its block.
                 VulkanRetiredResource::Buffer(buffer) => {
-                    self.device.destroy_buffer(buffer.buffer, None);
                     self.buffer_pool.borrow_mut().release(
                         buffer.block_index,
                         buffer.block_offset,
@@ -136,9 +146,8 @@ impl VulkanQueue {
                         self.device.destroy_image(texture.image, None);
                     }
                 }
-                VulkanRetiredResource::Sampler { sampler, .. } => {
-                    self.device.destroy_sampler(*sampler, None);
-                }
+                // Descriptor-only; the slot is recycled below.
+                VulkanRetiredResource::Sampler { .. } => {}
             }
         }
         match resource {
@@ -153,10 +162,12 @@ impl VulkanQueue {
     }
 
     fn completed_submission_value(&self) -> u64 {
+        // Reading the counter only fails on a lost device. Reporting 0 instead would silently
+        // stall every reclamation path, turning that into an unexplained leak.
         unsafe {
             self.device
                 .get_semaphore_counter_value(self.completion_semaphore)
-                .unwrap_or(0)
+                .expect("read Vulkan completion timeline")
         }
     }
 
@@ -181,29 +192,27 @@ impl VulkanQueue {
             }
             return Err(error);
         }
-        let waits: SmallVec<[(vk::Semaphore, u64); 4]> = timeline_pairs(desc.wait_semaphores);
-        let mut signals: SmallVec<[(vk::Semaphore, u64); 4]> =
-            timeline_pairs(desc.signal_semaphores);
-        let wait_stages: SmallVec<[vk::PipelineStageFlags; 4]> =
-            SmallVec::from_elem(vk::PipelineStageFlags::ALL_COMMANDS, waits.len());
+        let waits = timeline_waits(desc.wait_semaphores);
+        let mut signals = timeline_waits(desc.signal_semaphores);
         let completion_value = self.next_completion_value()?;
-        signals.push((self.completion_semaphore, completion_value));
-        if let Err(err) = self.submit_timeline(
-            cmd.command_buffer,
-            &waits,
-            &wait_stages,
-            &signals,
-            vk::Fence::null(),
-        ) {
+        signals.push(semaphore_submit(
+            self.completion_semaphore,
+            completion_value,
+        ));
+        if let Err(err) =
+            self.submit_timeline(cmd.command_buffer, &waits, &signals, vk::Fence::null())
+        {
             unsafe {
                 self.device
                     .free_command_buffers(self.command_pool, &[cmd.command_buffer]);
             }
             return Err(err);
         }
-        self.pending_commands
-            .borrow_mut()
-            .push_back((cmd.command_buffer, completion_value));
+        self.pending_commands.borrow_mut().push_back(PendingCommand {
+            command_buffer: cmd.command_buffer,
+            completion_value,
+            retained_pipelines: std::mem::take(&mut cmd.retained_pipelines),
+        });
         Ok(())
     }
 
@@ -220,54 +229,34 @@ impl VulkanQueue {
         let mut pending = self.pending_commands.borrow_mut();
         while pending
             .front()
-            .is_some_and(|(_, value)| *value <= completed)
+            .is_some_and(|entry| entry.completion_value <= completed)
         {
-            let (command_buffer, _) = pending
+            let entry = pending
                 .pop_front()
                 .expect("pending command queue front disappeared");
-            self.recycle_command_buffer(command_buffer);
+            // Dropping `entry` releases this submission's hold on its pipelines.
+            self.recycle_command_buffer(entry.command_buffer);
         }
     }
 
-    /// Encode a `vkQueueSubmit` with timeline-semaphore wait/signal pairs.
-    ///
-    /// `wait_stages` must have the same length as `waits`. Pass `vk::Fence::null()` when
-    /// no completion fence is needed.
+    /// Encode a `vkQueueSubmit2`. Each `SemaphoreSubmitInfo` carries its own value and stage
+    /// mask, so binary and timeline semaphores go through one array with no `pNext` chain.
+    /// Pass `vk::Fence::null()` when no completion fence is needed.
     fn submit_timeline(
         &self,
         cmd: vk::CommandBuffer,
-        waits: &[(vk::Semaphore, u64)],
-        wait_stages: &[vk::PipelineStageFlags],
-        signals: &[(vk::Semaphore, u64)],
+        waits: &[vk::SemaphoreSubmitInfo<'_>],
+        signals: &[vk::SemaphoreSubmitInfo<'_>],
         fence: vk::Fence,
     ) -> RhiResult<()> {
-        let command_buffers = [cmd];
-        let mut wait_semaphores = SmallVec::<[vk::Semaphore; 4]>::with_capacity(waits.len());
-        let mut wait_values = SmallVec::<[u64; 4]>::with_capacity(waits.len());
-        for &(semaphore, value) in waits {
-            wait_semaphores.push(semaphore);
-            wait_values.push(value);
-        }
-        let mut signal_semaphores = SmallVec::<[vk::Semaphore; 4]>::with_capacity(signals.len());
-        let mut signal_values = SmallVec::<[u64; 4]>::with_capacity(signals.len());
-        for &(semaphore, value) in signals {
-            signal_semaphores.push(semaphore);
-            signal_values.push(value);
-        }
-        let mut submit_info = vk::SubmitInfo::default()
-            .wait_semaphores(&wait_semaphores)
-            .wait_dst_stage_mask(wait_stages)
-            .command_buffers(&command_buffers)
-            .signal_semaphores(&signal_semaphores);
-        let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
-            .wait_semaphore_values(&wait_values)
-            .signal_semaphore_values(&signal_values);
-        if !wait_values.is_empty() || !signal_values.is_empty() {
-            submit_info = submit_info.push_next(&mut timeline_info);
-        }
+        let command_buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+        let submit_info = vk::SubmitInfo2::default()
+            .wait_semaphore_infos(waits)
+            .command_buffer_infos(&command_buffers)
+            .signal_semaphore_infos(signals);
         unsafe {
             self.device
-                .queue_submit(self.queue, &[submit_info], fence)
+                .queue_submit2(self.queue, &[submit_info], fence)
                 .map_err(|e| RhiError::QueueSubmit(e.to_string()))?;
         }
         Ok(())
@@ -377,14 +366,21 @@ impl VulkanQueue {
             }
             return Err(error);
         }
-        let mut waits: SmallVec<[(vk::Semaphore, u64); 4]> = SmallVec::new();
-        waits.push((sc.present_complete_semaphores[frame_index], 0));
-        let mut wait_stages: SmallVec<[vk::PipelineStageFlags; 4]> = SmallVec::new();
-        wait_stages.push(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT);
-        let mut signals: SmallVec<[(vk::Semaphore, u64); 4]> = SmallVec::new();
-        signals.push((sc.rendering_complete_semaphores[image_index], 0));
+        let waits: SmallVec<[vk::SemaphoreSubmitInfo<'_>; 4]> = SmallVec::from_elem(
+            semaphore_submit(sc.present_complete_semaphores[frame_index], 0)
+                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT),
+            1,
+        );
+        let mut signals: SmallVec<[vk::SemaphoreSubmitInfo<'_>; 4]> = SmallVec::new();
+        signals.push(semaphore_submit(
+            sc.rendering_complete_semaphores[image_index],
+            0,
+        ));
         let completion_value = self.next_completion_value()?;
-        signals.push((self.completion_semaphore, completion_value));
+        signals.push(semaphore_submit(
+            self.completion_semaphore,
+            completion_value,
+        ));
         let fence = sc.in_flight_fences[frame_index];
         let raw_cmd = cmd.command_buffer;
         // Reset late: a frame that never submits would otherwise wedge this slot's next acquire.
@@ -393,7 +389,7 @@ impl VulkanQueue {
                 .reset_fences(&[fence])
                 .map_err(|e| RhiError::SyncError(e.to_string()))?;
         }
-        self.submit_timeline(raw_cmd, &waits, &wait_stages, &signals, fence)?;
+        self.submit_timeline(raw_cmd, &waits, &signals, fence)?;
         self.frame_fence_armed.borrow_mut()[frame_index] = true;
         self.frame_completion_values.borrow_mut()[frame_index] = completion_value;
         sc.acquired_images.borrow_mut()[frame_index] = None;
@@ -436,15 +432,21 @@ impl VulkanQueue {
     }
 }
 
-/// Semaphore/value pairs for one submission.
-type ValuePairs = SmallVec<[(vk::Semaphore, u64); 4]>;
+/// One wait or signal entry. `value` is ignored for binary semaphores.
+fn semaphore_submit<'a>(semaphore: vk::Semaphore, value: u64) -> vk::SemaphoreSubmitInfo<'a> {
+    vk::SemaphoreSubmitInfo::default()
+        .semaphore(semaphore)
+        .value(value)
+        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+}
 
-/// Unwrap a slice of `(TimelineSemaphore, u64)` into `(vk::Semaphore, u64)` pairs.
-fn timeline_pairs(pairs: &[(TimelineSemaphore, u64)]) -> ValuePairs {
+fn timeline_waits<'a>(
+    pairs: &[(TimelineSemaphore, u64)],
+) -> SmallVec<[vk::SemaphoreSubmitInfo<'a>; 4]> {
     pairs
         .iter()
         .map(|(sem, value)| {
-            (
+            semaphore_submit(
                 backend_expect!(&sem.inner, TimelineSemaphoreInner::Vulkan).semaphore,
                 *value,
             )

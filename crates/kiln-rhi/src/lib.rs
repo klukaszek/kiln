@@ -19,24 +19,29 @@
 //!
 //! # Binding layout
 //!
-//! Set 0 is owned by the RHI. Shaders must not claim anything on set 0; all
-//! per-draw/dispatch data arrives via the root pointer.
+//! There is nothing to bind. Neither backend uses descriptor sets or pipeline layouts, and every
+//! pipeline is created without one; all per-draw/dispatch data arrives through the root pointer.
 //!
-//! | Resource                | Vulkan                  | Metal            |
-//! |-------------------------|-------------------------|------------------|
-//! | Bindless sampled images | set 0, binding 2        | arg-table slot 1 |
-//! | Bindless samplers       | set 0, binding 0        | arg-table slot 2 |
-//! | Bindless storage images | set 0, binding 2        | inline in root   |
-//! | Root data pointer       | push constant, offset 0 | buffer(0)        |
-//! | All other buffers/SSBO  | BDA inside root struct  | BDA              |
-//! | Acceleration structures | BDA inside root struct  | inline in root   |
+//! | Resource                | Vulkan                     | Metal            |
+//! |-------------------------|----------------------------|------------------|
+//! | Bindless textures       | resource heap slot         | arg-table slot 1 |
+//! | Bindless samplers       | sampler heap slot          | arg-table slot 2 |
+//! | Root data pointer       | `vkCmdPushDataEXT`         | buffer(0)        |
+//! | All other buffers       | address inside root struct | address          |
+//! | Acceleration structures | address inside root struct | arg-table slot   |
+//!
+//! Both heaps are bound once per command buffer and never rebound. A texture or sampler handle is
+//! its slot index on Vulkan and its `gpuResourceID` on Metal; either way the shader just indexes
+//! what `gpu_struct!` declared.
 //!
 //! # Shader authoring
 //!
 //! Per-draw data flows through one root struct. [`gpu_struct!`] emits the `#[repr(C)]` Rust type
 //! plus a `SLANG` string to prepend to the shader source; take it as an entry-point `uniform`
-//! pointer. [`AccelHandle`], [`TextureHandle`] and [`SamplerHandle`] fields map to Slang
-//! `DescriptorHandle<..>` with no annotation.
+//! pointer. [`TextureHandle`] and [`SamplerHandle`] fields become Slang `DescriptorHandle<..>`
+//! with no annotation; [`AccelHandle`] becomes a `RaytracingAccelerationStructure` property, since
+//! that is the one resource the two backends genuinely reach differently. Either way the shader
+//! reads the field and gets the resource.
 //!
 //! ```text
 //! [shader("compute")] [numthreads(64, 1, 1)]
@@ -50,8 +55,8 @@
 //! Two things bite:
 //!
 //! - **Never declare root data as a module-scope `uniform`.** Slang collapses those into a
-//!   `$Globals` cbuffer at set 0, binding 0, colliding with the bindless heap. The compiler
-//!   passes `-fvk-bind-globals 0 1` so a stray global becomes a missing-binding error instead.
+//!   `$Globals` cbuffer, which the descriptor-heap path has nowhere to bind. Declare it as an
+//!   entry-point `uniform Root*` parameter instead.
 //! - **No `NonUniformResourceIndex`.** It is unavailable in Metal compute.
 
 #[macro_use]
@@ -81,7 +86,6 @@ pub mod accel;
 pub(crate) mod backend;
 pub mod barrier;
 pub mod command;
-#[cfg(feature = "slangc")]
 pub mod compiler;
 pub mod device;
 pub mod error;
@@ -125,7 +129,7 @@ pub use command::{
     ColorAttachment, CommandBuffer, DepthAttachment, DispatchIndirectArgs, DrawIndexedIndirectArgs,
     DrawIndirectArgs, LoadOp, Pipeline, RenderPassDesc, RenderTarget, StoreOp,
 };
-pub use device::{Backend, BindlessMode, Device, DeviceDesc, DeviceResource};
+pub use device::{Backend, Device, DeviceDesc, DeviceResource};
 pub use error::{RhiError, RhiResult};
 pub use memory::{
     Allocation, AllocationDesc, BumpAllocator, DEFAULT_ALIGN, GpuPod, Mapped, MemoryType,

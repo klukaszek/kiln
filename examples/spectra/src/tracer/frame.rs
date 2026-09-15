@@ -23,7 +23,7 @@ gpu_struct! {
     pub(super) struct ClearRoot {
         film: GpuPtr<f32>,
         count: u32, // number of f32 in the film (stride * pixels)
-        _pad: u32,
+        pad: u32,
     }
 }
 
@@ -57,7 +57,7 @@ gpu_struct! {
         pass_start: u32,
         pass_count: u32,
         settings: UVec4,
-        _pad: UVec2,
+        pad: UVec2,
     }
 }
 
@@ -253,7 +253,7 @@ impl PathTracer {
                     self.schedule.pixel_stride * self.schedule.pixel_stride,
                     u32::from(self.spectral_capture),
                 ),
-                _pad: UVec2::ZERO,
+                pad: UVec2::ZERO,
             },
         );
 
@@ -284,7 +284,7 @@ impl PathTracer {
             &ClearRoot {
                 film: accum.gpu().cast(),
                 count: float_count,
-                _pad: 0,
+                pad: 0,
             },
         );
 

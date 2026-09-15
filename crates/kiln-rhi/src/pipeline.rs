@@ -74,7 +74,7 @@ pub struct GraphicsPso {
 
 pub(crate) enum GraphicsPsoInner {
     #[cfg(feature = "vulkan")]
-    Vulkan(Box<crate::backend::vulkan::pipeline::VulkanGraphicsPso>),
+    Vulkan(std::rc::Rc<crate::backend::vulkan::pipeline::VulkanGraphicsPso>),
     #[cfg(feature = "metal")]
     Metal(Box<crate::backend::metal::pipeline::MetalGraphicsPso>),
 }
@@ -104,7 +104,7 @@ pub struct ComputePso {
 
 pub(crate) enum ComputePsoInner {
     #[cfg(feature = "vulkan")]
-    Vulkan(Box<crate::backend::vulkan::pipeline::VulkanComputePso>),
+    Vulkan(std::rc::Rc<crate::backend::vulkan::pipeline::VulkanComputePso>),
     #[cfg(feature = "metal")]
     Metal(Box<crate::backend::metal::pipeline::MetalComputePso>),
 }
@@ -192,7 +192,7 @@ pub struct MeshletPso {
 
 pub(crate) enum MeshletPsoInner {
     #[cfg(feature = "vulkan")]
-    Vulkan(Box<crate::backend::vulkan::pipeline::VulkanMeshletPso>),
+    Vulkan(std::rc::Rc<crate::backend::vulkan::pipeline::VulkanMeshletPso>),
     #[cfg(feature = "metal")]
     Metal(Box<crate::backend::metal::pipeline::MetalMeshletPso>),
 }

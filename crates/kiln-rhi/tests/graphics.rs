@@ -572,7 +572,7 @@ gpu_struct! {
     pub struct DepthRoot {
         color: [f32; 4],
         depth: f32,
-        _pad: [f32; 3],
+        pad: [f32; 3],
     }
 }
 
@@ -611,7 +611,7 @@ fn depth_test_rejects_farther_geometry() {
         .write(&DepthRoot {
             color: [0.0, 1.0, 0.0, 1.0], // green, near
             depth: 0.25,
-            _pad: [0.0; 3],
+            pad: [0.0; 3],
         })
         .unwrap();
     let far = bump
@@ -621,7 +621,7 @@ fn depth_test_rejects_farther_geometry() {
         .write(&DepthRoot {
             color: [1.0, 0.0, 0.0, 1.0], // red, far — must lose
             depth: 0.75,
-            _pad: [0.0; 3],
+            pad: [0.0; 3],
         })
         .unwrap();
 

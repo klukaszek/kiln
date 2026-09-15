@@ -1,8 +1,12 @@
-//! Slang shader compiler with a file-based binary cache. Behind the `slangc` feature.
+//! Slang shader compiler with a file-based binary cache.
 //!
 //! This shells out to a `slangc` binary on `PATH` at runtime, which suits tests, examples and
 //! iteration but not a shipped application. For that, compile offline and pass the bytes to
 //! [`Device::create_shader_module`] directly — the RHI needs nothing from this module.
+//!
+//! Compiling is a runtime capability, not a build-time one: whether it works depends on `slangc`
+//! being installed, which no Cargo feature can decide. Calls report a
+//! [`ShaderCompilation`](crate::RhiError::ShaderCompilation) error when it is missing.
 //!
 //! Provides a single canonical path for compiling Slang source to the active
 //! backend's format (SPIR-V or metallib) and loading the result as a
@@ -16,10 +20,10 @@
 //!
 //! - `-fvk-use-entrypoint-name`: preserves the entry-point name in `OpEntryPoint`
 //!   so `ShaderModuleDesc::entry_point` matches what Vulkan expects.
-//! - `-fvk-bind-globals 0 1`: redirects Slang's `$Globals` cbuffer (module-scope
-//!   uniforms) from set 0 to set 1. Set 0 is the bindless heap; a stray global
-//!   there silently aliases it. With this flag the collision becomes a
-//!   missing-binding error.
+//! - `-capability spvDescriptorHeapEXT`: lowers `DescriptorHandle<T>` onto
+//!   `SPV_EXT_descriptor_heap`'s `ResourceHeapEXT`/`SamplerHeapEXT` builtins instead of an
+//!   unbounded runtime array. The result carries no descriptor set or binding decorations at
+//!   all, which is what lets pipelines be created with a null layout.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -36,6 +40,48 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 // aggressive speed optimizations we want for runtime shaders without the code-size and compile-time
 // tradeoffs of level 3.
 const SLANG_OPTIMIZATION_LEVEL: &str = "2";
+
+/// Lowers `DescriptorHandle<T>` onto `SPV_EXT_descriptor_heap`'s heap builtins instead of an
+/// unbounded runtime descriptor array.
+const SPIRV_DESCRIPTOR_HEAP_CAPABILITY: &str = "spvDescriptorHeapEXT";
+
+/// Defines `KILN_ACCEL_FIELD`, which `gpu_struct!` emits for every `AccelHandle` field.
+///
+/// Acceleration structures are the one resource the two backends genuinely reach differently:
+/// Metal resolves them through the same bindless table as everything else, while Vulkan passes
+/// the device address and converts. Both spellings occupy the same eight bytes, so the Rust
+/// struct layout is identical either way, and both expose the field as a
+/// `RaytracingAccelerationStructure` property. Shaders just read the field; nothing in shader
+/// source is backend-specific.
+///
+/// Do not collapse these into one spelling. Each half is wrong on the other backend in a way
+/// that does not fail the build:
+///
+/// - Metal accepts `RaytracingAccelerationStructure(someAddress)` and emits a function with an
+///   empty body, so the structure is silently garbage at runtime rather than a compile error.
+/// - Vulkan accepts `DescriptorHandle<RaytracingAccelerationStructure>` and lowers it to a heap
+///   load plus `OpConvertUToAccelerationStructureKHR`. That path produces no hits here even
+///   when the slot holds exactly the bytes `vkWriteResourceDescriptorsEXT` itself writes, at
+///   the driver's reported 8-byte acceleration-structure descriptor size.
+fn accel_field_preamble(target: &str) -> &'static str {
+    if target == "spirv" {
+        concat!(
+            "#define KILN_ACCEL_FIELD(name) uint64_t name##_address; ",
+            "property RaytracingAccelerationStructure name ",
+            "{ get { return RaytracingAccelerationStructure(name##_address); } }
+",
+        )
+    } else {
+        concat!(
+            "#define KILN_ACCEL_FIELD(name) ",
+            "DescriptorHandle<RaytracingAccelerationStructure> name##_handle; ",
+            "property RaytracingAccelerationStructure name ",
+            "{ get { return name##_handle; } }
+",
+        )
+    }
+}
+
 
 struct TempShaderFiles {
     source: PathBuf,
@@ -59,7 +105,15 @@ pub fn compile(
     capabilities: &[&str],
 ) -> RhiResult<ShaderModule> {
     let (target, ext) = backend_target(device);
-    let code = get_or_compile(src, entry, stage, target, ext, capabilities)?;
+    // Fold the heap capability into the requested set so it reaches both slangc and the cache
+    // key; leaving it out of the key would serve pre-descriptor-heap SPIR-V from an old cache.
+    let mut effective: Vec<&str> = capabilities.to_vec();
+    if target == "spirv" {
+        effective.push(SPIRV_DESCRIPTOR_HEAP_CAPABILITY);
+    }
+    // One line, so slangc diagnostics stay on the caller's line numbers.
+    let src = format!("{}{src}", accel_field_preamble(target));
+    let code = get_or_compile(&src, entry, stage, target, ext, &effective)?;
     make_module(device, &code, entry, stage)
 }
 
@@ -88,7 +142,6 @@ fn get_or_compile(
         stage,
         target,
         capabilities,
-        SLANG_OPTIMIZATION_LEVEL,
     );
     let path = cache_dir().join(format!("{key:016x}.{ext}"));
     if let Ok(cached) = std::fs::read(&path)
@@ -133,7 +186,6 @@ fn cache_key(
     stage: ShaderStage,
     target: &str,
     capabilities: &[&str],
-    optimization_level: &str,
 ) -> u64 {
     let mut h = DefaultHasher::new();
     version_hash.hash(&mut h);
@@ -141,7 +193,7 @@ fn cache_key(
     entry.hash(&mut h);
     stage_str(stage).hash(&mut h);
     target.hash(&mut h);
-    optimization_level.hash(&mut h);
+    SLANG_OPTIMIZATION_LEVEL.hash(&mut h);
     let mut caps = capabilities.to_vec();
     caps.sort_unstable();
     caps.hash(&mut h);
@@ -205,8 +257,9 @@ fn invoke_slangc(
     if target == "spirv" {
         // Keep the entry-point name in `OpEntryPoint` so it matches the RHI.
         cmd.arg("-fvk-use-entrypoint-name");
-        // Reserve set 0 for the bindless heap.
-        cmd.args(["-fvk-bind-globals", "0", "1"]);
+        // Force one stride for every resource array in the heap. Without it Slang sizes each by
+        // its own type -- images by `OpConstantSizeOfEXT`, acceleration structures as 8-byte
+        // addresses -- and a slot index would mean a different byte offset per resource kind.
     }
     // `spv*` capabilities are SPIR-V-only. Slang accepts them silently on a metallib compile,
     // so filter here rather than making every caller branch on the backend.
@@ -218,9 +271,19 @@ fn invoke_slangc(
     }
     cmd.arg("-o").arg(&files.output);
 
-    let output = cmd
-        .output()
-        .map_err(|error| RhiError::ShaderCompilation(format!("run slangc: {error}")))?;
+    let output = cmd.output().map_err(|error| {
+        RhiError::ShaderCompilation(match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                concat!(
+                    "`slangc` was not found on PATH; install the Slang toolchain, ",
+                    "or compile shaders offline and pass the bytes to ",
+                    "`Device::create_shader_module`",
+                )
+                .to_string()
+            }
+            _ => format!("run slangc: {error}"),
+        })
+    })?;
 
     if !output.status.success() {
         return Err(RhiError::ShaderCompilation(format!(

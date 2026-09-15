@@ -4,12 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["metal", "slangc"]
+default = ["vulkan"]
 vulkan = ["dep:ash", "dep:ash-window"]
-# Compile Slang source at runtime by shelling out to `slangc` on PATH, caching artifacts in the
-# temp dir. Convenient for tests, examples and iteration; a shipping build should compile shaders
-# offline and hand `Device::create_shader_module` the bytes instead.
-slangc = []
 metal = ["dep:objc2-metal", "dep:objc2", "dep:objc2-foundation", "dep:objc2-quartz-core", "dep:objc2-core-foundation", "dep:dispatch2"]
 
 [dependencies]
@@ -22,8 +18,11 @@ bitflags = "2"
 smallvec = "1"
 
 # Vulkan backend
-ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"], optional = true }
-ash-window = { version = "0.13", optional = true }
+# Tracks ash master: the Vulkan 1.4 binding model (VK_EXT_descriptor_heap,
+# VK_KHR_device_address_commands, VK_KHR_shader_untyped_pointers) predates any ash release.
+# ash-window must come from the same repo, or it pulls a second, incompatible ash off crates.io.
+ash = { git = "https://github.com/ash-rs/ash", default-features = false, features = ["loaded", "debug", "std"], optional = true }
+ash-window = { git = "https://github.com/ash-rs/ash", optional = true }
 
 # Metal backend
 objc2-metal = { version = "0.3.2", optional = true, features = [

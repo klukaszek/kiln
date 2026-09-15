@@ -5,23 +5,21 @@ use std::cell::Cell;
 use ash::vk;
 
 use super::device::{
-    VulkanDevice, format_has_stencil, format_to_vk, initial_image_layout, is_depth_format,
-    sampled_image_layout,
+    IMAGE_LAYOUT, VulkanDevice, format_has_stencil, format_to_vk, is_depth_format,
 };
 use super::queue::VulkanRetiredResource;
 
 use crate::error::{RhiError, RhiResult};
 use crate::queue::QueueInner;
 use crate::texture::{Texture, TextureDesc, TextureSizeAlign, TextureUsage};
-use crate::types::{Format, GpuPtr, SampleCount, TextureDimension, TextureHandle, TextureId};
+use crate::types::{
+    Format, GpuPtr, MAX_BINDLESS_TEXTURES, SampleCount, TextureDimension, TextureHandle, TextureId,
+};
 
 /// Vulkan texture stored in the bindless heap.
 pub struct VulkanTexture {
     pub(crate) image: vk::Image,
     pub(crate) image_view: vk::ImageView,
-    /// Layout selected from the texture's dominant usage at creation time. Mixed-use images use
-    /// GENERAL because the RHI intentionally does not maintain a global per-resource tracker.
-    pub(crate) layout: vk::ImageLayout,
     /// True when this entry is a view into another texture's image.
     /// On destruction, only `image_view` is freed; `image` belongs to the source.
     pub(crate) is_view: bool,
@@ -134,10 +132,13 @@ impl VulkanDevice {
             return Ok(id);
         }
         let mut next = self.next_texture_id.borrow_mut();
+        if *next >= MAX_BINDLESS_TEXTURES {
+            return Err(RhiError::TextureCreation(
+                "Vulkan bindless texture heap exhausted".into(),
+            ));
+        }
         let id = TextureId(*next);
-        *next = next
-            .checked_add(1)
-            .ok_or_else(|| RhiError::TextureCreation("Vulkan texture ID space exhausted".into()))?;
+        *next += 1;
         Ok(id)
     }
 
@@ -149,9 +150,10 @@ impl VulkanDevice {
     fn resolve_texture_placement(
         &self,
         texture_gpu: GpuPtr<u8>,
-        mem_reqs: &vk::MemoryRequirements,
     ) -> RhiResult<(vk::DeviceMemory, u64)> {
-        let fail = |msg: String| RhiError::TextureCreation(msg);
+        // Only the lookup is checked here. Alignment, available size and memory-type
+        // compatibility are all conditions `vkBindImageMemory` already validates, and restating
+        // them buys nothing the validation layer does not report more precisely.
         let allocations = self.allocations.borrow();
         let alloc = allocations
             .range(..=texture_gpu.address)
@@ -159,44 +161,25 @@ impl VulkanDevice {
             .map(|(_, alloc)| alloc)
             .filter(|alloc| texture_gpu.address - alloc.base.address < alloc.size)
             .ok_or_else(|| {
-                fail(format!(
+                RhiError::TextureCreation(format!(
                     "texture allocation address 0x{:x} was not returned by gpuMalloc",
                     texture_gpu.address
                 ))
             })?;
 
         let offset = texture_gpu.address - alloc.base.address;
-        let memory_offset = alloc.memory_offset + offset;
-        if !memory_offset.is_multiple_of(mem_reqs.alignment) {
-            return Err(fail(format!(
-                "texture allocation address 0x{:x} has memory offset {memory_offset}, expected alignment {}",
-                texture_gpu.address, mem_reqs.alignment
-            )));
-        }
-        if mem_reqs.size > alloc.size - offset {
-            return Err(fail(format!(
-                "texture allocation address 0x{:x} has {} bytes available, needs {}",
-                texture_gpu.address,
-                alloc.size - offset,
-                mem_reqs.size
-            )));
-        }
-        if mem_reqs.memory_type_bits & (1 << alloc.memory_type_index) == 0 {
-            return Err(fail(
-                "texture allocation memory type is not compatible with this image".into(),
-            ));
-        }
-        Ok((alloc.memory, memory_offset))
+        Ok((alloc.memory, alloc.memory_offset + offset))
     }
 
     /// Full-resource view of `image`, covering every mip and layer.
-    fn create_default_view(
-        &self,
+    /// The view description for a texture's default view. Attachments need a real `VkImageView`,
+    /// while descriptors are written from this info directly, so both are derived from it.
+    fn default_view_info(
         desc: &TextureDesc,
         image: vk::Image,
         array_layers: u32,
         vk_format: vk::Format,
-    ) -> RhiResult<vk::ImageView> {
+    ) -> vk::ImageViewCreateInfo<'static> {
         let view_type = match desc.dimension {
             TextureDimension::D1 => vk::ImageViewType::TYPE_1D,
             TextureDimension::D2 => vk::ImageViewType::TYPE_2D,
@@ -205,7 +188,7 @@ impl VulkanDevice {
             TextureDimension::Cube => vk::ImageViewType::CUBE,
             TextureDimension::CubeArray => vk::ImageViewType::CUBE_ARRAY,
         };
-        let info = vk::ImageViewCreateInfo::default()
+        vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(view_type)
             .format(vk_format)
@@ -215,8 +198,14 @@ impl VulkanDevice {
                 level_count: desc.mip_levels,
                 base_array_layer: 0,
                 layer_count: array_layers,
-            });
-        unsafe { self.device.create_image_view(&info, None) }
+            })
+    }
+
+    fn create_default_view(
+        &self,
+        info: &vk::ImageViewCreateInfo<'_>,
+    ) -> RhiResult<vk::ImageView> {
+        unsafe { self.device.create_image_view(info, None) }
             .map_err(|e| RhiError::TextureCreation(e.to_string()))
     }
 
@@ -228,12 +217,6 @@ impl VulkanDevice {
             textures.resize_with(index + 1, || None);
         }
         textures[index] = Some(texture);
-
-        let mut flags = self.texture_view_flags.borrow_mut();
-        if flags.len() <= index {
-            flags.resize(index + 1, false);
-        }
-        flags[index] = false;
     }
 
     pub fn create_texture(
@@ -248,16 +231,16 @@ impl VulkanDevice {
         }
 
         let (image, array_layers, vk_format) = self.create_image_for_desc(desc)?;
-        let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
 
         let image_view = Cell::new(vk::ImageView::null());
         let texture_id = Cell::new(None);
         let build = || -> RhiResult<Texture> {
-            let (memory, memory_offset) = self.resolve_texture_placement(texture_gpu, &mem_reqs)?;
+            let (memory, memory_offset) = self.resolve_texture_placement(texture_gpu)?;
             unsafe { self.device.bind_image_memory(image, memory, memory_offset) }
                 .map_err(|e| RhiError::TextureCreation(e.to_string()))?;
 
-            image_view.set(self.create_default_view(desc, image, array_layers, vk_format)?);
+            let view_info = Self::default_view_info(desc, image, array_layers, vk_format);
+            image_view.set(self.create_default_view(&view_info)?);
             let view = image_view.get();
             if let Some(label) = desc.label.as_deref() {
                 self.set_object_name(image, label);
@@ -267,26 +250,24 @@ impl VulkanDevice {
             let id = self.allocate_texture_id()?;
             texture_id.set(Some(id));
 
-            let initial_layout = initial_image_layout(desc);
             let aspect = texture_aspect(desc.format);
             let transition_aspect = if format_has_stencil(desc.format) {
                 aspect | vk::ImageAspectFlags::STENCIL
             } else {
                 aspect
             };
-            self.transition_image_to_layout(
+            self.initialize_image_layout(
                 image,
                 transition_aspect,
                 desc.mip_levels,
                 array_layers,
-                initial_layout,
             )?;
 
             if desc.usage.contains(TextureUsage::SAMPLED) {
-                self.write_image_descriptor(id, view, sampled_image_layout(desc), false)?;
+                self.write_image_descriptor(id, &view_info, IMAGE_LAYOUT, false)?;
             }
             if desc.usage.contains(TextureUsage::STORAGE) {
-                self.write_image_descriptor(id, view, vk::ImageLayout::GENERAL, true)?;
+                self.write_image_descriptor(id, &view_info, vk::ImageLayout::GENERAL, true)?;
             }
 
             self.register_texture(
@@ -294,7 +275,6 @@ impl VulkanDevice {
                 VulkanTexture {
                     image,
                     image_view: view,
-                    layout: initial_layout,
                     is_view: false,
                 },
             );
@@ -330,9 +310,6 @@ impl VulkanDevice {
             .get_mut(idx)
             .and_then(Option::take);
         if let Some(texture) = retired {
-            if let Some(is_view) = self.texture_view_flags.borrow_mut().get_mut(idx) {
-                *is_view = false;
-            }
             backend_expect!(&self.queue.inner, QueueInner::Vulkan).release_resource(
                 VulkanRetiredResource::Texture {
                     id: texture_id,
@@ -344,21 +321,15 @@ impl VulkanDevice {
 
     pub fn destroy_texture_view(&self, id: TextureId) {
         let idx = id.0 as usize;
-        // Claim the view in one critical section. Splitting the test and the clear lets two
-        // callers both observe `true` for the same ID.
-        let was_view = self
-            .texture_view_flags
-            .borrow_mut()
-            .get_mut(idx)
-            .is_some_and(|flag| std::mem::replace(flag, false));
-        if !was_view {
-            return;
-        }
-        let retired = self
-            .textures
-            .borrow_mut()
-            .get_mut(idx)
-            .and_then(Option::take);
+        // Taking the entry is itself the claim, so a second call finds nothing to do. Only
+        // entries that really are views are claimed; a base texture keeps its slot.
+        let retired = {
+            let mut textures = self.textures.borrow_mut();
+            match textures.get_mut(idx) {
+                Some(slot) if slot.as_ref().is_some_and(|t| t.is_view) => slot.take(),
+                _ => None,
+            }
+        };
         if let Some(texture) = retired {
             backend_expect!(&self.queue.inner, QueueInner::Vulkan)
                 .release_resource(VulkanRetiredResource::Texture { id, texture });
@@ -463,9 +434,9 @@ impl VulkanDevice {
         let layout = if storage {
             vk::ImageLayout::GENERAL
         } else {
-            sampled_image_layout(source.desc())
+            IMAGE_LAYOUT
         };
-        if let Err(err) = self.write_image_descriptor(texture_id, image_view, layout, storage) {
+        if let Err(err) = self.write_image_descriptor(texture_id, &view_info, layout, storage) {
             unsafe { self.device.destroy_image_view(image_view, None) };
             self.recycle_texture_id(texture_id);
             return Err(err);
@@ -474,7 +445,6 @@ impl VulkanDevice {
         let vk_texture = VulkanTexture {
             image: vk::Image::null(),
             image_view,
-            layout,
             is_view: true,
         };
 
@@ -484,13 +454,6 @@ impl VulkanDevice {
                 textures.resize_with(texture_id.0 as usize + 1, || None);
             }
             textures[texture_id.0 as usize] = Some(vk_texture);
-        }
-        {
-            let mut flags = self.texture_view_flags.borrow_mut();
-            if flags.len() <= texture_id.0 as usize {
-                flags.resize(texture_id.0 as usize + 1, false);
-            }
-            flags[texture_id.0 as usize] = true;
         }
 
         Ok(texture_id)

@@ -58,6 +58,7 @@ pub fn mtl_to_format(mtl: MTLPixelFormat) -> Format {
 }
 
 use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLDevice, MTLHeap, MTLResidencySet, MTLStorageMode, MTLTexture, MTLTextureDescriptor,
@@ -70,6 +71,14 @@ use crate::error::{RhiError, RhiResult};
 use crate::queue::QueueInner;
 use crate::texture::{Texture, TextureDesc, TextureSizeAlign, TextureUsage};
 use crate::types::{GpuPtr, SampleCount, TextureDimension, TextureHandle, TextureId};
+
+/// A texture slot's contents. Mirrors `VulkanTexture`: the view flag lives with the texture
+/// rather than in a parallel array that has to be kept in step.
+pub(crate) struct MetalTexture {
+    pub(crate) texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    /// True when this entry is a view into another texture rather than a heap placement.
+    pub(crate) is_view: bool,
+}
 
 impl MetalDevice {
     /// Build the native `MTLTextureDescriptor` for a `TextureDesc`. Shared by
@@ -164,10 +173,6 @@ impl MetalDevice {
         }
 
         let mtl_desc = self.build_texture_descriptor(desc);
-        let size_align = self
-            .shared
-            .device
-            .heapTextureSizeAndAlignWithDescriptor(&mtl_desc);
         let (heap, heap_offset) = {
             let allocations = self.shared.allocations.borrow();
             let alloc = allocations
@@ -186,22 +191,10 @@ impl MetalDevice {
             // `newTextureWithDescriptor:offset:` positions the texture within the heap, so the
             // allocation's own placement has to be added in; otherwise every allocation that is
             // not itself at heap offset 0 lands the texture on top of unrelated resources.
-            let heap_offset = alloc.heap_offset + offset;
-            if !heap_offset.is_multiple_of(size_align.align as u64) {
-                return Err(RhiError::TextureCreation(format!(
-                    "texture allocation address 0x{:x} has heap offset {heap_offset}, expected alignment {}",
-                    texture_gpu.address, size_align.align
-                )));
-            }
-            if size_align.size as u64 > alloc.size - offset {
-                return Err(RhiError::TextureCreation(format!(
-                    "texture allocation address 0x{:x} has {} bytes available, needs {}",
-                    texture_gpu.address,
-                    alloc.size - offset,
-                    size_align.size
-                )));
-            }
-            (alloc.heap.clone(), heap_offset)
+            // Only the lookup is checked here, matching the Vulkan backend: a misaligned or
+            // oversized placement makes `newTextureWithDescriptor:offset:` return nil, which is
+            // handled just below, and Metal's own validation reports the reason.
+            (alloc.heap.clone(), alloc.heap_offset + offset)
         };
 
         let texture =
@@ -211,10 +204,6 @@ impl MetalDevice {
                 })?;
 
         // Track the buffer for Metal 4 residency.
-        self.shared
-            .residency_set
-            .addAllocation(as_allocation(&texture));
-        self.shared.residency_dirty.set(true);
 
         if let Some(label) = &desc.label {
             use objc2_metal::MTLResource;
@@ -228,13 +217,11 @@ impl MetalDevice {
         if textures.len() <= idx {
             textures.resize_with(idx + 1, || None);
         }
-        textures[idx] = Some(texture.clone());
+        textures[idx] = Some(MetalTexture {
+            texture: texture.clone(),
+            is_view: false,
+        });
         drop(textures);
-        let mut view_flags = self.texture_view_flags.borrow_mut();
-        if view_flags.len() <= idx {
-            view_flags.resize(idx + 1, false);
-        }
-        view_flags[idx] = false;
         Self::write_heap_slot(
             &self.shared.texture_heap,
             idx,
@@ -261,41 +248,34 @@ impl MetalDevice {
             }
         };
         if let Some(tex) = retired {
-            if let Some(is_view) = self
-                .texture_view_flags
-                .borrow_mut()
-                .get_mut(texture.id.0 as usize)
-            {
-                *is_view = false;
-            }
             backend_expect!(&self.rhi_queue.inner, QueueInner::Metal).release_resource(
                 MetalRetiredResource::Texture {
                     id: texture.id,
-                    texture: tex,
+                    texture: tex.texture,
+                    is_view: tex.is_view,
                 },
             );
         }
     }
 
     pub fn destroy_texture_view(&self, id: TextureId) {
-        // Claim the view in one borrow, mirroring the Vulkan path.
-        let was_view = self
-            .texture_view_flags
-            .borrow_mut()
-            .get_mut(id.0 as usize)
-            .is_some_and(|flag| std::mem::replace(flag, false));
-        if !was_view {
-            return;
-        }
-        let retired = self
-            .shared
-            .textures
-            .borrow_mut()
-            .get_mut(id.0 as usize)
-            .and_then(Option::take);
+        // Taking the entry is itself the claim, so a second call finds nothing to do. Only
+        // entries that really are views are claimed; a base texture keeps its slot.
+        let retired = {
+            let mut textures = self.shared.textures.borrow_mut();
+            match textures.get_mut(id.0 as usize) {
+                Some(slot) if slot.as_ref().is_some_and(|t| t.is_view) => slot.take(),
+                _ => None,
+            }
+        };
         if let Some(texture) = retired {
-            backend_expect!(&self.rhi_queue.inner, QueueInner::Metal)
-                .release_resource(MetalRetiredResource::Texture { id, texture });
+            backend_expect!(&self.rhi_queue.inner, QueueInner::Metal).release_resource(
+                MetalRetiredResource::Texture {
+                    id,
+                    texture: texture.texture,
+                    is_view: true,
+                },
+            );
         }
     }
 
@@ -324,7 +304,7 @@ impl MetalDevice {
             .get(id.0 as usize)
             .and_then(|t| t.as_ref())
             .expect("invalid TextureId");
-        texture.gpuResourceID().to_raw()
+        texture.texture.gpuResourceID().to_raw()
     }
 
     fn create_view_internal(
@@ -342,6 +322,7 @@ impl MetalDevice {
             .ok_or_else(|| {
                 RhiError::TextureCreation("create texture view: invalid source TextureId".into())
             })?
+            .texture
             .clone();
         drop(textures_borrow);
 
@@ -416,13 +397,11 @@ impl MetalDevice {
         if textures.len() <= idx {
             textures.resize_with(idx + 1, || None);
         }
-        textures[idx] = Some(view_texture);
+        textures[idx] = Some(MetalTexture {
+            texture: view_texture,
+            is_view: true,
+        });
         drop(textures);
-        let mut view_flags = self.texture_view_flags.borrow_mut();
-        if view_flags.len() <= idx {
-            view_flags.resize(idx + 1, false);
-        }
-        view_flags[idx] = true;
         Self::write_heap_slot(&self.shared.texture_heap, idx, resource_id);
 
         Ok(id)

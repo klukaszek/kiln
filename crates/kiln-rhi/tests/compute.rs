@@ -10,7 +10,7 @@ gpu_struct! {
         output: GpuPtr<u32>,
         count: u32,
         // Keep the host and Slang layouts identical.
-        _pad: u32,
+        pad: u32,
     }
 }
 
@@ -62,13 +62,13 @@ fn compute_barrier_across_pipeline_switches() {
                 input: a.gpu().cast(),
                 output: b.gpu().cast(),
                 count: N,
-                _pad: 0,
+                pad: 0,
             },
             Data {
                 input: b.gpu().cast(),
                 output: a.gpu().cast(),
                 count: N,
-                _pad: 0,
+                pad: 0,
             },
         ])
         .expect("upload roots");
@@ -132,7 +132,7 @@ fn compute_doubles_buffer() {
         input: input.gpu().cast(),
         output: output.gpu().cast(),
         count: N,
-        _pad: 0,
+        pad: 0,
     })
     .expect("upload root");
 

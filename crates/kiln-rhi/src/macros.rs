@@ -28,46 +28,30 @@ macro_rules! backend_expect {
 
 /// Define a GPU struct once, emitting the `#[repr(C)]` Rust type and a matching Slang
 /// declaration in `Name::SLANG`. Field types map through [`gpu_slang_ty!`](crate::gpu_slang_ty);
-/// `as "..."` overrides a mapping. Padding is rejected at compile time by `IntoBytes`.
-///
-/// ```ignore
-/// gpu_struct! {
-///     pub struct Material {
-///         albedo: u32,                      // -> uint
-///         tint:   Vec4,                     // -> float4
-///         data:   GpuPtr<Surface>,          // -> Surface*
-///         table:  GpuPtr<f32, Read>,        // -> Ptr<float, Access.Read>
-///     }
-/// }
-/// ```
-///
-/// # Padding
-///
-/// The struct is memcpy'd into GPU memory, so every byte has to be initialized and the layout has
-/// to match the Slang declaration exactly. That rules out compiler-inserted padding, and the
-/// derive rejects it with the exact byte count when it would occur, so declare it:
+/// `as "..."` overrides a mapping.
 ///
 /// ```ignore
 /// gpu_struct! {
 ///     pub struct DrawRoot {
-///         vertices: GpuPtr<Vertex>,   // 8 bytes
-///         count: u32,                 // 4 bytes
-///         pad: u32,                  // 4, so the struct is a multiple of its 8-byte alignment
+///         tint:     Vec4,                // -> float4
+///         vertices: GpuPtr<Vertex>,      // -> Vertex*
+///         table:    GpuPtr<f32, Read>,   // -> Ptr<float, Access.Read>
+///         count:    u32,                 // -> uint
+///         pad:      u32,                 // declared, so the struct has no implicit padding
 ///     }
 /// }
 /// ```
 ///
-/// Padding is written out at every construction site, like any other field. That is deliberate:
-/// the alternative is a zeroed base (`..Self::new_zeroed()`, available since `FromZeros` is
-/// derived), which also silently fills any *real* field you leave out, turning a forgotten pointer
-/// into a null address instead of a compile error. Naming the bytes keeps the layout visible and
-/// keeps the compiler checking omissions.
+/// The struct is memcpy'd to the GPU, so every byte must be initialized and the layout must match
+/// the Slang declaration; `IntoBytes` rejects implicit padding with the exact byte count, so
+/// declare it as a field. Padding is then written at each construction site like any other field,
+/// which keeps the compiler catching omissions — a zeroed base would mask a forgotten real field
+/// too, turning it into a null address rather than an error.
 ///
 /// A pointer's second parameter is a shader-side annotation, not a Rust type parameter: the field
-/// is a plain [`GpuPtr<T>`](crate::GpuPtr) either way. `Read` emits Slang's read-only pointer, which
-/// lets the compiler assume nothing writes through it; the default is a read-write `T*`. Access is a
-/// property of how *this* shader uses the buffer, so the same allocation can be `Read` in one root
-/// struct and read-write in another.
+/// is a plain [`GpuPtr<T>`](crate::GpuPtr) either way. `Read` emits Slang's read-only pointer, so
+/// the compiler can assume no aliasing writes; the default is read-write `T*`. The same allocation
+/// can be `Read` in one root struct and read-write in another.
 #[macro_export]
 macro_rules! gpu_struct {
     (
@@ -144,17 +128,16 @@ macro_rules! __gpu_struct_parse {
         }
     };
 
-    // An acceleration-structure handle: eight bytes like every other handle, but the two backends
-    // build a structure from them differently, so the field is private and a property hands back
-    // the `RaytracingAccelerationStructure` through `kiln::accel`. Shader code just reads the
-    // field; only the accessor knows there was a choice.
+    // Eight bytes like any handle, but the backends build a structure from them differently, so a
+    // property hands the field back as a `RaytracingAccelerationStructure` through `kiln::accel`.
     ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
         $field:ident : AccelHandle, $($rest:tt)*) => {
         $crate::__gpu_struct_parse! {
             [$($meta)*] [$vis] [$name]
             [$($rust)* pub $field: $crate::AccelHandle,]
             [$($out)*
-                "    uint64_t ", stringify!($field), "_handle;\n",
+                "    DescriptorHandle<RaytracingAccelerationStructure> ",
+                stringify!($field), "_handle;\n",
                 "    property RaytracingAccelerationStructure ", stringify!($field),
                 " { get { return kiln::accel(", stringify!($field), "_handle); } }\n",]
             ; $($rest)*

@@ -20,9 +20,9 @@
 //!   unbounded runtime array. The result carries no descriptor set or binding decorations at
 //!   all, which is what lets pipelines be created with a null layout.
 //!
-//! Shader source itself is backend-agnostic and reaches slangc unmodified, prefixed only by
-//! [`ACCEL_PRELUDE`]: every resource but one is a `DescriptorHandle<T>` that each backend
-//! resolves through its own heap, and acceleration structures go through `kiln::accel`.
+//! Shader source itself is backend-agnostic and reaches slangc unmodified, prefixed only by the
+//! `kiln::accel` prelude: every resource is a `DescriptorHandle<T>` that each backend resolves
+//! through its own heap, and acceleration structures go through that one accessor.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -47,19 +47,21 @@ const SPIRV_DESCRIPTOR_HEAP_CAPABILITY: &str = "spvDescriptorHeapEXT";
 /// Declares `kiln::accel`, which turns an [`AccelHandle`](crate::AccelHandle)'s eight bytes into
 /// the `RaytracingAccelerationStructure` that a `gpu_struct!` field's property returns.
 ///
-/// An acceleration structure is the one resource with no shared model: Vulkan reaches one by
-/// device address, Metal only as a bindless resource id. `__target_switch` keeps that the sole
-/// backend-specific line in the whole shader pipeline; the handle itself is a plain `uint64_t` on
-/// both, so a root struct's layout never depends on the target.
+/// The one resource with no shared model: Vulkan reaches it by device address, Metal only as a
+/// bindless resource id. `__target_switch` keeps that the sole backend-specific line in the shader
+/// pipeline, and the handle is eight bytes either way, so root layout never varies by target.
 ///
-/// Neither arm fails the build on the other backend, so do not collapse them: Metal compiles
-/// `RaytracingAccelerationStructure(address)` to an empty function body, and
-/// `VK_EXT_descriptor_heap` has no acceleration-structure descriptor at all, so Slang's heap
-/// lowering reads a slot the driver never populates and every ray misses.
+/// Only SPIR-V converts, because only Metal can hold the value natively -- MSL builds an
+/// `acceleration_structure` from its opaque handle type and nothing else, so a `uint64_t` handle
+/// would need a cast Metal rejects.
+///
+/// Do not collapse the arms: each is silently wrong on the other backend, compiling to an empty
+/// function body on Metal and to a heap load of a never-populated slot on Vulkan.
 const ACCEL_PRELUDE: &str = concat!(
-    "namespace kiln { RaytracingAccelerationStructure accel(uint64_t h) { __target_switch { ",
-    "case spirv: return RaytracingAccelerationStructure(h); ",
-    "default: return reinterpret<DescriptorHandle<RaytracingAccelerationStructure> >(h); } } }
+    "namespace kiln { RaytracingAccelerationStructure accel(",
+    "DescriptorHandle<RaytracingAccelerationStructure> h) { __target_switch { ",
+    "case spirv: return RaytracingAccelerationStructure(reinterpret<uint64_t>(h)); ",
+    "default: return h; } } }
 ",
 );
 

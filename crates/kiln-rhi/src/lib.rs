@@ -38,10 +38,9 @@
 //!
 //! Per-draw data flows through one root struct. [`gpu_struct!`] emits the `#[repr(C)]` Rust type
 //! plus a `SLANG` string to prepend to the shader source; take it as an entry-point `uniform`
-//! pointer. [`TextureHandle`] and [`SamplerHandle`] fields become Slang `DescriptorHandle<..>`
-//! with no annotation; [`AccelHandle`] becomes a `RaytracingAccelerationStructure` property, since
-//! that is the one resource the two backends genuinely reach differently. Either way the shader
-//! reads the field and gets the resource.
+//! pointer. [`TextureHandle`], [`SamplerHandle`] and [`AccelHandle`] fields all become Slang
+//! `DescriptorHandle<..>` with no annotation, so the shader reads the field and gets the
+//! resource -- acceleration structures included, with nothing backend-specific in the source.
 //!
 //! ```text
 //! [shader("compute")] [numthreads(64, 1, 1)]

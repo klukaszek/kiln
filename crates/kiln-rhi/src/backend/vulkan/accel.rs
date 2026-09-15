@@ -20,10 +20,12 @@ use crate::types::{BlasDesc, GeometryType, TlasDesc};
 pub struct VulkanAccelerationStructure {
     pub(crate) acceleration_structure: vk::AccelerationStructureKHR,
     pub(crate) backing: BlockRange,
-    /// The GPU-visible address of this acceleration structure.
-    /// Use this value in `TlasInstance::acceleration_structure_reference`
-    /// and in root structs where the shader accesses it via `TraceRayInline`.
-    pub(crate) device_address: u64,
+    /// Resource-heap slot holding this structure's device address, released on drop. The slot is
+    /// the only copy: a TLAS build reads it back through `accel_device_address`.
+    pub(crate) accel_slot: u32,
+    /// The value a shader's `DescriptorHandle<RaytracingAccelerationStructure>` carries.
+    pub(crate) heap_index: u64,
+    pub(crate) free_accel_slots: super::device::SharedAccelFreeSlots,
     /// Build scratch storage, owned by the structure so it outlives the GPU build:
     /// `build_blas`/`build_tlas` only *record* the build into a command buffer that
     /// executes later, so the scratch must stay alive until then. `scratch_address`
@@ -50,6 +52,7 @@ impl Drop for VulkanAccelerationStructure {
             self.accel_loader
                 .destroy_acceleration_structure(self.acceleration_structure, None);
         }
+        self.free_accel_slots.borrow_mut().push(self.accel_slot);
         let mut pool = self.buffer_pool.borrow_mut();
         for r in [self.backing, self.scratch] {
             pool.release(r.block_index, r.offset, r.range);
@@ -146,9 +149,15 @@ impl VulkanDevice {
         std::mem::size_of::<crate::types::TlasInstance>()
     }
 
+    /// The layouts agree on every field but the structure reference, where a build needs the
+    /// device address that the public handle's heap slot holds.
     pub fn write_tlas_instance(&self, dst: *mut u8, inst: &crate::types::TlasInstance) {
+        let mut native = *inst;
+        native.acceleration_structure_reference = crate::types::AccelHandle::from_raw(
+            self.accel_device_address(inst.acceleration_structure_reference),
+        );
         unsafe {
-            std::ptr::write_unaligned(dst as *mut crate::types::TlasInstance, *inst);
+            std::ptr::write_unaligned(dst as *mut crate::types::TlasInstance, native);
         }
     }
 
@@ -226,7 +235,6 @@ impl VulkanDevice {
             )
         };
 
-
         // Leave enough headroom to align the scratch address as required by Vulkan.
         let scratch_align = self.accel_scratch_alignment();
         let (scratch, scratch_base) = self.allocate_accel_range(
@@ -235,11 +243,16 @@ impl VulkanDevice {
         )?;
         let scratch_address = scratch_base.next_multiple_of(scratch_align);
 
+        // Publish the address into the heap so shaders can reach the structure bindlessly.
+        let (accel_slot, heap_index) = self.write_accel_address(device_address)?;
+
         Ok(AccelerationStructure {
             inner: AccelInner::Vulkan(Box::new(VulkanAccelerationStructure {
                 acceleration_structure,
                 backing,
-                device_address,
+                accel_slot,
+                heap_index,
+                free_accel_slots: self.free_accel_slots.clone(),
                 scratch,
                 scratch_address,
                 buffer_pool: self.buffer_pool.clone(),

@@ -65,7 +65,11 @@ fn readme_arena_example(device: &Device, vertex_count: u32) -> RhiResult<()> {
 
 /// The snippet at the top of the README.
 #[allow(dead_code)]
-fn readme_draw_example(cmd: &mut CommandBuffer, pipeline: &GraphicsPso, root: kiln_rhi::Allocation) {
+fn readme_draw_example(
+    cmd: &mut CommandBuffer,
+    pipeline: &GraphicsPso,
+    root: kiln_rhi::Allocation,
+) {
     let vertex_count = 3;
     cmd.set_pipeline(pipeline);
     cmd.draw(root.gpu(), vertex_count, 1, 0, 0);

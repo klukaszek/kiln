@@ -144,20 +144,6 @@ macro_rules! __gpu_struct_parse {
         }
     };
 
-    // An acceleration-structure handle. The two backends reach one differently, so the field is
-    // emitted through `KILN_ACCEL_FIELD`, which the RHI's Slang compiler defines per backend.
-    // Shader code just reads the field and gets a `RaytracingAccelerationStructure`.
-    ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
-        $field:ident : AccelHandle, $($rest:tt)*) => {
-        $crate::__gpu_struct_parse! {
-            [$($meta)*] [$vis] [$name]
-            [$($rust)* pub $field: AccelHandle,]
-            [$($out)* "    KILN_ACCEL_FIELD(", stringify!($field), ")
-",]
-            ; $($rest)*
-        }
-    };
-
     // Ordinary field with an explicit Slang spelling.
     ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
         $field:ident : $ty:tt as $slang:literal, $($rest:tt)*) => {
@@ -192,6 +178,9 @@ macro_rules! gpu_slang_ty {
         $slang
     };
 
+    (AccelHandle) => {
+        "DescriptorHandle<RaytracingAccelerationStructure>"
+    };
     (TextureHandle) => {
         "DescriptorHandle<Texture2D>"
     };

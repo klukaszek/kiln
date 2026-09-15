@@ -201,10 +201,7 @@ impl VulkanDevice {
             })
     }
 
-    fn create_default_view(
-        &self,
-        info: &vk::ImageViewCreateInfo<'_>,
-    ) -> RhiResult<vk::ImageView> {
+    fn create_default_view(&self, info: &vk::ImageViewCreateInfo<'_>) -> RhiResult<vk::ImageView> {
         unsafe { self.device.create_image_view(info, None) }
             .map_err(|e| RhiError::TextureCreation(e.to_string()))
     }
@@ -256,12 +253,7 @@ impl VulkanDevice {
             } else {
                 aspect
             };
-            self.initialize_image_layout(
-                image,
-                transition_aspect,
-                desc.mip_levels,
-                array_layers,
-            )?;
+            self.initialize_image_layout(image, transition_aspect, desc.mip_levels, array_layers)?;
 
             if desc.usage.contains(TextureUsage::SAMPLED) {
                 self.write_image_descriptor(id, &view_info, IMAGE_LAYOUT, false)?;

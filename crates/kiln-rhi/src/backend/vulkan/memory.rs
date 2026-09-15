@@ -301,7 +301,6 @@ fn granularity_padded(alignment: u64, size: u64, granularity: u64) -> Option<(u6
     Some((align, range))
 }
 
-
 /// Create a buffer, back it with memory of `properties`, bind it, and return its device address.
 /// The `DEVICE_ADDRESS` allocate flag is required for any buffer whose address is taken and is
 /// easy to omit, so every such allocation goes through here.

@@ -33,8 +33,7 @@ use crate::swapchain::{AcquiredImage, Swapchain, SwapchainDesc, SwapchainInner};
 use crate::sync::{TimelineSemaphore, TimelineSemaphoreInner};
 use crate::types::{
     BlasDesc, Cull, GpuPtr, InstanceFlags, MAX_BINDLESS_SAMPLERS, MAX_BINDLESS_TEXTURES,
-    MAX_FRAMES_IN_FLIGHT,
-    SampleCount, SamplerId, TextureId, TlasDesc, Topology,
+    MAX_FRAMES_IN_FLIGHT, SampleCount, SamplerId, TextureId, TlasDesc, Topology,
 };
 
 use super::as_allocation;
@@ -429,12 +428,11 @@ impl MetalDevice {
         let frame_event = device
             .newSharedEvent()
             .ok_or_else(|| RhiError::DeviceCreation("Failed to create MTLSharedEvent".into()))?;
-        let buffer_pool: SharedMetalBufferPool =
-            Rc::new(RefCell::new(MetalBufferPool::new(
-                device.clone(),
-                residency_set.clone(),
-                residency_dirty.clone(),
-            )));
+        let buffer_pool: SharedMetalBufferPool = Rc::new(RefCell::new(MetalBufferPool::new(
+            device.clone(),
+            residency_set.clone(),
+            residency_dirty.clone(),
+        )));
         let frame_fence_values: FrameFenceValues =
             Rc::new(RefCell::new([0u64; MAX_FRAMES_IN_FLIGHT]));
         let frame_fence_next = Rc::new(Cell::new(0u64));
@@ -447,7 +445,6 @@ impl MetalDevice {
         let frame_table_slots = Rc::new(RefCell::new(vec![None; MAX_FRAMES_IN_FLIGHT]));
 
         log::info!("Metal device created: {}", device.name());
-
 
         let create_heap = |len: usize, label: &str| {
             let heap = device

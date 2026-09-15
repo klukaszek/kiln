@@ -223,7 +223,8 @@ impl MetalBufferPool {
                 continue;
             }
             if kept_empty.contains(&block.memory) {
-                self.residency_set.removeAllocation(as_allocation(&block.heap));
+                self.residency_set
+                    .removeAllocation(as_allocation(&block.heap));
                 self.residency_dirty.set(true);
                 *slot = None;
             } else {

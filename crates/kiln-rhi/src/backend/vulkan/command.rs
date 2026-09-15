@@ -1,7 +1,5 @@
 use super::barrier::{to_vk_access_flags, to_vk_stage_flags};
-use super::device::{
-    IMAGE_LAYOUT, SharedTextures, build_accel_flags_to_vk, geometry_flags_to_vk,
-};
+use super::device::{IMAGE_LAYOUT, SharedTextures, build_accel_flags_to_vk, geometry_flags_to_vk};
 use super::texture::texture_aspect;
 use crate::barrier::{HazardFlags, StageFlags};
 use crate::command::{
@@ -83,11 +81,7 @@ impl VulkanCommandBuffer {
     }
 
     /// Same, for the indirect-argument commands, which also carry a stride.
-    fn strided_range(
-        addr: GpuPtr<u8>,
-        size: u64,
-        stride: u64,
-    ) -> vk::StridedDeviceAddressRangeKHR {
+    fn strided_range(addr: GpuPtr<u8>, size: u64, stride: u64) -> vk::StridedDeviceAddressRangeKHR {
         vk::StridedDeviceAddressRangeKHR::default()
             .address(addr.address)
             .size(size)
@@ -402,12 +396,7 @@ impl VulkanCommandBuffer {
     ) {
         let (image, aspect, src_range) =
             self.prepare_texture_copy(src, texture, region, "copy_buffer_to_texture");
-        let copy = build_memory_image_region(
-            src_range,
-            aspect,
-            region,
-            IMAGE_LAYOUT,
-        );
+        let copy = build_memory_image_region(src_range, aspect, region, IMAGE_LAYOUT);
         let info = vk::CopyDeviceMemoryImageInfoKHR::default()
             .image(image)
             .regions(std::slice::from_ref(&copy));
@@ -425,12 +414,7 @@ impl VulkanCommandBuffer {
     ) {
         let (image, aspect, dst_range) =
             self.prepare_texture_copy(dst, texture, region, "copy_texture_to_buffer");
-        let copy = build_memory_image_region(
-            dst_range,
-            aspect,
-            region,
-            IMAGE_LAYOUT,
-        );
+        let copy = build_memory_image_region(dst_range, aspect, region, IMAGE_LAYOUT);
         let info = vk::CopyDeviceMemoryImageInfoKHR::default()
             .image(image)
             .regions(std::slice::from_ref(&copy));
@@ -481,11 +465,7 @@ impl VulkanCommandBuffer {
         texture: &Texture,
         region: ResolvedRegion,
         op: &'static str,
-    ) -> (
-        vk::Image,
-        vk::ImageAspectFlags,
-        vk::DeviceAddressRangeKHR,
-    ) {
+    ) -> (vk::Image, vk::ImageAspectFlags, vk::DeviceAddressRangeKHR) {
         let image = self.resolve_texture_info(texture.id()).0;
         let bpp = bytes_per_pixel(texture.desc().format)
             .unwrap_or_else(|| panic!("Unsupported texture format for {op}"));
@@ -530,8 +510,8 @@ impl VulkanCommandBuffer {
             dst_stage |= vk::PipelineStageFlags2::VERTEX_SHADER
                 | vk::PipelineStageFlags2::FRAGMENT_SHADER
                 | vk::PipelineStageFlags2::COMPUTE_SHADER;
-            dst_access |= vk::AccessFlags2::RESOURCE_HEAP_READ_EXT
-                | vk::AccessFlags2::SAMPLER_HEAP_READ_EXT;
+            dst_access |=
+                vk::AccessFlags2::RESOURCE_HEAP_READ_EXT | vk::AccessFlags2::SAMPLER_HEAP_READ_EXT;
         }
 
         let memory_barrier = vk::MemoryBarrier2::default()

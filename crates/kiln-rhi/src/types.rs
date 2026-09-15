@@ -141,6 +141,11 @@ impl<T: ?Sized> std::fmt::LowerHex for GpuPtr<T> {
 pub const MAX_BINDLESS_TEXTURES: u32 = 1_000_000;
 /// Maximum number of bindless samplers supported by the RHI.
 pub const MAX_BINDLESS_SAMPLERS: u32 = 256;
+/// Maximum number of acceleration structures reachable from a shader at once.
+///
+/// Small because only structures a shader names need a slot -- typically a handful of TLASes.
+/// Vulkan-only, unlike the two above: a Metal structure is reached by its own resource ID.
+pub const MAX_BINDLESS_ACCELS: u32 = 65_536;
 
 /// Texture handle -- index into the global bindless heap.
 #[repr(transparent)]
@@ -384,7 +389,8 @@ pub struct TlasInstance {
     /// Low 24 bits: shader binding table hit group offset.
     /// High 8 bits: `InstanceFlags`.
     pub instance_sbt_offset_and_flags: u32,
-    /// BLAS referenced by this instance — assign `blas.gpu()`.
+    /// BLAS referenced by this instance — assign `blas.gpu()`, the same handle a shader takes.
+    /// The backend resolves it to whatever its native instance descriptor needs.
     pub acceleration_structure_reference: AccelHandle,
 }
 

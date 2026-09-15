@@ -10,11 +10,14 @@ pub struct AccelerationStructure {
 }
 
 impl AccelerationStructure {
-    /// Opaque shader handle; assign to an [`AccelHandle`] field in root data.
+    /// Opaque shader handle; assign to an [`AccelHandle`] field in root data or to a
+    /// [`TlasInstance`](crate::TlasInstance)'s structure reference.
+    ///
+    /// A bindless-heap handle like [`Texture::gpu`](crate::Texture::gpu), not an address.
     pub fn gpu(&self) -> AccelHandle {
         let value = match &self.inner {
             #[cfg(feature = "vulkan")]
-            AccelInner::Vulkan(a) => a.device_address,
+            AccelInner::Vulkan(a) => a.heap_index,
             #[cfg(feature = "metal")]
             AccelInner::Metal(a) => a.gpu_resource_id,
         };

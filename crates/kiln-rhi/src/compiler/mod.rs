@@ -1,20 +1,15 @@
 //! Slang shader compiler with a file-based binary cache.
 //!
-//! This shells out to a `slangc` binary on `PATH` at runtime, which suits tests, examples and
-//! iteration but not a shipped application. For that, compile offline and pass the bytes to
-//! [`Device::create_shader_module`] directly — the RHI needs nothing from this module.
+//! One canonical path from Slang source to the active backend's format (SPIR-V or metallib),
+//! loaded as a [`ShaderModule`]. Results are cached on disk, keyed on source content, entry point,
+//! stage, target, capabilities and slangc version, so repeated compilations are instant. The cache
+//! and version probe are process-wide, so there is nothing to construct.
 //!
-//! Compiling is a runtime capability, not a build-time one: whether it works depends on `slangc`
-//! being installed, which no Cargo feature can decide. Calls report a
-//! [`ShaderCompilation`](crate::RhiError::ShaderCompilation) error when it is missing.
-//!
-//! Provides a single canonical path for compiling Slang source to the active
-//! backend's format (SPIR-V or metallib) and loading the result as a
-//! [`ShaderModule`]. Compiled binaries are cached on disk keyed on source
-//! content, entry point, stage, target, capabilities, and slangc version, so
-//! repeated compilations of the same shader are instant.
-//!
-//! The cache and version probe are process-wide, so there is nothing to construct.
+//! It shells out to a `slangc` on `PATH` at runtime, which suits tests, examples and iteration but
+//! not a shipped application: for that, compile offline and pass the bytes to
+//! [`Device::create_shader_module`] directly. Being a runtime capability, no Cargo feature can
+//! decide whether it works — calls report
+//! [`ShaderCompilation`](crate::RhiError::ShaderCompilation) when `slangc` is missing.
 //!
 //! # Vulkan flags applied on every compile
 //!
@@ -24,6 +19,10 @@
 //!   `SPV_EXT_descriptor_heap`'s `ResourceHeapEXT`/`SamplerHeapEXT` builtins instead of an
 //!   unbounded runtime array. The result carries no descriptor set or binding decorations at
 //!   all, which is what lets pipelines be created with a null layout.
+//!
+//! Shader source itself is backend-agnostic and reaches slangc unmodified: every resource,
+//! acceleration structures included, is a `DescriptorHandle<T>` that each backend resolves
+//! through its own heap.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -45,53 +44,30 @@ const SLANG_OPTIMIZATION_LEVEL: &str = "2";
 /// unbounded runtime descriptor array.
 const SPIRV_DESCRIPTOR_HEAP_CAPABILITY: &str = "spvDescriptorHeapEXT";
 
-/// Defines `KILN_ACCEL_FIELD`, which `gpu_struct!` emits for every `AccelHandle` field.
+/// The MSL definition of `RayDesc` that Slang omits, `-include`d into the Metal translation unit.
 ///
-/// Acceleration structures are the one resource the two backends genuinely reach differently:
-/// Metal resolves them through the same bindless table as everything else, while Vulkan passes
-/// the device address and converts. Both spellings occupy the same eight bytes, so the Rust
-/// struct layout is identical either way, and both expose the field as a
-/// `RaytracingAccelerationStructure` property. Shaders just read the field; nothing in shader
-/// source is backend-specific.
-///
-/// Do not collapse these into one spelling. Each half is wrong on the other backend in a way
-/// that does not fail the build:
-///
-/// - Metal accepts `RaytracingAccelerationStructure(someAddress)` and emits a function with an
-///   empty body, so the structure is silently garbage at runtime rather than a compile error.
-/// - Vulkan accepts `DescriptorHandle<RaytracingAccelerationStructure>` and lowers it to a heap
-///   load plus `OpConvertUToAccelerationStructureKHR`. That path produces no hits here even
-///   when the slot holds exactly the bytes `vkWriteResourceDescriptorsEXT` itself writes, at
-///   the driver's reported 8-byte acceleration-structure descriptor size.
-fn accel_field_preamble(target: &str) -> &'static str {
-    if target == "spirv" {
-        concat!(
-            "#define KILN_ACCEL_FIELD(name) uint64_t name##_address; ",
-            "property RaytracingAccelerationStructure name ",
-            "{ get { return RaytracingAccelerationStructure(name##_address); } }
-",
-        )
-    } else {
-        concat!(
-            "#define KILN_ACCEL_FIELD(name) ",
-            "DescriptorHandle<RaytracingAccelerationStructure> name##_handle; ",
-            "property RaytracingAccelerationStructure name ",
-            "{ get { return name##_handle; } }
-",
-        )
-    }
-}
-
+/// Slang 2026.17.1 drops this declaration on `metal`/`metallib` whenever a shader mentions
+/// `DescriptorHandle<T>`, leaving the type used but undefined; 2026.14 emitted it, and SPIR-V is
+/// unaffected. Shader source cannot work around it: `TraceRayInline` lowers to a `RayDesc`
+/// temporary even where the shader never names the type. Fields match by name, not position.
+/// Delete this and its `-Xmetal` flag once Slang emits the declaration again.
+const RAYDESC_MSL_DEFINITION: &str =
+    "struct RayDesc { float3 Origin; float TMin; float3 Direction; float TMax; };\n";
 
 struct TempShaderFiles {
     source: PathBuf,
     output: PathBuf,
+    /// Metal only: holds [`RAYDESC_MSL_DEFINITION`] for the downstream `-include`.
+    prelude: Option<PathBuf>,
 }
 
 impl Drop for TempShaderFiles {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.source);
         let _ = std::fs::remove_file(&self.output);
+        if let Some(prelude) = &self.prelude {
+            let _ = std::fs::remove_file(prelude);
+        }
     }
 }
 
@@ -111,9 +87,7 @@ pub fn compile(
     if target == "spirv" {
         effective.push(SPIRV_DESCRIPTOR_HEAP_CAPABILITY);
     }
-    // One line, so slangc diagnostics stay on the caller's line numbers.
-    let src = format!("{}{src}", accel_field_preamble(target));
-    let code = get_or_compile(&src, entry, stage, target, ext, &effective)?;
+    let code = get_or_compile(src, entry, stage, target, ext, &effective)?;
     make_module(device, &code, entry, stage)
 }
 
@@ -197,6 +171,10 @@ fn cache_key(
     let mut caps = capabilities.to_vec();
     caps.sort_unstable();
     caps.hash(&mut h);
+    // Part of the Metal translation unit, so editing it has to invalidate cached metallibs.
+    if target != "spirv" {
+        RAYDESC_MSL_DEFINITION.hash(&mut h);
+    }
     h.finish()
 }
 
@@ -238,11 +216,17 @@ fn invoke_slangc(
     let files = TempShaderFiles {
         source: dir.join(format!("kiln_{pid}_{seq}.slang")),
         output: dir.join(format!("kiln_{pid}_{seq}.{ext}")),
+        prelude: (target != "spirv").then(|| dir.join(format!("kiln_{pid}_{seq}_prelude.h"))),
     };
 
     std::fs::write(&files.source, src).map_err(|error| {
         RhiError::ShaderCompilation(format!("write `{}`: {error}", files.source.display()))
     })?;
+    if let Some(prelude) = &files.prelude {
+        std::fs::write(prelude, RAYDESC_MSL_DEFINITION).map_err(|error| {
+            RhiError::ShaderCompilation(format!("write `{}`: {error}", prelude.display()))
+        })?;
+    }
 
     let mut cmd = Command::new("slangc");
     cmd.arg(&files.source).args([
@@ -257,9 +241,11 @@ fn invoke_slangc(
     if target == "spirv" {
         // Keep the entry-point name in `OpEntryPoint` so it matches the RHI.
         cmd.arg("-fvk-use-entrypoint-name");
-        // Force one stride for every resource array in the heap. Without it Slang sizes each by
-        // its own type -- images by `OpConstantSizeOfEXT`, acceleration structures as 8-byte
-        // addresses -- and a slot index would mean a different byte offset per resource kind.
+    }
+    if let Some(prelude) = &files.prelude {
+        // Hands the Metal compiler a definition Slang leaves out; see `RAYDESC_MSL_DEFINITION`.
+        cmd.arg("-Xmetal")
+            .arg(format!("--include={}", prelude.display()));
     }
     // `spv*` capabilities are SPIR-V-only. Slang accepts them silently on a metallib compile,
     // so filter here rather than making every caller branch on the backend.
@@ -273,14 +259,12 @@ fn invoke_slangc(
 
     let output = cmd.output().map_err(|error| {
         RhiError::ShaderCompilation(match error.kind() {
-            std::io::ErrorKind::NotFound => {
-                concat!(
-                    "`slangc` was not found on PATH; install the Slang toolchain, ",
-                    "or compile shaders offline and pass the bytes to ",
-                    "`Device::create_shader_module`",
-                )
-                .to_string()
-            }
+            std::io::ErrorKind::NotFound => concat!(
+                "`slangc` was not found on PATH; install the Slang toolchain, ",
+                "or compile shaders offline and pass the bytes to ",
+                "`Device::create_shader_module`",
+            )
+            .to_string(),
             _ => format!("run slangc: {error}"),
         })
     })?;

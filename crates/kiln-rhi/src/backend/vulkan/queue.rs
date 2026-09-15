@@ -65,7 +65,9 @@ pub(crate) enum VulkanRetiredResource {
     },
     /// No Vulkan object to free: under `VK_EXT_descriptor_heap` a sampler is only a descriptor
     /// in the heap, so retirement exists purely to keep an in-flight slot from being reused.
-    Sampler { id: SamplerId },
+    Sampler {
+        id: SamplerId,
+    },
 }
 
 impl VulkanQueue {
@@ -208,11 +210,13 @@ impl VulkanQueue {
             }
             return Err(err);
         }
-        self.pending_commands.borrow_mut().push_back(PendingCommand {
-            command_buffer: cmd.command_buffer,
-            completion_value,
-            retained_pipelines: std::mem::take(&mut cmd.retained_pipelines),
-        });
+        self.pending_commands
+            .borrow_mut()
+            .push_back(PendingCommand {
+                command_buffer: cmd.command_buffer,
+                completion_value,
+                retained_pipelines: std::mem::take(&mut cmd.retained_pipelines),
+            });
         Ok(())
     }
 

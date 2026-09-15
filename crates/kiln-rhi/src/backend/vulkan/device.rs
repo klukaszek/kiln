@@ -29,8 +29,8 @@ use crate::surface::{Surface, SurfaceDesc, SurfaceInner};
 use crate::swapchain::{Swapchain, SwapchainInner};
 use crate::sync::{TimelineSemaphore, TimelineSemaphoreInner};
 use crate::types::{
-    AddressMode, BuildAccelFlags, CompareOp, Format, GeometryFlags, GpuPtr, MAX_BINDLESS_ACCELS,
-    MAX_BINDLESS_SAMPLERS, MAX_BINDLESS_TEXTURES, MAX_FRAMES_IN_FLIGHT, SamplerId, TextureId,
+    AddressMode, BuildAccelFlags, CompareOp, Format, GeometryFlags, GpuPtr, MAX_BINDLESS_SAMPLERS,
+    MAX_BINDLESS_TEXTURES, MAX_FRAMES_IN_FLIGHT, SamplerId, TextureId,
 };
 
 use super::command::VulkanCommandBuffer;
@@ -85,18 +85,7 @@ pub(crate) struct DescriptorHeap {
     pub descriptor_size: u64,
     pub reserved_offset: u64,
     pub reserved_size: u64,
-    /// Byte offset of the acceleration-structure region, past the last image descriptor.
-    /// Zero on a heap that has no such region.
-    pub accel_base: u64,
 }
-
-/// Stride of an acceleration-structure entry in the resource heap.
-///
-/// `VK_EXT_descriptor_heap` has no acceleration-structure descriptor, and Slang wants none: it
-/// reads the heap as an array of `uint64_t` and hands the value to
-/// `OpConvertUToAccelerationStructureKHR`. So the slot holds a plain device address the RHI stores
-/// itself, indexed in 8-byte units rather than by `image_descriptor_size`.
-pub(crate) const ACCEL_HEAP_ENTRY_SIZE: u64 = 8;
 
 impl DescriptorHeap {
     /// Byte range of slot `index`. The heap is sized from the same constant the id allocators
@@ -104,32 +93,11 @@ impl DescriptorHeap {
     pub(crate) fn slot(&self, index: u32) -> std::ops::Range<usize> {
         let start = index as u64 * self.descriptor_size;
         let end = start + self.descriptor_size;
-        // Not `reserved_offset`: that sits past the accel region, so an out-of-range slot would
-        // alias accel entries instead of tripping here.
-        let limit = if self.accel_base == 0 {
-            self.reserved_offset
-        } else {
-            self.accel_base
-        };
-        debug_assert!(end <= limit, "descriptor slot {index} out of range");
-        start as usize..end as usize
-    }
-
-    /// Byte range of acceleration-structure slot `index`.
-    pub(crate) fn accel_slot(&self, index: u32) -> std::ops::Range<usize> {
-        let start = self.accel_base + index as u64 * ACCEL_HEAP_ENTRY_SIZE;
-        let end = start + ACCEL_HEAP_ENTRY_SIZE;
         debug_assert!(
             end <= self.reserved_offset,
-            "accel slot {index} out of range"
+            "descriptor slot {index} out of range"
         );
         start as usize..end as usize
-    }
-
-    /// The value a shader's `DescriptorHandle<RaytracingAccelerationStructure>` carries: an
-    /// [`ACCEL_HEAP_ENTRY_SIZE`] index from the heap base, not from `accel_base`.
-    pub(crate) fn accel_shader_index(&self, index: u32) -> u64 {
-        self.accel_base / ACCEL_HEAP_ENTRY_SIZE + index as u64
     }
 
     fn bind_info(&self) -> vk::BindHeapInfoEXT<'static> {
@@ -157,8 +125,6 @@ type SharedMappedAllocations = Rc<RefCell<BTreeMap<usize, MappedAllocation>>>;
 pub(crate) type SharedTextures = Rc<RefCell<Vec<Option<VulkanTexture>>>>;
 pub(crate) type SharedTextureFreeIds = Rc<RefCell<Vec<TextureId>>>;
 pub(crate) type SharedSamplerFreeIds = Rc<RefCell<Vec<SamplerId>>>;
-/// Acceleration-structure heap slots, handed back by `VulkanAccelerationStructure::drop`.
-pub(crate) type SharedAccelFreeSlots = Rc<RefCell<Vec<u32>>>;
 
 pub struct VulkanDevice {
     pub(crate) entry: Entry,
@@ -197,9 +163,6 @@ pub struct VulkanDevice {
 
     pub(crate) next_sampler_id: RefCell<u32>,
     pub(crate) free_sampler_ids: SharedSamplerFreeIds,
-
-    pub(crate) next_accel_slot: RefCell<u32>,
-    pub(crate) free_accel_slots: SharedAccelFreeSlots,
 
     /// User timeline semaphores stay alive until device teardown. This permits callers to use a
     /// temporary `SubmitDesc` without destroying a semaphore still referenced by queued work.
@@ -804,8 +767,6 @@ impl VulkanDevice {
             buffer_requirements_probe: RefCell::new(Vec::new()),
             textures: Rc::new(RefCell::new(Vec::new())),
             next_texture_id: RefCell::new(0),
-            next_accel_slot: RefCell::new(0),
-            free_accel_slots: Rc::new(RefCell::new(Vec::new())),
             free_texture_ids,
             allocations: Rc::new(RefCell::new(BTreeMap::new())),
             mapped_allocations: Rc::new(RefCell::new(BTreeMap::new())),
@@ -1388,58 +1349,6 @@ impl VulkanDevice {
     ///
     /// `VK_EXT_descriptor_heap` describes the view inline, so this takes the
     /// `ImageViewCreateInfo` rather than a `VkImageView`; sampled and storage images share the
-    /// Device address of the structure whose heap slot `handle` names; null stays null.
-    ///
-    /// The slot holds the address itself, so this needs no side table.
-    pub(crate) fn accel_device_address(&self, handle: crate::types::AccelHandle) -> u64 {
-        if handle.is_null() {
-            return 0;
-        }
-        let offset = handle.0 * ACCEL_HEAP_ENTRY_SIZE;
-        debug_assert!(
-            offset + ACCEL_HEAP_ENTRY_SIZE <= self.descriptor_heaps.resource.reserved_offset,
-            "acceleration-structure handle {offset:#x} is outside the heap"
-        );
-        // SAFETY: `offset` is in the mapped heap; `write_accel_address` put an address there.
-        unsafe {
-            std::ptr::read_unaligned(
-                self.descriptor_heaps
-                    .resource
-                    .mapped_ptr
-                    .add(offset as usize) as *const u64,
-            )
-        }
-    }
-
-    /// Reserve an acceleration-structure heap slot and store `device_address` in it.
-    ///
-    /// A direct store rather than a `vkWriteResourceDescriptors` call; see
-    /// [`ACCEL_HEAP_ENTRY_SIZE`].
-    pub(crate) fn write_accel_address(&self, device_address: u64) -> RhiResult<(u32, u64)> {
-        let slot = match self.free_accel_slots.borrow_mut().pop() {
-            Some(slot) => slot,
-            None => {
-                let mut next = self.next_accel_slot.borrow_mut();
-                if *next >= MAX_BINDLESS_ACCELS {
-                    return Err(RhiError::AllocationFailed(
-                        "Vulkan acceleration-structure heap region exhausted".into(),
-                    ));
-                }
-                let slot = *next;
-                *next += 1;
-                slot
-            }
-        };
-
-        let heap = &self.descriptor_heaps.resource;
-        let range = heap.accel_slot(slot);
-        // SAFETY: `range` is in the mapped, host-coherent heap, disjoint from every image slot.
-        unsafe {
-            std::ptr::write_unaligned(heap.mapped_ptr.add(range.start) as *mut u64, device_address);
-        }
-        Ok((slot, heap.accel_shader_index(slot)))
-    }
-
     /// slot and differ only in descriptor type and layout.
     pub(crate) fn write_image_descriptor(
         &self,
@@ -1615,8 +1524,9 @@ fn create_descriptor_heaps(
         instance.get_physical_device_properties2(physical_device, &mut props2);
     }
 
-    // Images, strided by `imageDescriptorSize` -- never the image/buffer maximum, since buffers
-    // reach the shader as device addresses -- plus an accel region appended past them.
+    // The resource heap holds only images: buffers reach the shader as device addresses, and an
+    // acceleration structure is its own device address, so the stride is `imageDescriptorSize`
+    // and never the image/buffer maximum.
     let resource = create_descriptor_heap(
         device,
         mem_props,
@@ -1626,7 +1536,6 @@ fn create_descriptor_heaps(
             alignment: props.resource_heap_alignment,
             reserved_size: props.min_resource_heap_reserved_range,
             max_size: props.max_resource_heap_size,
-            accel_slots: MAX_BINDLESS_ACCELS,
         },
         "resource descriptor heap",
     )?;
@@ -1639,7 +1548,6 @@ fn create_descriptor_heaps(
             alignment: props.sampler_heap_alignment,
             reserved_size: props.min_sampler_heap_reserved_range,
             max_size: props.max_sampler_heap_size,
-            accel_slots: 0,
         },
         "sampler descriptor heap",
     )?;
@@ -1654,8 +1562,6 @@ struct HeapLayout {
     alignment: u64,
     reserved_size: u64,
     max_size: u64,
-    /// Acceleration-structure entries appended past the last descriptor; 0 for none.
-    accel_slots: u32,
 }
 
 fn create_descriptor_heap(
@@ -1668,13 +1574,8 @@ fn create_descriptor_heap(
     let descriptors = (layout.slots as u64)
         .checked_mul(layout.descriptor_size)
         .ok_or_else(|| RhiError::AllocationFailed(format!("{what} size overflows")))?;
-    // Indexed in 8-byte units from the heap base, so the region starts on that boundary.
-    let accel_base = align_up(descriptors, ACCEL_HEAP_ENTRY_SIZE);
-    let accel_bytes = (layout.accel_slots as u64)
-        .checked_mul(ACCEL_HEAP_ENTRY_SIZE)
-        .ok_or_else(|| RhiError::AllocationFailed(format!("{what} accel region overflows")))?;
-    // Park the driver's reserved range past everything so slot N stays at N * stride.
-    let reserved_offset = align_up(accel_base + accel_bytes, align);
+    // Park the driver's reserved range past the last descriptor so slot N stays at N * stride.
+    let reserved_offset = align_up(descriptors, align);
     let size = align_up(reserved_offset + layout.reserved_size, align);
 
     if size > layout.max_size {
@@ -1724,11 +1625,6 @@ fn create_descriptor_heap(
         descriptor_size: layout.descriptor_size,
         reserved_offset,
         reserved_size: layout.reserved_size,
-        accel_base: if layout.accel_slots == 0 {
-            0
-        } else {
-            accel_base
-        },
     })
 }
 

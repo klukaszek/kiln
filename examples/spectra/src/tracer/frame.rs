@@ -5,7 +5,7 @@
 //! state; every buffer the shader touches is a pointer in one of these structs.
 
 use glam::{UVec2, UVec4, Vec4};
-use kiln_rhi::{AccelHandle, CommandBuffer, StageFlags, gpu_struct};
+use kiln_rhi::{CommandBuffer, StageFlags, gpu_struct};
 
 use crate::render::{self, RenderFrame};
 use crate::scene::Camera;

@@ -4,8 +4,8 @@ mod common;
 
 use kiln_rhi::gpu_struct;
 use kiln_rhi::{
-    AccelHandle, BlasDesc, BlasMeshDesc, BuildAccelFlags, ComputePsoDesc, GeometryFlags,
-    GeometryType, GpuPtr, MemoryType, ShaderStage, StageFlags, TlasDesc, TlasInstance,
+    BlasDesc, BlasMeshDesc, BuildAccelFlags, ComputePsoDesc, GeometryFlags, GeometryType, GpuPtr,
+    MemoryType, ShaderStage, StageFlags, TlasDesc, TlasInstance,
 };
 
 gpu_struct! {

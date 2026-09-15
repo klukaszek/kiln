@@ -20,9 +20,9 @@
 //!   unbounded runtime array. The result carries no descriptor set or binding decorations at
 //!   all, which is what lets pipelines be created with a null layout.
 //!
-//! Shader source itself is backend-agnostic and reaches slangc unmodified: every resource,
-//! acceleration structures included, is a `DescriptorHandle<T>` that each backend resolves
-//! through its own heap.
+//! Shader source itself is backend-agnostic and reaches slangc unmodified, prefixed only by
+//! [`ACCEL_PRELUDE`]: every resource but one is a `DescriptorHandle<T>` that each backend
+//! resolves through its own heap, and acceleration structures go through `kiln::accel`.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -43,6 +43,25 @@ const SLANG_OPTIMIZATION_LEVEL: &str = "2";
 /// Lowers `DescriptorHandle<T>` onto `SPV_EXT_descriptor_heap`'s heap builtins instead of an
 /// unbounded runtime descriptor array.
 const SPIRV_DESCRIPTOR_HEAP_CAPABILITY: &str = "spvDescriptorHeapEXT";
+
+/// Declares `kiln::accel`, which turns an [`AccelHandle`](crate::AccelHandle)'s eight bytes into
+/// the `RaytracingAccelerationStructure` that a `gpu_struct!` field's property returns.
+///
+/// An acceleration structure is the one resource with no shared model: Vulkan reaches one by
+/// device address, Metal only as a bindless resource id. `__target_switch` keeps that the sole
+/// backend-specific line in the whole shader pipeline; the handle itself is a plain `uint64_t` on
+/// both, so a root struct's layout never depends on the target.
+///
+/// Neither arm fails the build on the other backend, so do not collapse them: Metal compiles
+/// `RaytracingAccelerationStructure(address)` to an empty function body, and
+/// `VK_EXT_descriptor_heap` has no acceleration-structure descriptor at all, so Slang's heap
+/// lowering reads a slot the driver never populates and every ray misses.
+const ACCEL_PRELUDE: &str = concat!(
+    "namespace kiln { RaytracingAccelerationStructure accel(uint64_t h) { __target_switch { ",
+    "case spirv: return RaytracingAccelerationStructure(h); ",
+    "default: return reinterpret<DescriptorHandle<RaytracingAccelerationStructure> >(h); } } }
+",
+);
 
 /// The MSL definition of `RayDesc` that Slang omits, `-include`d into the Metal translation unit.
 ///
@@ -87,7 +106,8 @@ pub fn compile(
     if target == "spirv" {
         effective.push(SPIRV_DESCRIPTOR_HEAP_CAPABILITY);
     }
-    let code = get_or_compile(src, entry, stage, target, ext, &effective)?;
+    let src = format!("{ACCEL_PRELUDE}{src}");
+    let code = get_or_compile(&src, entry, stage, target, ext, &effective)?;
     make_module(device, &code, entry, stage)
 }
 

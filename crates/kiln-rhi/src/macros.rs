@@ -144,6 +144,23 @@ macro_rules! __gpu_struct_parse {
         }
     };
 
+    // An acceleration-structure handle: eight bytes like every other handle, but the two backends
+    // build a structure from them differently, so the field is private and a property hands back
+    // the `RaytracingAccelerationStructure` through `kiln::accel`. Shader code just reads the
+    // field; only the accessor knows there was a choice.
+    ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
+        $field:ident : AccelHandle, $($rest:tt)*) => {
+        $crate::__gpu_struct_parse! {
+            [$($meta)*] [$vis] [$name]
+            [$($rust)* pub $field: $crate::AccelHandle,]
+            [$($out)*
+                "    uint64_t ", stringify!($field), "_handle;\n",
+                "    property RaytracingAccelerationStructure ", stringify!($field),
+                " { get { return kiln::accel(", stringify!($field), "_handle); } }\n",]
+            ; $($rest)*
+        }
+    };
+
     // Ordinary field with an explicit Slang spelling.
     ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
         $field:ident : $ty:tt as $slang:literal, $($rest:tt)*) => {
@@ -178,9 +195,6 @@ macro_rules! gpu_slang_ty {
         $slang
     };
 
-    (AccelHandle) => {
-        "DescriptorHandle<RaytracingAccelerationStructure>"
-    };
     (TextureHandle) => {
         "DescriptorHandle<Texture2D>"
     };

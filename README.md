@@ -182,10 +182,11 @@ Sampled and storage views go into a global heap and travel through roots as smal
 Vulkan backs the heap with `VK_EXT_descriptor_heap`, Metal with argument tables, and neither shows
 through. The heaps are bound once per command buffer and never rebound.
 
-`AccelHandle` is the one exception. Metal reaches an acceleration structure through the same
-bindless table as everything else, while Vulkan passes its device address and converts, so
-`gpu_struct!` emits a `RaytracingAccelerationStructure` property instead. Shader code still just
-reads the field.
+`AccelHandle` is the one exception, because the two APIs share no model for it: Vulkan reaches an
+acceleration structure by device address and never puts it in the heap at all, while Metal reaches
+one only through its bindless table. The handle is a plain `uint64_t` either way, so `gpu_struct!`
+emits it as a private field plus a `RaytracingAccelerationStructure` property that resolves it via
+`kiln::accel`. That one function is the whole of the difference; shader code just reads the field.
 
 ### Barriers name stages, not resources
 

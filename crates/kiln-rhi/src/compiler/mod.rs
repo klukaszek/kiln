@@ -11,6 +11,18 @@
 //! decide whether it works — calls report
 //! [`ShaderCompilation`](crate::RhiError::ShaderCompilation) when `slangc` is missing.
 //!
+//! # Metal compute takes a detour
+//!
+//! Slang drops `[numthreads]` on its Metal target, so compute entry points compile to MSL, have
+//! `[[max_total_threads_per_threadgroup]]` injected from slangc's own reflection, and are then
+//! assembled by `xcrun metal`. Without it the threadgroup size a shader declares is binding on
+//! Vulkan and ignored on Metal, and a dispatch wider than whatever Metal's register allocator
+//! happened to allow is silently dropped. See [`METAL_THREADGROUP_FIXUP`].
+//!
+//! That needs the Xcode command line tools on top of `slangc`. When they are absent the compile
+//! falls back to slangc's direct metallib output, which is the old behaviour: correct for
+//! threadgroups that fit, and caught at pipeline creation for those that do not.
+//!
 //! # Vulkan flags applied on every compile
 //!
 //! - `-fvk-use-entrypoint-name`: preserves the entry-point name in `OpEntryPoint`
@@ -64,6 +76,29 @@ const ACCEL_PRELUDE: &str = concat!(
     "default: return h; } } }
 ",
 );
+
+/// Slang drops `[numthreads]` on the Metal target, so the compute pipeline below routes through MSL
+/// to put it back. Part of the cache key, so upgrading past this reuses nothing stale.
+///
+/// The generated MSL entry point comes out bare — `[[kernel]] void name(...)` — with no
+/// `[[max_total_threads_per_threadgroup(N)]]`, for a literal size or a named constant alike. The
+/// same source becomes an authoritative `OpExecutionMode LocalSize` on SPIR-V, so a threadgroup
+/// size is binding on Vulkan and merely advisory on Metal.
+///
+/// That is not cosmetic. Metal then allocates registers without knowing the size the shader asked
+/// for and caps the pipeline wherever it lands, which for a ray-query shader can be 32 threads; a
+/// dispatch wider than the cap is *silently dropped*, and only the backend's
+/// `maxTotalThreadsPerThreadgroup` check turns that into an error rather than a black frame. Worse,
+/// the cap moves with unrelated edits elsewhere in the module, so a shader can stop launching
+/// because something near it grew.
+///
+/// Injecting the attribute fixes it outright: the same shader that reported a 32-thread ceiling
+/// reports 64 once Metal is told what to compile for, because the compiler will spill to meet a
+/// declared size. `MTL4ComputePipelineDescriptor::requiredThreadsPerThreadgroup`, which the backend
+/// already sets, does not substitute — the reported ceiling is invariant to it.
+///
+/// Delete this path once Slang emits the attribute itself.
+const METAL_THREADGROUP_FIXUP: &str = "metal-numthreads-attribute-v1";
 
 /// The MSL definition of `RayDesc` that Slang omits, `-include`d into the Metal translation unit.
 ///
@@ -145,7 +180,11 @@ fn get_or_compile(
     {
         return Ok(cached);
     }
-    let code = invoke_slangc(src, entry, stage, target, ext, capabilities)?;
+    let code = if uses_metal_compute_fixup(target, stage) {
+        compile_metal_compute(src, entry, capabilities)?
+    } else {
+        invoke_slangc(src, entry, stage, target, ext, capabilities)?
+    };
     if !valid_artifact(&code, target) {
         return Err(RhiError::ShaderCompilation(format!(
             "slangc produced an invalid {target} artifact for `{entry}`"
@@ -197,7 +236,180 @@ fn cache_key(
     if target != "spirv" {
         RAYDESC_MSL_DEFINITION.hash(&mut h);
     }
+    if uses_metal_compute_fixup(target, stage) {
+        METAL_THREADGROUP_FIXUP.hash(&mut h);
+    }
     h.finish()
+}
+
+/// Whether this compile takes the MSL detour that restores `[numthreads]`.
+///
+/// Compute only: the attribute has no meaning for the other stages, and routing them through a
+/// second compiler for nothing would only add a way to fail. Requires the Metal toolchain, which
+/// `slangc` alone does not; without it this falls back to the direct path and the backend's
+/// threadgroup check remains the safety net.
+fn uses_metal_compute_fixup(target: &str, stage: ShaderStage) -> bool {
+    target != "spirv" && stage == ShaderStage::Compute && metal_toolchain().is_some()
+}
+
+/// `xcrun` paths for the Metal compiler and archiver, probed once.
+fn metal_toolchain() -> Option<&'static (PathBuf, PathBuf)> {
+    static TOOLCHAIN: OnceLock<Option<(PathBuf, PathBuf)>> = OnceLock::new();
+    TOOLCHAIN
+        .get_or_init(|| Some((xcrun_find("metal")?, xcrun_find("metallib")?)))
+        .as_ref()
+}
+
+fn xcrun_find(tool: &str) -> Option<PathBuf> {
+    let out = Command::new("xcrun")
+        .args(["-sdk", "macosx", "-f", tool])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+    path.exists().then_some(path)
+}
+
+/// Compile a compute entry point to a metallib by way of MSL, injecting the threadgroup size Slang
+/// leaves out. See [`METAL_THREADGROUP_FIXUP`].
+fn compile_metal_compute(src: &str, entry: &str, capabilities: &[&str]) -> RhiResult<Vec<u8>> {
+    let (metal, metallib) = metal_toolchain().ok_or_else(|| {
+        RhiError::ShaderCompilation("the Metal toolchain went missing mid-compile".into())
+    })?;
+    let dir = std::env::temp_dir();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let stem = format!("kiln_{pid}_{seq}");
+    let files = MetalComputeFiles {
+        source: dir.join(format!("{stem}.slang")),
+        msl: dir.join(format!("{stem}.metal")),
+        reflection: dir.join(format!("{stem}.json")),
+        air: dir.join(format!("{stem}.air")),
+        output: dir.join(format!("{stem}.metallib")),
+        prelude: dir.join(format!("{stem}_prelude.h")),
+    };
+
+    write_file(&files.source, src.as_bytes())?;
+    write_file(&files.prelude, RAYDESC_MSL_DEFINITION.as_bytes())?;
+
+    // Slang to MSL, asking for the reflection that carries the threadgroup size. Taking it from
+    // reflection rather than from the pipeline description keeps `[numthreads]` the single source
+    // of truth, exactly as it is on the SPIR-V path.
+    let mut cmd = Command::new("slangc");
+    cmd.arg(&files.source)
+        .args(["-target", "metal", "-entry", entry, "-stage", "compute"])
+        .arg(format!("-O{SLANG_OPTIMIZATION_LEVEL}"))
+        .arg("-reflection-json")
+        .arg(&files.reflection);
+    for cap in capabilities {
+        if !cap.starts_with("spv") {
+            cmd.args(["-capability", cap]);
+        }
+    }
+    cmd.arg("-o").arg(&files.msl);
+    run(&mut cmd, "slangc", entry)?;
+
+    let msl = std::fs::read_to_string(&files.msl).map_err(|error| {
+        RhiError::ShaderCompilation(format!("read `{}`: {error}", files.msl.display()))
+    })?;
+    let reflection = std::fs::read_to_string(&files.reflection).map_err(|error| {
+        RhiError::ShaderCompilation(format!("read `{}`: {error}", files.reflection.display()))
+    })?;
+    let threads = thread_group_size(&reflection).ok_or_else(|| {
+        RhiError::ShaderCompilation(format!(
+            "slangc reflection for `{entry}` carries no threadGroupSize"
+        ))
+    })?;
+    write_file(
+        &files.msl,
+        inject_threadgroup_attribute(&msl, entry, threads)?.as_bytes(),
+    )?;
+
+    let mut cmd = Command::new(metal);
+    cmd.arg("-c")
+        .arg(&files.msl)
+        .arg("-include")
+        .arg(&files.prelude)
+        .arg("-o")
+        .arg(&files.air);
+    run(&mut cmd, "metal", entry)?;
+
+    let mut cmd = Command::new(metallib);
+    cmd.arg(&files.air).arg("-o").arg(&files.output);
+    run(&mut cmd, "metallib", entry)?;
+
+    std::fs::read(&files.output).map_err(|error| {
+        RhiError::ShaderCompilation(format!("read `{}`: {error}", files.output.display()))
+    })
+}
+
+struct MetalComputeFiles {
+    source: PathBuf,
+    msl: PathBuf,
+    reflection: PathBuf,
+    air: PathBuf,
+    output: PathBuf,
+    prelude: PathBuf,
+}
+
+impl Drop for MetalComputeFiles {
+    fn drop(&mut self) {
+        for path in [
+            &self.source,
+            &self.msl,
+            &self.reflection,
+            &self.air,
+            &self.output,
+            &self.prelude,
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn write_file(path: &std::path::Path, bytes: &[u8]) -> RhiResult<()> {
+    std::fs::write(path, bytes).map_err(|error| {
+        RhiError::ShaderCompilation(format!("write `{}`: {error}", path.display()))
+    })
+}
+
+fn run(cmd: &mut Command, tool: &str, entry: &str) -> RhiResult<()> {
+    let output = cmd
+        .output()
+        .map_err(|error| RhiError::ShaderCompilation(format!("run {tool}: {error}")))?;
+    if !output.status.success() {
+        return Err(RhiError::ShaderCompilation(format!(
+            "{tool} failed compiling `{entry}`:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
+/// `"threadGroupSize": [x, y, z]` out of slangc's reflection JSON. Scanned rather than parsed: the
+/// RHI has no JSON dependency, and one well-known key from one tool does not justify one.
+fn thread_group_size(reflection: &str) -> Option<[u32; 3]> {
+    let rest = reflection.split_once("\"threadGroupSize\"")?.1;
+    let inside = rest.split_once('[')?.1.split_once(']')?.0;
+    let mut dims = inside.split(',').map(|v| v.trim().parse::<u32>());
+    let size = [dims.next()?.ok()?, dims.next()?.ok()?, dims.next()?.ok()?];
+    (size.iter().all(|d| *d > 0) && dims.next().is_none()).then_some(size)
+}
+
+/// Put `[[max_total_threads_per_threadgroup(N)]]` on the entry point's `[[kernel]]` declaration.
+fn inject_threadgroup_attribute(msl: &str, entry: &str, threads: [u32; 3]) -> RhiResult<String> {
+    let declaration = format!("[[kernel]] void {entry}(");
+    let at = msl.find(&declaration).ok_or_else(|| {
+        RhiError::ShaderCompilation(format!("no `{declaration}` in the MSL slangc generated"))
+    })?;
+    let total = threads[0] * threads[1] * threads[2];
+    Ok(format!(
+        "{}[[max_total_threads_per_threadgroup({total})]]\n{}",
+        &msl[..at],
+        &msl[at..]
+    ))
 }
 
 fn valid_artifact(code: &[u8], target: &str) -> bool {

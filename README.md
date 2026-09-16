@@ -31,6 +31,7 @@ This is a personal research project. Expect the API to move.
 | `triangle-mesh` | Same, through a mesh shader. |
 | `egui-demo` | egui overlay. |
 | `spectra` | USD importer with progressive spectral path tracing. |
+| `hrc` | Holographic radiance cascades: 2D global illumination over an analytic SDF scene. |
 
 ## Requirements
 
@@ -78,6 +79,7 @@ cargo run -p triangle-graphics
 cargo run -p triangle-mesh
 cargo run -p egui-demo
 cargo run -p spectra
+cargo run --release -p hrc
 ```
 
 Spectra is the interesting one. It opens the bundled Cornell box and path traces it progressively.
@@ -88,11 +90,27 @@ cargo run --release -p spectra -- --scene cornell-box --spp 64 --headless 1024x1
 ```
 
 Scenes, light spectra, and the analysis dumps are covered in
-[`examples/spectra/README.md`](examples/spectra/README.md). Every example takes `--help`.
+[`examples/spectra/README.md`](examples/spectra/README.md).
+
+`hrc` is the other substantial one: holographic radiance cascades over a 2D signed-distance scene,
+about a hundred compute dispatches and a per-frame BVH rebuild in a single command buffer. Drag to
+move a light, `1`-`4` to switch scene, `--verify` to measure the solver against a brute-force
+angular integral. Its [README](examples/holographic-radiance-cascades/README.md) covers the port
+from SlangPy and what profiling it did and did not find.
+
+Every example takes `--help`.
 
 Shaders compile through `slangc` and cache in your temp directory under `kiln-shader-cache/`. The
 key covers the source and everything about how it got compiled, `slangc` version included, so
 upgrading the compiler doesn't hand you a stale binary.
+
+Metal compute takes one detour. Slang drops `[numthreads]` on its Metal target, which leaves the
+threadgroup size binding on Vulkan and ignored on Metal — and a dispatch wider than whatever
+Metal's register allocator happened to allow is silently dropped rather than refused. So compute
+entry points compile to MSL, have `[[max_total_threads_per_threadgroup]]` injected from slangc's
+own reflection, and are assembled by `xcrun metal`. That wants the Xcode command line tools; if
+they are missing it falls back to slangc's direct metallib and the backend's threadgroup check
+stays the safety net.
 
 ## Design
 

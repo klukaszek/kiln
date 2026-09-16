@@ -9,5 +9,6 @@ members = [
     "examples/triangle-graphics",
     "examples/triangle-mesh",
     "examples/spectra",
+    "examples/holographic-radiance-cascades",
     "examples/egui-demo",
 ]

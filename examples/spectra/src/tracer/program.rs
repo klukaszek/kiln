@@ -196,7 +196,13 @@ mod tests {
         })
         .expect("no headless GPU device available");
 
-        check(&device, &trace(), "traceMain", ShaderStage::Compute, &["spvRayQueryKHR"]);
+        check(
+            &device,
+            &trace(),
+            "traceMain",
+            ShaderStage::Compute,
+            &["spvRayQueryKHR"],
+        );
         check(&device, &clear(), "clearMain", ShaderStage::Compute, &[]);
         check(&device, &display(), "displayVs", ShaderStage::Vertex, &[]);
         check(&device, &display(), "displayFs", ShaderStage::Pixel, &[]);

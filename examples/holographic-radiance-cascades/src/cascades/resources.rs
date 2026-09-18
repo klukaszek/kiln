@@ -6,8 +6,9 @@
 //! replacement every frame is a lot of churn for geometry whose topology never changes.
 
 use kiln_rhi::{
-    AccelerationStructure, Allocation, AllocationDesc, BlasDesc, BlasMeshDesc, BuildAccelFlags,
-    Device, GeometryFlags, GeometryType, GpuPtr, MemoryType, RhiResult, TlasDesc, TlasInstance,
+    AccelerationStructure, Allocation, AllocationDesc, BlasDesc, BlasGeometry, BlasIndices,
+    BlasMeshDesc, BuildAccelFlags, Device, GeometryFlags, GpuPtr, MemoryType, RhiResult, TlasDesc,
+    TlasInstance,
 };
 
 use crate::scene::{MAX_PRIMS, ROWS_PER_PRIM};
@@ -44,11 +45,11 @@ pub(super) struct SceneResources {
 
 impl SceneResources {
     pub(super) fn new(device: &Device) -> RhiResult<Self> {
-        let device_buffer = |size: u64, label: &str| {
+        let device_buffer = |size: u64, label: &'static str| {
             device.create_allocation(&AllocationDesc {
                 size,
                 memory: MemoryType::GpuOnly,
-                label: Some(label.into()),
+                label: Some(label),
                 ..Default::default()
             })
         };
@@ -76,16 +77,20 @@ impl SceneResources {
 
         // Sized for the largest scene that will ever be traced; each frame builds whatever the
         // current one actually uses.
-        let blas = device.create_blas(&blas_desc(
+        let meshes = [blas_mesh(
             vertices.gpu().cast(),
             indices.gpu().cast(),
             MAX_PRIMS,
-        ))?;
+        )];
+        let blas = device.create_blas(&BlasDesc {
+            meshes: &meshes,
+            flags: BLAS_FLAGS,
+        })?;
 
         let mut instances = device.create_allocation(&AllocationDesc {
             size: device.tlas_instance_stride() as u64,
             memory: MemoryType::Upload,
-            label: Some("hrc-tlas-instances".into()),
+            label: Some("hrc-tlas-instances"),
             ..Default::default()
         })?;
         // One instance at the identity, written once: the BLAS is rebuilt in place, so neither its
@@ -121,8 +126,8 @@ impl SceneResources {
         })
     }
 
-    pub(super) fn blas_desc(&self) -> BlasDesc {
-        blas_desc(
+    pub(super) fn blas_mesh(&self) -> BlasMeshDesc {
+        blas_mesh(
             self.vertices.gpu().cast(),
             self.indices.gpu().cast(),
             self.prim_count,
@@ -146,27 +151,27 @@ impl SceneResources {
         device.destroy(self.cell_prims);
         device.destroy(self.cell_clear);
         device.destroy(self.instances);
-        drop(self.blas);
-        drop(self.tlas);
+        device.destroy(self.blas);
+        device.destroy(self.tlas);
     }
 }
 
-fn blas_desc(vertices: GpuPtr<[f32; 3]>, indices: GpuPtr<u32>, prims: u32) -> BlasDesc {
+/// The geometry is rewritten every frame, so build time is the cost that matters.
+pub(super) const BLAS_FLAGS: BuildAccelFlags = BuildAccelFlags::PREFER_FAST_BUILD;
+
+fn blas_mesh(vertices: GpuPtr<[f32; 3]>, indices: GpuPtr<u32>, prims: u32) -> BlasMeshDesc {
     let edges = prims * EDGES_PER_PRIM;
-    BlasDesc {
-        meshes: vec![BlasMeshDesc {
-            geometry_type: GeometryType::Triangles,
-            flags: GeometryFlags::OPAQUE,
-            vertex_buffer: vertices,
-            vertex_stride: VERTEX_STRIDE,
-            vertex_count: edges * VERTS_PER_EDGE,
-            index_buffer: indices,
-            index_count: edges * INDICES_PER_EDGE,
-            aabb_buffer: GpuPtr::NULL,
-            aabb_count: 0,
-        }],
-        // The geometry is rewritten every frame, so build time is the cost that matters.
-        flags: BuildAccelFlags::PREFER_FAST_BUILD,
+    BlasMeshDesc {
+        flags: GeometryFlags::OPAQUE,
+        geometry: BlasGeometry::Triangles {
+            vertices,
+            stride: VERTEX_STRIDE,
+            count: edges * VERTS_PER_EDGE,
+            indices: Some(BlasIndices {
+                buffer: indices,
+                count: edges * INDICES_PER_EDGE,
+            }),
+        },
     }
 }
 

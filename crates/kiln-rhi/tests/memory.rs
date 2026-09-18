@@ -76,7 +76,7 @@ fn bump(device: &kiln_rhi::Device, size: u64) -> BumpAllocator {
         .create_allocation(&AllocationDesc {
             size,
             memory: MemoryType::Upload,
-            label: Some("bump".into()),
+            label: Some("bump"),
             ..Default::default()
         })
         .expect("create_buffer(Default)");

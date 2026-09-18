@@ -5,8 +5,8 @@
 //! keeps in step.
 
 use kiln_rhi::{
-    BlendState, ColorTarget, ComputePso, ComputePsoDesc, Cull, Device, Format, GraphicsPso,
-    GraphicsPsoDesc, SampleCount, ShaderStage, Topology, compiler,
+    ColorTarget, ComputePso, ComputePsoDesc, Cull, Device, Format, GraphicsPso, GraphicsPsoDesc,
+    SampleCount, ShaderStage, Topology, compiler,
 };
 
 use super::device::GpuTextureBinding;
@@ -114,9 +114,10 @@ impl Pipelines {
     pub(super) fn new(device: &Device, color_format: Format) -> render::Result<Self> {
         let trace_source = trace();
         let trace = device.create_compute_pso(
+            // The threadgroup size comes from the shader's `[numthreads]` via reflection.
             &ComputePsoDesc {
-                threads_per_threadgroup: TRACE_THREADS,
-                label: Some("spectral-trace".into()),
+                label: Some("spectral-trace"),
+                ..Default::default()
             },
             &compiler::compile(
                 device,
@@ -130,8 +131,8 @@ impl Pipelines {
         let clear_source = clear();
         let clear = device.create_compute_pso(
             &ComputePsoDesc {
-                threads_per_threadgroup: [CLEAR_THREADS, 1, 1],
-                label: Some("spectral-film-clear".into()),
+                label: Some("spectral-film-clear"),
+                ..Default::default()
             },
             &compiler::compile(
                 device,
@@ -146,12 +147,11 @@ impl Pipelines {
         let display = device.create_graphics_pso(
             &GraphicsPsoDesc {
                 topology: Topology::TriangleList,
-                color_targets: vec![ColorTarget::new(color_format)],
+                color_targets: &[ColorTarget::new(color_format)],
                 depth_format: None,
                 sample_count: SampleCount::S1,
                 cull: Cull::None,
-                blendstate: Some(BlendState::default()),
-                label: Some("spectral-display".into()),
+                label: Some("spectral-display"),
                 ..Default::default()
             },
             &compiler::compile(
@@ -191,7 +191,7 @@ mod tests {
     fn assembled_sources_compile() {
         let device = Device::new(&DeviceDesc {
             validation: false,
-            label: Some("spectra-shader-check".into()),
+            label: Some("spectra-shader-check"),
             ..Default::default()
         })
         .expect("no headless GPU device available");

@@ -1,28 +1,18 @@
 //! Internal helper macros.
 
-/// Collapse a backend-passthrough match into `backend_dispatch!(&self.inner, DeviceInner, d
-/// => d.foo(x))`. The body is duplicated into each backend arm under its `cfg`.
-macro_rules! backend_dispatch {
-    ($value:expr, $variant:ident, $bind:ident => $body:expr $(,)?) => {
-        match $value {
-            #[cfg(feature = "vulkan")]
-            $variant::Vulkan($bind) => $body,
-            #[cfg(feature = "metal")]
-            $variant::Metal($bind) => $body,
-        }
-    };
-}
-
-/// Unwrap a backend-tagged handle to the variant the calling backend owns:
-/// `backend_expect!(&pso.inner, ComputePsoInner::Metal)`. The fallback arm exists only in
-/// multi-backend builds, where reaching it means a handle from the other backend crossed over.
-macro_rules! backend_expect {
-    ($value:expr, $variant:path) => {
-        match $value {
-            $variant(inner) => inner,
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("handle belongs to a different backend"),
-        }
+/// Name a backend's type for a handle. Exactly one backend is compiled in (the features are
+/// mutually exclusive), so this is a plain alias and a handle's `inner` *is* the backend object.
+macro_rules! backend_enum {
+    (
+        $(#[$meta:meta])*
+        $name:ident { vulkan: $vulkan:ty, metal: $metal:ty $(,)? }
+    ) => {
+        #[cfg(feature = "vulkan")]
+        $(#[$meta])*
+        pub(crate) type $name = $vulkan;
+        #[cfg(feature = "metal")]
+        $(#[$meta])*
+        pub(crate) type $name = $metal;
     };
 }
 
@@ -42,16 +32,13 @@ macro_rules! backend_expect {
 /// }
 /// ```
 ///
-/// The struct is memcpy'd to the GPU, so every byte must be initialized and the layout must match
-/// the Slang declaration; `IntoBytes` rejects implicit padding with the exact byte count, so
-/// declare it as a field. Padding is then written at each construction site like any other field,
-/// which keeps the compiler catching omissions — a zeroed base would mask a forgotten real field
-/// too, turning it into a null address rather than an error.
+/// The struct is memcpy'd to the GPU, so padding must be declared as a field: `IntoBytes` rejects
+/// implicit padding, and a declared field keeps the compiler catching omissions at every
+/// construction site.
 ///
-/// A pointer's second parameter is a shader-side annotation, not a Rust type parameter: the field
-/// is a plain [`GpuPtr<T>`](crate::GpuPtr) either way. `Read` emits Slang's read-only pointer, so
-/// the compiler can assume no aliasing writes; the default is read-write `T*`. The same allocation
-/// can be `Read` in one root struct and read-write in another.
+/// A pointer's second parameter is a shader-side annotation, not a Rust type parameter — the field
+/// is a plain [`GpuPtr<T>`](crate::GpuPtr) either way. The same allocation can be `Read` in one
+/// root struct and read-write in another.
 #[macro_export]
 macro_rules! gpu_struct {
     (
@@ -94,7 +81,7 @@ macro_rules! __gpu_struct_parse {
         }
     };
 
-    // Device pointer the shader only reads. Slang can then assume no aliasing writes.
+    // Read-only device pointer, so Slang can assume no aliasing writes.
     ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
         $field:ident : GpuPtr<$pointee:tt, Read>, $($rest:tt)*) => {
         $crate::__gpu_struct_parse! {
@@ -106,7 +93,7 @@ macro_rules! __gpu_struct_parse {
         }
     };
 
-    // Device pointer the shader writes through, spelled out.
+    // Read-write device pointer, spelled out.
     ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
         $field:ident : GpuPtr<$pointee:tt, ReadWrite>, $($rest:tt)*) => {
         $crate::__gpu_struct_parse! {
@@ -128,8 +115,8 @@ macro_rules! __gpu_struct_parse {
         }
     };
 
-    // Eight bytes like any handle, but the backends build a structure from them differently, so a
-    // property hands the field back as a `RaytracingAccelerationStructure` through `kiln::accel`.
+    // Stored as a handle; a Slang property converts it on access, since the backends build the
+    // structure from those bytes differently.
     ([$($meta:tt)*] [$vis:vis] [$name:ident] [$($rust:tt)*] [$($out:tt)*] ;
         $field:ident : AccelHandle, $($rest:tt)*) => {
         $crate::__gpu_struct_parse! {
@@ -167,13 +154,12 @@ macro_rules! __gpu_struct_parse {
     };
 }
 
-/// Map a Rust field type to its Slang spelling for [`gpu_struct!`]. A trailing
-/// `, "literal"` overrides the mapping when the Rust and Slang names differ.
-/// Field types must be a single token (import the type rather than writing a path).
+/// Map a Rust field type to its Slang spelling for [`gpu_struct!`]. A trailing `, "literal"`
+/// overrides the mapping. Field types must be a single token, so import the type rather than
+/// writing a path.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! gpu_slang_ty {
-    // Explicit override (device pointers, or any type without a built-in mapping).
     ($fty:tt, $slang:literal) => {
         $slang
     };

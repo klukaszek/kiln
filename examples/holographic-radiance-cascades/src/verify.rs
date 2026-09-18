@@ -38,7 +38,7 @@ pub struct Options {
 pub fn run(options: &Options) -> RhiResult<()> {
     let device = Device::new(&DeviceDesc {
         validation: false,
-        label: Some("hrc-verify".into()),
+        label: Some("hrc-verify"),
         ..Default::default()
     })?;
     // The format only reaches the tonemap, and nothing here is tonemapped on the GPU.
@@ -74,7 +74,7 @@ pub fn run(options: &Options) -> RhiResult<()> {
             out_res: res,
         };
         renderer.record(&frame, &mut cmd, &prims, settings)?;
-        cmd.end();
+        cmd.end()?;
         device.queue().submit(cmd)?;
         device.queue().wait_idle();
     }
@@ -84,7 +84,7 @@ pub fn run(options: &Options) -> RhiResult<()> {
     renderer.record_light_field_linear(&mut cmd, 0, settings, solved.gpu().cast());
     // The reference accumulates, so it starts from a cleared target.
     renderer.record_clear(&mut cmd, 0, reference.gpu().cast(), bytes / 4);
-    cmd.end();
+    cmd.end()?;
     device.queue().submit(cmd)?;
     device.queue().wait_idle();
 
@@ -101,7 +101,7 @@ pub fn run(options: &Options) -> RhiResult<()> {
             options.dirs,
             begin..end,
         );
-        cmd.end();
+        cmd.end()?;
         device.queue().submit(cmd)?;
         device.queue().wait_idle();
         begin = end;
@@ -163,7 +163,7 @@ fn read_rgb(
     let mut cmd = device.create_command_buffer()?;
     cmd.barrier(StageFlags::COMPUTE, StageFlags::TRANSFER);
     cmd.memcpy(readback.gpu(), source.gpu(), bytes);
-    cmd.end();
+    cmd.end()?;
     device.queue().submit(cmd)?;
     device.queue().wait_idle();
 
@@ -225,7 +225,12 @@ fn write_png(path: &str, res: UVec2, rgb: &[f32], exposure: f32) -> RhiResult<()
     image::RgbImage::from_raw(res.x, res.y, bytes)
         .expect("image dimensions match the buffer")
         .save(path)
-        .map_err(|error| kiln_rhi::RhiError::AllocationFailed(format!("write {path}: {error}")))?;
+        .map_err(|error| {
+            kiln_rhi::RhiError::AllocationFailed(kiln_rhi::ErrorDetail::with_source(
+                format!("write {path}"),
+                error,
+            ))
+        })?;
     Ok(())
 }
 

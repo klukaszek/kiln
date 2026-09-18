@@ -8,21 +8,22 @@ pub struct TimelineSemaphore {
     pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
-pub(crate) enum TimelineSemaphoreInner {
-    #[cfg(feature = "vulkan")]
-    Vulkan(Box<crate::backend::vulkan::sync::VulkanTimelineSemaphore>),
-    #[cfg(feature = "metal")]
-    Metal(Box<crate::backend::metal::sync::MetalTimelineSemaphore>),
-}
+backend_enum!(TimelineSemaphoreInner { vulkan: Box<crate::backend::vulkan::sync::VulkanTimelineSemaphore>, metal: Box<crate::backend::metal::sync::MetalTimelineSemaphore> });
 
 impl TimelineSemaphore {
     pub fn value(&self) -> RhiResult<u64> {
-        backend_dispatch!(&self.inner, TimelineSemaphoreInner, s => s.value())
+        {
+            let s = &self.inner;
+            s.value()
+        }
     }
 
     /// `Ok(true)` if the value was reached, `Ok(false)` on timeout. Backend failures are `Err`
     /// rather than being mistaken for a successful wait.
     pub fn wait(&self, value: u64, timeout_ns: u64) -> RhiResult<bool> {
-        backend_dispatch!(&self.inner, TimelineSemaphoreInner, s => s.wait(value, timeout_ns))
+        {
+            let s = &self.inner;
+            s.wait(value, timeout_ns)
+        }
     }
 }

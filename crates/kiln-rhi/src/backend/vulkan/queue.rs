@@ -11,15 +11,15 @@ use super::command::RetainedPipeline;
 use super::memory::{SharedBufferPool, VulkanBuffer};
 use super::swapchain::VulkanSwapchain;
 use super::texture::VulkanTexture;
+use crate::backend::retire::RetirementQueue;
 use crate::error::{RhiError, RhiResult};
 use crate::queue::SubmitDesc;
-use crate::swapchain::AcquiredImage;
-use crate::sync::{TimelineSemaphore, TimelineSemaphoreInner};
+use crate::sync::TimelineSemaphore;
 use crate::types::MAX_FRAMES_IN_FLIGHT;
 use crate::types::{SamplerId, TextureId};
 
 use super::command::VulkanCommandBuffer;
-use super::device::{SharedSamplerFreeIds, SharedTextureFreeIds};
+use super::device::{SharedSamplerIds, SharedTextures};
 
 /// Vulkan queue wrapper.
 pub struct VulkanQueue {
@@ -28,37 +28,48 @@ pub struct VulkanQueue {
     pub(crate) swapchain_loader: swapchain::Device,
     pub(crate) command_pool: vk::CommandPool,
     pub(crate) buffer_pool: SharedBufferPool,
-    /// Generic command buffers are returned to the pool once their queue timeline value is
-    /// complete. Swapchain command buffers have their own frame fences and are intentionally not
-    /// placed in this list.
-    /// Submitted buffers awaiting their timeline value, each holding the pipelines it bound so
-    /// they outlive the GPU work even if the application dropped them.
+    /// Submitted command buffers awaiting their timeline value, each holding the pipelines it
+    /// bound so they outlive the GPU work even if the application dropped them. Entries are
+    /// returned to `available_commands` once their value is complete. Swapchain command buffers
+    /// have their own frame fences and are intentionally not placed in this list.
     pub(crate) pending_commands: RefCell<VecDeque<PendingCommand>>,
     pub(crate) available_commands: RefCell<Vec<vk::CommandBuffer>>,
     pub(crate) completion_semaphore: vk::Semaphore,
     pub(crate) next_completion_value: RefCell<u64>,
-    pub(crate) frame_completion_values: RefCell<[u64; MAX_FRAMES_IN_FLIGHT]>,
-    /// Whether each frame slot's fence has a submission pending to signal it. A submit that fails
-    /// after `reset_fences` would otherwise leave the fence unsignaled forever, and the next
-    /// acquire on that slot would block on it for good.
-    pub(crate) frame_fence_armed: RefCell<[bool; MAX_FRAMES_IN_FLIGHT]>,
+    /// The last frame submission on each in-flight slot. Lives here rather than on the swapchain
+    /// because a slot outlives the swapchain it last presented to.
+    pub(crate) frames: RefCell<[FrameSubmission; MAX_FRAMES_IN_FLIGHT]>,
     /// Resources destroyed by the app, each tagged with the timeline value that must retire
-    /// before its storage and its bindless slot can be reused. See `release_resource`.
-    pub(crate) retired_resources: RefCell<VecDeque<(u64, VulkanRetiredResource)>>,
-    pub(crate) free_texture_ids: SharedTextureFreeIds,
-    pub(crate) free_sampler_ids: SharedSamplerFreeIds,
+    /// before its storage and its bindless slot can be reused.
+    pub(crate) retired_resources: RetirementQueue<VulkanRetiredResource>,
+    pub(crate) textures: SharedTextures,
+    pub(crate) samplers: SharedSamplerIds,
+}
+
+/// What the queue remembers about one frame slot's last submission.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FrameSubmission {
+    /// Completion timeline value; 0 means the slot has never been submitted.
+    pub(crate) value: u64,
+    /// Whether the slot's fence has a submission pending to signal it. A submit that fails after
+    /// `reset_fences` would otherwise leave the fence unsignaled forever, and the next acquire on
+    /// that slot would block on it for good.
+    pub(crate) armed: bool,
 }
 
 pub(crate) struct PendingCommand {
     pub(crate) command_buffer: vk::CommandBuffer,
     pub(crate) completion_value: u64,
-    /// Held, never read: released when this entry is reclaimed.
-    #[allow(dead_code)]
+    /// Pipelines the application may have dropped while this submission still bound them.
+    /// Released by [`VulkanQueue::reclaim_completed_commands`] once the submission retires.
     pub(crate) retained_pipelines: SmallVec<[RetainedPipeline; 4]>,
 }
 
 pub(crate) enum VulkanRetiredResource {
     Buffer(VulkanBuffer),
+    /// The `VkAccelerationStructureKHR` plus its backing and scratch ranges. Destroying any of
+    /// them while a frame is still tracing against the structure is a use-after-free.
+    Accel(Box<super::accel::VulkanAccelerationStructure>),
     Texture {
         id: TextureId,
         texture: VulkanTexture,
@@ -76,7 +87,9 @@ impl VulkanQueue {
             unsafe {
                 self.device
                     .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-                    .map_err(|e| RhiError::CommandBuffer(format!("Reset command buffer: {e}")))?;
+                    .map_err(|e| {
+                        RhiError::CommandBuffer(format!("Reset command buffer: {e}").into())
+                    })?;
             }
             return Ok(command_buffer);
         }
@@ -89,7 +102,7 @@ impl VulkanQueue {
             self.device
                 .allocate_command_buffers(&alloc_info)
                 .map(|buffers| buffers[0])
-                .map_err(|e| RhiError::CommandBuffer(e.to_string()))
+                .map_err(|e| RhiError::CommandBuffer(e.into()))
         }
     }
 
@@ -97,69 +110,57 @@ impl VulkanQueue {
         self.available_commands.borrow_mut().push(command_buffer);
     }
 
-    /// Release a destroyed resource's storage immediately: destroy the native handles, hand any
-    /// bindless ID back to the free list, and return the buffer range to the pool.
-    ///
-    /// Hold a resource until every submission issued so far has retired.
+    /// Hold a destroyed resource until every submission issued so far has retired, then free it:
+    /// destroy the native handles, hand any bindless ID back to the free list, and return the
+    /// buffer range to the pool. Nothing has been submitted yet means nothing can reference it,
+    /// so that case frees immediately.
     pub(crate) fn release_resource(&self, resource: VulkanRetiredResource) {
-        let pending_until = *self.next_completion_value.borrow();
-        if pending_until == 0 {
-            self.free_resource(resource);
-            return;
-        }
-        self.retired_resources
-            .borrow_mut()
-            .push_back((pending_until, resource));
+        self.retired_resources.release(
+            *self.next_completion_value.borrow(),
+            resource,
+            |resource| self.free_resource(resource),
+        );
     }
 
-    /// Values are pushed in issue order, so a prefix drain is enough.
     fn collect_retired(&self, completed: u64) {
-        loop {
-            let Some(resource) = ({
-                let mut retired = self.retired_resources.borrow_mut();
-                match retired.front() {
-                    Some((value, _)) if *value <= completed => {
-                        retired.pop_front().map(|(_, resource)| resource)
-                    }
-                    _ => None,
-                }
-            }) else {
-                return;
-            };
-            self.free_resource(resource);
-        }
+        self.retired_resources
+            .collect(completed, |resource| self.free_resource(resource));
     }
 
     fn free_resource(&self, resource: VulkanRetiredResource) {
-        unsafe {
-            match &resource {
-                // The block owns the mapping and the memory; the buffer only returns its range.
-                // Nothing to destroy: the range simply returns to its block.
-                VulkanRetiredResource::Buffer(buffer) => {
-                    self.buffer_pool.borrow_mut().release(
-                        buffer.block_index,
-                        buffer.block_offset,
-                        buffer.block_range,
-                    );
-                }
-                VulkanRetiredResource::Texture { texture, .. } => {
+        match &resource {
+            // The block owns the mapping and the memory; the buffer only returns its range.
+            // Nothing to destroy: the range simply returns to its block.
+            VulkanRetiredResource::Buffer(buffer) => {
+                self.buffer_pool.borrow_mut().release(
+                    buffer.block_index,
+                    buffer.block_offset,
+                    buffer.block_range,
+                );
+            }
+            VulkanRetiredResource::Texture { texture, .. } => {
+                // SAFETY: reached only once `completed` passed this entry's timeline value, so
+                // no submission still references the image or its view.
+                unsafe {
                     self.device.destroy_image_view(texture.image_view, None);
                     if !texture.is_view {
                         self.device.destroy_image(texture.image, None);
                     }
                 }
-                // Descriptor-only; the slot is recycled below.
-                VulkanRetiredResource::Sampler { .. } => {}
             }
+            // Descriptor-only; the slot is recycled below.
+            VulkanRetiredResource::Sampler { .. } => {}
+            // SAFETY: as above — every submission that could be tracing this has retired.
+            VulkanRetiredResource::Accel(accel) => unsafe { accel.destroy() },
         }
         match resource {
             VulkanRetiredResource::Texture { id, .. } => {
-                self.free_texture_ids.borrow_mut().push(id);
+                self.textures.recycle(id.0);
             }
             VulkanRetiredResource::Sampler { id, .. } => {
-                self.free_sampler_ids.borrow_mut().push(id);
+                self.samplers.recycle(id.0);
             }
-            VulkanRetiredResource::Buffer(_) => {}
+            VulkanRetiredResource::Buffer(_) | VulkanRetiredResource::Accel(_) => {}
         }
     }
 
@@ -223,8 +224,7 @@ impl VulkanQueue {
     /// Reclaim completed generic command buffers without waiting. Submission stays asynchronous;
     /// the next submission pays one timeline-counter query and then reclaims a prefix of work.
     fn reclaim_completed_commands(&self) {
-        let idle =
-            self.pending_commands.borrow().is_empty() && self.retired_resources.borrow().is_empty();
+        let idle = self.pending_commands.borrow().is_empty() && self.retired_resources.is_empty();
         if idle {
             return;
         }
@@ -235,11 +235,16 @@ impl VulkanQueue {
             .front()
             .is_some_and(|entry| entry.completion_value <= completed)
         {
-            let entry = pending
+            let PendingCommand {
+                command_buffer,
+                retained_pipelines,
+                ..
+            } = pending
                 .pop_front()
                 .expect("pending command queue front disappeared");
-            // Dropping `entry` releases this submission's hold on its pipelines.
-            self.recycle_command_buffer(entry.command_buffer);
+            // The submission has retired, so this is where its hold on the pipelines ends.
+            drop(retained_pipelines);
+            self.recycle_command_buffer(command_buffer);
         }
     }
 
@@ -261,63 +266,53 @@ impl VulkanQueue {
         unsafe {
             self.device
                 .queue_submit2(self.queue, &[submit_info], fence)
-                .map_err(|e| RhiError::QueueSubmit(e.to_string()))?;
+                .map_err(|e| RhiError::QueueSubmit(e.into()))?;
         }
         Ok(())
     }
 
-    pub fn acquire_image(
-        &self,
-        sc: &VulkanSwapchain,
-        frame_index: usize,
-    ) -> RhiResult<AcquiredImage> {
-        let armed = {
-            let mut flags = self.frame_fence_armed.borrow_mut();
-            std::mem::replace(&mut flags[frame_index], false)
-        };
-        unsafe {
-            let fence = sc.in_flight_fences[frame_index];
-            if armed {
-                self.device
-                    .wait_for_fences(&[fence], true, u64::MAX)
-                    .map_err(|e| RhiError::SyncError(e.to_string()))?;
-            }
-            self.reclaim_completed_commands();
-
-            {
-                let mut cmd_buffers = sc.in_flight_cmd_buffers.borrow_mut();
-                if let Some(prev) = cmd_buffers.get_mut(frame_index)
-                    && *prev != vk::CommandBuffer::null()
-                {
-                    self.recycle_command_buffer(*prev);
-                    *prev = vk::CommandBuffer::null();
-                }
-            }
-
-            let semaphore = sc.present_complete_semaphores[frame_index];
-            let mut acquired = sc.acquired_images.borrow_mut();
-            let image_index = match acquired[frame_index] {
-                Some(index) => index,
-                None => {
-                    let (index, _) = self
-                        .swapchain_loader
-                        .acquire_next_image(sc.swapchain, u64::MAX, semaphore, vk::Fence::null())
-                        .map_err(|e| match e {
-                            vk::Result::ERROR_OUT_OF_DATE_KHR => RhiError::SwapchainOutOfDate,
-                            _ => RhiError::SwapchainCreation(e.to_string()),
-                        })?;
-                    acquired[frame_index] = Some(index);
-                    index
-                }
-            };
-
-            Ok(AcquiredImage {
-                index: image_index,
-                format: sc.format,
-                width: sc.extent.width,
-                height: sc.extent.height,
-            })
+    pub fn acquire_image(&self, sc: &VulkanSwapchain, frame_index: usize) -> RhiResult<u32> {
+        let armed = std::mem::take(&mut self.frames.borrow_mut()[frame_index].armed);
+        let fence = sc.frames.borrow()[frame_index].fence;
+        if armed {
+            // SAFETY: `fence` belongs to this device and is signalled by the submission that
+            // armed it.
+            unsafe { self.device.wait_for_fences(&[fence], true, u64::MAX) }
+                .map_err(|e| RhiError::SyncError(e.into()))?;
         }
+        self.reclaim_completed_commands();
+
+        let mut frames = sc.frames.borrow_mut();
+        let slot = &mut frames[frame_index];
+        let previous = std::mem::replace(&mut slot.command_buffer, vk::CommandBuffer::null());
+        if previous != vk::CommandBuffer::null() {
+            self.recycle_command_buffer(previous);
+        }
+
+        let semaphore = slot.present_complete;
+        let image_index = match slot.acquired_image {
+            Some(index) => index,
+            None => {
+                // SAFETY: the swapchain and semaphore are this device's, and the frame slot's
+                // previous acquisition has completed (the fence wait above).
+                let (index, _) = unsafe {
+                    self.swapchain_loader.acquire_next_image(
+                        sc.swapchain,
+                        u64::MAX,
+                        semaphore,
+                        vk::Fence::null(),
+                    )
+                }
+                .map_err(|e| match e {
+                    vk::Result::ERROR_OUT_OF_DATE_KHR => RhiError::SwapchainOutOfDate,
+                    _ => RhiError::SwapchainCreation(e.into()),
+                })?;
+                slot.acquired_image = Some(index);
+                index
+            }
+        };
+
+        Ok(image_index)
     }
 
     pub fn present(
@@ -343,7 +338,7 @@ impl VulkanQueue {
                 .queue_present(self.queue, &present_info)
                 .map_err(|e| match e {
                     vk::Result::ERROR_OUT_OF_DATE_KHR => RhiError::SwapchainOutOfDate,
-                    _ => RhiError::PresentFailed(e.to_string()),
+                    _ => RhiError::PresentFailed(e.into()),
                 })?;
         }
         Ok(())
@@ -358,7 +353,7 @@ impl VulkanQueue {
     ) -> RhiResult<()> {
         // Acquire waits gate color writes; timeline waits cover all commands.
         let image_index = image_index as usize;
-        if sc.acquired_images.borrow()[frame_index] != Some(image_index as u32) {
+        if sc.frames.borrow()[frame_index].acquired_image != Some(image_index as u32) {
             return Err(RhiError::QueueSubmit(
                 "frame does not own this acquired image".into(),
             ));
@@ -370,8 +365,12 @@ impl VulkanQueue {
             }
             return Err(error);
         }
+        let (present_complete, fence) = {
+            let slot = sc.frames.borrow()[frame_index];
+            (slot.present_complete, slot.fence)
+        };
         let waits: SmallVec<[vk::SemaphoreSubmitInfo<'_>; 4]> = SmallVec::from_elem(
-            semaphore_submit(sc.present_complete_semaphores[frame_index], 0)
+            semaphore_submit(present_complete, 0)
                 .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT),
             1,
         );
@@ -385,21 +384,22 @@ impl VulkanQueue {
             self.completion_semaphore,
             completion_value,
         ));
-        let fence = sc.in_flight_fences[frame_index];
         let raw_cmd = cmd.command_buffer;
         // Reset late: a frame that never submits would otherwise wedge this slot's next acquire.
         unsafe {
             self.device
                 .reset_fences(&[fence])
-                .map_err(|e| RhiError::SyncError(e.to_string()))?;
+                .map_err(|e| RhiError::SyncError(e.into()))?;
         }
         self.submit_timeline(raw_cmd, &waits, &signals, fence)?;
-        self.frame_fence_armed.borrow_mut()[frame_index] = true;
-        self.frame_completion_values.borrow_mut()[frame_index] = completion_value;
-        sc.acquired_images.borrow_mut()[frame_index] = None;
-
-        if let Some(slot) = sc.in_flight_cmd_buffers.borrow_mut().get_mut(frame_index) {
-            *slot = raw_cmd;
+        self.frames.borrow_mut()[frame_index] = FrameSubmission {
+            value: completion_value,
+            armed: true,
+        };
+        {
+            let slot = &mut sc.frames.borrow_mut()[frame_index];
+            slot.acquired_image = None;
+            slot.command_buffer = raw_cmd;
         }
 
         // `submit_frame` owns presentation on both backends. A stale swapchain is rebuilt on the
@@ -410,8 +410,30 @@ impl VulkanQueue {
         }
     }
 
+    /// Submit the device's setup command buffer and block until it has completed.
+    ///
+    /// Goes through the shared completion timeline so the wait covers this submission alone.
+    pub(crate) fn submit_setup_and_wait(&self, cmd: vk::CommandBuffer) -> RhiResult<()> {
+        let completion_value = self.next_completion_value()?;
+        let signals = [semaphore_submit(
+            self.completion_semaphore,
+            completion_value,
+        )];
+        self.submit_timeline(cmd, &[], &signals, vk::Fence::null())?;
+
+        let semaphores = [self.completion_semaphore];
+        let values = [completion_value];
+        let wait = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        // SAFETY: the semaphore is this device's and the value was just signalled by the submit.
+        unsafe { self.device.wait_semaphores(&wait, u64::MAX) }
+            .map_err(|e| RhiError::SyncError(e.into()))?;
+        Ok(())
+    }
+
     pub fn wait_for_frame(&self, frame_index: usize) {
-        let value = self.frame_completion_values.borrow()[frame_index];
+        let value = self.frames.borrow()[frame_index].value;
         if value == 0 {
             return;
         }
@@ -445,15 +467,10 @@ fn semaphore_submit<'a>(semaphore: vk::Semaphore, value: u64) -> vk::SemaphoreSu
 }
 
 fn timeline_waits<'a>(
-    pairs: &[(TimelineSemaphore, u64)],
+    pairs: &[(&TimelineSemaphore, u64)],
 ) -> SmallVec<[vk::SemaphoreSubmitInfo<'a>; 4]> {
     pairs
         .iter()
-        .map(|(sem, value)| {
-            semaphore_submit(
-                backend_expect!(&sem.inner, TimelineSemaphoreInner::Vulkan).semaphore,
-                *value,
-            )
-        })
+        .map(|(sem, value)| semaphore_submit(sem.inner.semaphore, *value))
         .collect()
 }

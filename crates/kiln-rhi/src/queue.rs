@@ -2,7 +2,7 @@
 
 use crate::command::CommandBuffer;
 use crate::error::RhiResult;
-use crate::swapchain::{AcquiredImage, Swapchain};
+use crate::swapchain::Swapchain;
 use crate::sync::TimelineSemaphore;
 
 /// GPU queue for submission and presentation.
@@ -10,17 +10,15 @@ pub struct Queue {
     pub(crate) inner: QueueInner,
 }
 
-pub(crate) enum QueueInner {
-    #[cfg(feature = "vulkan")]
-    Vulkan(Box<crate::backend::vulkan::queue::VulkanQueue>),
-    #[cfg(feature = "metal")]
-    Metal(Box<crate::backend::metal::device::MetalQueue>),
-}
+backend_enum!(QueueInner {
+    vulkan: std::rc::Rc<crate::backend::vulkan::queue::VulkanQueue>,
+    metal: std::rc::Rc<crate::backend::metal::queue::MetalQueue>,
+});
 
 #[derive(Default)]
 pub struct SubmitDesc<'a> {
-    pub wait_semaphores: &'a [(TimelineSemaphore, u64)],
-    pub signal_semaphores: &'a [(TimelineSemaphore, u64)],
+    pub wait_semaphores: &'a [(&'a TimelineSemaphore, u64)],
+    pub signal_semaphores: &'a [(&'a TimelineSemaphore, u64)],
 }
 
 impl Queue {
@@ -29,39 +27,24 @@ impl Queue {
     }
 
     pub fn submit_with_desc(&self, cmd: CommandBuffer, desc: &SubmitDesc<'_>) -> RhiResult<()> {
-        match (&self.inner, cmd.inner) {
-            #[cfg(feature = "vulkan")]
-            (QueueInner::Vulkan(q), crate::command::CommandBufferInner::Vulkan(cmd)) => {
-                q.submit_with_desc(*cmd, desc)
-            }
-            #[cfg(feature = "metal")]
-            (QueueInner::Metal(q), crate::command::CommandBufferInner::Metal(cmd)) => {
-                q.submit_with_desc(*cmd, desc)
-            }
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("mismatched backend types"),
+        {
+            let q = &self.inner;
+            let cmd = cmd.inner;
+            q.submit_with_desc(*cmd, desc)
         }
     }
 
     /// Wait for the frame slot and acquire its image. If recording is abandoned before
     /// submission, acquiring the same slot again reuses its outstanding image. Recreate the
     /// swapchain to discard outstanding acquisitions (for example after a resize).
-    pub fn acquire_image(
-        &self,
-        swapchain: &Swapchain,
-        frame_index: usize,
-    ) -> RhiResult<AcquiredImage> {
-        match (&self.inner, &swapchain.inner) {
-            #[cfg(feature = "vulkan")]
-            (QueueInner::Vulkan(q), crate::swapchain::SwapchainInner::Vulkan(sc)) => {
-                q.acquire_image(sc, frame_index)
-            }
-            #[cfg(feature = "metal")]
-            (QueueInner::Metal(q), crate::swapchain::SwapchainInner::Metal(sc)) => {
-                q.acquire_image(sc, frame_index)
-            }
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("mismatched backend types"),
+    /// Returns the index of the acquired image, for
+    /// [`RenderTarget::swapchain_image`](crate::RenderTarget::swapchain_image) and
+    /// [`submit_frame`](Self::submit_frame).
+    pub fn acquire_image(&self, swapchain: &Swapchain, frame_index: usize) -> RhiResult<u32> {
+        {
+            let q = &self.inner;
+            let sc = &swapchain.inner;
+            q.acquire_image(sc, frame_index)
         }
     }
 
@@ -73,30 +56,20 @@ impl Queue {
         frame_index: usize,
         image_index: u32,
     ) -> RhiResult<()> {
-        match (&self.inner, cmd.inner, &swapchain.inner) {
-            #[cfg(feature = "vulkan")]
-            (
-                QueueInner::Vulkan(q),
-                crate::command::CommandBufferInner::Vulkan(cmd),
-                crate::swapchain::SwapchainInner::Vulkan(sc),
-            ) => q.submit_frame(*cmd, sc, frame_index, image_index),
-            #[cfg(feature = "metal")]
-            (
-                QueueInner::Metal(q),
-                crate::command::CommandBufferInner::Metal(cmd),
-                crate::swapchain::SwapchainInner::Metal(sc),
-            ) => q.submit_frame(*cmd, sc, frame_index, image_index),
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("mismatched backend types"),
+        {
+            let q = &self.inner;
+            let cmd = cmd.inner;
+            let sc = &swapchain.inner;
+            q.submit_frame(*cmd, sc, frame_index, image_index)
         }
     }
 
     pub fn wait_idle(&self) {
         match &self.inner {
             #[cfg(feature = "vulkan")]
-            QueueInner::Vulkan(q) => q.wait_idle(),
+            q => q.wait_idle(),
             #[cfg(feature = "metal")]
-            QueueInner::Metal(q) => q.wait_idle(),
+            q => q.wait_idle(),
         }
     }
 }

@@ -114,7 +114,7 @@ impl<'a> GpuUploadBatch<'a> {
         };
         // Texture copies leave the image in a transfer layout; open it to every later stage.
         commands.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
-        commands.end();
+        commands.end()?;
         self.device.queue().submit(commands)?;
         self.device.queue().wait_idle();
         for staging in self.staging.drain(..) {

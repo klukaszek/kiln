@@ -11,7 +11,7 @@ fn device_creation_and_properties() {
     let start = std::time::Instant::now();
     let device = Device::new(&DeviceDesc {
         validation: false,
-        label: Some("rhi-timing".into()),
+        label: Some("rhi-timing"),
         ..Default::default()
     })
     .expect("no headless GPU device available");
@@ -30,7 +30,7 @@ fn resources_may_outlive_the_device_handle() {
         .create_allocation(&AllocationDesc {
             size: 256,
             memory: MemoryType::Upload,
-            label: Some("device-lifetime-buffer".into()),
+            label: Some("device-lifetime-buffer"),
             ..Default::default()
         })
         .expect("allocation");

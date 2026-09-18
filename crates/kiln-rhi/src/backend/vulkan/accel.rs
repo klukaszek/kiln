@@ -8,9 +8,73 @@ use super::device::{
 };
 use super::memory::SharedBufferPool;
 
-use crate::accel::{AccelInner, AccelerationStructure};
+use super::queue::VulkanRetiredResource;
+use crate::accel::AccelerationStructure;
 use crate::error::{RhiError, RhiResult};
-use crate::types::{BlasDesc, GeometryType, TlasDesc};
+use crate::types::{BlasDesc, BlasGeometry, TlasDesc};
+use smallvec::SmallVec;
+
+/// Geometry descriptors and primitive counts for a BLAS, shared by `create_blas` (which sizes the
+/// structure) and `build_blas` (which records it), so the two cannot disagree.
+pub(crate) fn blas_geometries(
+    desc: &BlasDesc<'_>,
+) -> (
+    SmallVec<[vk::AccelerationStructureGeometryKHR<'static>; 4]>,
+    SmallVec<[u32; 4]>,
+) {
+    let geometries = desc
+        .meshes
+        .iter()
+        .map(|mesh| {
+            let (ty, data) = match mesh.geometry {
+                BlasGeometry::Triangles {
+                    vertices,
+                    stride,
+                    count,
+                    indices,
+                } => (
+                    vk::GeometryTypeKHR::TRIANGLES,
+                    vk::AccelerationStructureGeometryDataKHR {
+                        triangles: vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+                            .vertex_format(vk::Format::R32G32B32_SFLOAT)
+                            .vertex_data(vk::DeviceOrHostAddressConstKHR {
+                                device_address: vertices.address,
+                            })
+                            .vertex_stride(stride)
+                            .max_vertex(count.saturating_sub(1))
+                            .index_type(match indices {
+                                Some(_) => vk::IndexType::UINT32,
+                                None => vk::IndexType::NONE_KHR,
+                            })
+                            .index_data(vk::DeviceOrHostAddressConstKHR {
+                                device_address: indices.map_or(0, |i| i.buffer.address),
+                            }),
+                    },
+                ),
+                BlasGeometry::Aabbs { buffer, .. } => (
+                    vk::GeometryTypeKHR::AABBS,
+                    vk::AccelerationStructureGeometryDataKHR {
+                        aabbs: vk::AccelerationStructureGeometryAabbsDataKHR::default()
+                            .data(vk::DeviceOrHostAddressConstKHR {
+                                device_address: buffer.address,
+                            })
+                            .stride(std::mem::size_of::<vk::AabbPositionsKHR>() as u64),
+                    },
+                ),
+            };
+            vk::AccelerationStructureGeometryKHR::default()
+                .geometry_type(ty)
+                .geometry(data)
+                .flags(geometry_flags_to_vk(mesh.flags))
+        })
+        .collect();
+    let primitive_counts = desc
+        .meshes
+        .iter()
+        .map(|mesh| mesh.geometry.primitive_count())
+        .collect();
+    (geometries, primitive_counts)
+}
 
 /// Vulkan acceleration structure entry (BLAS or TLAS).
 ///
@@ -43,9 +107,13 @@ pub(crate) struct BlockRange {
     pub(crate) range: u64,
 }
 
-impl Drop for VulkanAccelerationStructure {
-    /// Destroys immediately; the caller guarantees the GPU is done with it.
-    fn drop(&mut self) {
+impl VulkanAccelerationStructure {
+    /// Destroy the structure and return its backing and scratch ranges to the pool. Called from
+    /// the queue's retirement path, never from `Drop`.
+    ///
+    /// # Safety
+    /// No submission referencing this structure may still be executing.
+    pub(crate) unsafe fn destroy(&self) {
         unsafe {
             self.accel_loader
                 .destroy_acceleration_structure(self.acceleration_structure, None);
@@ -58,64 +126,10 @@ impl Drop for VulkanAccelerationStructure {
 }
 
 impl VulkanDevice {
-    pub fn create_blas(&self, desc: &BlasDesc) -> RhiResult<AccelerationStructure> {
-        let accel_loader = &self.acceleration_structure;
+    pub fn create_blas(&self, desc: &BlasDesc<'_>) -> RhiResult<AccelerationStructure> {
+        let accel_loader = &self.loaders.acceleration_structure;
 
-        let geometries: Vec<vk::AccelerationStructureGeometryKHR> = desc
-            .meshes
-            .iter()
-            .map(|m| match m.geometry_type {
-                GeometryType::Triangles => {
-                    let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
-                        .vertex_format(vk::Format::R32G32B32_SFLOAT)
-                        .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.vertex_buffer.address,
-                        })
-                        .vertex_stride(m.vertex_stride)
-                        .max_vertex(m.vertex_count.saturating_sub(1))
-                        .index_type(if m.index_count > 0 {
-                            vk::IndexType::UINT32
-                        } else {
-                            vk::IndexType::NONE_KHR
-                        })
-                        .index_data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.index_buffer.address,
-                        });
-                    let geo_data = vk::AccelerationStructureGeometryDataKHR { triangles };
-                    vk::AccelerationStructureGeometryKHR::default()
-                        .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
-                        .geometry(geo_data)
-                        .flags(geometry_flags_to_vk(m.flags))
-                }
-                GeometryType::Aabbs => {
-                    let aabbs = vk::AccelerationStructureGeometryAabbsDataKHR::default()
-                        .data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.aabb_buffer.address,
-                        })
-                        .stride(std::mem::size_of::<vk::AabbPositionsKHR>() as u64);
-                    let geo_data = vk::AccelerationStructureGeometryDataKHR { aabbs };
-                    vk::AccelerationStructureGeometryKHR::default()
-                        .geometry_type(vk::GeometryTypeKHR::AABBS)
-                        .geometry(geo_data)
-                        .flags(geometry_flags_to_vk(m.flags))
-                }
-            })
-            .collect();
-
-        let primitive_counts: Vec<u32> = desc
-            .meshes
-            .iter()
-            .map(|m| match m.geometry_type {
-                GeometryType::Triangles => {
-                    if m.index_count > 0 {
-                        m.index_count / 3
-                    } else {
-                        m.vertex_count / 3
-                    }
-                }
-                GeometryType::Aabbs => m.aabb_count,
-            })
-            .collect();
+        let (geometries, primitive_counts) = blas_geometries(desc);
 
         let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
@@ -147,15 +161,15 @@ impl VulkanDevice {
     }
 
     /// The public layout is already Vulkan's: an [`AccelHandle`](crate::AccelHandle) is the
-    /// structure's device address, which is exactly what the instance descriptor wants.
-    pub fn write_tlas_instance(&self, dst: *mut u8, inst: &crate::types::TlasInstance) {
-        unsafe {
-            std::ptr::write_unaligned(dst as *mut crate::types::TlasInstance, *inst);
-        }
+    /// structure's device address, which is what the instance descriptor wants. So this is a
+    /// byte copy, with no native descriptor type in between.
+    pub fn write_tlas_instance(&self, dst: &mut [u8], inst: &crate::types::TlasInstance) {
+        use zerocopy::IntoBytes;
+        dst[..size_of::<crate::types::TlasInstance>()].copy_from_slice(inst.as_bytes());
     }
 
     pub fn create_tlas(&self, desc: &TlasDesc) -> RhiResult<AccelerationStructure> {
-        let accel_loader = &self.acceleration_structure;
+        let accel_loader = &self.loaders.acceleration_structure;
 
         let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::default()
             .array_of_pointers(false)
@@ -208,7 +222,7 @@ impl VulkanDevice {
         // `create_acceleration_structure2` takes an address range, so the storage is an ordinary
         // suballocation rather than a dedicated buffer.
         let (backing, backing_address) =
-            self.allocate_accel_range(size, super::memory::BLOCK_BUFFER_USAGE)?;
+            self.allocate_accel_range(size, 1, super::memory::BLOCK_BUFFER_USAGE)?;
         let create_info = vk::AccelerationStructureCreateInfo2KHR::default()
             .address_range(
                 vk::DeviceAddressRangeKHR::default()
@@ -217,9 +231,10 @@ impl VulkanDevice {
             )
             .ty(ty);
         let acceleration_structure = unsafe {
-            self.address_commands_loader
+            self.loaders
+                .address_commands
                 .create_acceleration_structure2(&create_info, None)
-                .map_err(|e| RhiError::AllocationFailed(e.to_string()))?
+                .map_err(|e| RhiError::AllocationFailed(e.into()))?
         };
         let device_address = unsafe {
             accel_loader.get_acceleration_structure_device_address(
@@ -228,16 +243,21 @@ impl VulkanDevice {
             )
         };
 
-        // Leave enough headroom to align the scratch address as required by Vulkan.
-        let scratch_align = self.accel_scratch_alignment();
-        let (scratch, scratch_base) = self.allocate_accel_range(
-            scratch_size + scratch_align,
+        // The pool carves at the alignment asked for, so the scratch range is exactly the size
+        // the build needs. It used to over-allocate by a whole `scratch_align` and shift inside.
+        let (scratch, scratch_address) = self.allocate_accel_range(
+            scratch_size,
+            self.accel_scratch_alignment,
             super::memory::SCRATCH_BUFFER_USAGE,
         )?;
-        let scratch_address = scratch_base.next_multiple_of(scratch_align);
+        debug_assert_eq!(
+            scratch_address % self.accel_scratch_alignment,
+            0,
+            "scratch must satisfy minAccelerationStructureScratchOffsetAlignment"
+        );
 
         Ok(AccelerationStructure {
-            inner: AccelInner::Vulkan(Box::new(VulkanAccelerationStructure {
+            inner: Box::new(VulkanAccelerationStructure {
                 acceleration_structure,
                 backing,
                 device_address,
@@ -245,7 +265,7 @@ impl VulkanDevice {
                 scratch_address,
                 buffer_pool: self.buffer_pool.clone(),
                 accel_loader: accel_loader.clone(),
-            })),
+            }),
             _owner: None,
         })
     }
@@ -255,9 +275,11 @@ impl VulkanDevice {
     fn allocate_accel_range(
         &self,
         size: u64,
+        align: u64,
         usage: vk::BufferUsageFlags,
     ) -> RhiResult<(BlockRange, u64)> {
-        let requirements = self.buffer_requirements(size, usage)?;
+        let mut requirements = self.buffer_requirements(size, usage)?;
+        requirements.alignment = requirements.alignment.max(align).max(1);
         let memory_type = find_memorytype_index(
             &requirements,
             &self.device_memory_properties,
@@ -265,7 +287,7 @@ impl VulkanDevice {
         )
         .ok_or_else(|| RhiError::AllocationFailed("no device-local memory type".into()))?;
         let sub = self.buffer_pool.borrow_mut().allocate(
-            &self.device,
+            &self.loaders.device,
             &requirements,
             memory_type,
             false,
@@ -279,5 +301,10 @@ impl VulkanDevice {
             },
             sub.address,
         ))
+    }
+
+    pub fn destroy_accel(&self, accel: Box<VulkanAccelerationStructure>) {
+        self.queue
+            .release_resource(VulkanRetiredResource::Accel(accel));
     }
 }

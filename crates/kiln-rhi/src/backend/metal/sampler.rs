@@ -2,9 +2,8 @@
 
 use objc2_metal::{MTLDevice, MTLSamplerDescriptor, MTLSamplerState};
 
-use super::device::{METAL_BINDLESS_SAMPLER_CAPACITY, MetalDevice, MetalRetiredResource};
+use super::device::{MetalDevice, MetalRetiredResource};
 use crate::error::{RhiError, RhiResult};
-use crate::queue::QueueInner;
 use crate::sampler::{Sampler, SamplerDesc};
 use crate::types::{AddressMode, FilterMode, SamplerHandle, SamplerId};
 
@@ -32,19 +31,6 @@ fn address_to_mtl(a: AddressMode) -> objc2_metal::MTLSamplerAddressMode {
 }
 
 impl MetalDevice {
-    fn allocate_sampler_id(&self) -> RhiResult<SamplerId> {
-        if let Some(id) = self.shared.free_sampler_ids.borrow_mut().pop() {
-            return Ok(id);
-        }
-        let next = self.shared.samplers.borrow().len();
-        if next >= METAL_BINDLESS_SAMPLER_CAPACITY {
-            return Err(RhiError::Backend(
-                "Metal bindless sampler heap exhausted".into(),
-            ));
-        }
-        Ok(SamplerId(next as u32))
-    }
-
     pub fn create_sampler(&self, desc: &SamplerDesc) -> RhiResult<Sampler> {
         let mtl_desc = MTLSamplerDescriptor::new();
 
@@ -58,7 +44,7 @@ impl MetalDevice {
         mtl_desc.setLodMaxClamp(desc.max_lod);
 
         if let Some(aniso) = desc.max_anisotropy {
-            mtl_desc.setMaxAnisotropy(aniso as usize);
+            mtl_desc.setMaxAnisotropy(usize::from(aniso.get()));
         }
 
         if let Some(cmp) = desc.compare {
@@ -72,45 +58,24 @@ impl MetalDevice {
             .newSamplerStateWithDescriptor(&mtl_desc)
             .ok_or_else(|| RhiError::Backend("Failed to create Metal sampler".into()))?;
 
-        let id = self.allocate_sampler_id()?;
-        let idx = id.0 as usize;
-        let mut samplers = self.shared.samplers.borrow_mut();
-        if samplers.len() <= idx {
-            samplers.resize_with(idx + 1, || None);
-        }
-        samplers[idx] = Some(sampler.clone());
-        drop(samplers);
-        Self::write_heap_slot(
-            &self.shared.sampler_heap,
-            idx,
-            sampler.gpuResourceID().to_raw(),
-        );
+        let resource_id = sampler.gpuResourceID().to_raw();
+        let id = SamplerId(self.shared.samplers.allocate_id()?);
+        self.shared.samplers.insert(id.0, sampler, resource_id);
 
         Ok(Sampler {
             id,
-            handle: SamplerHandle::from_raw(sampler.gpuResourceID().to_raw()),
+            handle: SamplerHandle::from_raw(resource_id),
             _owner: None,
         })
     }
 
     pub fn destroy_sampler(&self, sampler: Sampler) {
         let sampler_id = sampler.id();
-        let retired = {
-            let mut samplers = self.shared.samplers.borrow_mut();
-            let idx = sampler_id.0 as usize;
-            if idx < samplers.len() {
-                samplers[idx].take()
-            } else {
-                None
-            }
-        };
-        if let Some(sampler) = retired {
-            backend_expect!(&self.rhi_queue.inner, QueueInner::Metal).release_resource(
-                MetalRetiredResource::Sampler {
-                    id: sampler_id,
-                    sampler,
-                },
-            );
+        if let Some(sampler) = self.shared.samplers.take(sampler_id.0) {
+            self.queue.release_resource(MetalRetiredResource::Sampler {
+                id: sampler_id,
+                sampler,
+            });
         }
     }
 }

@@ -14,15 +14,21 @@ pub const MAX_PRIMS: u32 = 64;
 /// `float4` rows per packed primitive.
 pub const ROWS_PER_PRIM: u32 = 4;
 
-const KIND_CIRCLE: f32 = 0.0;
-const KIND_BOX: f32 = 1.0;
-const KIND_SEGMENT: f32 = 2.0;
-
 const BLACK: Vec3 = Vec3::ZERO;
+
+/// Primitive kind. The discriminants are the values the shader switches on; `constants` in
+/// `cascades::program` emits them so both sides cannot drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum Kind {
+    Circle = 0,
+    Box = 1,
+    Segment = 2,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Prim {
-    kind: f32,
+    kind: Kind,
     /// Circle/box centre, or segment start.
     a: Vec2,
     /// Box half-extent, or segment end.
@@ -35,7 +41,7 @@ pub struct Prim {
 }
 
 impl Prim {
-    fn new(kind: f32, a: Vec2) -> Self {
+    fn new(kind: Kind, a: Vec2) -> Self {
         Self {
             kind,
             a,
@@ -47,12 +53,12 @@ impl Prim {
         }
     }
 
-    pub fn emission(mut self, emission: Vec3) -> Self {
+    fn emission(mut self, emission: Vec3) -> Self {
         self.emission = emission;
         self
     }
 
-    pub fn albedo(mut self, albedo: Vec3) -> Self {
+    fn albedo(mut self, albedo: Vec3) -> Self {
         self.albedo = albedo;
         self
     }
@@ -72,14 +78,14 @@ impl Prim {
 pub fn circle(cx: f32, cy: f32, r: f32) -> Prim {
     Prim {
         r,
-        ..Prim::new(KIND_CIRCLE, Vec2::new(cx, cy))
+        ..Prim::new(Kind::Circle, Vec2::new(cx, cy))
     }
 }
 
 pub fn box_prim(cx: f32, cy: f32, hx: f32, hy: f32) -> Prim {
     Prim {
         b: Vec2::new(hx, hy),
-        ..Prim::new(KIND_BOX, Vec2::new(cx, cy))
+        ..Prim::new(Kind::Box, Vec2::new(cx, cy))
     }
 }
 
@@ -87,7 +93,7 @@ pub fn segment(ax: f32, ay: f32, bx: f32, by: f32, r: f32) -> Prim {
     Prim {
         b: Vec2::new(bx, by),
         r,
-        ..Prim::new(KIND_SEGMENT, Vec2::new(ax, ay))
+        ..Prim::new(Kind::Segment, Vec2::new(ax, ay))
     }
 }
 
@@ -102,9 +108,14 @@ pub fn pack(prims: &[Prim], res: (u32, u32), out: &mut Vec<Vec4>) {
     out.clear();
     for p in prims {
         let centre = Vec2::new(ox, oy) + p.a * scale;
-        out.push(Vec4::new(p.kind, centre.x, centre.y, p.r * scale));
+        out.push(Vec4::new(
+            p.kind as i32 as f32,
+            centre.x,
+            centre.y,
+            p.r * scale,
+        ));
         // A segment's second point is a position; every other kind's is an extent.
-        let b = if p.kind == KIND_SEGMENT {
+        let b = if p.kind == Kind::Segment {
             Vec2::new(ox, oy) + p.b * scale
         } else {
             p.b * scale

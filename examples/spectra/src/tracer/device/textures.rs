@@ -90,7 +90,7 @@ fn sampler(device: &Device, wrap_u: WrapMode, wrap_v: WrapMode) -> Result<Sample
         address_u: address_mode(wrap_u),
         address_v: address_mode(wrap_v),
         address_w: AddressMode::ClampToEdge,
-        label: Some("spectra-texture-sampler".into()),
+        label: Some("spectra-texture-sampler"),
         ..Default::default()
     })?)
 }
@@ -117,7 +117,7 @@ impl GpuImage {
             dimension: TextureDimension::D2,
             sample_count: SampleCount::S1,
             usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
-            label: Some(image.name.clone()),
+            label: Some(&image.name),
         };
         let size = device.texture_size_align(&desc)?;
         let memory = device.allocate_aligned(size.size, size.align, MemoryType::GpuOnly)?;

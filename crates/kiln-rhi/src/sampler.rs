@@ -1,10 +1,11 @@
 //! Sampler creation and descriptor registration.
 
 use crate::types::{AddressMode, CompareOp, FilterMode, SamplerHandle, SamplerId};
+use std::num::NonZeroU8;
 
 /// Description for creating a sampler.
 #[derive(Clone, Debug)]
-pub struct SamplerDesc {
+pub struct SamplerDesc<'a> {
     pub min_filter: FilterMode,
     pub mag_filter: FilterMode,
     pub mip_filter: FilterMode,
@@ -12,14 +13,17 @@ pub struct SamplerDesc {
     pub address_v: AddressMode,
     pub address_w: AddressMode,
     pub mip_lod_bias: f32,
-    pub max_anisotropy: Option<f32>,
+    /// Maximum anisotropy, `None` to disable. Both backends take an integer here: Metal's
+    /// `setMaxAnisotropy` rejects 0, and Vulkan caps this at `maxSamplerAnisotropy` (16 on every
+    /// current implementation), so a float would only add a way to pass NaN.
+    pub max_anisotropy: Option<NonZeroU8>,
     pub compare: Option<CompareOp>,
     pub min_lod: f32,
     pub max_lod: f32,
-    pub label: Option<String>,
+    pub label: Option<&'a str>,
 }
 
-impl Default for SamplerDesc {
+impl Default for SamplerDesc<'_> {
     fn default() -> Self {
         Self {
             min_filter: FilterMode::Linear,

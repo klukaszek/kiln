@@ -122,7 +122,7 @@ fn copy_to_readback(
     device.wait_idle();
     let mut cmd = device.create_command_buffer()?;
     cmd.memcpy(destination.gpu(), source.gpu(), source.size());
-    cmd.end();
+    cmd.end()?;
     let queue = device.queue();
     queue.submit(cmd)?;
     queue.wait_idle();

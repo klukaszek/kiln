@@ -42,7 +42,9 @@ struct TriangleMesh {
 }
 
 impl Example for TriangleMesh {
-    fn new(device: &Device, color_format: Format) -> Self {
+    type Config = ();
+
+    fn new(device: &Device, color_format: Format, _: ()) -> Self {
         let ms = kiln_rhi::compiler::compile(device, TRI_BODY, "msMain", ShaderStage::Mesh, &[])
             .expect("shader compilation");
         let fs = kiln_rhi::compiler::compile(device, TRI_BODY, "fsMain", ShaderStage::Pixel, &[])
@@ -52,14 +54,14 @@ impl Example for TriangleMesh {
             .create_meshlet_pso(
                 &MeshletPsoDesc {
                     topology: Topology::TriangleList,
-                    color_targets: vec![ColorTarget::new(color_format)],
+                    color_targets: &[ColorTarget::new(color_format)],
                     depth_format: None,
                     depth: Default::default(),
                     sample_count: SampleCount::S1,
                     alpha_to_coverage: false,
                     cull: Cull::None,
-                    blendstate: None,
-                    label: Some("triangle-mesh".into()),
+                    blend: &[],
+                    label: Some("triangle-mesh"),
                 },
                 &ms,
                 &fs,

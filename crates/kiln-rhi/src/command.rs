@@ -2,8 +2,9 @@
 
 use crate::accel::AccelerationStructure;
 use crate::barrier::{HazardFlags, StageFlags};
+use crate::error::RhiResult;
 use crate::pipeline::{ComputePso, GraphicsPso, MeshletPso};
-use crate::query::{QueryPool, QueryPoolInner};
+use crate::query::QueryPool;
 use crate::texture::{ResolvedRegion, Texture, TextureRegion};
 use crate::types::{BlasDesc, GpuPtr, TextureId, TlasDesc};
 
@@ -124,7 +125,7 @@ macro_rules! impl_pipeline {
         $(
             impl Pipeline for $ty {
                 fn bind_to(&self, cmd: &mut CommandBuffer) {
-                    backend_dispatch!(&mut cmd.inner, CommandBufferInner, c => c.$bind(self))
+                    { let c = &mut cmd.inner; c.$bind(self) }
                 }
             }
         )+
@@ -143,29 +144,44 @@ pub struct CommandBuffer {
     pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
-pub(crate) enum CommandBufferInner {
-    #[cfg(feature = "vulkan")]
-    Vulkan(Box<crate::backend::vulkan::command::VulkanCommandBuffer>),
-    #[cfg(feature = "metal")]
-    Metal(Box<crate::backend::metal::command::MetalCommandBuffer>),
-}
+backend_enum!(CommandBufferInner { vulkan: Box<crate::backend::vulkan::command::VulkanCommandBuffer>, metal: Box<crate::backend::metal::command::MetalCommandBuffer> });
 
 impl CommandBuffer {
+    pub(crate) fn new(inner: CommandBufferInner) -> Self {
+        Self {
+            inner,
+            _owner: None,
+        }
+    }
+
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.begin_render_pass(desc))
+        {
+            let cmd = &mut self.inner;
+            cmd.begin_render_pass(desc)
+        }
     }
 
     pub fn end_render_pass(&mut self) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.end_render_pass())
+        {
+            let cmd = &mut self.inner;
+            cmd.end_render_pass()
+        }
     }
 
-    /// Bind a pipeline. Its type selects which draw or dispatch calls are then valid.
+    /// Bind a pipeline.
+    ///
+    /// Which draw or dispatch calls are then valid follows from the pipeline's type, but is not
+    /// enforced by it: `set_pipeline(&compute_pso)` followed by [`draw`](Self::draw) compiles and
+    /// is caught by the backend, not the borrow checker.
     pub fn set_pipeline<P: Pipeline>(&mut self, pso: &P) {
         pso.bind_to(self);
     }
 
     fn set_root_data<T: ?Sized>(&mut self, root: GpuPtr<T>) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_root_data(root.cast()))
+        {
+            let cmd = &mut self.inner;
+            cmd.set_root_data(root.cast())
+        }
     }
 
     /// `root` is shared by the vertex and pixel stages.
@@ -178,25 +194,45 @@ impl CommandBuffer {
         first_instance: u32,
     ) {
         self.set_root_data(root);
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd =>
-            cmd.draw(vertex_count, instance_count, first_vertex, first_instance))
+        {
+            let cmd = &mut self.inner;
+            cmd.draw(vertex_count, instance_count, first_vertex, first_instance)
+        }
     }
 
+    /// `root` is shared by the vertex and pixel stages.
+    ///
+    /// `indices` points at the first index to read, so there is no `first_index`: offset the
+    /// pointer instead. `vertex_offset` and `first_instance` match
+    /// [`DrawIndexedIndirectArgs`]'s fields of the same name.
     pub fn draw_indexed<R: ?Sized>(
         &mut self,
         root: GpuPtr<R>,
         indices: GpuPtr<u32>,
         index_count: u32,
         instance_count: u32,
+        vertex_offset: i32,
+        first_instance: u32,
     ) {
         self.set_root_data(root);
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd =>
-            cmd.draw_indexed(indices.cast(), index_count, instance_count))
+        {
+            let cmd = &mut self.inner;
+            cmd.draw_indexed(
+                indices.cast(),
+                index_count,
+                instance_count,
+                vertex_offset,
+                first_instance,
+            )
+        }
     }
 
     pub fn dispatch<R: ?Sized>(&mut self, root: GpuPtr<R>, x: u32, y: u32, z: u32) {
         self.set_root_data(root);
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch(x, y, z))
+        {
+            let cmd = &mut self.inner;
+            cmd.dispatch(x, y, z)
+        }
     }
 
     /// Indirect dispatch.
@@ -206,13 +242,19 @@ impl CommandBuffer {
         args: GpuPtr<DispatchIndirectArgs>,
     ) {
         self.set_root_data(root);
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.dispatch_indirect(args.cast()))
+        {
+            let cmd = &mut self.inner;
+            cmd.dispatch_indirect(args.cast())
+        }
     }
 
     /// Indirect draw.
     pub fn draw_indirect<R: ?Sized>(&mut self, root: GpuPtr<R>, args: GpuPtr<DrawIndirectArgs>) {
         self.set_root_data(root);
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indirect(args.cast()))
+        {
+            let cmd = &mut self.inner;
+            cmd.draw_indirect(args.cast())
+        }
     }
 
     /// Indirect indexed draw.
@@ -227,11 +269,17 @@ impl CommandBuffer {
         args: GpuPtr<DrawIndexedIndirectArgs>,
     ) {
         self.set_root_data(root);
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_indexed_indirect(indices.cast(), max_index_count, args.cast()))
+        {
+            let cmd = &mut self.inner;
+            cmd.draw_indexed_indirect(indices.cast(), max_index_count, args.cast())
+        }
     }
 
     pub fn memcpy<D: ?Sized, S: ?Sized>(&mut self, dst: GpuPtr<D>, src: GpuPtr<S>, size: u64) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.memcpy(dst.cast(), src.cast(), size))
+        {
+            let cmd = &mut self.inner;
+            cmd.memcpy(dst.cast(), src.cast(), size)
+        }
     }
 
     /// Upload tightly packed texels into one mip/layer of `texture`.
@@ -246,7 +294,10 @@ impl CommandBuffer {
         region: impl Into<Option<TextureRegion>>,
     ) {
         let region = resolve_region(region, texture);
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_buffer_to_texture(src.cast(), texture, region))
+        {
+            let cmd = &mut self.inner;
+            cmd.copy_buffer_to_texture(src.cast(), texture, region)
+        }
     }
 
     /// Read one mip/layer of `texture` back into a tightly packed buffer. See
@@ -258,7 +309,10 @@ impl CommandBuffer {
         region: impl Into<Option<TextureRegion>>,
     ) {
         let region = resolve_region(region, texture);
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_texture_to_buffer(dst.cast(), texture, region))
+        {
+            let cmd = &mut self.inner;
+            cmd.copy_texture_to_buffer(dst.cast(), texture, region)
+        }
     }
 
     /// Copy one mip/layer of `src` into one mip/layer of `dst`. The copied extent comes from
@@ -272,28 +326,31 @@ impl CommandBuffer {
     ) {
         let src_region = resolve_region(src_region, src);
         let dst_region = resolve_region(dst_region, dst);
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.copy_texture_to_texture(src, src_region, dst, dst_region))
+        {
+            let cmd = &mut self.inner;
+            cmd.copy_texture_to_texture(src, src_region, dst, dst_region)
+        }
     }
 
+    /// Orders `src` before this point against `dst` after it, for the rest of the command buffer.
+    /// Name the stage that does the work; an acceleration build is not `COMPUTE`.
+    ///
+    /// An empty `src` or `dst` orders nothing and is dropped. It is never widened to "all
+    /// stages": a call that reads as a no-op must not become a device-wide stall.
     pub fn barrier(&mut self, src: StageFlags, dst: StageFlags) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.barrier(src, dst))
+        self.barrier_with_hazard(src, dst, HazardFlags::empty());
     }
 
+    /// See [`barrier`](Self::barrier); `hazard` adds cache invalidation beyond the stage
+    /// dependency.
     pub fn barrier_with_hazard(&mut self, src: StageFlags, dst: StageFlags, hazard: HazardFlags) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.barrier_with_hazard(src, dst, hazard))
-    }
-
-    /// Open a split barrier: record that work up to here in `src` must complete before the
-    /// matching [`wait_before`](Self::wait_before). Nothing is encoded until that call, so
-    /// unrelated work recorded in between overlaps freely.
-    pub fn signal_after(&mut self, src: StageFlags, hazard: HazardFlags) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.signal_after(src, hazard))
-    }
-
-    /// Close a split barrier opened by [`signal_after`](Self::signal_after), making `dst` wait on
-    /// it. Panics if no split barrier is open.
-    pub fn wait_before(&mut self, dst: StageFlags, hazard: HazardFlags) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.wait_before(dst, hazard))
+        if src.is_empty() || dst.is_empty() {
+            return;
+        }
+        {
+            let cmd = &mut self.inner;
+            cmd.barrier_with_hazard(src, dst, hazard)
+        }
     }
 
     pub fn set_viewport(
@@ -305,74 +362,59 @@ impl CommandBuffer {
         min_depth: f32,
         max_depth: f32,
     ) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd =>
-            cmd.set_viewport(x, y, width, height, min_depth, max_depth))
+        {
+            let cmd = &mut self.inner;
+            cmd.set_viewport(x, y, width, height, min_depth, max_depth)
+        }
     }
 
     pub fn set_scissor(&mut self, x: i32, y: i32, width: u32, height: u32) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.set_scissor(x, y, width, height))
+        {
+            let cmd = &mut self.inner;
+            cmd.set_scissor(x, y, width, height)
+        }
     }
 
     /// Must be outside a render pass, after the previous GPU use of this pool has completed.
     /// On Metal the reset happens immediately on the CPU, rather than at submission.
     pub fn reset_queries(&mut self, pool: &QueryPool) {
-        match (&mut self.inner, &pool.inner) {
-            #[cfg(feature = "vulkan")]
-            (CommandBufferInner::Vulkan(cmd), QueryPoolInner::Vulkan(p)) => {
-                cmd.reset_queries(p.pool, 0, pool.count)
-            }
-            #[cfg(feature = "metal")]
-            (CommandBufferInner::Metal(_), QueryPoolInner::Metal(p)) => {
-                use objc2_metal::MTL4CounterHeap;
-                // Metal invalidation runs immediately on the CPU. The caller must
-                // have waited for the previous use of this pool before resetting it.
-                unsafe {
-                    p.heap.invalidateCounterRange(objc2_foundation::NSRange {
-                        location: 0,
-                        length: pool.count as usize,
-                    });
-                }
-            }
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("query pool backend does not match command buffer backend"),
+        {
+            let cmd = &mut self.inner;
+            let p = &pool.inner;
+            cmd.reset_queries(p, pool.count)
         }
     }
 
     /// Must be outside a render pass.
     pub fn write_timestamp(&mut self, pool: &QueryPool, query: u32) {
         assert!(query < pool.count, "timestamp query index out of range");
-        match (&mut self.inner, &pool.inner) {
-            #[cfg(feature = "vulkan")]
-            (CommandBufferInner::Vulkan(cmd), QueryPoolInner::Vulkan(p)) => {
-                cmd.write_timestamp(p.pool, query)
-            }
-            #[cfg(feature = "metal")]
-            (CommandBufferInner::Metal(cmd), QueryPoolInner::Metal(p)) => {
-                cmd.write_timestamp(&p.heap, query as usize)
-            }
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("query pool backend does not match command buffer backend"),
+        {
+            let cmd = &mut self.inner;
+            let p = &pool.inner;
+            cmd.write_timestamp(p, query)
         }
     }
 
-    /// Finalize command recording early. This is idempotent and optional because queue submission
-    /// finalizes command buffers on both backends.
-    pub fn end(&mut self) {
+    /// Finalize command recording early. Idempotent and optional: queue submission finalizes
+    /// command buffers on both backends, and reports the same error this does.
+    pub fn end(&mut self) -> RhiResult<()> {
         match &mut self.inner {
             #[cfg(feature = "vulkan")]
-            CommandBufferInner::Vulkan(cmd) => {
-                cmd.finish().expect("Failed to end command buffer");
-            }
+            cmd => cmd.finish(),
             #[cfg(feature = "metal")]
-            CommandBufferInner::Metal(cmd) => {
+            cmd => {
                 cmd.finish();
+                Ok(())
             }
         }
     }
 
     pub fn draw_meshlets<R: ?Sized>(&mut self, root: GpuPtr<R>, x: u32, y: u32, z: u32) {
         self.set_root_data(root);
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets(x, y, z))
+        {
+            let cmd = &mut self.inner;
+            cmd.draw_meshlets(x, y, z)
+        }
     }
 
     /// Indirect mesh draw.
@@ -382,15 +424,24 @@ impl CommandBuffer {
         args: GpuPtr<DispatchIndirectArgs>,
     ) {
         self.set_root_data(root);
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.draw_meshlets_indirect(args.cast()))
+        {
+            let cmd = &mut self.inner;
+            cmd.draw_meshlets_indirect(args.cast())
+        }
     }
 
     /// `accel` must come from `device.create_blas` with this same `desc`.
-    pub fn build_blas(&mut self, accel: &AccelerationStructure, desc: &BlasDesc) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.build_blas(accel, desc))
+    pub fn build_blas(&mut self, accel: &AccelerationStructure, desc: &BlasDesc<'_>) {
+        {
+            let cmd = &mut self.inner;
+            cmd.build_blas(accel, desc)
+        }
     }
 
     pub fn build_tlas(&mut self, accel: &AccelerationStructure, desc: &TlasDesc) {
-        backend_dispatch!(&mut self.inner, CommandBufferInner, cmd => cmd.build_tlas(accel, desc))
+        {
+            let cmd = &mut self.inner;
+            cmd.build_tlas(accel, desc)
+        }
     }
 }

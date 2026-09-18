@@ -4,6 +4,10 @@ use crate::types::AccelHandle;
 
 /// A BLAS or TLAS. Build with `cmd.build_blas`/`build_tlas`, then pass [`gpu()`](Self::gpu) to
 /// the shader.
+///
+/// A [`DeviceResource`](crate::DeviceResource): release it with
+/// [`Device::destroy`](crate::Device::destroy), which holds the storage until the submissions
+/// that trace against it have retired. Dropping one instead leaks it.
 pub struct AccelerationStructure {
     pub(crate) inner: AccelInner,
     pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
@@ -20,17 +24,12 @@ impl AccelerationStructure {
     pub fn gpu(&self) -> AccelHandle {
         let value = match &self.inner {
             #[cfg(feature = "vulkan")]
-            AccelInner::Vulkan(a) => a.device_address,
+            a => a.device_address,
             #[cfg(feature = "metal")]
-            AccelInner::Metal(a) => a.gpu_resource_id,
+            a => a.gpu_resource_id,
         };
         AccelHandle::from_raw(value)
     }
 }
 
-pub(crate) enum AccelInner {
-    #[cfg(feature = "vulkan")]
-    Vulkan(Box<crate::backend::vulkan::accel::VulkanAccelerationStructure>),
-    #[cfg(feature = "metal")]
-    Metal(Box<crate::backend::metal::accel::MetalAccelerationStructure>),
-}
+backend_enum!(AccelInner { vulkan: Box<crate::backend::vulkan::accel::VulkanAccelerationStructure>, metal: Box<crate::backend::metal::accel::MetalAccelerationStructure> });

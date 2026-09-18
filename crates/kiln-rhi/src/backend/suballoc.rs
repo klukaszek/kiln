@@ -81,12 +81,136 @@ impl FreeRanges {
         self.ranges.insert(offset, size);
     }
 
-    /// True when nothing in this block is allocated.
-    pub(crate) fn is_empty(&self) -> bool {
+    /// True when nothing in this block is allocated. Note this is the opposite of
+    /// the inner `BTreeMap` being empty, which would mean the block is entirely handed out.
+    pub(crate) fn is_fully_free(&self) -> bool {
         match self.ranges.iter().next() {
             Some((&offset, &size)) => self.ranges.len() == 1 && offset == 0 && size == self.size,
             // A zero-sized block holds no ranges and can never have handed anything out.
             None => self.size == 0,
+        }
+    }
+}
+
+/// A pool of fixed-size blocks, each subdivided by a [`FreeRanges`].
+///
+/// `K` is what makes two blocks interchangeable (memory type, plus buffer usage on Vulkan) and
+/// `P` is the native block. Creating and destroying one is the caller's closure, since Vulkan
+/// passes its `&ash::Device` in per call while Metal's pool owns its device.
+pub(crate) struct BlockPool<K, P> {
+    /// Emptied, never removed, so a suballocation's block index stays valid for its whole life.
+    blocks: Vec<Option<PoolBlock<K, P>>>,
+}
+
+pub(crate) struct PoolBlock<K, P> {
+    pub(crate) key: K,
+    pub(crate) payload: P,
+    free_ranges: FreeRanges,
+}
+
+impl<K, P> Default for BlockPool<K, P> {
+    fn default() -> Self {
+        Self { blocks: Vec::new() }
+    }
+}
+
+impl<K: Copy + PartialEq, P> BlockPool<K, P> {
+    /// Carve `size` bytes at `align` from a block matching `key`, creating one if none has room.
+    ///
+    /// `create` is handed the size the new block must be at least — the request itself, which may
+    /// exceed [`BLOCK_SIZE`] — and returns the native block. Returns the block's index and the
+    /// offset within it.
+    pub(crate) fn allocate<E>(
+        &mut self,
+        key: K,
+        size: u64,
+        align: u64,
+        create: impl FnOnce(u64) -> Result<P, E>,
+    ) -> Result<(usize, u64), E> {
+        if let Some(found) = self.allocate_from_existing(key, size, align) {
+            return Ok(found);
+        }
+        let payload = create(size.max(BLOCK_SIZE))?;
+        let index = self.insert(PoolBlock {
+            key,
+            payload,
+            free_ranges: FreeRanges::full(size.max(BLOCK_SIZE)),
+        });
+        let offset = self.blocks[index]
+            .as_mut()
+            .expect("the block was just inserted")
+            .free_ranges
+            .allocate(size, align)
+            .expect("a fresh block is at least as large as the request that created it");
+        Ok((index, offset))
+    }
+
+    fn allocate_from_existing(&mut self, key: K, size: u64, align: u64) -> Option<(usize, u64)> {
+        self.blocks
+            .iter_mut()
+            .enumerate()
+            .find_map(|(index, slot)| {
+                let block = slot.as_mut()?;
+                (block.key == key)
+                    .then(|| block.free_ranges.allocate(size, align))
+                    .flatten()
+                    .map(|offset| (index, offset))
+            })
+    }
+
+    fn insert(&mut self, block: PoolBlock<K, P>) -> usize {
+        match self.blocks.iter().position(Option::is_none) {
+            Some(index) => {
+                self.blocks[index] = Some(block);
+                index
+            }
+            None => {
+                self.blocks.push(Some(block));
+                self.blocks.len() - 1
+            }
+        }
+    }
+
+    pub(crate) fn block(&self, index: usize) -> &PoolBlock<K, P> {
+        self.blocks[index]
+            .as_ref()
+            .expect("a block outlives its suballocations")
+    }
+
+    /// Return a range to its block. Never frees the block — see [`trim`](Self::trim).
+    pub(crate) fn release(&mut self, index: usize, offset: u64, size: u64) {
+        self.blocks[index]
+            .as_mut()
+            .expect("a block outlives its suballocations")
+            .free_ranges
+            .release(offset, size);
+    }
+
+    /// Destroy empty blocks, keeping one per key. Call only where already synchronising.
+    pub(crate) fn trim(&mut self, mut destroy: impl FnMut(P)) {
+        let mut kept: Vec<K> = Vec::new();
+        for slot in &mut self.blocks {
+            let Some(block) = slot.as_ref() else { continue };
+            if !block.free_ranges.is_fully_free() {
+                continue;
+            }
+            if kept.contains(&block.key) {
+                let block = slot.take().expect("checked just above");
+                destroy(block.payload);
+            } else {
+                kept.push(block.key);
+            }
+        }
+    }
+
+    /// Destroy every block. Call only once all GPU work has retired.
+    ///
+    /// Vulkan-only in practice: a `VkDeviceMemory` has to be freed explicitly at device teardown,
+    /// while an `MTLHeap` is released by ARC when the pool drops.
+    #[cfg(feature = "vulkan")]
+    pub(crate) fn destroy_all(&mut self, mut destroy: impl FnMut(P)) {
+        for block in self.blocks.drain(..).flatten() {
+            destroy(block.payload);
         }
     }
 }
@@ -104,23 +228,19 @@ pub(crate) fn align_up(offset: u64, align: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn splits_aligns_and_coalesces() {
         let mut ranges = FreeRanges::full(128);
         assert_eq!(ranges.allocate(17, 16), Some(0));
         assert_eq!(ranges.allocate(9, 32), Some(32));
-        assert!(!ranges.is_empty());
+        // No room once the request is aligned up.
+        assert_eq!(ranges.allocate(80, 64), None);
+        assert!(!ranges.is_fully_free());
         ranges.release(0, 17);
         ranges.release(32, 9);
-        assert!(ranges.is_empty(), "freeing everything must coalesce");
-    }
-
-    #[test]
-    fn rejects_an_allocation_that_does_not_fit_after_alignment() {
-        let mut ranges = FreeRanges::full(32);
-        assert_eq!(ranges.allocate(8, 1), Some(0));
-        assert_eq!(ranges.allocate(17, 32), None);
+        assert!(ranges.is_fully_free(), "freeing everything must coalesce");
     }
 
     #[test]
@@ -132,21 +252,63 @@ mod tests {
         // Outer two first, so the middle release has a neighbour on each side.
         ranges.release(a, 32);
         ranges.release(c, 32);
-        assert!(!ranges.is_empty());
+        assert!(!ranges.is_fully_free());
         ranges.release(b, 32);
-        assert!(ranges.is_empty());
+        assert!(ranges.is_fully_free());
         // The whole block is available again as a single run.
         assert_eq!(ranges.allocate(96, 1), Some(0));
     }
 
     #[test]
-    fn a_fully_freed_block_is_reported_empty_only_when_truly_free() {
-        let mut ranges = FreeRanges::full(64);
-        assert!(ranges.is_empty());
-        let offset = ranges.allocate(1, 1).expect("one byte");
-        assert!(!ranges.is_empty());
-        ranges.release(offset, 1);
-        assert!(ranges.is_empty());
+    fn a_pool_reuses_a_block_with_room_and_creates_one_otherwise() {
+        let mut pool: BlockPool<u8, &'static str> = BlockPool::default();
+        let created = Cell::new(0);
+        let create = |_size: u64| -> Result<&'static str, ()> {
+            created.set(created.get() + 1);
+            Ok("block")
+        };
+        let (first, _) = pool.allocate(1, 64, 16, create).expect("first");
+        let (second, _) = pool.allocate(1, 64, 16, create).expect("second");
+        assert_eq!((first, second), (0, 0), "same key reuses the same block");
+        assert_eq!(created.get(), 1);
+
+        let (other, _) = pool.allocate(2, 64, 16, create).expect("other key");
+        assert_eq!(other, 1, "a different key needs its own block");
+        assert_eq!(created.get(), 2);
+    }
+
+    #[test]
+    fn a_request_larger_than_a_block_gets_a_block_of_its_own() {
+        let mut pool: BlockPool<u8, u64> = BlockPool::default();
+        let huge = BLOCK_SIZE * 3;
+        let (index, offset) = pool
+            .allocate(0, huge, 1, |size| -> Result<u64, ()> {
+                assert_eq!(size, huge, "the block must cover the request");
+                Ok(size)
+            })
+            .expect("oversized allocation");
+        assert_eq!((index, offset), (0, 0));
+    }
+
+    #[test]
+    fn trim_keeps_one_empty_block_per_key() {
+        let mut pool: BlockPool<u8, u32> = BlockPool::default();
+        let next = Cell::new(0);
+        let create = |_: u64| -> Result<u32, ()> {
+            next.set(next.get() + 1);
+            Ok(next.get())
+        };
+        // Two blocks under one key: the second only exists because the first was full.
+        let (a, a_off) = pool.allocate(7, BLOCK_SIZE, 1, create).expect("a");
+        let (b, b_off) = pool.allocate(7, BLOCK_SIZE, 1, create).expect("b");
+        assert_ne!(a, b);
+
+        pool.release(a, a_off, BLOCK_SIZE);
+        pool.release(b, b_off, BLOCK_SIZE);
+
+        let mut destroyed = Vec::new();
+        pool.trim(|payload| destroyed.push(payload));
+        assert_eq!(destroyed.len(), 1, "one of the two empty blocks is kept");
     }
 
     #[test]

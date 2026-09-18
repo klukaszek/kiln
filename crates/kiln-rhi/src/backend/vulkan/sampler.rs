@@ -5,26 +5,10 @@ use ash::vk;
 use super::device::{VulkanDevice, address_mode_to_vk, compare_op_to_vk};
 use super::queue::VulkanRetiredResource;
 use crate::error::{RhiError, RhiResult};
-use crate::queue::QueueInner;
 use crate::sampler::{Sampler, SamplerDesc};
-use crate::types::{FilterMode, MAX_BINDLESS_SAMPLERS, SamplerHandle, SamplerId};
+use crate::types::{FilterMode, SamplerHandle, SamplerId};
 
 impl VulkanDevice {
-    fn allocate_sampler_id(&self) -> RhiResult<SamplerId> {
-        if let Some(id) = self.free_sampler_ids.borrow_mut().pop() {
-            return Ok(id);
-        }
-        let mut next = self.next_sampler_id.borrow_mut();
-        if *next >= MAX_BINDLESS_SAMPLERS {
-            return Err(RhiError::Backend(
-                "Vulkan bindless sampler heap exhausted".into(),
-            ));
-        }
-        let id = SamplerId(*next);
-        *next += 1;
-        Ok(id)
-    }
-
     pub fn create_sampler(&self, desc: &SamplerDesc) -> RhiResult<Sampler> {
         let mag_filter = match desc.mag_filter {
             FilterMode::Nearest => vk::Filter::NEAREST,
@@ -56,7 +40,7 @@ impl VulkanDevice {
         if let Some(max_aniso) = desc.max_anisotropy {
             sampler_info = sampler_info
                 .anisotropy_enable(true)
-                .max_anisotropy(max_aniso);
+                .max_anisotropy(f32::from(max_aniso.get()));
         }
 
         if let Some(compare) = desc.compare {
@@ -65,7 +49,7 @@ impl VulkanDevice {
                 .compare_op(compare_op_to_vk(compare));
         }
 
-        let id = self.allocate_sampler_id()?;
+        let id = SamplerId(self.samplers.allocate_id()?);
         if let Err(err) = self.write_sampler_descriptor(id, &sampler_info) {
             self.recycle_sampler_id(id);
             return Err(err);
@@ -79,7 +63,7 @@ impl VulkanDevice {
     }
 
     pub fn destroy_sampler(&self, sampler: Sampler) {
-        backend_expect!(&self.queue.inner, QueueInner::Vulkan)
+        self.queue
             .release_resource(VulkanRetiredResource::Sampler { id: sampler.id() });
     }
 
@@ -95,12 +79,13 @@ impl VulkanDevice {
 
         unsafe {
             let dst = std::slice::from_raw_parts_mut(heap.mapped_ptr.add(slot.start), slot.len());
-            self.descriptor_heap_loader
+            self.loaders
+                .descriptor_heap
                 .write_sampler_descriptors(
                     std::slice::from_ref(info),
                     &[vk::HostAddressRangeEXT::default().address(dst)],
                 )
-                .map_err(|e| RhiError::Backend(format!("write sampler descriptor: {e}")))
+                .map_err(|e| RhiError::Backend(format!("write sampler descriptor: {e}").into()))
         }
     }
 }

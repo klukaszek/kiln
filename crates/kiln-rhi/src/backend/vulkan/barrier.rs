@@ -2,6 +2,10 @@ use crate::barrier::{HazardFlags, StageFlags};
 use ash::vk;
 
 /// Convert RHI stage flags to Vulkan pipeline stage flags (synchronization2).
+///
+/// Empty in means empty out: `PipelineStageFlags2::NONE` is Vulkan's own "no stage", and the
+/// caller's barrier degenerates to nothing. Widening it to `ALL_COMMANDS` here would turn a
+/// barrier that reads as a no-op into a device-wide stall.
 pub fn to_vk_stage_flags(flags: StageFlags) -> vk::PipelineStageFlags2 {
     if flags.contains(StageFlags::ALL_COMMANDS) {
         return vk::PipelineStageFlags2::ALL_COMMANDS;
@@ -28,15 +32,19 @@ pub fn to_vk_stage_flags(flags: StageFlags) -> vk::PipelineStageFlags2 {
     if flags.contains(StageFlags::TRANSFER) {
         result |= vk::PipelineStageFlags2::TRANSFER;
     }
+    if flags.contains(StageFlags::ACCELERATION_STRUCTURE) {
+        // The build, plus the traversal a ray query performs from a shader.
+        result |= vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR
+            | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR;
+    }
+    if flags.contains(StageFlags::MESH_SHADER) {
+        result |= vk::PipelineStageFlags2::MESH_SHADER_EXT;
+    }
     if flags.contains(StageFlags::ALL_GRAPHICS) {
         result |= vk::PipelineStageFlags2::ALL_GRAPHICS;
     }
 
-    if result.is_empty() {
-        vk::PipelineStageFlags2::ALL_COMMANDS
-    } else {
-        result
-    }
+    result
 }
 
 /// Convert RHI hazard flags to Vulkan access flags (for global memory barriers).

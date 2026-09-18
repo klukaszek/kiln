@@ -66,11 +66,10 @@ use objc2_metal::{
 };
 
 use super::as_allocation;
-use super::device::{METAL_BINDLESS_TEXTURE_CAPACITY, MetalDevice, MetalRetiredResource};
+use super::device::{MetalDevice, MetalRetiredResource};
 use crate::error::{RhiError, RhiResult};
-use crate::queue::QueueInner;
-use crate::texture::{Texture, TextureDesc, TextureSizeAlign, TextureUsage};
-use crate::types::{GpuPtr, SampleCount, TextureDimension, TextureHandle, TextureId};
+use crate::texture::{Texture, TextureDesc, TextureSizeAlign, TextureUsage, ViewKind};
+use crate::types::{GpuPtr, TextureDimension, TextureHandle, TextureId};
 
 /// A texture slot's contents. Mirrors `VulkanTexture`: the view flag lives with the texture
 /// rather than in a parallel array that has to be kept in step.
@@ -93,14 +92,6 @@ impl MetalDevice {
             TextureDimension::D3 => MTLTextureType::Type3D,
             TextureDimension::Cube => MTLTextureType::TypeCube,
             TextureDimension::CubeArray => MTLTextureType::TypeCubeArray,
-        };
-
-        let sample_count = match desc.sample_count {
-            SampleCount::S1 => 1usize,
-            SampleCount::S2 => 2,
-            SampleCount::S4 => 4,
-            SampleCount::S8 => 8,
-            SampleCount::S16 => 16,
         };
 
         let mut usage = MtlTextureUsage::empty();
@@ -126,9 +117,11 @@ impl MetalDevice {
             mtl_desc.setHeight(desc.height as usize);
             mtl_desc.setDepth(desc.depth as usize);
             mtl_desc.setMipmapLevelCount(desc.mip_levels as usize);
+            // Metal counts cubes, not faces, so `array_layers` goes through unchanged for every
+            // dimension. `TypeCube` requires exactly 1, which `TextureDesc::validate` enforces.
             mtl_desc.setArrayLength(desc.array_layers as usize);
             mtl_desc.setTextureType(texture_type);
-            mtl_desc.setSampleCount(sample_count);
+            mtl_desc.setSampleCount(desc.sample_count.count() as usize);
             mtl_desc.setUsage(usage);
             mtl_desc.setStorageMode(MTLStorageMode::Private);
         }
@@ -148,19 +141,6 @@ impl MetalDevice {
         })
     }
 
-    fn allocate_texture_id(&self) -> RhiResult<TextureId> {
-        if let Some(id) = self.shared.free_texture_ids.borrow_mut().pop() {
-            return Ok(id);
-        }
-        let next = self.shared.textures.borrow().len();
-        if next >= METAL_BINDLESS_TEXTURE_CAPACITY {
-            return Err(RhiError::TextureCreation(
-                "Metal bindless texture heap exhausted".into(),
-            ));
-        }
-        Ok(TextureId(next as u32))
-    }
-
     pub fn create_texture(
         &self,
         desc: &TextureDesc,
@@ -173,29 +153,27 @@ impl MetalDevice {
         }
 
         let mtl_desc = self.build_texture_descriptor(desc);
-        let (heap, heap_offset) = {
-            let allocations = self.shared.allocations.borrow();
-            let alloc = allocations
-                .range(..=texture_gpu.address)
-                .next_back()
-                .map(|(_, alloc)| alloc)
-                .filter(|alloc| texture_gpu.address - alloc.base.address < alloc.size)
-                .ok_or_else(|| {
-                    RhiError::TextureCreation(format!(
+        let (heap, heap_offset) =
+            {
+                let allocations = self.shared.allocations.borrow();
+                let alloc =
+                    allocations
+                        .range(..=texture_gpu.address)
+                        .next_back()
+                        .map(|(_, alloc)| alloc)
+                        .filter(|alloc| texture_gpu.address - alloc.base.address < alloc.size)
+                        .ok_or_else(|| {
+                            RhiError::TextureCreation(format!(
                         "texture allocation address 0x{:x} was not returned by gpuMalloc",
                         texture_gpu.address
-                    ))
-                })?;
+                    ).into())
+                        })?;
 
-            let offset = texture_gpu.address - alloc.base.address;
-            // `newTextureWithDescriptor:offset:` positions the texture within the heap, so the
-            // allocation's own placement has to be added in; otherwise every allocation that is
-            // not itself at heap offset 0 lands the texture on top of unrelated resources.
-            // Only the lookup is checked here, matching the Vulkan backend: a misaligned or
-            // oversized placement makes `newTextureWithDescriptor:offset:` return nil, which is
-            // handled just below, and Metal's own validation reports the reason.
-            (alloc.heap.clone(), alloc.heap_offset + offset)
-        };
+                let offset = texture_gpu.address - alloc.base.address;
+                // Offsets are heap-relative, so the allocation's own placement adds in. Only the
+                // lookup is checked: a bad placement returns nil just below.
+                (alloc.heap.clone(), alloc.heap_offset + offset)
+            };
 
         let texture =
             unsafe { heap.newTextureWithDescriptor_offset(&mtl_desc, heap_offset as usize) }
@@ -203,140 +181,92 @@ impl MetalDevice {
                     RhiError::TextureCreation("Metal placed texture allocation failed".into())
                 })?;
 
-        // Track the buffer for Metal 4 residency.
-
         if let Some(label) = &desc.label {
             use objc2_metal::MTLResource;
             let ns_label = NSString::from_str(label);
             texture.setLabel(Some(&ns_label));
         }
 
-        let id = self.allocate_texture_id()?;
-        let idx = id.0 as usize;
-        let mut textures = self.shared.textures.borrow_mut();
-        if textures.len() <= idx {
-            textures.resize_with(idx + 1, || None);
-        }
-        textures[idx] = Some(MetalTexture {
-            texture: texture.clone(),
-            is_view: false,
-        });
-        drop(textures);
-        Self::write_heap_slot(
-            &self.shared.texture_heap,
-            idx,
-            texture.gpuResourceID().to_raw(),
+        let resource_id = texture.gpuResourceID().to_raw();
+        let id = TextureId(self.shared.textures.allocate_id()?);
+        self.shared.textures.insert(
+            id.0,
+            MetalTexture {
+                texture,
+                is_view: false,
+            },
+            resource_id,
         );
 
         Ok(Texture {
             id,
-            handle: TextureHandle::from_raw(texture.gpuResourceID().to_raw()),
+            handle: TextureHandle::from_raw(resource_id),
             views: Vec::new(),
-            desc: desc.clone(),
+            desc: TextureDesc {
+                label: None,
+                ..*desc
+            },
             _owner: None,
         })
     }
 
     pub fn destroy_texture(&self, texture: Texture) {
-        let retired = {
-            let mut textures = self.shared.textures.borrow_mut();
-            let idx = texture.id.0 as usize;
-            if idx < textures.len() {
-                textures[idx].take()
-            } else {
-                None
-            }
-        };
-        if let Some(tex) = retired {
-            backend_expect!(&self.rhi_queue.inner, QueueInner::Metal).release_resource(
-                MetalRetiredResource::Texture {
-                    id: texture.id,
-                    texture: tex.texture,
-                    is_view: tex.is_view,
-                },
-            );
+        if let Some(tex) = self.shared.textures.take(texture.id.0) {
+            self.queue.release_resource(MetalRetiredResource::Texture {
+                id: texture.id,
+                texture: tex.texture,
+                is_view: tex.is_view,
+            });
         }
     }
 
     pub fn destroy_texture_view(&self, id: TextureId) {
         // Taking the entry is itself the claim, so a second call finds nothing to do. Only
         // entries that really are views are claimed; a base texture keeps its slot.
-        let retired = {
-            let mut textures = self.shared.textures.borrow_mut();
-            match textures.get_mut(id.0 as usize) {
-                Some(slot) if slot.as_ref().is_some_and(|t| t.is_view) => slot.take(),
-                _ => None,
-            }
-        };
-        if let Some(texture) = retired {
-            backend_expect!(&self.rhi_queue.inner, QueueInner::Metal).release_resource(
-                MetalRetiredResource::Texture {
-                    id,
-                    texture: texture.texture,
-                    is_view: true,
-                },
-            );
+        if let Some(texture) = self.shared.textures.take_if(id.0, |t| t.is_view) {
+            self.queue.release_resource(MetalRetiredResource::Texture {
+                id,
+                texture: texture.texture,
+                is_view: true,
+            });
         }
-    }
-
-    pub fn create_sampled_view(
-        &self,
-        source: &Texture,
-        view: &crate::texture::TextureViewDesc,
-    ) -> RhiResult<TextureId> {
-        self.create_view_internal(source, view)
-    }
-
-    pub fn create_storage_view(
-        &self,
-        source: &Texture,
-        view: &crate::texture::TextureViewDesc,
-    ) -> RhiResult<TextureId> {
-        self.create_view_internal(source, view)
     }
 
     /// Value to store in a [`TextureHandle`](crate::TextureHandle) root field for sampled view
     /// `id`. On Metal a `DescriptorHandle<Texture2D>` is the texture's `gpuResourceID`, which the
     /// shader uses directly.
     pub fn texture_handle_raw(&self, id: TextureId) -> u64 {
-        let textures = self.shared.textures.borrow();
-        let texture = textures
-            .get(id.0 as usize)
-            .and_then(|t| t.as_ref())
-            .expect("invalid TextureId");
-        texture.texture.gpuResourceID().to_raw()
+        self.shared
+            .textures
+            .with(id.0, |t| t.texture.gpuResourceID().to_raw())
+            .expect("texture id has no live slot")
     }
 
-    fn create_view_internal(
+    /// `_kind` is unused: a Metal view inherits its usage from the source texture, so sampled and
+    /// storage views are built identically. Vulkan needs the distinction for the descriptor.
+    pub fn create_texture_view(
         &self,
         source: &Texture,
         view: &crate::texture::TextureViewDesc,
+        _kind: ViewKind,
     ) -> RhiResult<TextureId> {
-        use crate::texture::{ALL_LAYERS, ALL_MIPS};
         use objc2_foundation::NSRange;
 
-        let textures_borrow = self.shared.textures.borrow();
-        let src_texture = textures_borrow
-            .get(source.id.0 as usize)
-            .and_then(|t| t.as_ref())
+        let src_texture = self
+            .shared
+            .textures
+            .with(source.id.0, |t| t.texture.clone())
             .ok_or_else(|| {
                 RhiError::TextureCreation("create texture view: invalid source TextureId".into())
-            })?
-            .texture
-            .clone();
-        drop(textures_borrow);
+            })?;
 
         let src_format =
             super::texture::format_to_mtl(view.format.unwrap_or_else(|| source.desc().format));
+        // Mirrors `build_texture_descriptor`: a view must name the same texture type the source
+        // was created with, so the two matches have to stay identical.
         let src_type = match source.desc().dimension {
             TextureDimension::D1 => objc2_metal::MTLTextureType::Type1D,
-            TextureDimension::D2 => {
-                if source.desc().array_layers > 1 {
-                    objc2_metal::MTLTextureType::Type2DArray
-                } else {
-                    objc2_metal::MTLTextureType::Type2D
-                }
-            }
+            TextureDimension::D2 => objc2_metal::MTLTextureType::Type2D,
             TextureDimension::D2Array => objc2_metal::MTLTextureType::Type2DArray,
             TextureDimension::D3 => objc2_metal::MTLTextureType::Type3D,
             TextureDimension::Cube => objc2_metal::MTLTextureType::TypeCube,
@@ -344,20 +274,16 @@ impl MetalDevice {
         };
 
         let src_mips = source.desc().mip_levels;
-        let src_layers = source.desc().array_layers;
+        // `newTextureViewWithPixelFormat:` slices are faces for a cube, images otherwise.
+        let src_layers = source
+            .desc()
+            .dimension
+            .face_count(source.desc().array_layers);
 
         let mip_start = view.base_mip as usize;
-        let mip_count = if view.mip_count == ALL_MIPS {
-            (src_mips as usize).saturating_sub(mip_start)
-        } else {
-            view.mip_count as usize
-        };
+        let mip_count = view.resolved_mip_count(src_mips) as usize;
         let layer_start = view.base_layer as usize;
-        let layer_count = if view.layer_count == ALL_LAYERS {
-            (src_layers as usize).saturating_sub(layer_start)
-        } else {
-            view.layer_count as usize
-        };
+        let layer_count = view.resolved_layer_count(src_layers) as usize;
 
         let level_range = NSRange::new(mip_start, mip_count);
         let slice_range = NSRange::new(layer_start, layer_count);
@@ -381,8 +307,8 @@ impl MetalDevice {
             .addAllocation(as_allocation(&view_texture));
         self.shared.residency_dirty.set(true);
 
-        let id = match self.allocate_texture_id() {
-            Ok(id) => id,
+        let id = match self.shared.textures.allocate_id() {
+            Ok(id) => TextureId(id),
             Err(err) => {
                 self.shared
                     .residency_set
@@ -391,19 +317,43 @@ impl MetalDevice {
                 return Err(err);
             }
         };
-        let idx = id.0 as usize;
         let resource_id = view_texture.gpuResourceID().to_raw();
-        let mut textures = self.shared.textures.borrow_mut();
-        if textures.len() <= idx {
-            textures.resize_with(idx + 1, || None);
-        }
-        textures[idx] = Some(MetalTexture {
-            texture: view_texture,
-            is_view: true,
-        });
-        drop(textures);
-        Self::write_heap_slot(&self.shared.texture_heap, idx, resource_id);
+        self.shared.textures.insert(
+            id.0,
+            MetalTexture {
+                texture: view_texture,
+                is_view: true,
+            },
+            resource_id,
+        );
 
         Ok(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::TextureDimension;
+
+    #[test]
+    fn mtl_to_format_is_the_inverse_of_format_to_mtl() {
+        for &format in crate::types::ALL_FORMATS {
+            assert_eq!(
+                mtl_to_format(format_to_mtl(format)),
+                format,
+                "{format:?} does not survive the round trip through MTLPixelFormat"
+            );
+        }
+    }
+
+    /// Metal's `arrayLength` counts cubes while Vulkan's `arrayLayers` counts faces, so the
+    /// conversion has to live in one place and be six-to-one for both cube dimensions.
+    #[test]
+    fn cube_dimensions_count_six_faces_per_cube() {
+        assert_eq!(TextureDimension::Cube.face_count(1), 6);
+        assert_eq!(TextureDimension::CubeArray.face_count(4), 24);
+        assert_eq!(TextureDimension::D2Array.face_count(4), 4);
+        assert_eq!(TextureDimension::D2.face_count(1), 1);
     }
 }

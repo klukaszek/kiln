@@ -15,15 +15,15 @@ mod resources;
 
 use glam::{IVec2, UVec2, Vec4};
 use kiln_rhi::{
-    AllocationDesc, BumpAllocator, CommandBuffer, Device, Format, GpuPtr, MemoryType, RhiResult,
-    StageFlags, MAX_FRAMES_IN_FLIGHT,
+    AllocationDesc, BumpAllocator, CommandBuffer, Device, Format, GpuPtr, MAX_FRAMES_IN_FLIGHT,
+    MemoryType, RhiResult, StageFlags,
 };
 
 use crate::scene::{self, Prim};
 
 use program::{
-    ClearRoot, Pipelines, ReferenceRoot, Root, CASCADE_THREADS, CLEAR_THREADS, CONE_STRIDE,
-    EDGES_PER_PRIM, FIELD_THREADS, GRID_CELLS, REFERENCE_EPSILON, REFERENCE_MAX_STEPS,
+    CASCADE_THREADS, CLEAR_THREADS, CONE_STRIDE, ClearRoot, EDGES_PER_PRIM, FIELD_THREADS,
+    GRID_CELLS, Pipelines, REFERENCE_EPSILON, REFERENCE_MAX_STEPS, ReferenceRoot, Root,
     SEGMENT_STRIDE,
 };
 pub use program::{DIRECT_TRACE_LEVELS, REFERENCE_DIRECTIONS};
@@ -192,14 +192,14 @@ struct Parity {
     cones: Vec<Level>,
 }
 
-pub struct HrcRenderer {
-    pipelines: Pipelines,
-    resources: SceneResources,
-    arenas: Vec<BumpAllocator>,
+/// Everything sized to one probe grid, replaced wholesale when the grid changes. Absent until the
+/// first frame configures it, so "not configured yet" has exactly one representation and every
+/// pointer below is valid whenever it exists.
+struct Layout {
     /// One allocation behind every cascade level; sub-buffers are offsets into it.
-    cascades: Option<kiln_rhi::Allocation>,
+    cascades: kiln_rhi::Allocation,
     /// The resolved field, plus the two blur scratch buffers.
-    field: Option<kiln_rhi::Allocation>,
+    field: kiln_rhi::Allocation,
     parities: [Parity; 2],
     quadrant_cones: [GpuPtr<u8>; 4],
     field_buffers: [GpuPtr<Vec4>; 3],
@@ -207,61 +207,84 @@ pub struct HrcRenderer {
     /// surfaces re-emit.
     resolved: GpuPtr<Vec4>,
     res: UVec2,
+    plan: Plan,
+}
+
+pub struct HrcRenderer {
+    pipelines: Pipelines,
+    resources: SceneResources,
+    arenas: [BumpAllocator; MAX_FRAMES_IN_FLIGHT],
+    layout: Option<Layout>,
     out_res: UVec2,
     target_is_srgb: bool,
     packed: Vec<Vec4>,
     /// Root for the resolve draw, uploaded during `record` and consumed in the render pass.
     resolve_root: GpuPtr<Root>,
-    pub plan: Plan,
-    pub traced_rays: u64,
+    traced_rays: u64,
 }
 
 impl HrcRenderer {
     pub fn new(device: &Device, color_format: Format) -> RhiResult<Self> {
         let pipelines = Pipelines::new(device, color_format)?;
         let resources = SceneResources::new(device)?;
-        let mut arenas = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
-        for slot in 0..MAX_FRAMES_IN_FLIGHT {
-            arenas.push(BumpAllocator::new(device.create_allocation(
-                &AllocationDesc {
-                    size: ARENA_BYTES,
-                    memory: MemoryType::Upload,
-                    label: Some(format!("hrc-frame-roots-{slot}")),
-                    ..Default::default()
-                },
-            )?));
-        }
+        let arenas: Vec<BumpAllocator> = (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|slot| {
+                let label = format!("hrc-frame-roots-{slot}");
+                device
+                    .create_allocation(&AllocationDesc {
+                        size: ARENA_BYTES,
+                        memory: MemoryType::Upload,
+                        label: Some(&label),
+                        ..Default::default()
+                    })
+                    .map(BumpAllocator::new)
+            })
+            .collect::<RhiResult<_>>()?;
+        let arenas: [BumpAllocator; MAX_FRAMES_IN_FLIGHT] = arenas
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("built one arena per frame in flight"));
 
         Ok(Self {
             pipelines,
             resources,
             arenas,
-            cascades: None,
-            field: None,
-            parities: [Parity::default(), Parity::default()],
-            quadrant_cones: [GpuPtr::NULL; 4],
-            field_buffers: [GpuPtr::NULL; 3],
-            resolved: GpuPtr::NULL,
-            res: UVec2::ZERO,
+            layout: None,
             out_res: UVec2::ZERO,
             target_is_srgb: matches!(color_format, Format::R8G8B8A8Srgb | Format::B8G8R8A8Srgb),
             packed: Vec::new(),
             resolve_root: GpuPtr::NULL,
-            plan: plan(UVec2::splat(MIN_RESOLUTION)),
             traced_rays: 0,
         })
     }
 
+    /// Zero until the first frame configures a grid; the overlay is built before `record` runs.
     pub fn resolution(&self) -> UVec2 {
-        self.res
+        self.layout.as_ref().map_or(UVec2::ZERO, |l| l.res)
     }
 
     pub fn output_resolution(&self) -> UVec2 {
         self.out_res
     }
 
+    pub fn plan(&self) -> Plan {
+        self.layout
+            .as_ref()
+            .map_or_else(|| plan(UVec2::splat(MIN_RESOLUTION)), |l| l.plan)
+    }
+
+    pub fn traced_rays(&self) -> u64 {
+        self.traced_rays
+    }
+
     pub fn levels_per_axis(&self) -> (u32, u32) {
-        (self.parities[0].levels + 1, self.parities[1].levels + 1)
+        self.layout.as_ref().map_or((0, 0), |l| {
+            (l.parities[0].levels + 1, l.parities[1].levels + 1)
+        })
+    }
+
+    /// The current grid's layout. Every caller runs after `configure`, which establishes it.
+    fn layout(&self) -> &Layout {
+        self.layout.as_ref().expect("configured before use")
     }
 
     // --- allocation ---------------------------------------------------------
@@ -275,23 +298,23 @@ impl HrcRenderer {
         slot: usize,
         res: UVec2,
     ) -> RhiResult<()> {
-        if res == self.res {
+        if self.layout.as_ref().is_some_and(|l| l.res == res) {
             return Ok(());
         }
 
-        self.plan = plan(res);
+        let plan = plan(res);
         let field_entries = u64::from(res.x) * u64::from(res.y);
 
         let cascades = device.create_allocation(&AllocationDesc {
-            size: self.plan.cascade_bytes,
+            size: plan.cascade_bytes,
             memory: MemoryType::GpuOnly,
-            label: Some("hrc-cascades".into()),
+            label: Some("hrc-cascades"),
             ..Default::default()
         })?;
         let field = device.create_allocation(&AllocationDesc {
-            size: self.plan.field_bytes,
+            size: plan.field_bytes,
             memory: MemoryType::GpuOnly,
-            label: Some("hrc-fluence-field".into()),
+            label: Some("hrc-fluence-field"),
             ..Default::default()
         })?;
 
@@ -309,6 +332,8 @@ impl HrcRenderer {
             level
         };
 
+        let mut parities = [Parity::default(), Parity::default()];
+        let mut quadrant_cones = [GpuPtr::NULL; 4];
         for parity in 0..2 {
             let c = canon(res, parity);
             let levels = levels_for(c.x);
@@ -330,7 +355,7 @@ impl HrcRenderer {
                 cones.push(take(level_width(c.x, n), c.y, 1 << n, CONE_STRIDE));
             }
             cones.push(placeholder);
-            self.parities[parity] = Parity {
+            parities[parity] = Parity {
                 levels,
                 canon: c,
                 segments,
@@ -339,27 +364,31 @@ impl HrcRenderer {
         }
         for quadrant in 0..4 {
             let c = canon(res, quadrant & 1);
-            self.quadrant_cones[quadrant] = take(level_width(c.x, 0), c.y, 1, CONE_STRIDE).base;
+            quadrant_cones[quadrant] = take(level_width(c.x, 0), c.y, 1, CONE_STRIDE).base;
         }
         debug_assert!(offset <= cascades.size());
 
         let field_base = field.gpu().cast::<Vec4>();
-        for (i, slot) in self.field_buffers.iter_mut().enumerate() {
-            *slot = field_base.byte_add(field_entries * 16 * i as u64);
-        }
-        self.resolved = self.field_buffers[0];
+        let field_buffers =
+            std::array::from_fn(|i| field_base.byte_add(field_entries * 16 * i as u64));
 
-        if let Some(previous) = self.cascades.replace(cascades) {
-            device.destroy(previous);
+        if let Some(previous) = self.layout.replace(Layout {
+            cascades,
+            field,
+            parities,
+            quadrant_cones,
+            field_buffers,
+            resolved: field_buffers[0],
+            res,
+            plan,
+        }) {
+            device.destroy(previous.cascades);
+            device.destroy(previous.field);
         }
-        if let Some(previous) = self.field.replace(field) {
-            device.destroy(previous);
-        }
-        self.res = res;
 
         // The field is read a frame before it is first written: surfaces re-emit whatever reached
         // them last frame, and on the first frame that is this buffer's uninitialised contents.
-        self.clear(cmd, slot, field_base, self.plan.field_bytes / 4);
+        self.clear(cmd, slot, field_base, plan.field_bytes / 4);
         cmd.barrier(StageFlags::COMPUTE, StageFlags::COMPUTE);
         Ok(())
     }
@@ -426,7 +455,8 @@ impl HrcRenderer {
     /// straight out of upload memory would put a host-visible fetch in the inner loop of every
     /// distance query.
     fn upload_scene(&mut self, cmd: &mut CommandBuffer, slot: usize, prims: &[Prim]) {
-        scene::pack(prims, (self.res.x, self.res.y), &mut self.packed);
+        let res = self.layout().res;
+        scene::pack(prims, (res.x, res.y), &mut self.packed);
         self.resources.prim_count = prims.len() as u32;
 
         let bytes = std::mem::size_of_val(self.packed.as_slice()) as u64;
@@ -456,12 +486,26 @@ impl HrcRenderer {
             1,
         );
 
-        // The acceleration build reads what the tessellation just wrote, from its own encoder, so
-        // this has to be queue-scoped rather than encoder-scoped.
-        cmd.barrier(StageFlags::COMPUTE, StageFlags::ALL_COMMANDS);
-        cmd.build_blas(self.resources.blas(), &self.resources.blas_desc());
+        cmd.barrier(StageFlags::COMPUTE, StageFlags::ACCELERATION_STRUCTURE);
+        let meshes = [self.resources.blas_mesh()];
+        cmd.build_blas(
+            self.resources.blas(),
+            &kiln_rhi::BlasDesc {
+                meshes: &meshes,
+                flags: resources::BLAS_FLAGS,
+            },
+        );
+        // The instance build reads the BLAS this frame just rewrote.
+        cmd.barrier(
+            StageFlags::ACCELERATION_STRUCTURE,
+            StageFlags::ACCELERATION_STRUCTURE,
+        );
         cmd.build_tlas(&self.resources.tlas, &self.resources.tlas_desc());
-        cmd.barrier(StageFlags::ALL_COMMANDS, StageFlags::COMPUTE);
+        // `traceSegments` traverses and writes, so it consumes both stages.
+        cmd.barrier(
+            StageFlags::ACCELERATION_STRUCTURE,
+            StageFlags::ACCELERATION_STRUCTURE | StageFlags::COMPUTE,
+        );
     }
 
     /// `T` bottom-up then `R` top-down, once per quadrant. The two quadrants of a parity share the
@@ -471,7 +515,7 @@ impl HrcRenderer {
         let mut traced_rays = 0;
 
         for quadrant in 0..4usize {
-            let p = &self.parities[quadrant & 1];
+            let p = &self.layout().parities[quadrant & 1];
             let levels = p.levels;
             let quad = Root {
                 quadrant: quadrant as i32,
@@ -521,7 +565,7 @@ impl HrcRenderer {
             for n in (0..levels).rev() {
                 let level = if n == 0 {
                     Level {
-                        base: self.quadrant_cones[quadrant],
+                        base: self.layout().quadrant_cones[quadrant],
                         width: level_width(p.canon.x, 0),
                         dirs: 1,
                     }
@@ -556,14 +600,14 @@ impl HrcRenderer {
         settings: Settings,
     ) {
         let groups = (
-            self.res.x.div_ceil(FIELD_THREADS[0]),
-            self.res.y.div_ceil(FIELD_THREADS[1]),
+            self.layout().res.x.div_ceil(FIELD_THREADS[0]),
+            self.layout().res.y.div_ceil(FIELD_THREADS[1]),
         );
 
         let root = self.upload(
             slot,
             &Root {
-                fluence_out: self.field_buffers[0],
+                fluence_out: self.layout().field_buffers[0],
                 ..*base
             },
         );
@@ -573,8 +617,8 @@ impl HrcRenderer {
 
         // The checkerboard sits at Nyquist and a single 1-4-1 cross only takes it to a third; the
         // resolve then magnifies whatever is left.
-        let mut src = self.field_buffers[0];
-        let mut dst = self.field_buffers[1];
+        let mut src = self.layout().field_buffers[0];
+        let mut dst = self.layout().field_buffers[1];
         cmd.set_pipeline(&self.pipelines.blur_fluence);
         for pass in 0..settings.blur_passes {
             let root = self.upload(
@@ -588,9 +632,12 @@ impl HrcRenderer {
             cmd.dispatch(root, groups.0, groups.1, 1);
             cmd.barrier(StageFlags::COMPUTE, StageFlags::COMPUTE);
             src = dst;
-            dst = self.field_buffers[1 + (pass as usize + 1) % 2];
+            dst = self.layout().field_buffers[1 + (pass as usize + 1) % 2];
         }
-        self.resolved = src;
+        self.layout
+            .as_mut()
+            .expect("configured before use")
+            .resolved = src;
 
         self.resolve_root = self.upload(
             slot,
@@ -633,23 +680,23 @@ impl HrcRenderer {
             vertices: self.resources.vertices.gpu().cast(),
             indices: self.resources.indices.gpu().cast(),
             // Last frame's resolved field, which surfaces re-emit.
-            history: self.resolved,
-            fluence_in: self.resolved,
-            fluence_out: self.field_buffers[0],
+            history: self.layout().resolved,
+            fluence_in: self.layout().resolved,
+            fluence_out: self.layout().field_buffers[0],
             segments_out: GpuPtr::NULL,
             segments_prev: GpuPtr::NULL,
             segments_cur: GpuPtr::NULL,
             segments_next: GpuPtr::NULL,
             cones_out: GpuPtr::NULL,
             cones_next: GpuPtr::NULL,
-            cones0_q0: self.quadrant_cones[0].cast(),
-            cones0_q1: self.quadrant_cones[1].cast(),
-            cones0_q2: self.quadrant_cones[2].cast(),
-            cones0_q3: self.quadrant_cones[3].cast(),
+            cones0_q0: self.layout().quadrant_cones[0].cast(),
+            cones0_q1: self.layout().quadrant_cones[1].cast(),
+            cones0_q2: self.layout().quadrant_cones[2].cast(),
+            cones0_q3: self.layout().quadrant_cones[3].cast(),
             tlas: self.resources.tlas.gpu(),
-            res: self.res.as_ivec2(),
+            res: self.layout().res.as_ivec2(),
             out_res: self.out_res.as_ivec2(),
-            canon_res: self.res.as_ivec2(),
+            canon_res: self.layout().res.as_ivec2(),
             cells: IVec2::splat(GRID_CELLS as i32),
             exposure: settings.exposure,
             surface_offset: 1.5,
@@ -657,7 +704,7 @@ impl HrcRenderer {
             bounce: settings.bounce,
             quadrant: 0,
             level: 0,
-            levels: self.parities[0].levels as i32,
+            levels: self.layout().parities[0].levels as i32,
             prim_count: self.resources.prim_count as i32,
             surface_shading: i32::from(settings.surface_shading),
             view_mode: 0,
@@ -710,9 +757,9 @@ impl HrcRenderer {
         ReferenceRoot {
             sky: Vec4::new(sky * 0.6, sky * 0.75, sky, 0.0),
             scene: self.resources.scene.gpu().cast(),
-            fluence_in: self.resolved,
+            fluence_in: self.layout().resolved,
             fluence_out: dst,
-            res: self.res.as_ivec2(),
+            res: self.layout().res.as_ivec2(),
             out_res: self.out_res.as_ivec2(),
             prim_count: self.resources.prim_count as i32,
             ref_dir_begin: slice.start,
@@ -720,7 +767,7 @@ impl HrcRenderer {
             ref_dirs: dirs,
             ref_max_steps: REFERENCE_MAX_STEPS,
             // Long enough to leave the domain from any point inside it.
-            ref_max_dist: self.res.as_vec2().length() * 1.5,
+            ref_max_dist: self.layout().res.as_vec2().length() * 1.5,
             ref_eps: REFERENCE_EPSILON,
             pad0: 0,
             pad1: 0,
@@ -766,11 +813,9 @@ impl HrcRenderer {
         for arena in self.arenas {
             device.destroy(arena.into_allocation());
         }
-        if let Some(cascades) = self.cascades {
-            device.destroy(cascades);
-        }
-        if let Some(field) = self.field {
-            device.destroy(field);
+        if let Some(layout) = self.layout {
+            device.destroy(layout.cascades);
+            device.destroy(layout.field);
         }
     }
 }

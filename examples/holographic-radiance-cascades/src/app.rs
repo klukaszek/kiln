@@ -1,6 +1,5 @@
 //! Windowed application: the harness lifecycle, the clock, and the scene rebuilt each frame.
 
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use kiln_app::{Example, FrameCtx, PerformanceStats};
@@ -10,14 +9,10 @@ use crate::cascades::{self, HrcRenderer, Settings};
 use crate::scene::{self, Prim};
 use crate::ui::{Controls, Readout};
 
-/// The CLI's opening state. `Example::new` takes only a device, so the options parsed in `main`
-/// reach the app through here rather than through a constructor argument.
-static STARTUP: OnceLock<(u32, usize)> = OnceLock::new();
-
-pub fn configure(probes: u32, scene: usize) {
-    STARTUP
-        .set((probes, scene))
-        .expect("app configured more than once");
+/// What `main` parses from the command line and hands to the app.
+pub struct Config {
+    pub probes: u32,
+    pub scene: usize,
 }
 
 pub struct App {
@@ -32,8 +27,8 @@ pub struct App {
 }
 
 impl App {
-    fn try_new(device: &Device, color_format: Format) -> kiln_rhi::RhiResult<Self> {
-        let (probes, scene) = *STARTUP.get().unwrap_or(&(0, 0));
+    fn try_new(device: &Device, color_format: Format, config: Config) -> kiln_rhi::RhiResult<Self> {
+        let Config { probes, scene } = config;
         let defaults = Controls::default();
         let controls = Controls {
             scene,
@@ -73,8 +68,10 @@ impl App {
 }
 
 impl Example for App {
-    fn new(device: &Device, color_format: Format) -> Self {
-        Self::try_new(device, color_format).unwrap_or_else(|error| {
+    type Config = Config;
+
+    fn new(device: &Device, color_format: Format, config: Config) -> Self {
+        Self::try_new(device, color_format, config).unwrap_or_else(|error| {
             eprintln!("{error}");
             std::process::exit(1);
         })
@@ -88,8 +85,8 @@ impl Example for App {
             res: self.renderer.resolution(),
             out_res: self.renderer.output_resolution(),
             levels: self.renderer.levels_per_axis(),
-            rays: self.renderer.traced_rays,
-            plan: self.renderer.plan,
+            rays: self.renderer.traced_rays(),
+            plan: self.renderer.plan(),
         };
         self.controls.show(ui, &readout);
     }

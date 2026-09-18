@@ -72,9 +72,13 @@ pub struct PerformanceStats {
 /// What each windowed example implements: build its pipelines once, then record draw commands into
 /// the per-frame render pass.
 pub trait Example {
+    /// What the example needs at construction, typically parsed from the command line. Use `()`
+    /// when there is nothing to pass.
+    type Config;
+
     /// Build pipelines/resources. `color_format` is the swapchain's colour format — any PSO colour
     /// target must match it.
-    fn new(device: &Device, color_format: Format) -> Self
+    fn new(device: &Device, color_format: Format, config: Self::Config) -> Self
     where
         Self: Sized;
 
@@ -162,11 +166,11 @@ struct PresentOpts {
 
 /// Run `E` in an 800×600 window titled `title`, clearing each frame to `clear`, parsing
 /// [`HarnessOpts`] from argv. Blocks until the window is closed (or Esc is pressed).
-pub fn run<E: Example + 'static>(
+pub fn run<E: Example<Config = ()> + 'static>(
     title: &str,
     clear: [f32; 4],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_with::<E>(title, clear, HarnessOpts::parse())
+    run_with::<E>(title, clear, HarnessOpts::parse(), ())
 }
 
 /// Like [`run`], but with already-parsed [`HarnessOpts`] — for examples that own their CLI and
@@ -175,6 +179,7 @@ pub fn run_with<E: Example + 'static>(
     title: &str,
     clear: [f32; 4],
     opts: HarnessOpts,
+    config: E::Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let validation = opts.validation;
     if validation {
@@ -182,7 +187,7 @@ pub fn run_with<E: Example + 'static>(
     }
     let device = Device::new(&DeviceDesc {
         validation,
-        label: Some(title.into()),
+        label: Some(title),
         ..Default::default()
     })?;
 
@@ -200,6 +205,7 @@ pub fn run_with<E: Example + 'static>(
         swapchain: None,
         depth: None,
         example: None,
+        config: Some(config),
         frame_index: 0,
         benchmark_frame_count: 0,
         surface_size: (0, 0),
@@ -223,7 +229,7 @@ fn make_depth(device: &Device, format: Format, w: u32, h: u32) -> (Texture, Allo
         dimension: TextureDimension::D2,
         sample_count: SampleCount::S1,
         usage: TextureUsage::DEPTH_STENCIL_ATTACHMENT,
-        label: Some("depth".into()),
+        label: Some("depth"),
     };
     let sa = device.texture_size_align(&desc).expect("depth size_align");
     let mem = device
@@ -245,6 +251,8 @@ struct App<E: Example> {
     window: Option<Window>,
     depth: Option<(Texture, Allocation)>,
     example: Option<E>,
+    /// Taken when the window appears and the example is built.
+    config: Option<E::Config>,
     frame_index: usize,
     benchmark_frame_count: u32,
     present: PresentOpts,
@@ -266,11 +274,9 @@ impl<E: Example> App<E> {
             .recreate_swapchain(
                 swapchain,
                 &SwapchainDesc {
-                    width: w,
-                    height: h,
                     vsync: self.present.vsync,
                     image_count: self.present.image_count,
-                    ..Default::default()
+                    ..SwapchainDesc::new(w, h)
                 },
             )
             .expect("recreate_swapchain");
@@ -310,8 +316,8 @@ impl<E: Example> App<E> {
         // `acquire_image` waits on this slot's fence, so the slot's resources are free.
         #[cfg(feature = "egui")]
         let acquire_start = Instant::now();
-        let image = match queue.acquire_image(swapchain, frame_index) {
-            Ok(image) => image,
+        let image_index = match queue.acquire_image(swapchain, frame_index) {
+            Ok(index) => index,
             Err(e) => {
                 // A wedged drawable pool won't recover on its own; drain and rebuild.
                 eprintln!("acquire_image failed: {e}; rebuilding swapchain");
@@ -324,7 +330,8 @@ impl<E: Example> App<E> {
         if let Some(egui) = self.egui.as_mut() {
             egui.wait_ms = ema(egui.wait_ms, acquire_start.elapsed().as_secs_f64() * 1.0e3);
         }
-        let extent = UVec2::new(image.width, image.height);
+        let [width, height] = swapchain.extent();
+        let extent = UVec2::new(width, height);
         let ctx = FrameCtx {
             device: &self.device,
             extent,
@@ -357,7 +364,7 @@ impl<E: Example> App<E> {
         example.pre_render(&ctx, &mut cmd);
         cmd.begin_render_pass(&RenderPassDesc {
             color_attachments: &[ColorAttachment {
-                target: RenderTarget::swapchain_image(image.index),
+                target: RenderTarget::swapchain_image(image_index),
                 load_op: LoadOp::Clear,
                 store_op: StoreOp::Store,
                 clear_color: self.clear,
@@ -384,7 +391,7 @@ impl<E: Example> App<E> {
         if let (Some(egui), Some(frame)) = (self.egui.as_mut(), egui_frame.as_ref()) {
             cmd.begin_render_pass(&RenderPassDesc {
                 color_attachments: &[ColorAttachment {
-                    target: RenderTarget::swapchain_image(image.index),
+                    target: RenderTarget::swapchain_image(image_index),
                     load_op: LoadOp::Load,
                     store_op: StoreOp::Store,
                     clear_color: [0.0; 4],
@@ -411,10 +418,10 @@ impl<E: Example> App<E> {
             cmd.write_timestamp(&egui.query_pools[frame_index], 1);
         }
 
-        cmd.end();
+        cmd.end().expect("end command buffer");
 
         queue
-            .submit_frame(cmd, swapchain, frame_index, image.index)
+            .submit_frame(cmd, swapchain, frame_index, image_index)
             .expect("submit_frame");
         self.frame_index = (frame_index + 1) % MAX_FRAMES_IN_FLIGHT;
 
@@ -524,15 +531,17 @@ impl<E: Example> ApplicationHandler for App<E> {
             .create_swapchain(
                 &surface,
                 &SwapchainDesc {
-                    width: w,
-                    height: h,
                     vsync: self.present.vsync,
                     image_count: self.present.image_count,
-                    ..Default::default()
+                    ..SwapchainDesc::new(w, h)
                 },
             )
             .expect("create_swapchain");
-        let example = E::new(&self.device, swapchain.format());
+        let config = self
+            .config
+            .take()
+            .expect("the example is built once, on the first resume");
+        let example = E::new(&self.device, swapchain.format(), config);
         let depth = example
             .depth_format()
             .map(|fmt| make_depth(&self.device, fmt, w, h));

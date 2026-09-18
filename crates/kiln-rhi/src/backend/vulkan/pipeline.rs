@@ -1,12 +1,18 @@
 use ash::vk;
 use ash::vk::TaggedStructure as _;
 
-use super::device::format_to_vk;
+use super::device::{VulkanDevice, spirv_words};
+use super::device::{compare_op_to_vk, format_to_vk};
+use super::shader::VulkanShaderModule;
 use crate::error::{RhiError, RhiResult};
-use crate::pipeline::{BlendAttachment, BlendState, ColorTarget, DepthState};
-use crate::types::{
-    BlendFactor, BlendOp, ColorWriteMask, CompareOp, Cull, DepthFlags, SampleCount, Topology,
+use crate::pipeline::{BlendAttachment, ColorTarget, DepthState};
+use crate::pipeline::{
+    ComputePso, ComputePsoDesc, GraphicsPso, GraphicsPsoDesc, MeshletPso, MeshletPsoDesc,
 };
+use crate::shader::{ShaderModule, ShaderModuleDesc};
+use crate::types::{BlendFactor, BlendOp, ColorWriteMask, Cull, DepthFlags, SampleCount, Topology};
+use smallvec::SmallVec;
+use std::ffi::CString;
 
 /// Depth state is baked into the pipeline on both backends; see `RasterPsoDesc`.
 fn depth_stencil_create_info(
@@ -18,25 +24,14 @@ fn depth_stencil_create_info(
         .depth_compare_op(compare_op_to_vk(depth.compare))
 }
 
-fn compare_op_to_vk(op: CompareOp) -> vk::CompareOp {
-    match op {
-        CompareOp::Never => vk::CompareOp::NEVER,
-        CompareOp::Less => vk::CompareOp::LESS,
-        CompareOp::Equal => vk::CompareOp::EQUAL,
-        CompareOp::LessOrEqual => vk::CompareOp::LESS_OR_EQUAL,
-        CompareOp::Greater => vk::CompareOp::GREATER,
-        CompareOp::NotEqual => vk::CompareOp::NOT_EQUAL,
-        CompareOp::GreaterOrEqual => vk::CompareOp::GREATER_OR_EQUAL,
-        CompareOp::Always => vk::CompareOp::ALWAYS,
-    }
-}
-
 /// Vulkan graphics pipeline state.
+///
+/// Holds the pipeline and nothing else: the descriptor it was built from is consumed by
+/// `create_raster_pipeline` and never needed again, and keeping it would mean keeping
+/// `vk::ShaderModule` handles that dangle once the caller drops the `ShaderModule`.
 pub struct VulkanGraphicsPso {
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) device: ash::Device,
-    pub(crate) pipeline_cache: vk::PipelineCache,
-    pub(crate) desc: VulkanGraphicsPsoDesc,
 }
 
 /// Vulkan compute pipeline state.
@@ -54,39 +49,25 @@ impl Drop for VulkanComputePso {
     }
 }
 
-pub struct VulkanGraphicsPsoDesc {
-    pub(crate) vert_module: vk::ShaderModule,
-    pub(crate) frag_module: vk::ShaderModule,
-    pub(crate) vert_entry: std::ffi::CString,
-    pub(crate) frag_entry: std::ffi::CString,
-    pub(crate) topology: Topology,
-    pub(crate) color_targets: Vec<ColorTarget>,
+/// Raster state shared by the vertex and mesh pipeline paths.
+pub(crate) struct RasterState<'a> {
+    pub(crate) color_targets: &'a [ColorTarget],
     pub(crate) depth_format: Option<vk::Format>,
+    pub(crate) depth: DepthState,
     pub(crate) sample_count: SampleCount,
     pub(crate) alpha_to_coverage: bool,
     pub(crate) cull: Cull,
-    pub(crate) depth: DepthState,
-}
-
-/// Raster state shared by the vertex and mesh pipeline paths.
-struct RasterState<'a> {
-    color_targets: &'a [ColorTarget],
-    depth_format: Option<vk::Format>,
-    depth: DepthState,
-    sample_count: SampleCount,
-    alpha_to_coverage: bool,
-    cull: Cull,
+    pub(crate) blend: &'a [BlendAttachment],
 }
 
 /// Build a raster pipeline. `topology` is `Some` for the vertex path, which also needs vertex-input
 /// and input-assembly state; the mesh path passes `None` and supplies neither.
-fn create_raster_pipeline(
+pub(crate) fn create_raster_pipeline(
     device: &ash::Device,
     cache: vk::PipelineCache,
     stages: &[vk::PipelineShaderStageCreateInfo<'_>],
     topology: Option<Topology>,
     state: &RasterState<'_>,
-    blend: &BlendState,
     what: &str,
 ) -> RhiResult<vk::Pipeline> {
     // Always empty: vertex data is read through pointers in the shader, never bound. The
@@ -109,13 +90,8 @@ fn create_raster_pipeline(
         .cull_mode(cull_mode)
         .front_face(front_face);
 
-    let samples = match state.sample_count {
-        SampleCount::S1 => vk::SampleCountFlags::TYPE_1,
-        SampleCount::S2 => vk::SampleCountFlags::TYPE_2,
-        SampleCount::S4 => vk::SampleCountFlags::TYPE_4,
-        SampleCount::S8 => vk::SampleCountFlags::TYPE_8,
-        SampleCount::S16 => vk::SampleCountFlags::TYPE_16,
-    };
+    // `VkSampleCountFlagBits` is the sample count itself as a single bit.
+    let samples = vk::SampleCountFlags::from_raw(state.sample_count.count());
     let mut multisampling =
         vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(samples);
     if state.alpha_to_coverage {
@@ -124,12 +100,12 @@ fn create_raster_pipeline(
 
     let depth_stencil = depth_stencil_create_info(state.depth);
 
-    let color_blend_attachments: Vec<vk::PipelineColorBlendAttachmentState> = state
+    let color_blend_attachments: SmallVec<[vk::PipelineColorBlendAttachmentState; 4]> = state
         .color_targets
         .iter()
         .enumerate()
         .map(|(i, target)| {
-            let att = blend.attachments.get(i).copied().unwrap_or_default();
+            let att = state.blend.get(i).copied().unwrap_or_default();
             blend_attachment_to_vk(att, target.write_mask)
         })
         .collect();
@@ -140,7 +116,7 @@ fn create_raster_pipeline(
     let dynamic_state_info =
         vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-    let color_attachment_formats: Vec<vk::Format> = state
+    let color_attachment_formats: SmallVec<[vk::Format; 4]> = state
         .color_targets
         .iter()
         .map(|t| format_to_vk(t.format))
@@ -175,41 +151,10 @@ fn create_raster_pipeline(
         device
             .create_graphics_pipelines(cache, &[pipeline_info], None)
             .map_err(|(_, e)| {
-                RhiError::PipelineCreation(format!("Vulkan {what} pipeline creation: {e:?}"))
+                RhiError::PipelineCreation(format!("Vulkan {what} pipeline creation: {e:?}").into())
             })?
     };
     Ok(pipelines[0])
-}
-
-impl VulkanGraphicsPso {
-    pub(crate) fn create_pipeline(&self, blend: &BlendState) -> RhiResult<vk::Pipeline> {
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(self.desc.vert_module)
-                .name(&self.desc.vert_entry),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(self.desc.frag_module)
-                .name(&self.desc.frag_entry),
-        ];
-        create_raster_pipeline(
-            &self.device,
-            self.pipeline_cache,
-            &stages,
-            Some(self.desc.topology),
-            &RasterState {
-                color_targets: &self.desc.color_targets,
-                depth_format: self.desc.depth_format,
-                depth: self.desc.depth,
-                sample_count: self.desc.sample_count,
-                alpha_to_coverage: self.desc.alpha_to_coverage,
-                cull: self.desc.cull,
-            },
-            blend,
-            "graphics",
-        )
-    }
 }
 
 impl Drop for VulkanGraphicsPso {
@@ -229,7 +174,6 @@ fn cull_to_vk(cull: Cull) -> (vk::CullModeFlags, vk::FrontFace) {
         Cull::None => (vk::CullModeFlags::NONE, front),
         Cull::Cw => (vk::CullModeFlags::BACK, front),
         Cull::Ccw => (vk::CullModeFlags::FRONT, front),
-        Cull::All => (vk::CullModeFlags::FRONT_AND_BACK, front),
     }
 }
 
@@ -301,52 +245,6 @@ fn blend_op_to_vk(op: BlendOp) -> vk::BlendOp {
 pub struct VulkanMeshletPso {
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) device: ash::Device,
-    pub(crate) pipeline_cache: vk::PipelineCache,
-    pub(crate) desc: VulkanMeshletPsoDesc,
-}
-
-pub struct VulkanMeshletPsoDesc {
-    pub(crate) mesh_module: vk::ShaderModule,
-    pub(crate) frag_module: vk::ShaderModule,
-    pub(crate) mesh_entry: std::ffi::CString,
-    pub(crate) frag_entry: std::ffi::CString,
-    pub(crate) color_targets: Vec<ColorTarget>,
-    pub(crate) depth_format: Option<vk::Format>,
-    pub(crate) depth: DepthState,
-    pub(crate) sample_count: SampleCount,
-    pub(crate) alpha_to_coverage: bool,
-    pub(crate) cull: Cull,
-}
-
-impl VulkanMeshletPso {
-    pub(crate) fn create_pipeline(&self, blend: &BlendState) -> RhiResult<vk::Pipeline> {
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::MESH_EXT)
-                .module(self.desc.mesh_module)
-                .name(&self.desc.mesh_entry),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(self.desc.frag_module)
-                .name(&self.desc.frag_entry),
-        ];
-        create_raster_pipeline(
-            &self.device,
-            self.pipeline_cache,
-            &stages,
-            None,
-            &RasterState {
-                color_targets: &self.desc.color_targets,
-                depth_format: self.desc.depth_format,
-                depth: self.desc.depth,
-                sample_count: self.desc.sample_count,
-                alpha_to_coverage: self.desc.alpha_to_coverage,
-                cull: self.desc.cull,
-            },
-            blend,
-            "meshlet",
-        )
-    }
 }
 
 impl Drop for VulkanMeshletPso {
@@ -355,5 +253,172 @@ impl Drop for VulkanMeshletPso {
         unsafe {
             self.device.destroy_pipeline(self.pipeline, None);
         }
+    }
+}
+
+impl VulkanDevice {
+    pub fn create_shader_module(&self, desc: &ShaderModuleDesc) -> RhiResult<ShaderModule> {
+        let code = spirv_words(desc.code)?;
+
+        let shader_info = vk::ShaderModuleCreateInfo::default().code(&code);
+
+        let module = unsafe {
+            self.loaders
+                .device
+                .create_shader_module(&shader_info, None)
+                .map_err(|e| RhiError::ShaderCompilation(e.into()))?
+        };
+
+        let entry_point = CString::new(desc.entry_point).map_err(|e| {
+            RhiError::ShaderCompilation(crate::error::ErrorDetail::with_source(
+                format!(
+                    "entry point {:?} contains an interior NUL",
+                    desc.entry_point
+                ),
+                e,
+            ))
+        })?;
+
+        Ok(ShaderModule {
+            inner: Box::new(VulkanShaderModule::new(
+                self.loaders.device.clone(),
+                module,
+                entry_point,
+            )),
+            stage: desc.stage,
+            threads_per_threadgroup: desc.threads_per_threadgroup,
+            _owner: None,
+        })
+    }
+
+    pub fn create_graphics_pso(
+        &self,
+        desc: &GraphicsPsoDesc,
+        vert_module: &VulkanShaderModule,
+        frag_module: &VulkanShaderModule,
+    ) -> RhiResult<GraphicsPso> {
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vert_module.module)
+                .name(&vert_module.entry_point),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(frag_module.module)
+                .name(&frag_module.entry_point),
+        ];
+        let pipeline = super::pipeline::create_raster_pipeline(
+            &self.loaders.device,
+            self.pipeline_cache,
+            &stages,
+            Some(desc.topology),
+            &super::pipeline::RasterState {
+                color_targets: desc.color_targets,
+                depth_format: desc.depth_format.map(format_to_vk),
+                depth: desc.depth,
+                sample_count: desc.sample_count,
+                alpha_to_coverage: desc.alpha_to_coverage,
+                cull: desc.cull,
+                blend: desc.blend,
+            },
+            "graphics",
+        )?;
+        if let Some(label) = desc.label {
+            self.set_object_name(pipeline, label);
+        }
+
+        Ok(GraphicsPso {
+            inner: std::rc::Rc::new(VulkanGraphicsPso {
+                pipeline,
+                device: self.loaders.device.clone(),
+            }),
+            _owner: None,
+        })
+    }
+
+    /// `_threads` is the frontend's resolved `[numthreads]`, which Metal needs at dispatch.
+    /// Vulkan takes it from the SPIR-V, so the size is validated by the caller and dropped here.
+    pub fn create_compute_pso(
+        &self,
+        desc: &ComputePsoDesc,
+        shader: &VulkanShaderModule,
+        _threads: Option<[u32; 3]>,
+    ) -> RhiResult<ComputePso> {
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader.module)
+            .name(&shader.entry_point);
+
+        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default()
+            .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT);
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(vk::PipelineLayout::null())
+            .push(&mut flags2);
+
+        let pipelines = unsafe {
+            self.loaders
+                .device
+                .create_compute_pipelines(self.pipeline_cache, &[pipeline_info], None)
+                .map_err(|e| RhiError::PipelineCreation(format!("{e:?}").into()))?
+        };
+
+        if let Some(label) = desc.label {
+            self.set_object_name(pipelines[0], label);
+        }
+
+        Ok(ComputePso {
+            inner: std::rc::Rc::new(VulkanComputePso {
+                pipeline: pipelines[0],
+                device: self.loaders.device.clone(),
+            }),
+            _owner: None,
+        })
+    }
+
+    pub fn create_meshlet_pso(
+        &self,
+        desc: &MeshletPsoDesc,
+        mesh_module: &VulkanShaderModule,
+        frag_module: &VulkanShaderModule,
+    ) -> RhiResult<MeshletPso> {
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::MESH_EXT)
+                .module(mesh_module.module)
+                .name(&mesh_module.entry_point),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(frag_module.module)
+                .name(&frag_module.entry_point),
+        ];
+        // `None` topology: the mesh stage replaces vertex input and input assembly.
+        let pipeline = super::pipeline::create_raster_pipeline(
+            &self.loaders.device,
+            self.pipeline_cache,
+            &stages,
+            None,
+            &super::pipeline::RasterState {
+                color_targets: desc.color_targets,
+                depth_format: desc.depth_format.map(format_to_vk),
+                depth: desc.depth,
+                sample_count: desc.sample_count,
+                alpha_to_coverage: desc.alpha_to_coverage,
+                cull: desc.cull,
+                blend: desc.blend,
+            },
+            "meshlet",
+        )?;
+        if let Some(label) = desc.label {
+            self.set_object_name(pipeline, label);
+        }
+
+        Ok(MeshletPso {
+            inner: std::rc::Rc::new(VulkanMeshletPso {
+                pipeline,
+                device: self.loaders.device.clone(),
+            }),
+            _owner: None,
+        })
     }
 }

@@ -22,7 +22,7 @@ fn timestamps_bracket_transfers() {
             cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
         }
         cmd.write_timestamp(&pool, 1);
-        cmd.end();
+        cmd.end().expect("end command buffer");
         let start = Instant::now();
         device.queue().submit(cmd).expect("submit");
         device.queue().wait_idle();

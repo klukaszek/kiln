@@ -1,6 +1,6 @@
 use kiln_rhi::{
-    AccelerationStructure, Allocation, BlasDesc, BlasMeshDesc, BuildAccelFlags, Device,
-    GeometryFlags, GeometryType, GpuPtr, MemoryType, TlasDesc, TlasInstance,
+    AccelerationStructure, Allocation, BlasDesc, BlasGeometry, BlasIndices, BlasMeshDesc,
+    BuildAccelFlags, Device, GeometryFlags, MemoryType, TlasDesc, TlasInstance,
 };
 
 use crate::render;
@@ -55,8 +55,7 @@ impl SceneAccel {
     }
 
     /// Rebuild the TLAS after instance transforms moved. BLAS geometry is in local space, so it
-    /// is reused untouched. The caller has already drained the queue, so the old TLAS is freed
-    /// immediately rather than retired against a frame slot.
+    /// is reused untouched.
     pub(super) fn rebuild_tlas(&mut self, device: &Device, scene: &Scene) -> render::Result<()> {
         if scene.geometry.instances.len() != self.blases.len() {
             return Err(render::Error::Unsupported(
@@ -64,7 +63,9 @@ impl SceneAccel {
             ));
         }
         let tlas = build_tlas(device, &self.blases, scene, &mut self.instance_buffer)?;
-        self.tlas = tlas;
+        // Built before the old one is released, so a failed rebuild leaves the scene intact.
+        // `destroy` retires it against the frames still tracing it; dropping it would leak.
+        device.destroy(std::mem::replace(&mut self.tlas, tlas));
         Ok(())
     }
 
@@ -76,8 +77,10 @@ impl SceneAccel {
             ray_vertices,
             ray_indices,
         } = self;
-        drop(tlas);
-        drop(blases);
+        device.destroy(tlas);
+        for blas in blases {
+            device.destroy(blas);
+        }
         device.destroy(instance_buffer);
         for vertices in ray_vertices {
             vertices.destroy(device);
@@ -99,7 +102,9 @@ struct Partial {
 
 impl Partial {
     fn destroy(self, device: &Device) {
-        drop(self.blases);
+        for blas in self.blases {
+            device.destroy(blas);
+        }
         for vertices in self.ray_vertices {
             vertices.destroy(device);
         }
@@ -127,32 +132,35 @@ fn build_into(
     }
     uploads.submit()?;
 
-    let mut blas_descs = Vec::with_capacity(geometries.len());
-    for (vertices, indices) in partial.ray_vertices.iter().zip(&partial.ray_indices) {
+    let meshes: Vec<BlasMeshDesc> = partial
+        .ray_vertices
+        .iter()
+        .zip(&partial.ray_indices)
+        .map(|(vertices, indices)| BlasMeshDesc {
+            flags: GeometryFlags::OPAQUE,
+            geometry: BlasGeometry::Triangles {
+                vertices: vertices.gpu(),
+                stride: std::mem::size_of::<[f32; 3]>() as u64,
+                count: vertices.len(),
+                indices: Some(BlasIndices {
+                    buffer: indices.gpu(),
+                    count: indices.len(),
+                }),
+            },
+        })
+        .collect();
+
+    for mesh in &meshes {
         let desc = BlasDesc {
-            meshes: vec![BlasMeshDesc {
-                geometry_type: GeometryType::Triangles,
-                flags: GeometryFlags::OPAQUE,
-                vertex_buffer: vertices.gpu(),
-                vertex_stride: std::mem::size_of::<[f32; 3]>() as u64,
-                vertex_count: vertices.len(),
-                index_buffer: indices.gpu(),
-                index_count: indices.len(),
-                aabb_buffer: GpuPtr::NULL,
-                aabb_count: 0,
-            }],
+            meshes: std::slice::from_ref(mesh),
             flags: BuildAccelFlags::PREFER_FAST_TRACE,
         };
-        blas_descs.push(desc);
-    }
-
-    for desc in &blas_descs {
-        let blas = device.create_blas(desc)?;
+        let blas = device.create_blas(&desc)?;
         partial.blases.push(blas);
         build_blas(
             device,
             partial.blases.last().expect("just pushed the blas"),
-            desc,
+            &desc,
         )?;
     }
 
@@ -211,7 +219,7 @@ fn build_blas(
 ) -> render::Result<()> {
     let mut cmd = device.create_command_buffer()?;
     cmd.build_blas(blas, desc);
-    cmd.end();
+    cmd.end()?;
     device.queue().submit(cmd)?;
     device.queue().wait_idle();
     Ok(())
@@ -243,7 +251,7 @@ fn build_tlas(
     let tlas = device.create_tlas(&desc)?;
     let mut cmd = device.create_command_buffer()?;
     cmd.build_tlas(&tlas, &desc);
-    cmd.end();
+    cmd.end()?;
     device.queue().submit(cmd)?;
     Ok(tlas)
 }

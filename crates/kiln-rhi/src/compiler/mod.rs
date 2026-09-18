@@ -11,38 +11,23 @@
 //! decide whether it works — calls report
 //! [`ShaderCompilation`](crate::RhiError::ShaderCompilation) when `slangc` is missing.
 //!
-//! # Metal compute takes a detour
+//! Metal compute detours through MSL and `xcrun metal` to put `[numthreads]` back; see
+//! `METAL_THREADGROUP_FIXUP`. That needs the Xcode command line tools, and without them the
+//! compile falls back to slangc's direct metallib output.
 //!
-//! Slang drops `[numthreads]` on its Metal target, so compute entry points compile to MSL, have
-//! `[[max_total_threads_per_threadgroup]]` injected from slangc's own reflection, and are then
-//! assembled by `xcrun metal`. Without it the threadgroup size a shader declares is binding on
-//! Vulkan and ignored on Metal, and a dispatch wider than whatever Metal's register allocator
-//! happened to allow is silently dropped. See [`METAL_THREADGROUP_FIXUP`].
+//! Vulkan compiles add `-fvk-use-entrypoint-name`, so `ShaderModuleDesc::entry_point` matches
+//! `OpEntryPoint`, and `-capability spvDescriptorHeapEXT` (see
+//! `SPIRV_DESCRIPTOR_HEAP_CAPABILITY`).
 //!
-//! That needs the Xcode command line tools on top of `slangc`. When they are absent the compile
-//! falls back to slangc's direct metallib output, which is the old behaviour: correct for
-//! threadgroups that fit, and caught at pipeline creation for those that do not.
-//!
-//! # Vulkan flags applied on every compile
-//!
-//! - `-fvk-use-entrypoint-name`: preserves the entry-point name in `OpEntryPoint`
-//!   so `ShaderModuleDesc::entry_point` matches what Vulkan expects.
-//! - `-capability spvDescriptorHeapEXT`: lowers `DescriptorHandle<T>` onto
-//!   `SPV_EXT_descriptor_heap`'s `ResourceHeapEXT`/`SamplerHeapEXT` builtins instead of an
-//!   unbounded runtime array. The result carries no descriptor set or binding decorations at
-//!   all, which is what lets pipelines be created with a null layout.
-//!
-//! Shader source itself is backend-agnostic and reaches slangc unmodified, prefixed only by the
-//! `kiln::accel` prelude: every resource is a `DescriptorHandle<T>` that each backend resolves
-//! through its own heap, and acceleration structures go through that one accessor.
+//! Shader source is backend-agnostic and reaches slangc unmodified, prefixed only by
+//! `ACCEL_PRELUDE`.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::error::ErrorDetail;
 use crate::{Backend, Device, RhiError, RhiResult, ShaderModule, ShaderModuleDesc, ShaderStage};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -52,23 +37,20 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 // tradeoffs of level 3.
 const SLANG_OPTIMIZATION_LEVEL: &str = "2";
 
-/// Lowers `DescriptorHandle<T>` onto `SPV_EXT_descriptor_heap`'s heap builtins instead of an
-/// unbounded runtime descriptor array.
+/// Lowers `DescriptorHandle<T>` onto `SPV_EXT_descriptor_heap`'s heap builtins rather than an
+/// unbounded runtime array. The result carries no set or binding decorations, which is what lets
+/// pipelines be created with a null layout.
 const SPIRV_DESCRIPTOR_HEAP_CAPABILITY: &str = "spvDescriptorHeapEXT";
 
-/// Declares `kiln::accel`, which turns an [`AccelHandle`](crate::AccelHandle)'s eight bytes into
-/// the `RaytracingAccelerationStructure` that a `gpu_struct!` field's property returns.
+/// Declares `kiln::accel`, turning an [`AccelHandle`](crate::AccelHandle)'s eight bytes into the
+/// `RaytracingAccelerationStructure` a `gpu_struct!` field's property returns.
 ///
-/// The one resource with no shared model: Vulkan reaches it by device address, Metal only as a
-/// bindless resource id. `__target_switch` keeps that the sole backend-specific line in the shader
-/// pipeline, and the handle is eight bytes either way, so root layout never varies by target.
+/// The one resource with no shared model: Vulkan reaches it by device address, Metal as a resource
+/// id. Only SPIR-V converts -- MSL builds an `acceleration_structure` from its own opaque handle
+/// and rejects a `uint64_t` cast.
 ///
-/// Only SPIR-V converts, because only Metal can hold the value natively -- MSL builds an
-/// `acceleration_structure` from its opaque handle type and nothing else, so a `uint64_t` handle
-/// would need a cast Metal rejects.
-///
-/// Do not collapse the arms: each is silently wrong on the other backend, compiling to an empty
-/// function body on Metal and to a heap load of a never-populated slot on Vulkan.
+/// Do not collapse the arms. Each is silently wrong on the other target: an empty function body on
+/// Metal, a heap load of a never-populated slot on Vulkan.
 const ACCEL_PRELUDE: &str = concat!(
     "namespace kiln { RaytracingAccelerationStructure accel(",
     "DescriptorHandle<RaytracingAccelerationStructure> h) { __target_switch { ",
@@ -77,52 +59,104 @@ const ACCEL_PRELUDE: &str = concat!(
 ",
 );
 
-/// Slang drops `[numthreads]` on the Metal target, so the compute pipeline below routes through MSL
-/// to put it back. Part of the cache key, so upgrading past this reuses nothing stale.
+/// Slang emits MSL compute entry points bare, with no `[[max_total_threads_per_threadgroup(N)]]`,
+/// so the compute path routes through MSL to inject it. In the cache key, so upgrading past this
+/// reuses nothing stale.
 ///
-/// The generated MSL entry point comes out bare — `[[kernel]] void name(...)` — with no
-/// `[[max_total_threads_per_threadgroup(N)]]`, for a literal size or a named constant alike. The
-/// same source becomes an authoritative `OpExecutionMode LocalSize` on SPIR-V, so a threadgroup
-/// size is binding on Vulkan and merely advisory on Metal.
+/// Without it Metal allocates registers not knowing the requested size and caps the pipeline
+/// wherever it lands -- 32 threads for a ray-query shader -- and a dispatch wider than the cap is
+/// *silently dropped*; only the backend's `maxTotalThreadsPerThreadgroup` check makes that an
+/// error rather than a black frame. The cap also moves with unrelated edits nearby.
 ///
-/// That is not cosmetic. Metal then allocates registers without knowing the size the shader asked
-/// for and caps the pipeline wherever it lands, which for a ray-query shader can be 32 threads; a
-/// dispatch wider than the cap is *silently dropped*, and only the backend's
-/// `maxTotalThreadsPerThreadgroup` check turns that into an error rather than a black frame. Worse,
-/// the cap moves with unrelated edits elsewhere in the module, so a shader can stop launching
-/// because something near it grew.
-///
-/// Injecting the attribute fixes it outright: the same shader that reported a 32-thread ceiling
-/// reports 64 once Metal is told what to compile for, because the compiler will spill to meet a
-/// declared size. `MTL4ComputePipelineDescriptor::requiredThreadsPerThreadgroup`, which the backend
-/// already sets, does not substitute — the reported ceiling is invariant to it.
-///
-/// Delete this path once Slang emits the attribute itself.
+/// `MTL4ComputePipelineDescriptor::requiredThreadsPerThreadgroup` does not substitute: the
+/// reported ceiling is invariant to it. Delete once Slang emits the attribute itself.
 const METAL_THREADGROUP_FIXUP: &str = "metal-numthreads-attribute-v1";
 
 /// The MSL definition of `RayDesc` that Slang omits, `-include`d into the Metal translation unit.
 ///
-/// Slang 2026.17.1 drops this declaration on `metal`/`metallib` whenever a shader mentions
-/// `DescriptorHandle<T>`, leaving the type used but undefined; 2026.14 emitted it, and SPIR-V is
-/// unaffected. Shader source cannot work around it: `TraceRayInline` lowers to a `RayDesc`
-/// temporary even where the shader never names the type. Fields match by name, not position.
-/// Delete this and its `-Xmetal` flag once Slang emits the declaration again.
+/// Slang 2026.17.1 drops it on `metal`/`metallib` whenever a shader mentions
+/// `DescriptorHandle<T>`, leaving the type used but undefined; 2026.14 emitted it and SPIR-V is
+/// unaffected. Source cannot work around it -- `TraceRayInline` lowers to a `RayDesc` temporary
+/// even where the shader never names the type. Fields match by name. Delete this and its
+/// `-Xmetal` flag once Slang emits the declaration again.
 const RAYDESC_MSL_DEFINITION: &str =
     "struct RayDesc { float3 Origin; float TMin; float3 Direction; float TMax; };\n";
 
+/// The scratch files one compile works through, removed when it finishes. Both paths — direct,
+/// and the Metal compute detour through MSL — differ only in which optional ones they ask for.
 struct TempShaderFiles {
     source: PathBuf,
     output: PathBuf,
     /// Metal only: holds [`RAYDESC_MSL_DEFINITION`] for the downstream `-include`.
     prelude: Option<PathBuf>,
+    /// Compute only: slangc's reflection JSON, read for `[numthreads]`.
+    reflection: Option<PathBuf>,
+    /// Metal compute detour only: the generated MSL, and the AIR the Metal compiler emits.
+    msl: Option<PathBuf>,
+    air: Option<PathBuf>,
+}
+
+impl TempShaderFiles {
+    /// Reserve a fresh stem under the compiler's own scratch directory and name the required
+    /// files after it. The optional ones are added by the builder methods.
+    fn new(output_ext: &str) -> RhiResult<Self> {
+        let dir = scratch_dir()?;
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let stem = format!("kiln_{}_{seq}", std::process::id());
+        Ok(Self {
+            source: dir.join(format!("{stem}.slang")),
+            output: dir.join(format!("{stem}.{output_ext}")),
+            prelude: None,
+            reflection: None,
+            msl: None,
+            air: None,
+        })
+    }
+
+    fn with_prelude(mut self) -> Self {
+        self.prelude = Some(self.source.with_extension("prelude.h"));
+        self
+    }
+
+    fn with_reflection(mut self) -> Self {
+        self.reflection = Some(self.source.with_extension("json"));
+        self
+    }
+
+    fn with_msl_detour(mut self) -> Self {
+        self.msl = Some(self.source.with_extension("metal"));
+        self.air = Some(self.source.with_extension("air"));
+        self
+    }
+
+    fn msl(&self) -> &std::path::Path {
+        self.msl.as_deref().expect("the MSL detour was requested")
+    }
+
+    fn air(&self) -> &std::path::Path {
+        self.air.as_deref().expect("the MSL detour was requested")
+    }
+
+    fn prelude(&self) -> &std::path::Path {
+        self.prelude.as_deref().expect("a prelude was requested")
+    }
+
+    fn reflection(&self) -> &std::path::Path {
+        self.reflection
+            .as_deref()
+            .expect("reflection was requested")
+    }
 }
 
 impl Drop for TempShaderFiles {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.source);
         let _ = std::fs::remove_file(&self.output);
-        if let Some(prelude) = &self.prelude {
-            let _ = std::fs::remove_file(prelude);
+        for path in [&self.prelude, &self.reflection, &self.msl, &self.air]
+            .into_iter()
+            .flatten()
+        {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -144,18 +178,92 @@ pub fn compile(
         effective.push(SPIRV_DESCRIPTOR_HEAP_CAPABILITY);
     }
     let src = format!("{ACCEL_PRELUDE}{src}");
-    let code = get_or_compile(&src, entry, stage, target, ext, &effective)?;
-    make_module(device, &code, entry, stage)
+    let compiled = get_or_compile(&src, entry, stage, target, ext, &effective)?;
+    make_module(device, &compiled, entry, stage)
 }
 
-/// Cache directory, created once per process.
-fn cache_dir() -> &'static PathBuf {
-    static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
-    CACHE_DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join("kiln-shader-cache");
-        std::fs::create_dir_all(&dir).ok();
-        dir
+/// A compiled artifact plus whatever reflection the RHI needs alongside it.
+struct Compiled {
+    code: Vec<u8>,
+    /// `[numthreads]` for a compute entry point, from slangc's reflection. `None` for every other
+    /// stage, and for a cache entry written before the sidecar existed.
+    threads_per_threadgroup: Option<[u32; 3]>,
+}
+
+/// The compiler's own directory under the system temp dir, owner-only and per-user: everything
+/// below it is fed to a compiler or the GPU, and a predictable path in a world-writable `/tmp`
+/// lets another user plant a cache entry or a symlink.
+fn kiln_temp_root() -> RhiResult<&'static PathBuf> {
+    static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("kiln-rhi-{}", current_user_id()));
+        std::fs::create_dir_all(&dir).ok()?;
+        restrict_to_owner(&dir).ok()?;
+        Some(dir)
     })
+    .as_ref()
+    .ok_or_else(|| {
+        RhiError::ShaderCompilation(
+            "could not create a private directory for the shader compiler under the system \
+             temp directory"
+                .into(),
+        )
+    })
+}
+
+/// Something stable and per-user to name the directory after.
+fn current_user_id() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: `getuid` takes no arguments, cannot fail, and touches no memory.
+        unsafe { libc_getuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows gives each user their own temp directory already.
+        0
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "getuid"]
+    fn libc_getuid() -> u32;
+}
+
+/// Make `dir` inaccessible to other users. A no-op where the platform already does this.
+fn restrict_to_owner(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
+/// Where compiled artifacts are cached between runs.
+fn cache_dir() -> RhiResult<PathBuf> {
+    let dir = kiln_temp_root()?.join("shader-cache");
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        RhiError::ShaderCompilation(ErrorDetail::with_source("create the shader cache", error))
+    })?;
+    Ok(dir)
+}
+
+/// Where a single compile invocation puts its scratch files.
+fn scratch_dir() -> RhiResult<PathBuf> {
+    let dir = kiln_temp_root()?.join("scratch");
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        RhiError::ShaderCompilation(ErrorDetail::with_source(
+            "create the shader compiler scratch directory",
+            error,
+        ))
+    })?;
+    Ok(dir)
 }
 
 fn get_or_compile(
@@ -165,7 +273,7 @@ fn get_or_compile(
     target: &str,
     ext: &str,
     capabilities: &[&str],
-) -> RhiResult<Vec<u8>> {
+) -> RhiResult<Compiled> {
     let key = cache_key(
         slangc_version_hash(),
         src,
@@ -174,70 +282,132 @@ fn get_or_compile(
         target,
         capabilities,
     );
-    let path = cache_dir().join(format!("{key:016x}.{ext}"));
+    let path = cache_dir()?.join(format!("{key:032x}.{ext}"));
+    // The threadgroup size rides in a sidecar rather than in the artifact, so a cache hit does
+    // not have to re-run slangc just to recover it.
+    let sidecar = path.with_extension(format!("{ext}.threadgroup"));
     if let Ok(cached) = std::fs::read(&path)
         && valid_artifact(&cached, target)
     {
-        return Ok(cached);
+        let threads = std::fs::read_to_string(&sidecar)
+            .ok()
+            .and_then(|text| parse_threadgroup_sidecar(&text));
+        if threads.is_some() || stage != ShaderStage::Compute {
+            return Ok(Compiled {
+                code: cached,
+                threads_per_threadgroup: threads,
+            });
+        }
+        // A compute entry with no sidecar predates it; fall through and recompile once.
     }
-    let code = if uses_metal_compute_fixup(target, stage) {
+    let compiled = if uses_metal_compute_fixup(target, stage) {
         compile_metal_compute(src, entry, capabilities)?
     } else {
         invoke_slangc(src, entry, stage, target, ext, capabilities)?
     };
-    if !valid_artifact(&code, target) {
-        return Err(RhiError::ShaderCompilation(format!(
-            "slangc produced an invalid {target} artifact for `{entry}`"
-        )));
+    if !valid_artifact(&compiled.code, target) {
+        return Err(RhiError::ShaderCompilation(
+            format!("slangc produced an invalid {target} artifact for `{entry}`").into(),
+        ));
     }
-    write_cache_atomically(&path, &code);
-    Ok(code)
+    write_cache_atomically(&path, &compiled.code);
+    if let Some([x, y, z]) = compiled.threads_per_threadgroup {
+        write_cache_atomically(&sidecar, format!("{x} {y} {z}").as_bytes());
+    }
+    Ok(compiled)
+}
+
+/// Read back what `get_or_compile` wrote to the threadgroup sidecar.
+fn parse_threadgroup_sidecar(text: &str) -> Option<[u32; 3]> {
+    let mut dims = text.split_whitespace().map(str::parse::<u32>);
+    let size = [dims.next()?.ok()?, dims.next()?.ok()?, dims.next()?.ok()?];
+    (dims.next().is_none() && size.iter().all(|d| *d > 0)).then_some(size)
+}
+
+/// FNV-1a, 128-bit. Hand-rolled because `DefaultHasher` is not stable across Rust releases and
+/// this value names a file that outlives the process; 128 bits because a collision would serve
+/// the wrong compiled shader. Not cryptographic, which is fine for inputs we choose.
+struct CacheHasher {
+    state: u128,
+}
+
+impl CacheHasher {
+    const OFFSET_BASIS: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+
+    fn new() -> Self {
+        Self {
+            state: Self::OFFSET_BASIS,
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> &mut Self {
+        for &byte in bytes {
+            self.state ^= u128::from(byte);
+            self.state = self.state.wrapping_mul(Self::PRIME);
+        }
+        self
+    }
+
+    /// Length-prefixed, so `["ab", "c"]` and `["a", "bc"]` do not hash alike.
+    fn field(&mut self, bytes: &[u8]) -> &mut Self {
+        self.write(&(bytes.len() as u64).to_le_bytes());
+        self.write(bytes)
+    }
+
+    fn finish(&self) -> u128 {
+        self.state
+    }
 }
 
 /// Process-wide cached slangc version hash. `None` means slangc is unavailable.
-static SLANGC_VERSION: OnceLock<Option<u64>> = OnceLock::new();
+static SLANGC_VERSION: OnceLock<Option<u128>> = OnceLock::new();
 
-fn slangc_version_hash_raw() -> Option<u64> {
+fn slangc_version_hash_raw() -> Option<u128> {
     *SLANGC_VERSION.get_or_init(|| {
         let out = Command::new("slangc").arg("-v").output().ok()?;
         if !out.status.success() {
             return None;
         }
-        let mut h = DefaultHasher::new();
-        out.stdout.hash(&mut h);
-        out.stderr.hash(&mut h);
+        let mut h = CacheHasher::new();
+        h.field(&out.stdout).field(&out.stderr);
         Some(h.finish())
     })
 }
 
-fn slangc_version_hash() -> u64 {
+fn slangc_version_hash() -> u128 {
     slangc_version_hash_raw().unwrap_or(0)
 }
 
 fn cache_key(
-    version_hash: u64,
+    version_hash: u128,
     src: &str,
     entry: &str,
     stage: ShaderStage,
     target: &str,
     capabilities: &[&str],
-) -> u64 {
-    let mut h = DefaultHasher::new();
-    version_hash.hash(&mut h);
-    src.hash(&mut h);
-    entry.hash(&mut h);
-    stage_str(stage).hash(&mut h);
-    target.hash(&mut h);
-    SLANG_OPTIMIZATION_LEVEL.hash(&mut h);
+) -> u128 {
+    let mut h = CacheHasher::new();
+    h.field(&version_hash.to_le_bytes())
+        .field(src.as_bytes())
+        .field(entry.as_bytes())
+        .field(stage_str(stage).as_bytes())
+        .field(target.as_bytes())
+        .field(SLANG_OPTIMIZATION_LEVEL.as_bytes());
+
     let mut caps = capabilities.to_vec();
     caps.sort_unstable();
-    caps.hash(&mut h);
+    h.field(&(caps.len() as u64).to_le_bytes());
+    for cap in caps {
+        h.field(cap.as_bytes());
+    }
+
     // Part of the Metal translation unit, so editing it has to invalidate cached metallibs.
     if target != "spirv" {
-        RAYDESC_MSL_DEFINITION.hash(&mut h);
+        h.field(RAYDESC_MSL_DEFINITION.as_bytes());
     }
     if uses_metal_compute_fixup(target, stage) {
-        METAL_THREADGROUP_FIXUP.hash(&mut h);
+        h.field(METAL_THREADGROUP_FIXUP.as_bytes());
     }
     h.finish()
 }
@@ -274,25 +444,17 @@ fn xcrun_find(tool: &str) -> Option<PathBuf> {
 
 /// Compile a compute entry point to a metallib by way of MSL, injecting the threadgroup size Slang
 /// leaves out. See [`METAL_THREADGROUP_FIXUP`].
-fn compile_metal_compute(src: &str, entry: &str, capabilities: &[&str]) -> RhiResult<Vec<u8>> {
+fn compile_metal_compute(src: &str, entry: &str, capabilities: &[&str]) -> RhiResult<Compiled> {
     let (metal, metallib) = metal_toolchain().ok_or_else(|| {
         RhiError::ShaderCompilation("the Metal toolchain went missing mid-compile".into())
     })?;
-    let dir = std::env::temp_dir();
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let stem = format!("kiln_{pid}_{seq}");
-    let files = MetalComputeFiles {
-        source: dir.join(format!("{stem}.slang")),
-        msl: dir.join(format!("{stem}.metal")),
-        reflection: dir.join(format!("{stem}.json")),
-        air: dir.join(format!("{stem}.air")),
-        output: dir.join(format!("{stem}.metallib")),
-        prelude: dir.join(format!("{stem}_prelude.h")),
-    };
+    let files = TempShaderFiles::new("metallib")?
+        .with_prelude()
+        .with_reflection()
+        .with_msl_detour();
 
     write_file(&files.source, src.as_bytes())?;
-    write_file(&files.prelude, RAYDESC_MSL_DEFINITION.as_bytes())?;
+    write_file(files.prelude(), RAYDESC_MSL_DEFINITION.as_bytes())?;
 
     // Slang to MSL, asking for the reflection that carries the threadgroup size. Taking it from
     // reflection rather than from the pipeline description keeps `[numthreads]` the single source
@@ -302,94 +464,90 @@ fn compile_metal_compute(src: &str, entry: &str, capabilities: &[&str]) -> RhiRe
         .args(["-target", "metal", "-entry", entry, "-stage", "compute"])
         .arg(format!("-O{SLANG_OPTIMIZATION_LEVEL}"))
         .arg("-reflection-json")
-        .arg(&files.reflection);
+        .arg(files.reflection());
     for cap in capabilities {
         if !cap.starts_with("spv") {
             cmd.args(["-capability", cap]);
         }
     }
-    cmd.arg("-o").arg(&files.msl);
+    cmd.arg("-o").arg(files.msl());
     run(&mut cmd, "slangc", entry)?;
 
-    let msl = std::fs::read_to_string(&files.msl).map_err(|error| {
-        RhiError::ShaderCompilation(format!("read `{}`: {error}", files.msl.display()))
-    })?;
-    let reflection = std::fs::read_to_string(&files.reflection).map_err(|error| {
-        RhiError::ShaderCompilation(format!("read `{}`: {error}", files.reflection.display()))
-    })?;
+    let msl = read_scratch(files.msl(), |p| std::fs::read_to_string(p))?;
+    let reflection = read_scratch(files.reflection(), |p| std::fs::read_to_string(p))?;
     let threads = thread_group_size(&reflection).ok_or_else(|| {
-        RhiError::ShaderCompilation(format!(
-            "slangc reflection for `{entry}` carries no threadGroupSize"
-        ))
+        RhiError::ShaderCompilation(
+            format!("slangc reflection for `{entry}` carries no threadGroupSize").into(),
+        )
     })?;
     write_file(
-        &files.msl,
+        files.msl(),
         inject_threadgroup_attribute(&msl, entry, threads)?.as_bytes(),
     )?;
 
     let mut cmd = Command::new(metal);
     cmd.arg("-c")
-        .arg(&files.msl)
+        .arg(files.msl())
         .arg("-include")
-        .arg(&files.prelude)
+        .arg(files.prelude())
         .arg("-o")
-        .arg(&files.air);
+        .arg(files.air());
     run(&mut cmd, "metal", entry)?;
 
     let mut cmd = Command::new(metallib);
-    cmd.arg(&files.air).arg("-o").arg(&files.output);
+    cmd.arg(files.air()).arg("-o").arg(&files.output);
     run(&mut cmd, "metallib", entry)?;
 
-    std::fs::read(&files.output).map_err(|error| {
-        RhiError::ShaderCompilation(format!("read `{}`: {error}", files.output.display()))
+    Ok(Compiled {
+        code: read_scratch(&files.output, |p| std::fs::read(p))?,
+        threads_per_threadgroup: Some(threads),
     })
-}
-
-struct MetalComputeFiles {
-    source: PathBuf,
-    msl: PathBuf,
-    reflection: PathBuf,
-    air: PathBuf,
-    output: PathBuf,
-    prelude: PathBuf,
-}
-
-impl Drop for MetalComputeFiles {
-    fn drop(&mut self) {
-        for path in [
-            &self.source,
-            &self.msl,
-            &self.reflection,
-            &self.air,
-            &self.output,
-            &self.prelude,
-        ] {
-            let _ = std::fs::remove_file(path);
-        }
-    }
 }
 
 fn write_file(path: &std::path::Path, bytes: &[u8]) -> RhiResult<()> {
     std::fs::write(path, bytes).map_err(|error| {
-        RhiError::ShaderCompilation(format!("write `{}`: {error}", path.display()))
+        RhiError::ShaderCompilation(ErrorDetail::with_source(
+            format!("write `{}`", path.display()),
+            error,
+        ))
+    })
+}
+
+/// `std::fs::read`/`read_to_string` with the path in the error.
+fn read_scratch<T>(
+    path: &std::path::Path,
+    read: impl FnOnce(&std::path::Path) -> std::io::Result<T>,
+) -> RhiResult<T> {
+    read(path).map_err(|error| {
+        RhiError::ShaderCompilation(ErrorDetail::with_source(
+            format!("read `{}`", path.display()),
+            error,
+        ))
     })
 }
 
 fn run(cmd: &mut Command, tool: &str, entry: &str) -> RhiResult<()> {
     let output = cmd
         .output()
-        .map_err(|error| RhiError::ShaderCompilation(format!("run {tool}: {error}")))?;
+        .map_err(|error| RhiError::ShaderCompilation(format!("run {tool}: {error}").into()))?;
     if !output.status.success() {
-        return Err(RhiError::ShaderCompilation(format!(
-            "{tool} failed compiling `{entry}`:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
+        return Err(RhiError::ShaderCompilation(
+            format!(
+                "{tool} failed compiling `{entry}`:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into(),
+        ));
     }
     Ok(())
 }
 
 /// `"threadGroupSize": [x, y, z]` out of slangc's reflection JSON. Scanned rather than parsed: the
 /// RHI has no JSON dependency, and one well-known key from one tool does not justify one.
+///
+/// Takes the first occurrence, which is the only one: every `slangc` invocation here passes a
+/// single `-entry`, so the reflection describes exactly one entry point. Compiling several at
+/// once would need a real parser to tell their sizes apart.
 fn thread_group_size(reflection: &str) -> Option<[u32; 3]> {
     let rest = reflection.split_once("\"threadGroupSize\"")?.1;
     let inside = rest.split_once('[')?.1.split_once(']')?.0;
@@ -402,9 +560,18 @@ fn thread_group_size(reflection: &str) -> Option<[u32; 3]> {
 fn inject_threadgroup_attribute(msl: &str, entry: &str, threads: [u32; 3]) -> RhiResult<String> {
     let declaration = format!("[[kernel]] void {entry}(");
     let at = msl.find(&declaration).ok_or_else(|| {
-        RhiError::ShaderCompilation(format!("no `{declaration}` in the MSL slangc generated"))
+        RhiError::ShaderCompilation(
+            format!("no `{declaration}` in the MSL slangc generated").into(),
+        )
     })?;
-    let total = threads[0] * threads[1] * threads[2];
+    let total = threads[0]
+        .checked_mul(threads[1])
+        .and_then(|xy| xy.checked_mul(threads[2]))
+        .ok_or_else(|| {
+            RhiError::ShaderCompilation(
+                format!("threadgroup size {threads:?} for `{entry}` overflows a u32").into(),
+            )
+        })?;
     Ok(format!(
         "{}[[max_total_threads_per_threadgroup({total})]]\n{}",
         &msl[..at],
@@ -443,23 +610,20 @@ fn invoke_slangc(
     target: &str,
     ext: &str,
     capabilities: &[&str],
-) -> RhiResult<Vec<u8>> {
-    let dir = std::env::temp_dir();
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let files = TempShaderFiles {
-        source: dir.join(format!("kiln_{pid}_{seq}.slang")),
-        output: dir.join(format!("kiln_{pid}_{seq}.{ext}")),
-        prelude: (target != "spirv").then(|| dir.join(format!("kiln_{pid}_{seq}_prelude.h"))),
-    };
+) -> RhiResult<Compiled> {
+    let mut files = TempShaderFiles::new(ext)?;
+    if target != "spirv" {
+        files = files.with_prelude();
+    }
+    // Compute only: `[numthreads]` is the one piece of reflection the RHI consumes, and it
+    // reaches `ShaderModule` so a `ComputePsoDesc` never has to restate it.
+    if stage == ShaderStage::Compute {
+        files = files.with_reflection();
+    }
 
-    std::fs::write(&files.source, src).map_err(|error| {
-        RhiError::ShaderCompilation(format!("write `{}`: {error}", files.source.display()))
-    })?;
+    write_file(&files.source, src.as_bytes())?;
     if let Some(prelude) = &files.prelude {
-        std::fs::write(prelude, RAYDESC_MSL_DEFINITION).map_err(|error| {
-            RhiError::ShaderCompilation(format!("write `{}`: {error}", prelude.display()))
-        })?;
+        write_file(prelude, RAYDESC_MSL_DEFINITION.as_bytes())?;
     }
 
     let mut cmd = Command::new("slangc");
@@ -472,6 +636,9 @@ fn invoke_slangc(
         stage_str(stage),
     ]);
     cmd.arg(format!("-O{SLANG_OPTIMIZATION_LEVEL}"));
+    if let Some(reflection) = &files.reflection {
+        cmd.arg("-reflection-json").arg(reflection);
+    }
     if target == "spirv" {
         // Keep the entry-point name in `OpEntryPoint` so it matches the RHI.
         cmd.arg("-fvk-use-entrypoint-name");
@@ -498,33 +665,59 @@ fn invoke_slangc(
                 "or compile shaders offline and pass the bytes to ",
                 "`Device::create_shader_module`",
             )
-            .to_string(),
-            _ => format!("run slangc: {error}"),
+            .into(),
+            // The io::Error is kept as the source so a caller can tell a permissions failure
+            // from a missing binary without reading the message.
+            _ => crate::error::ErrorDetail::with_source("run slangc", error),
         })
     })?;
 
     if !output.status.success() {
-        return Err(RhiError::ShaderCompilation(format!(
-            "slangc failed compiling `{entry}` for {target}:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
+        return Err(RhiError::ShaderCompilation(
+            format!(
+                "slangc failed compiling `{entry}` for {target}:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into(),
+        ));
     }
 
-    std::fs::read(&files.output).map_err(|error| {
-        RhiError::ShaderCompilation(format!("read `{}`: {error}", files.output.display()))
+    let code = std::fs::read(&files.output).map_err(|error| {
+        RhiError::ShaderCompilation(format!("read `{}`: {error}", files.output.display()).into())
+    })?;
+
+    // Best effort: Vulkan reads `[numthreads]` out of the SPIR-V itself, so a slangc that
+    // stopped emitting this should degrade to "unknown" rather than fail every compute compile.
+    // Metal cannot, which is why `compile_metal_compute` does treat it as required.
+    let threads_per_threadgroup = files.reflection.as_ref().and_then(|path| {
+        let reflection = std::fs::read_to_string(path).ok()?;
+        let size = thread_group_size(&reflection);
+        if size.is_none() {
+            log::warn!(
+                "slangc reflection for `{entry}` carries no threadGroupSize; \
+                 ComputePsoDesc::threads_per_threadgroup must be set explicitly"
+            );
+        }
+        size
+    });
+
+    Ok(Compiled {
+        code,
+        threads_per_threadgroup,
     })
 }
 
 fn make_module(
     device: &Device,
-    code: &[u8],
+    compiled: &Compiled,
     entry: &str,
     stage: ShaderStage,
 ) -> RhiResult<ShaderModule> {
     device.create_shader_module(&ShaderModuleDesc {
-        code,
+        code: &compiled.code,
         entry_point: entry,
         stage,
+        threads_per_threadgroup: compiled.threads_per_threadgroup,
         label: Some(entry),
     })
 }
@@ -543,5 +736,37 @@ fn stage_str(stage: ShaderStage) -> &'static str {
         ShaderStage::Vertex => "vertex",
         ShaderStage::Pixel => "fragment",
         ShaderStage::Mesh => "mesh",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The key names a file that outlives the process, so it is an on-disk format.
+    #[test]
+    fn the_cache_key_format_is_stable() {
+        let mut h = CacheHasher::new();
+        assert_eq!(h.finish(), CacheHasher::OFFSET_BASIS);
+        // Cross-checked against an independent FNV-1a-128, so this pins the algorithm.
+        h.write(b"kiln");
+        assert_eq!(h.finish(), 0x6946_4f9f_0f75_7277_b806_e969_f75b_2213);
+
+        // Fields are length-prefixed; without that these two keys collide and the wrong
+        // shader loads from cache.
+        let mut a = CacheHasher::new();
+        a.field(b"ab").field(b"c");
+        let mut b = CacheHasher::new();
+        b.field(b"a").field(b"bc");
+        assert_ne!(a.finish(), b.finish());
+    }
+
+    #[test]
+    fn a_threadgroup_sidecar_round_trips() {
+        assert_eq!(parse_threadgroup_sidecar("64 2 1"), Some([64, 2, 1]));
+        assert_eq!(parse_threadgroup_sidecar("64 2"), None);
+        assert_eq!(parse_threadgroup_sidecar("64 2 0"), None);
+        assert_eq!(parse_threadgroup_sidecar("64 2 1 8"), None);
+        assert_eq!(parse_threadgroup_sidecar(""), None);
     }
 }

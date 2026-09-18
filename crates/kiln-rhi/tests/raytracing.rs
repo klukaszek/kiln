@@ -4,7 +4,7 @@ mod common;
 
 use kiln_rhi::gpu_struct;
 use kiln_rhi::{
-    BlasDesc, BlasMeshDesc, BuildAccelFlags, ComputePsoDesc, GeometryFlags, GeometryType, GpuPtr,
+    BlasDesc, BlasGeometry, BlasMeshDesc, BuildAccelFlags, ComputePsoDesc, GeometryFlags,
     MemoryType, ShaderStage, StageFlags, TlasDesc, TlasInstance,
 };
 
@@ -36,13 +36,37 @@ void rqMain(uint3 tid : SV_DispatchThreadID, uniform Root* data)
 }
 "#;
 
-#[test]
-fn ray_query_triangle_hit() {
-    let (device, _gpu) = common::device();
+/// The one-triangle scene both tests trace against: a BLAS, a single-instance TLAS, the buffers
+/// backing them, and the ray-query pipeline. Built once per test rather than inline, so the
+/// destroy-ordering test can reuse it without repeating 60 lines of setup.
+struct Scene {
+    blas: kiln_rhi::AccelerationStructure,
+    tlas: kiln_rhi::AccelerationStructure,
+    vbuf: kiln_rhi::Allocation,
+    instbuf: kiln_rhi::Allocation,
+    pso: kiln_rhi::ComputePso,
+}
 
+impl Scene {
+    /// Release everything except the acceleration structures, which each test disposes of itself.
+    fn destroy_buffers(
+        self,
+        device: &kiln_rhi::Device,
+    ) -> (
+        kiln_rhi::AccelerationStructure,
+        kiln_rhi::AccelerationStructure,
+    ) {
+        device.destroy(self.vbuf);
+        device.destroy(self.instbuf);
+        drop(self.pso);
+        (self.blas, self.tlas)
+    }
+}
+
+fn build_scene(device: &kiln_rhi::Device) -> Scene {
     let src = format!("{}{}", Root::SLANG, RQ_BODY);
     let module = kiln_rhi::compiler::compile(
-        &device,
+        device,
         &src,
         "rqMain",
         ShaderStage::Compute,
@@ -53,8 +77,8 @@ fn ray_query_triangle_hit() {
     let pso = device
         .create_compute_pso(
             &ComputePsoDesc {
-                threads_per_threadgroup: [1, 1, 1],
-                label: Some("ray-query".into()),
+                label: Some("ray-query"),
+                ..Default::default()
             },
             &module,
         )
@@ -68,16 +92,14 @@ fn ray_query_triangle_hit() {
     vbuf.upload(&verts).expect("upload vertices");
 
     let blas_desc = BlasDesc {
-        meshes: vec![BlasMeshDesc {
-            geometry_type: GeometryType::Triangles,
+        meshes: &[BlasMeshDesc {
             flags: GeometryFlags::OPAQUE,
-            vertex_buffer: vbuf.gpu().cast(),
-            vertex_stride: 12,
-            vertex_count: 3,
-            index_buffer: GpuPtr::NULL,
-            index_count: 0,
-            aabb_buffer: GpuPtr::NULL,
-            aabb_count: 0,
+            geometry: BlasGeometry::Triangles {
+                vertices: vbuf.gpu().cast(),
+                stride: 12,
+                count: 3,
+                indices: None,
+            },
         }],
         flags: BuildAccelFlags::PREFER_FAST_TRACE,
     };
@@ -86,7 +108,7 @@ fn ray_query_triangle_hit() {
     common::timed("build BLAS · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
         cmd.build_blas(&blas, &blas_desc);
-        cmd.end();
+        cmd.end().expect("end command buffer");
         let q = device.queue();
         q.submit(cmd).expect("submit");
         q.wait_idle();
@@ -121,41 +143,98 @@ fn ray_query_triangle_hit() {
     common::timed("build TLAS · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
         cmd.build_tlas(&tlas, &tlas_desc);
-        cmd.end();
+        cmd.end().expect("end command buffer");
         let q = device.queue();
         q.submit(cmd).expect("submit");
         q.wait_idle();
     });
 
+    Scene {
+        blas,
+        tlas,
+        vbuf,
+        instbuf,
+        pso,
+    }
+}
+
+/// Record one ray-query dispatch against `scene`, returning the root and output allocations so
+/// the caller controls when they are released relative to the submit.
+fn dispatch_ray_query(
+    device: &kiln_rhi::Device,
+    scene: &Scene,
+) -> (kiln_rhi::Allocation, kiln_rhi::Allocation) {
     let output = device.allocate(4, MemoryType::Readback).expect("output");
     let mut root = device
         .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Upload)
         .expect("root");
     root.upload(&Root {
         output: output.gpu().cast(),
-        tlas: tlas.gpu(),
+        tlas: scene.tlas.gpu(),
     })
     .expect("upload root");
 
-    common::timed("ray query dispatch · submit+wait", || {
-        let mut cmd = device.create_command_buffer().expect("cmd");
-        cmd.set_pipeline(&pso);
-        cmd.dispatch(root.gpu(), 1, 1, 1);
-        cmd.barrier(StageFlags::COMPUTE, StageFlags::ALL_COMMANDS);
-        cmd.end();
-        let q = device.queue();
-        q.submit(cmd).expect("submit");
-        q.wait_idle();
+    let mut cmd = device.create_command_buffer().expect("cmd");
+    cmd.set_pipeline(&scene.pso);
+    cmd.dispatch(root.gpu(), 1, 1, 1);
+    cmd.barrier(StageFlags::COMPUTE, StageFlags::ALL_COMMANDS);
+    cmd.end().expect("end command buffer");
+    device.queue().submit(cmd).expect("submit");
+    (output, root)
+}
+
+#[test]
+fn ray_query_triangle_hit() {
+    let (device, _gpu) = common::device();
+    let scene = build_scene(&device);
+
+    let (output, root) = common::timed("ray query dispatch · submit+wait", || {
+        let handles = dispatch_ray_query(&device, &scene);
+        device.queue().wait_idle();
+        handles
     });
 
     let hit = output.read::<u32>().expect("read hit result");
     assert_eq!(hit, 1, "ray query should report a triangle hit");
 
-    // Resources borrowed while recording must remain alive until the submitted work retires.
-    drop(tlas);
-    drop(blas);
-    device.destroy(vbuf);
-    device.destroy(instbuf);
+    // An acceleration structure is a `DeviceResource`: `destroy` hands it to the retirement
+    // queue, which holds it until the submissions tracing against it have retired.
+    let (blas, tlas) = scene.destroy_buffers(&device);
+    device.destroy(tlas);
+    device.destroy(blas);
+    device.destroy(output);
+    device.destroy(root);
+}
+
+/// Destroying a TLAS with a ray-query dispatch still in flight must not pull the structure out
+/// from under the GPU. An acceleration structure is a `DeviceResource`, so its release is
+/// deferred to the submission fence exactly like an `Allocation`'s.
+#[test]
+fn destroying_an_acceleration_structure_in_flight_defers_its_release() {
+    let (device, _gpu) = common::device();
+    let scene = build_scene(&device);
+
+    let (output, root) = dispatch_ray_query(&device, &scene);
+
+    // No fence of any kind between the submit and the destroy.
+    let (blas, tlas) = scene.destroy_buffers(&device);
+    device.destroy(tlas);
+    device.destroy(blas);
+
+    // Churn the pool so a prematurely released range would be handed straight back out.
+    let squatter = device
+        .allocate(1 << 20, MemoryType::Upload)
+        .expect("squatter");
+
+    device.queue().wait_idle();
+
+    let hit = output.read::<u32>().expect("read hit result");
+    assert_eq!(
+        hit, 1,
+        "the ray query must still see the TLAS it was recorded against"
+    );
+
+    device.destroy(squatter);
     device.destroy(output);
     device.destroy(root);
 }

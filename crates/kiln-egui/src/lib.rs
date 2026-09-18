@@ -23,8 +23,8 @@ use std::collections::HashMap;
 use std::mem::size_of;
 
 use kiln_rhi::{
-    AddressMode, Allocation, AllocationDesc, BlendAttachment, BlendFactor, BlendOp, BlendState,
-    ColorTarget, CommandBuffer, Cull, Device, FilterMode, Format, GraphicsPso, GraphicsPsoDesc,
+    AddressMode, Allocation, AllocationDesc, BlendAttachment, BlendFactor, BlendOp, ColorTarget,
+    CommandBuffer, Cull, Device, FilterMode, Format, GraphicsPso, GraphicsPsoDesc,
     MAX_FRAMES_IN_FLIGHT, MemoryType, RhiError, RhiResult, SampleCount, Sampler, SamplerDesc,
     SamplerHandle, ShaderStage, StageFlags, Texture, TextureDesc, TextureDimension, TextureHandle,
     TextureUsage, Topology, gpu_struct,
@@ -155,29 +155,27 @@ impl EguiRenderer {
 
         // Premultiplied-alpha blending: out = src + dst*(1-src.a); alpha accumulates so the
         // result composites correctly even when rendering egui into an offscreen target.
-        let blend = BlendState {
-            attachments: vec![BlendAttachment {
-                blend_enable: true,
-                src_color: BlendFactor::One,
-                dst_color: BlendFactor::OneMinusSrcAlpha,
-                color_op: BlendOp::Add,
-                src_alpha: BlendFactor::OneMinusDstAlpha,
-                dst_alpha: BlendFactor::One,
-                alpha_op: BlendOp::Add,
-            }],
-        };
+        let blend = [BlendAttachment {
+            blend_enable: true,
+            src_color: BlendFactor::One,
+            dst_color: BlendFactor::OneMinusSrcAlpha,
+            color_op: BlendOp::Add,
+            src_alpha: BlendFactor::OneMinusDstAlpha,
+            dst_alpha: BlendFactor::One,
+            alpha_op: BlendOp::Add,
+        }];
 
         let pso = device.create_graphics_pso(
             &GraphicsPsoDesc {
                 topology: Topology::TriangleList,
-                color_targets: vec![ColorTarget::new(color_format)],
+                color_targets: &[ColorTarget::new(color_format)],
                 depth_format: None,
                 sample_count: SampleCount::S1,
                 // Two root pointers (vertex + pixel share one EguiRoot): 2 * 8 bytes.
                 // egui is not consistent about winding; never cull.
                 cull: Cull::None,
-                blendstate: Some(blend),
-                label: Some("egui".into()),
+                blend: &blend,
+                label: Some("egui"),
                 ..Default::default()
             },
             &vs,
@@ -192,7 +190,7 @@ impl EguiRenderer {
             address_u: AddressMode::ClampToEdge,
             address_v: AddressMode::ClampToEdge,
             address_w: AddressMode::ClampToEdge,
-            label: Some("egui-sampler".into()),
+            label: Some("egui-sampler"),
             ..Default::default()
         })?;
         let sampler_handle = sampler.gpu();
@@ -345,7 +343,14 @@ impl EguiRenderer {
             })?;
 
             cmd.set_scissor(sx, sy, sw, sh);
-            cmd.draw_indexed(slot.gpu(), indices.gpu(), mesh.indices.len() as u32, 1);
+            cmd.draw_indexed(
+                slot.gpu(),
+                indices.gpu(),
+                mesh.indices.len() as u32,
+                1,
+                0,
+                0,
+            );
 
             v_off += mesh.vertices.len() as u64;
             i_off += mesh.indices.len() as u64;
@@ -432,7 +437,12 @@ fn mapped<T>(buf: &mut Allocation) -> kiln_rhi::Mapped<'_, T> {
 
 /// Ensure `buf` exists and holds at least `need` bytes, reallocating (and freeing the old) on
 /// growth. Grows in powers of two to amortize reallocation as egui's geometry fluctuates.
-fn grow(device: &Device, buf: &mut Option<Allocation>, need: u64, label: &str) -> RhiResult<()> {
+fn grow(
+    device: &Device,
+    buf: &mut Option<Allocation>,
+    need: u64,
+    label: &'static str,
+) -> RhiResult<()> {
     let have = buf.as_ref().map_or(0, |b| b.size());
     if have >= need {
         return Ok(());
@@ -444,7 +454,7 @@ fn grow(device: &Device, buf: &mut Option<Allocation>, need: u64, label: &str) -
     *buf = Some(device.create_allocation(&AllocationDesc {
         size,
         memory: MemoryType::Upload,
-        label: Some(label.into()),
+        label: Some(label),
         ..Default::default()
     })?);
     Ok(())
@@ -496,7 +506,7 @@ fn create_texture(
         dimension: TextureDimension::D2,
         sample_count: SampleCount::S1,
         usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
-        label: Some("egui-texture".into()),
+        label: Some("egui-texture"),
     };
     let sa = device.texture_size_align(&desc)?;
     let mem = device.allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)?;
@@ -519,7 +529,7 @@ fn upload_full(device: &Device, m: &ManagedTexture) -> RhiResult<()> {
     let mut cmd = device.create_command_buffer()?;
     cmd.copy_buffer_to_texture(staging.gpu(), &m.texture, None);
     cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
-    cmd.end();
+    cmd.end()?;
     device.queue().submit(cmd)?;
     device.destroy(staging);
     Ok(())

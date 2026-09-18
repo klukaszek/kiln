@@ -10,12 +10,10 @@ pub struct QueryPool {
     pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
-pub(crate) enum QueryPoolInner {
-    #[cfg(feature = "vulkan")]
-    Vulkan(crate::backend::vulkan::query::VulkanQueryPool),
-    #[cfg(feature = "metal")]
-    Metal(crate::backend::metal::query::MetalQueryPool),
-}
+backend_enum!(QueryPoolInner {
+    vulkan: crate::backend::vulkan::query::VulkanQueryPool,
+    metal: crate::backend::metal::query::MetalQueryPool
+});
 
 impl QueryPool {
     pub fn count(&self) -> u32 {

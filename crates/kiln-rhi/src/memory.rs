@@ -15,10 +15,13 @@ fn mapped_write(ptr: Option<*mut u8>, capacity: u64, bytes: &[u8]) -> RhiResult<
         RhiError::AllocationFailed("upload size does not fit in a GPU allocation".into())
     })?;
     if byte_count > capacity {
-        return Err(RhiError::AllocationFailed(format!(
-            "upload of {} bytes exceeds mapped region ({capacity} bytes)",
-            bytes.len()
-        )));
+        return Err(RhiError::AllocationFailed(
+            format!(
+                "upload of {} bytes exceeds mapped region ({capacity} bytes)",
+                bytes.len()
+            )
+            .into(),
+        ));
     }
     let dst =
         ptr.ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
@@ -33,18 +36,16 @@ fn mapped_read<T: GpuPod>(ptr: Option<*mut u8>, capacity: u64) -> RhiResult<T> {
     let src =
         ptr.ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
     if n as u64 > capacity {
-        return Err(RhiError::AllocationFailed(format!(
-            "read of {n} bytes exceeds mapped region ({capacity} bytes)"
-        )));
+        return Err(RhiError::AllocationFailed(
+            format!("read of {n} bytes exceeds mapped region ({capacity} bytes)").into(),
+        ));
     }
     // SAFETY: `src` is valid for `capacity` >= `n` bytes; `T: FromBytes`.
-    let bytes = unsafe { std::slice::from_raw_parts(src as *const u8, n) };
+    let bytes = unsafe { std::slice::from_raw_parts(src.cast_const(), n) };
     T::read_from_bytes(bytes).map_err(|_| RhiError::AllocationFailed("read size mismatch".into()))
 }
 
-/// Where an allocation lives. No default: `Upload` for memory the GPU reads hot is a silent
-/// bandwidth cost, not an error. (D3D12's `DEFAULT` is this `GpuOnly`.)
-/// Reinterpret `bytes` mapped bytes at `ptr` as `[T]`.
+/// Reinterpret the `bytes` mapped bytes at `ptr` as `[T]`.
 ///
 /// # Safety
 /// `ptr` must be valid for `bytes` over `'a`, and nothing may write those bytes while the
@@ -71,6 +72,8 @@ unsafe fn slice_from_raw_mut<'a, T: GpuPod>(ptr: *mut u8, bytes: u64) -> RhiResu
         .map_err(|_| RhiError::AllocationFailed("size is not a multiple of element size".into()))
 }
 
+/// Where an allocation lives. No default: `Upload` for memory the GPU reads hot is a silent
+/// bandwidth cost, not an error. (D3D12's `DEFAULT` is this `GpuOnly`.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryType {
     /// Host-visible, coherent. Uniforms, staging, draw args, descriptors.
@@ -83,15 +86,17 @@ pub enum MemoryType {
 
 /// Description for creating a GPU allocation.
 #[derive(Clone, Debug)]
-pub struct AllocationDesc {
+pub struct AllocationDesc<'a> {
     pub size: u64,
     /// Power of two. The RHI pads the backing allocation so `gpu()` comes back aligned.
     pub align: u64,
     pub memory: MemoryType,
-    pub label: Option<String>,
+    pub label: Option<&'a str>,
 }
 
-impl Default for AllocationDesc {
+impl Default for AllocationDesc<'_> {
+    /// `size` is 0, which no allocation wants: this exists so `..Default::default()` can fill in
+    /// `align` and `label`, not as a usable descriptor on its own.
     fn default() -> Self {
         Self {
             size: 0,
@@ -111,35 +116,29 @@ pub const DEFAULT_ALIGN: u64 = 16;
 pub struct Allocation {
     pub(crate) inner: AllocationInner,
     pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
-    pub(crate) offset: u64,
     pub(crate) size: u64,
 }
 
-pub(crate) enum AllocationInner {
-    #[cfg(feature = "vulkan")]
-    Vulkan(crate::backend::vulkan::memory::VulkanBuffer),
-    #[cfg(feature = "metal")]
-    Metal(crate::backend::metal::memory::MetalBuffer),
-}
+backend_enum!(AllocationInner {
+    vulkan: crate::backend::vulkan::memory::VulkanBuffer,
+    metal: crate::backend::metal::memory::MetalBuffer
+});
 
 impl Allocation {
-    fn base_cpu(&self) -> Option<*mut u8> {
-        backend_dispatch!(&self.inner, AllocationInner, allocation => allocation.mapped_ptr())
-    }
-
-    fn base_gpu(&self) -> GpuPtr<u8> {
-        backend_dispatch!(&self.inner, AllocationInner, allocation => allocation.gpu_address())
-    }
-
     fn cpu(&self) -> Option<*mut u8> {
-        self.base_cpu()
-            .zip(usize::try_from(self.offset).ok())
-            .map(|(ptr, offset)| unsafe { ptr.add(offset) })
+        {
+            let allocation = &self.inner;
+            allocation.mapped_ptr()
+        }
     }
 
-    /// GPU virtual address; present even for `GpuOnly`.
+    /// GPU virtual address; present even for `GpuOnly`. Aligned to the `align` the allocation was
+    /// created with — the backend's suballocator carves the range that way.
     pub fn gpu(&self) -> GpuPtr<u8> {
-        self.base_gpu().byte_add(self.offset)
+        {
+            let allocation = &self.inner;
+            allocation.gpu_address()
+        }
     }
 
     /// Typed handle to the mapped bytes, or `None` for `GpuOnly`. The mutable borrow excludes
@@ -193,8 +192,11 @@ impl Allocation {
 /// One mapped region, holding the CPU and GPU addresses for the same bytes. [`offset`](Self::offset)
 /// advances both, so the two sides cannot drift apart and the stride comes from `T`.
 ///
-/// The borrow pins a [`BumpAllocator`] against [`reset`](BumpAllocator::reset) while the handle
-/// lives, making arena recycling under a live handle a compile error.
+/// The borrow pins a [`BumpAllocator`] against [`reset`](BumpAllocator::reset), so recycling the
+/// arena under a live handle is a compile error.
+///
+/// `Copy`, so callers can offset repeatedly from one base. Reads and writes go through the
+/// bounds-checked methods; borrow the whole [`Allocation`] for slice access.
 pub struct Mapped<'a, T> {
     cpu: *mut u8,
     gpu: GpuPtr<T>,
@@ -206,18 +208,18 @@ pub struct Mapped<'a, T> {
 impl<'a, T> Mapped<'a, T> {
     /// GPU address of this position.
     #[inline]
-    pub fn gpu(self) -> GpuPtr<T> {
+    pub fn gpu(&self) -> GpuPtr<T> {
         self.gpu
     }
 
     /// CPU address, for writes this type cannot express.
     #[inline]
-    pub fn cpu(self) -> *mut u8 {
+    pub fn cpu(&self) -> *mut u8 {
         self.cpu
     }
 
     #[inline]
-    pub fn byte_len(self) -> u64 {
+    pub fn byte_len(&self) -> u64 {
         self.bytes
     }
 
@@ -255,45 +257,27 @@ impl<T> Mapped<'_, T> {
     }
 }
 
-impl<'a, T: GpuPod> Mapped<'a, T> {
-    /// Bounds-checked. The caller orders the write before the submit that reads it.
-    pub fn write(self, value: &T) -> RhiResult<()> {
-        mapped_write(Some(self.cpu), self.bytes, value.as_bytes())
-    }
-
-    pub fn write_slice(self, values: &[T]) -> RhiResult<()> {
-        mapped_write(Some(self.cpu), self.bytes, values.as_bytes())
-    }
-
-    /// Read back, e.g. from `Readback` memory after a GPU write.
-    pub fn read(self) -> RhiResult<T> {
-        mapped_read(Some(self.cpu), self.bytes)
-    }
-
-    /// Borrow the mapped bytes as a slice.
-    ///
-    /// # Safety
-    /// No mapped handle, raw pointer, or GPU command may write these bytes while the slice
-    /// is live. In particular, copies of this handle must not call `write` or `write_slice`.
-    pub unsafe fn as_slice(self) -> RhiResult<&'a [T]> {
-        unsafe { slice_from_raw(self.cpu, self.bytes) }
-    }
-
-    /// Borrow the mapped bytes as a mutable slice.
-    ///
-    /// # Safety
-    /// The slice must have exclusive access to these bytes for its lifetime, including all
-    /// copies or overlapping offsets of this handle and GPU accesses.
-    pub unsafe fn as_mut_slice(&mut self) -> RhiResult<&mut [T]> {
-        unsafe { slice_from_raw_mut(self.cpu, self.bytes) }
-    }
-}
-
 impl<T> Copy for Mapped<'_, T> {}
 
 impl<T> Clone for Mapped<'_, T> {
     fn clone(&self) -> Self {
         *self
+    }
+}
+
+impl<T: GpuPod> Mapped<'_, T> {
+    /// Bounds-checked. The caller orders the write before the submit that reads it.
+    pub fn write(&self, value: &T) -> RhiResult<()> {
+        mapped_write(Some(self.cpu), self.bytes, value.as_bytes())
+    }
+
+    pub fn write_slice(&self, values: &[T]) -> RhiResult<()> {
+        mapped_write(Some(self.cpu), self.bytes, values.as_bytes())
+    }
+
+    /// Read back, e.g. from `Readback` memory after a GPU write.
+    pub fn read(&self) -> RhiResult<T> {
+        mapped_read(Some(self.cpu), self.bytes)
     }
 }
 

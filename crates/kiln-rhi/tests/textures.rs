@@ -4,17 +4,17 @@ mod common;
 
 use kiln_rhi::gpu_struct;
 use kiln_rhi::{
-    ALL_LAYERS, ALL_MIPS, AddressMode, ColorAttachment, ColorTarget, Cull, FilterMode, Format,
-    GraphicsPsoDesc, HazardFlags, LoadOp, MemoryType, RenderPassDesc, SampleCount, SamplerDesc,
-    SamplerHandle, ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension, TextureHandle,
-    TextureRegion, TextureUsage, TextureViewDesc, Topology, ViewKind,
+    AddressMode, ColorAttachment, ColorTarget, Cull, FilterMode, Format, GraphicsPsoDesc,
+    HazardFlags, LoadOp, MemoryType, RenderPassDesc, SampleCount, SamplerDesc, SamplerHandle,
+    ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension, TextureHandle, TextureRegion,
+    TextureUsage, TextureViewDesc, Topology, ViewKind,
 };
 
 const W: u32 = 64;
 const H: u32 = 64;
 const BPP: usize = 4; // R8G8B8A8
 
-fn test_texture_desc() -> TextureDesc {
+fn test_texture_desc() -> TextureDesc<'static> {
     TextureDesc {
         width: W,
         height: H,
@@ -28,7 +28,7 @@ fn test_texture_desc() -> TextureDesc {
             | TextureUsage::STORAGE
             | TextureUsage::TRANSFER_SRC
             | TextureUsage::TRANSFER_DST,
-        label: Some("rhi-test-tex".into()),
+        label: Some("rhi-test-tex"),
     }
 }
 
@@ -58,18 +58,18 @@ fn texture_create_and_views() {
     let view = TextureViewDesc {
         format: None,
         base_mip: 0,
-        mip_count: ALL_MIPS,
+        mip_count: None,
         base_layer: 0,
-        layer_count: ALL_LAYERS,
+        layer_count: None,
     };
     let sampled = common::timed("Texture::view (sampled)", || {
-        texture
-            .view(ViewKind::Sampled, &view)
+        device
+            .create_texture_view(&mut texture, ViewKind::Sampled, &view)
             .expect("sampled view")
     });
     let storage = common::timed("Texture::view (storage)", || {
-        texture
-            .view(ViewKind::Storage, &view)
+        device
+            .create_texture_view(&mut texture, ViewKind::Storage, &view)
             .expect("storage view")
     });
     assert!(!sampled.is_null());
@@ -115,7 +115,7 @@ fn texture_copy_roundtrip() {
         cmd.barrier(StageFlags::TRANSFER, StageFlags::TRANSFER);
         cmd.copy_texture_to_buffer(&texture, dst.gpu(), None);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
-        cmd.end();
+        cmd.end().expect("end command buffer");
         let queue = device.queue();
         queue.submit(cmd).expect("submit");
         queue.wait_idle();
@@ -200,11 +200,11 @@ fn srgb_texture_view_reinterprets_the_same_texels() {
         .create_graphics_pso(
             &GraphicsPsoDesc {
                 topology: Topology::TriangleList,
-                color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
+                color_targets: &[ColorTarget::new(Format::R8G8B8A8Unorm)],
                 depth_format: None,
                 sample_count: SampleCount::S1,
                 cull: Cull::None,
-                label: Some("srgb-view".into()),
+                label: Some("srgb-view"),
                 ..Default::default()
             },
             &vs,
@@ -222,7 +222,7 @@ fn srgb_texture_view_reinterprets_the_same_texels() {
         dimension: TextureDimension::D2,
         sample_count: SampleCount::S1,
         usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST | TextureUsage::FORMAT_VIEW,
-        label: Some("srgb-view-src".into()),
+        label: Some("srgb-view-src"),
     };
     let tex_sa = device.texture_size_align(&tex_desc).expect("size_align");
     let tex_mem = device
@@ -233,8 +233,9 @@ fn srgb_texture_view_reinterprets_the_same_texels() {
         .expect("create_texture");
 
     let srgb_handle = common::timed("sampled_view (format reinterpret)", || {
-        texture
-            .view(
+        device
+            .create_texture_view(
+                &mut texture,
                 ViewKind::Sampled,
                 &TextureViewDesc {
                     format: Some(Format::R8G8B8A8Srgb),
@@ -279,7 +280,7 @@ fn srgb_texture_view_reinterprets_the_same_texels() {
         dimension: TextureDimension::D2,
         sample_count: SampleCount::S1,
         usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        label: Some("srgb-view-rt".into()),
+        label: Some("srgb-view-rt"),
     };
     let rt_sa = device.texture_size_align(&rt_desc).expect("rt size_align");
     let rt_mem = device
@@ -317,7 +318,7 @@ fn srgb_texture_view_reinterprets_the_same_texels() {
         cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
         cmd.copy_texture_to_buffer(&rt, readback.gpu(), None);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
-        cmd.end();
+        cmd.end().expect("end command buffer");
         let queue = device.queue();
         queue.submit(cmd).expect("submit");
         queue.wait_idle();
@@ -427,7 +428,7 @@ fn texture_subresource_copy_roundtrip() {
             let mut cmd = device.create_command_buffer().expect("cmd");
             cmd.copy_buffer_to_texture(src.gpu(), &texture, region);
             cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
-            cmd.end();
+            cmd.end().expect("end command buffer");
             device.queue().submit(cmd).expect("submit");
             device.queue().wait_idle();
         }
@@ -448,7 +449,7 @@ fn texture_subresource_copy_roundtrip() {
             let mut cmd = device.create_command_buffer().expect("cmd");
             cmd.copy_texture_to_buffer(&texture, dst.gpu(), region);
             cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
-            cmd.end();
+            cmd.end().expect("end command buffer");
             device.queue().submit(cmd).expect("submit");
             device.queue().wait_idle();
 

@@ -63,11 +63,11 @@ fn bindless_texture_sample() {
         .create_graphics_pso(
             &GraphicsPsoDesc {
                 topology: Topology::TriangleList,
-                color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
+                color_targets: &[ColorTarget::new(Format::R8G8B8A8Unorm)],
                 depth_format: None,
                 sample_count: SampleCount::S1,
                 cull: Cull::None,
-                label: Some("bindless-tex".into()),
+                label: Some("bindless-tex"),
                 ..Default::default()
             },
             &vs,
@@ -85,7 +85,7 @@ fn bindless_texture_sample() {
         dimension: TextureDimension::D2,
         sample_count: SampleCount::S1,
         usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
-        label: Some("bindless-src-tex".into()),
+        label: Some("bindless-src-tex"),
     };
     let tex_sa = device
         .texture_size_align(&tex_desc)
@@ -109,7 +109,7 @@ fn bindless_texture_sample() {
             address_u: AddressMode::ClampToEdge,
             address_v: AddressMode::ClampToEdge,
             address_w: AddressMode::ClampToEdge,
-            label: Some("bindless-sampler".into()),
+            label: Some("bindless-sampler"),
             ..Default::default()
         })
         .expect("create_sampler");
@@ -133,7 +133,7 @@ fn bindless_texture_sample() {
         dimension: TextureDimension::D2,
         sample_count: SampleCount::S1,
         usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        label: Some("bindless-rt".into()),
+        label: Some("bindless-rt"),
     };
     let rt_sa = device.texture_size_align(&rt_desc).expect("rt size_align");
     let rt_mem = device
@@ -176,7 +176,7 @@ fn bindless_texture_sample() {
         cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
         cmd.copy_texture_to_buffer(&rt, readback.gpu(), None);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
-        cmd.end();
+        cmd.end().expect("end command buffer");
         let queue = device.queue();
         queue.submit(cmd).expect("submit");
         queue.wait_idle();

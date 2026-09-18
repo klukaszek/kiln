@@ -33,9 +33,10 @@ fn compute_barrier_across_pipeline_switches() {
     let module =
         kiln_rhi::compiler::compile(&device, &src, "computeMain", ShaderStage::Compute, &[])
             .expect("compile module");
+    // No `threads_per_threadgroup`: it comes from the shader's `[numthreads]` via reflection.
     let desc = ComputePsoDesc {
-        threads_per_threadgroup: [64, 1, 1],
-        label: Some("pipeline-switch dependency".into()),
+        label: Some("pipeline-switch dependency"),
+        ..Default::default()
     };
     let pipelines = [
         device
@@ -106,8 +107,8 @@ fn compute_doubles_buffer() {
         device
             .create_compute_pso(
                 &ComputePsoDesc {
-                    threads_per_threadgroup: [64, 1, 1],
-                    label: Some("double".into()),
+                    label: Some("double"),
+                    ..Default::default()
                 },
                 &module,
             )
@@ -161,4 +162,48 @@ fn compute_doubles_buffer() {
     device.destroy(input);
     device.destroy(output);
     device.destroy(data);
+}
+
+/// The shader's `[numthreads]` and an explicit `ComputePsoDesc` size must agree. They used to
+/// diverge silently: Metal dispatched the descriptor's shape, Vulkan the shader's.
+#[test]
+fn a_threadgroup_size_disagreeing_with_the_shader_is_rejected() {
+    let (device, _gpu) = common::device();
+    let src = format!("{}{}", Data::SLANG, COMPUTE_BODY);
+    let module =
+        kiln_rhi::compiler::compile(&device, &src, "computeMain", ShaderStage::Compute, &[])
+            .expect("compile module");
+
+    assert_eq!(
+        module.threads_per_threadgroup(),
+        Some([64, 1, 1]),
+        "reflection should carry the shader's declared [numthreads]"
+    );
+
+    let mismatched = device.create_compute_pso(
+        &ComputePsoDesc {
+            threads_per_threadgroup: Some([32, 1, 1]),
+            label: Some("mismatched"),
+        },
+        &module,
+    );
+    let Err(err) = mismatched else {
+        panic!("a size that disagrees with the shader must not build");
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("32") && message.contains("64"),
+        "the error should name both sizes, got: {message}"
+    );
+
+    // The same size stated explicitly is fine.
+    device
+        .create_compute_pso(
+            &ComputePsoDesc {
+                threads_per_threadgroup: Some([64, 1, 1]),
+                label: Some("matching"),
+            },
+            &module,
+        )
+        .expect("an explicit size matching the shader should build");
 }

@@ -14,9 +14,7 @@ pub struct Surface {
     pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
-pub(crate) enum SurfaceInner {
-    #[cfg(feature = "vulkan")]
-    Vulkan(crate::backend::vulkan::surface::VulkanSurface),
-    #[cfg(feature = "metal")]
-    Metal(crate::backend::metal::surface::MetalSurface),
-}
+backend_enum!(SurfaceInner {
+    vulkan: crate::backend::vulkan::surface::VulkanSurface,
+    metal: crate::backend::metal::surface::MetalSurface
+});

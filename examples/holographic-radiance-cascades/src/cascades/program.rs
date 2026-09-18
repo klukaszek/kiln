@@ -6,9 +6,11 @@
 //! strings rather than a file with `#include`s.
 
 use glam::{IVec2, Vec4};
+
+use crate::scene::Kind;
 use kiln_rhi::{
-    compiler, gpu_struct, BlendState, ColorTarget, ComputePso, ComputePsoDesc, Cull, Device,
-    Format, GraphicsPso, GraphicsPsoDesc, RhiResult, SampleCount, ShaderStage, Topology,
+    ColorTarget, ComputePso, ComputePsoDesc, Cull, Device, Format, GraphicsPso, GraphicsPsoDesc,
+    RhiResult, SampleCount, ShaderStage, Topology, compiler, gpu_struct,
 };
 
 /// Threadgroup width for the passes that walk a cascade level, flattened over (direction, column).
@@ -162,16 +164,19 @@ gpu_struct! {
 /// Every scalar the shaders share with the host.
 fn constants() -> String {
     format!(
-        "static const int KIND_CIRCLE = 0;\n\
-         static const int KIND_BOX = 1;\n\
-         static const int KIND_SEGMENT = 2;\n\
+        "static const int KIND_CIRCLE = {circle};\n\
+         static const int KIND_BOX = {box_};\n\
+         static const int KIND_SEGMENT = {segment};\n\
          static const float PI = 3.14159265359;\n\
          static const float TWO_PI = 6.28318530718;\n\
          static const int EDGES_PER_PRIM = {EDGES_PER_PRIM};\n\
          static const int GRID_CAPACITY = {GRID_CAPACITY};\n\
          static const int DIRECT_TRACE_LEVELS = {DIRECT_TRACE_LEVELS};\n\
          typedef float16_t4 Half4;\n\
-         struct Half3 {{ float16_t x;\n float16_t y;\n float16_t z; }};\n"
+         struct Half3 {{ float16_t x;\n float16_t y;\n float16_t z; }};\n",
+        circle = Kind::Circle as i32,
+        box_ = Kind::Box as i32,
+        segment = Kind::Segment as i32,
     )
 }
 
@@ -237,21 +242,17 @@ pub(super) struct Pipelines {
 impl Pipelines {
     pub(super) fn new(device: &Device, color_format: Format) -> RhiResult<Self> {
         let solver = solver_source();
-        let cascade = |entry: &str| compute(device, &solver, entry, [CASCADE_THREADS, 1, 1]);
-        let field = |entry: &str| {
-            compute(
-                device,
-                &solver,
-                entry,
-                [FIELD_THREADS[0], FIELD_THREADS[1], 1],
-            )
-        };
+        // Both shapes are declared by the shaders' own `[numthreads]`, which reflection now
+        // carries onto the module, so they are no longer restated here.
+        let cascade = |entry: &str| compute(device, &solver, entry);
+        let field = |entry: &str| compute(device, &solver, entry);
 
         let clear_src = clear_source();
         let clear = device.create_compute_pso(
+            // The threadgroup size comes from the shader's `[numthreads]` via reflection.
             &ComputePsoDesc {
-                threads_per_threadgroup: [CLEAR_THREADS, 1, 1],
-                label: Some("hrc-clear".into()),
+                label: Some("hrc-clear"),
+                ..Default::default()
             },
             &compiler::compile(device, &clear_src, "clearMain", ShaderStage::Compute, &[])?,
         )?;
@@ -259,12 +260,11 @@ impl Pipelines {
         let resolve = device.create_graphics_pso(
             &GraphicsPsoDesc {
                 topology: Topology::TriangleList,
-                color_targets: vec![ColorTarget::new(color_format)],
+                color_targets: &[ColorTarget::new(color_format)],
                 depth_format: None,
                 sample_count: SampleCount::S1,
                 cull: Cull::None,
-                blendstate: Some(BlendState::default()),
-                label: Some("hrc-resolve".into()),
+                label: Some("hrc-resolve"),
                 ..Default::default()
             },
             &compiler::compile(
@@ -299,11 +299,12 @@ impl Pipelines {
     }
 }
 
-fn compute(device: &Device, source: &str, entry: &str, threads: [u32; 3]) -> RhiResult<ComputePso> {
+fn compute(device: &Device, source: &str, entry: &str) -> RhiResult<ComputePso> {
+    let label = format!("hrc-{entry}");
     device.create_compute_pso(
         &ComputePsoDesc {
-            threads_per_threadgroup: threads,
-            label: Some(format!("hrc-{entry}")),
+            label: Some(&label),
+            ..Default::default()
         },
         &compiler::compile(
             device,

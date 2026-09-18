@@ -40,7 +40,7 @@ pub fn device() -> (Device, GpuGuard) {
 
     let device = Device::new(&DeviceDesc {
         validation: true,
-        label: Some("rhi-headless-tests".into()),
+        label: Some("rhi-headless-tests"),
         ..Default::default()
     })
     .expect("no headless GPU device available");
@@ -54,7 +54,7 @@ pub fn test_bump(device: &Device) -> BumpAllocator {
         .create_allocation(&AllocationDesc {
             size: 64 * 1024,
             memory: MemoryType::Upload,
-            label: Some("test-bump".into()),
+            label: Some("test-bump"),
             ..Default::default()
         })
         .expect("create_buffer");

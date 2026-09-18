@@ -5,8 +5,6 @@
 //! change turns into a renderer transaction, so no UI code has to know how the renderer is
 //! invalidated.
 
-use std::sync::OnceLock;
-
 use glam::{DMat4, DVec3, UVec2};
 use kiln_app::{Example, FrameCtx, PerformanceStats};
 use kiln_rhi::{CommandBuffer, Device, Format};
@@ -23,15 +21,10 @@ use super::Result;
 use super::config::Config;
 use super::ui::{self, Edit, InspectorState};
 
-static CONFIG: OnceLock<Config> = OnceLock::new();
-
 pub fn run(config: Config) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let title = format!("Kiln \u{00b7} Spectral \u{2014} {}", config.scene_name());
     let harness = config.harness.clone();
-    CONFIG
-        .set(config)
-        .expect("viewer configured more than once");
-    kiln_app::run_with::<App>(&title, [0.02, 0.02, 0.03, 1.0], harness)
+    kiln_app::run_with::<App>(&title, [0.02, 0.02, 0.03, 1.0], harness, config)
 }
 
 struct App {
@@ -65,8 +58,8 @@ struct App {
 }
 
 impl App {
-    fn try_new(device: &Device, color_format: Format) -> Result<Self> {
-        let config = CONFIG.get().expect("viewer config not installed");
+    fn try_new(device: &Device, color_format: Format, config: Config) -> Result<Self> {
+        let config = &config;
         let asset = config.scene_path()?;
         let mut scene = usd::load(&asset)?;
         // Imported lights adopt the renderer-wide spectrum, which is the one the CLI selected and
@@ -295,8 +288,10 @@ impl App {
 }
 
 impl Example for App {
-    fn new(device: &Device, color_format: Format) -> Self {
-        Self::try_new(device, color_format).unwrap_or_else(|error| {
+    type Config = Config;
+
+    fn new(device: &Device, color_format: Format, config: Config) -> Self {
+        Self::try_new(device, color_format, config).unwrap_or_else(|error| {
             eprintln!("{error:#}");
             std::process::exit(1);
         })

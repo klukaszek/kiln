@@ -17,7 +17,7 @@ use super::controls::debug_camera_roundtrip;
 pub fn run(config: &Config, resolution: UVec2) -> Result<()> {
     let device = Device::new(&DeviceDesc {
         validation: false,
-        label: Some("spectral-headless".into()),
+        label: Some("spectral-headless"),
         ..Default::default()
     })?;
     let mut scene = usd::load(&config.scene_path()?)?;
@@ -107,7 +107,7 @@ fn render_to_completion(
         kiln_rhi::frame_scope(|| -> Result<()> {
             let mut cmd = frame.device.create_command_buffer()?;
             renderer.record_iteration(frame, &mut cmd, camera)?;
-            cmd.end();
+            cmd.end()?;
             let queue = frame.device.queue();
             queue.submit(cmd)?;
             queue.wait_idle();

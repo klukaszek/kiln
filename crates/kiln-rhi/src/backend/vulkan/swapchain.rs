@@ -5,14 +5,29 @@ use std::rc::Rc;
 
 use ash::vk;
 
-use super::device::{VulkanDevice, find_memorytype_index, format_to_vk, vk_to_format};
+use super::device::{VulkanDevice, format_to_vk, vk_to_format};
 
+use super::surface::VulkanSurface;
 use crate::error::{RhiError, RhiResult};
-use crate::queue::QueueInner;
-use crate::surface::{Surface, SurfaceInner};
-use crate::swapchain::{Swapchain, SwapchainDesc, SwapchainInner};
-use crate::types::Format;
+use crate::swapchain::{Swapchain, SwapchainDesc};
 use crate::types::MAX_FRAMES_IN_FLIGHT;
+
+/// Everything a swapchain owns per in-flight frame slot, indexed by `frame_index`.
+///
+/// The driver's image index is a separate axis: `images`, `image_views` and
+/// `rendering_complete_semaphores` are indexed by it and are a different length. Keeping the two
+/// sets apart is the point — a slot's semaphore and its image's semaphore are not interchangeable.
+#[derive(Clone, Copy)]
+pub(crate) struct FrameSlot {
+    pub(crate) present_complete: vk::Semaphore,
+    pub(crate) fence: vk::Fence,
+    /// The image this slot acquired, held across abandoned recording so a retry does not
+    /// re-signal `present_complete`.
+    pub(crate) acquired_image: Option<u32>,
+    /// The frame's command buffer, recycled on the slot's next acquire. It belongs to the
+    /// device's pool, so `Drop` cannot hand it back.
+    pub(crate) command_buffer: vk::CommandBuffer,
+}
 
 /// Vulkan swapchain wrapper.
 pub struct VulkanSwapchain {
@@ -20,18 +35,10 @@ pub struct VulkanSwapchain {
     pub(crate) surface: vk::SurfaceKHR,
     pub(crate) images: Rc<[vk::Image]>,
     pub(crate) image_views: Rc<[vk::ImageView]>,
-    pub(crate) format: Format,
     pub(crate) surface_format: vk::SurfaceFormatKHR,
-    pub(crate) extent: vk::Extent2D,
-    pub(crate) depth_image: vk::Image,
-    pub(crate) depth_image_view: vk::ImageView,
-    pub(crate) depth_image_memory: vk::DeviceMemory,
-    pub(crate) present_complete_semaphores: Vec<vk::Semaphore>,
-    pub(crate) rendering_complete_semaphores: Vec<vk::Semaphore>,
-    /// Acquisitions survive abandoned recording so a retry does not re-signal its semaphore.
-    pub(crate) acquired_images: RefCell<Vec<Option<u32>>>,
-    pub(crate) in_flight_fences: Vec<vk::Fence>,
-    pub(crate) in_flight_cmd_buffers: RefCell<Vec<vk::CommandBuffer>>,
+    /// Per image, not per frame slot.
+    pub(crate) rendering_complete_semaphores: Box<[vk::Semaphore]>,
+    pub(crate) frames: RefCell<[FrameSlot; MAX_FRAMES_IN_FLIGHT]>,
     // Keep the loaders with the swapchain; the device must outlive it.
     pub(crate) device: ash::Device,
     pub(crate) swapchain_loader: ash::khr::swapchain::Device,
@@ -43,17 +50,12 @@ impl Drop for VulkanSwapchain {
             for &view in self.image_views.iter() {
                 self.device.destroy_image_view(view, None);
             }
-            self.device.destroy_image_view(self.depth_image_view, None);
-            self.device.destroy_image(self.depth_image, None);
-            self.device.free_memory(self.depth_image_memory, None);
-            for &sem in &self.present_complete_semaphores {
-                self.device.destroy_semaphore(sem, None);
-            }
             for &sem in &self.rendering_complete_semaphores {
                 self.device.destroy_semaphore(sem, None);
             }
-            for &fence in &self.in_flight_fences {
-                self.device.destroy_fence(fence, None);
+            for slot in self.frames.borrow().iter() {
+                self.device.destroy_semaphore(slot.present_complete, None);
+                self.device.destroy_fence(slot.fence, None);
             }
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None);
@@ -67,76 +69,88 @@ struct SwapchainContents {
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
     extent: vk::Extent2D,
-    depth_image: vk::Image,
-    depth_image_view: vk::ImageView,
-    depth_image_memory: vk::DeviceMemory,
-    present_complete_semaphores: Vec<vk::Semaphore>,
-    rendering_complete_semaphores: Vec<vk::Semaphore>,
-    in_flight_fences: Vec<vk::Fence>,
-    in_flight_cmd_buffers: Vec<vk::CommandBuffer>,
+    rendering_complete_semaphores: Box<[vk::Semaphore]>,
+    frames: [FrameSlot; MAX_FRAMES_IN_FLIGHT],
 }
 
 impl VulkanDevice {
     pub fn create_swapchain(
         &self,
-        surface: &Surface,
+        surface: &VulkanSurface,
         desc: &SwapchainDesc,
     ) -> RhiResult<Swapchain> {
-        let vk_surface = backend_expect!(&surface.inner, SurfaceInner::Vulkan).surface;
+        let vk_surface = surface.surface;
 
         let surface_formats = unsafe {
             self.surface_loader
                 .get_physical_device_surface_formats(self.physical_device, vk_surface)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
+                .map_err(|e| RhiError::SwapchainCreation(e.into()))?
         };
+        // Only formats the RHI can name are candidates: `Swapchain::format()` reports this back
+        // to the application, which builds pipelines against it, so an unnameable format would
+        // have to be guessed at and would then mismatch every attachment.
         let desired_vk_format = format_to_vk(desc.format);
         let surface_format = surface_formats
             .iter()
             .find(|f| f.format == desired_vk_format)
-            .cloned()
-            .unwrap_or(surface_formats[0]);
+            .or_else(|| {
+                surface_formats
+                    .iter()
+                    .find(|f| vk_to_format(f.format).is_some())
+            })
+            .copied()
+            .ok_or_else(|| {
+                RhiError::SwapchainCreation(
+                    format!(
+                        "the surface supports no format kiln-rhi can name (offered: {:?})",
+                        surface_formats.iter().map(|f| f.format).collect::<Vec<_>>()
+                    )
+                    .into(),
+                )
+            })?;
+        let format = vk_to_format(surface_format.format).ok_or_else(|| {
+            RhiError::SwapchainCreation(
+                format!(
+                    "chosen surface format {:?} has no kiln-rhi Format",
+                    surface_format.format
+                )
+                .into(),
+            )
+        })?;
 
-        let SwapchainContents {
-            swapchain,
-            images,
-            image_views,
-            extent,
-            depth_image,
-            depth_image_view,
-            depth_image_memory,
-            present_complete_semaphores,
-            rendering_complete_semaphores,
-            in_flight_fences,
-            in_flight_cmd_buffers,
-        } = self.build_swapchain_contents(
+        let contents = self.build_swapchain_contents(
             vk_surface,
             surface_format,
             desc,
             vk::SwapchainKHR::null(),
         )?;
 
-        Ok(Swapchain {
-            inner: SwapchainInner::Vulkan(Box::new(VulkanSwapchain {
-                swapchain,
-                surface: vk_surface,
-                images: images.into(),
-                image_views: image_views.into(),
-                format: vk_to_format(surface_format.format),
-                surface_format,
-                extent,
-                depth_image,
-                depth_image_view,
-                depth_image_memory,
-                present_complete_semaphores,
-                rendering_complete_semaphores,
-                in_flight_fences,
-                in_flight_cmd_buffers: RefCell::new(in_flight_cmd_buffers),
-                acquired_images: RefCell::new(vec![None; MAX_FRAMES_IN_FLIGHT]),
-                device: self.device.clone(),
-                swapchain_loader: self.swapchain_loader.clone(),
-            })),
-            _owner: None,
-        })
+        let extent = contents.extent;
+        Ok(Swapchain::new(
+            Box::new(self.assemble_swapchain(contents, vk_surface, surface_format)),
+            format,
+            [extent.width, extent.height],
+        ))
+    }
+
+    /// Wrap freshly built contents; `Drop` owns tearing them down again.
+    fn assemble_swapchain(
+        &self,
+        contents: SwapchainContents,
+        surface: vk::SurfaceKHR,
+        surface_format: vk::SurfaceFormatKHR,
+    ) -> VulkanSwapchain {
+        VulkanSwapchain {
+            swapchain: contents.swapchain,
+            surface,
+            images: contents.images.into(),
+            image_views: contents.image_views.into(),
+            surface_format,
+            rendering_complete_semaphores: contents.rendering_complete_semaphores,
+            frames: RefCell::new(contents.frames),
+            device: self.loaders.device.clone(),
+            swapchain_loader: self.swapchain_loader.clone(),
+        }
     }
 
     pub fn recreate_swapchain(
@@ -144,79 +158,40 @@ impl VulkanDevice {
         swapchain: &mut Swapchain,
         desc: &SwapchainDesc,
     ) -> RhiResult<()> {
-        unsafe {
-            self.device
-                .device_wait_idle()
-                .map_err(|e| RhiError::Backend(e.to_string()))?
-        };
+        // SAFETY: everything below destroys swapchain-owned objects, so nothing may be in flight.
+        unsafe { self.loaders.device.device_wait_idle() }
+            .map_err(|e| RhiError::Backend(e.into()))?;
 
         // Nothing may reference the images about to be destroyed.
         self.flush_setup_barriers()?;
 
-        let sc = backend_expect!(&mut swapchain.inner, SwapchainInner::Vulkan);
+        let sc = &mut swapchain.inner;
 
-        let old_swapchain = sc.swapchain;
-        let surface = sc.surface;
-        let surface_format = sc.surface_format;
+        for slot in sc.frames.borrow_mut().iter_mut() {
+            let command_buffer =
+                std::mem::replace(&mut slot.command_buffer, vk::CommandBuffer::null());
+            if command_buffer != vk::CommandBuffer::null() {
+                self.recycle_command_buffer(command_buffer);
+            }
+        }
 
+        let (surface, surface_format) = (sc.surface, sc.surface_format);
         let contents =
-            self.build_swapchain_contents(surface, surface_format, desc, old_swapchain)?;
+            self.build_swapchain_contents(surface, surface_format, desc, sc.swapchain)?;
+        let extent = contents.extent;
 
-        unsafe {
-            self.device.destroy_image_view(sc.depth_image_view, None);
-            self.device.destroy_image(sc.depth_image, None);
-            self.device.free_memory(sc.depth_image_memory, None);
-            for &view in sc.image_views.iter() {
-                self.device.destroy_image_view(view, None);
-            }
-        }
-        {
-            let mut cmd_buffers = sc.in_flight_cmd_buffers.borrow_mut();
-            let to_free: Vec<_> = cmd_buffers
-                .iter()
-                .copied()
-                .filter(|c| *c != vk::CommandBuffer::null())
-                .collect();
-            if !to_free.is_empty() {
-                for command_buffer in to_free {
-                    self.recycle_command_buffer(command_buffer);
-                }
-            }
-            cmd_buffers.clear();
-        }
-        unsafe {
-            for &sem in &sc.present_complete_semaphores {
-                self.device.destroy_semaphore(sem, None);
-            }
-            for &sem in &sc.rendering_complete_semaphores {
-                self.device.destroy_semaphore(sem, None);
-            }
-            for &fence in &sc.in_flight_fences {
-                self.device.destroy_fence(fence, None);
-            }
+        // Assigning drops the old swapchain, and its `Drop` destroys exactly the views,
+        // semaphores, fences and handle that creating a new set replaced. The old handle is
+        // still live until here, which is what `oldSwapchain` above requires.
+        **sc = self.assemble_swapchain(contents, surface, surface_format);
+
+        // The fences the old slots armed went with them.
+        for frame in self.queue.frames.borrow_mut().iter_mut() {
+            frame.armed = false;
         }
 
-        unsafe {
-            self.swapchain_loader.destroy_swapchain(old_swapchain, None);
-        }
-
-        sc.swapchain = contents.swapchain;
-        sc.images = contents.images.into();
-        sc.image_views = contents.image_views.into();
-        sc.extent = contents.extent;
-        sc.depth_image = contents.depth_image;
-        sc.depth_image_view = contents.depth_image_view;
-        sc.depth_image_memory = contents.depth_image_memory;
-        sc.present_complete_semaphores = contents.present_complete_semaphores;
-        sc.rendering_complete_semaphores = contents.rendering_complete_semaphores;
-        sc.in_flight_fences = contents.in_flight_fences;
-        sc.in_flight_cmd_buffers = RefCell::new(contents.in_flight_cmd_buffers);
-        sc.acquired_images.borrow_mut().fill(None);
-        backend_expect!(&self.queue.inner, QueueInner::Vulkan)
-            .frame_fence_armed
-            .borrow_mut()
-            .fill(false);
-
+        // The surface may clamp the requested size, so report what was actually created.
+        swapchain.extent = [extent.width, extent.height];
         Ok(())
     }
 
@@ -230,7 +205,7 @@ impl VulkanDevice {
         let caps = unsafe {
             self.surface_loader
                 .get_physical_device_surface_capabilities(self.physical_device, surface)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
+                .map_err(|e| RhiError::SwapchainCreation(e.into()))?
         };
 
         let mut image_count = desc.image_count.max(caps.min_image_count);
@@ -262,7 +237,7 @@ impl VulkanDevice {
             unsafe {
                 self.surface_loader
                     .get_physical_device_surface_present_modes(self.physical_device, surface)
-                    .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
+                    .map_err(|e| RhiError::SwapchainCreation(e.into()))?
             }
             .into_iter()
             .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
@@ -287,35 +262,39 @@ impl VulkanDevice {
         let swapchain = unsafe {
             self.swapchain_loader
                 .create_swapchain(&create_info, None)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
+                .map_err(|e| RhiError::SwapchainCreation(e.into()))?
         };
         let images = unsafe {
             self.swapchain_loader
                 .get_swapchain_images(swapchain)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?
+                .map_err(|e| RhiError::SwapchainCreation(e.into()))?
         };
         let image_views = self.create_swapchain_image_views(&images, surface_format.format)?;
-        let (depth_image, depth_image_view, depth_image_memory) =
-            self.create_depth_buffer(extent.width, extent.height)?;
 
         let sem_info = vk::SemaphoreCreateInfo::default();
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
         let mk_sem = || unsafe {
-            self.device
+            self.loaders
+                .device
                 .create_semaphore(&sem_info, None)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))
+                .map_err(|e| RhiError::SwapchainCreation(e.into()))
         };
         let mk_fence = || unsafe {
-            self.device
+            self.loaders
+                .device
                 .create_fence(&fence_info, None)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))
+                .map_err(|e| RhiError::SwapchainCreation(e.into()))
         };
 
-        let mut present_complete_semaphores = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
-        let mut in_flight_fences = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
-        for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            present_complete_semaphores.push(mk_sem()?);
-            in_flight_fences.push(mk_fence()?);
+        let mut frames = [FrameSlot {
+            present_complete: vk::Semaphore::null(),
+            fence: vk::Fence::null(),
+            acquired_image: None,
+            command_buffer: vk::CommandBuffer::null(),
+        }; MAX_FRAMES_IN_FLIGHT];
+        for slot in &mut frames {
+            slot.present_complete = mk_sem()?;
+            slot.fence = mk_fence()?;
         }
         let mut rendering_complete_semaphores = Vec::with_capacity(images.len());
         for _ in 0..images.len() {
@@ -327,13 +306,8 @@ impl VulkanDevice {
             images,
             image_views,
             extent,
-            depth_image,
-            depth_image_view,
-            depth_image_memory,
-            present_complete_semaphores,
-            rendering_complete_semaphores,
-            in_flight_fences,
-            in_flight_cmd_buffers: vec![vk::CommandBuffer::null(); MAX_FRAMES_IN_FLIGHT],
+            rendering_complete_semaphores: rendering_complete_semaphores.into_boxed_slice(),
+            frames,
         })
     }
 
@@ -363,89 +337,12 @@ impl VulkanDevice {
                     })
                     .image(image);
                 unsafe {
-                    self.device
+                    self.loaders
+                        .device
                         .create_image_view(&view_info, None)
-                        .map_err(|e| RhiError::SwapchainCreation(e.to_string()))
+                        .map_err(|e| RhiError::SwapchainCreation(e.into()))
                 }
             })
             .collect()
-    }
-
-    fn create_depth_buffer(
-        &self,
-        width: u32,
-        height: u32,
-    ) -> RhiResult<(vk::Image, vk::ImageView, vk::DeviceMemory)> {
-        let depth_image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::D32_SFLOAT)
-            .extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-        let depth_image = unsafe {
-            self.device
-                .create_image(&depth_image_info, None)
-                .map_err(|e| RhiError::SwapchainCreation(format!("Depth image: {e}")))?
-        };
-
-        let mem_reqs = unsafe { self.device.get_image_memory_requirements(depth_image) };
-        let mem_index = find_memorytype_index(
-            &mem_reqs,
-            &self.device_memory_properties,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )
-        .ok_or_else(|| RhiError::AllocationFailed("No memory for depth".into()))?;
-
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_reqs.size)
-            .memory_type_index(mem_index);
-
-        let depth_memory = unsafe {
-            self.device
-                .allocate_memory(&alloc_info, None)
-                .map_err(|e| RhiError::AllocationFailed(e.to_string()))?
-        };
-
-        unsafe {
-            self.device
-                .bind_image_memory(depth_image, depth_memory, 0)
-                .map_err(|e| RhiError::SwapchainCreation(e.to_string()))?;
-        }
-
-        self.initialize_image_layout(depth_image, vk::ImageAspectFlags::DEPTH, 1, 1)?;
-        // Submit straight away rather than batching: this image is destroyed on the next
-        // swapchain rebuild, which would invalidate the setup buffer while it still held this
-        // barrier. Batching only pays off for the many images of a scene load, not for one depth
-        // buffer per swapchain.
-        self.flush_setup_barriers()?;
-
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(depth_image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::D32_SFLOAT)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::DEPTH,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-
-        let depth_view = unsafe {
-            self.device
-                .create_image_view(&view_info, None)
-                .map_err(|e| RhiError::SwapchainCreation(format!("Depth view: {e}")))?
-        };
-
-        Ok((depth_image, depth_view, depth_memory))
     }
 }

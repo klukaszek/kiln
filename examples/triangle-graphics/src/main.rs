@@ -37,7 +37,9 @@ struct TriangleGraphics {
 }
 
 impl Example for TriangleGraphics {
-    fn new(device: &Device, color_format: Format) -> Self {
+    type Config = ();
+
+    fn new(device: &Device, color_format: Format, _: ()) -> Self {
         let vs = kiln_rhi::compiler::compile(device, TRI_BODY, "vsMain", ShaderStage::Vertex, &[])
             .expect("shader compilation");
         let fs = kiln_rhi::compiler::compile(device, TRI_BODY, "fsMain", ShaderStage::Pixel, &[])
@@ -48,11 +50,11 @@ impl Example for TriangleGraphics {
                 &GraphicsPsoDesc {
                     topology: Topology::TriangleList,
                     // Must match the swapchain's colour format, not a fixed RGBA8.
-                    color_targets: vec![ColorTarget::new(color_format)],
+                    color_targets: &[ColorTarget::new(color_format)],
                     depth_format: None,
                     sample_count: SampleCount::S1,
                     cull: Cull::None,
-                    label: Some("triangle-graphics".into()),
+                    label: Some("triangle-graphics"),
                     ..Default::default()
                 },
                 &vs,

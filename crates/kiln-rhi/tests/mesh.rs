@@ -80,20 +80,20 @@ fn make_meshlet_pso(
     device: &Device,
     ms: &ShaderModule,
     fs: &ShaderModule,
-    label: &str,
+    label: &'static str,
 ) -> MeshletPso {
     device
         .create_meshlet_pso(
             &MeshletPsoDesc {
                 topology: Topology::TriangleList,
-                color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
+                color_targets: &[ColorTarget::new(Format::R8G8B8A8Unorm)],
                 depth_format: None,
                 depth: Default::default(),
                 sample_count: SampleCount::S1,
                 alpha_to_coverage: false,
                 cull: Cull::None,
-                blendstate: None,
-                label: Some(label.into()),
+                blend: &[],
+                label: Some(label),
             },
             ms,
             fs,
@@ -122,7 +122,7 @@ fn render_meshlets(
         dimension: TextureDimension::D2,
         sample_count: SampleCount::S1,
         usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        label: Some("rt".into()),
+        label: Some("rt"),
     };
     let sa = device.texture_size_align(&tex_desc).expect("size_align");
     let tex_mem = device
@@ -156,7 +156,7 @@ fn render_meshlets(
     cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
     cmd.copy_texture_to_buffer(&texture, readback.gpu(), None);
     cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
-    cmd.end();
+    cmd.end().expect("end command buffer");
     let queue = device.queue();
     queue.submit(cmd).expect("submit");
     queue.wait_idle();

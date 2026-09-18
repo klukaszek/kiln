@@ -18,7 +18,9 @@ struct Demo {
 }
 
 impl Example for Demo {
-    fn new(_device: &Device, _color_format: Format) -> Self {
+    type Config = ();
+
+    fn new(_device: &Device, _color_format: Format, _: ()) -> Self {
         Self {
             name: "Kiln".to_string(),
             age: 36,

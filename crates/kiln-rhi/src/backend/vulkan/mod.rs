@@ -2,6 +2,7 @@ pub mod accel;
 pub mod barrier;
 pub mod command;
 pub mod device;
+pub mod heap;
 pub mod memory;
 pub mod pipeline;
 pub mod query;

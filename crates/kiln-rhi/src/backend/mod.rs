@@ -8,4 +8,9 @@ pub mod vulkan;
 pub mod metal;
 
 #[cfg(any(feature = "vulkan", feature = "metal"))]
+pub(crate) mod mapped;
+#[cfg(any(feature = "vulkan", feature = "metal"))]
+pub(crate) mod retire;
+pub(crate) mod slots;
+#[cfg(any(feature = "vulkan", feature = "metal"))]
 pub(crate) mod suballoc;

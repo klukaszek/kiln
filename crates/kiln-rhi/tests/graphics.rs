@@ -90,7 +90,7 @@ fn graphics_static_color_write_mask() {
     let pso = device
         .create_graphics_pso(
             &GraphicsPsoDesc {
-                color_targets: vec![ColorTarget {
+                color_targets: &[ColorTarget {
                     format: Format::R8G8B8A8Unorm,
                     write_mask: ColorWriteMask::R,
                 }],
@@ -127,17 +127,17 @@ fn make_graphics_pso(
     device: &Device,
     vs: &ShaderModule,
     fs: &ShaderModule,
-    label: &str,
+    label: &'static str,
 ) -> GraphicsPso {
     device
         .create_graphics_pso(
             &GraphicsPsoDesc {
                 topology: Topology::TriangleList,
-                color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
+                color_targets: &[ColorTarget::new(Format::R8G8B8A8Unorm)],
                 depth_format: None,
                 sample_count: SampleCount::S1,
                 cull: Cull::None,
-                label: Some(label.into()),
+                label: Some(label),
                 ..Default::default()
             },
             vs,
@@ -185,7 +185,7 @@ fn render(
         dimension: TextureDimension::D2,
         sample_count: SampleCount::S1,
         usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        label: Some("rt".into()),
+        label: Some("rt"),
     };
     let sa = device.texture_size_align(&tex_desc).expect("size_align");
     let tex_mem = device
@@ -204,7 +204,7 @@ fn render(
             height: size,
             format: Format::D32Float,
             usage: TextureUsage::DEPTH_STENCIL_ATTACHMENT,
-            label: Some("depth".into()),
+            label: Some("depth"),
             ..Default::default()
         };
         let sa = device.texture_size_align(&desc).expect("depth size_align");
@@ -245,7 +245,7 @@ fn render(
     cmd.barrier(StageFlags::RASTER_COLOR_OUT, StageFlags::TRANSFER);
     cmd.copy_texture_to_buffer(&texture, readback.gpu(), None);
     cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
-    cmd.end();
+    cmd.end().expect("end command buffer");
     let queue = device.queue();
     queue.submit(cmd).expect("submit");
     queue.wait_idle();
@@ -507,7 +507,7 @@ fn graphics_root_from_bump_allocator() {
         .create_allocation(&AllocationDesc {
             size: 4096,
             memory: MemoryType::Upload,
-            label: Some("bump-root".into()),
+            label: Some("bump-root"),
             ..Default::default()
         })
         .expect("create_buffer");
@@ -590,12 +590,12 @@ fn depth_test_rejects_farther_geometry() {
         .create_graphics_pso(
             &GraphicsPsoDesc {
                 topology: Topology::TriangleList,
-                color_targets: vec![ColorTarget::new(Format::R8G8B8A8Unorm)],
+                color_targets: &[ColorTarget::new(Format::R8G8B8A8Unorm)],
                 depth_format: Some(Format::D32Float),
                 depth: kiln_rhi::DepthState::read_write(kiln_rhi::CompareOp::LessOrEqual),
                 sample_count: SampleCount::S1,
                 cull: Cull::None,
-                label: Some("depth".into()),
+                label: Some("depth"),
                 ..Default::default()
             },
             &vs,

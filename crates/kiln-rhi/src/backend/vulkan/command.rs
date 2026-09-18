@@ -1,19 +1,19 @@
 use super::barrier::{to_vk_access_flags, to_vk_stage_flags};
-use super::device::{IMAGE_LAYOUT, SharedTextures, build_accel_flags_to_vk, geometry_flags_to_vk};
+use super::device::VulkanDevice;
+use super::device::{IMAGE_LAYOUT, SharedTextures, VulkanLoaders, build_accel_flags_to_vk};
+use super::swapchain::VulkanSwapchain;
 use super::texture::texture_aspect;
 use crate::barrier::{HazardFlags, StageFlags};
+use crate::command::CommandBuffer;
 use crate::command::{
     DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectArgs, LoadOp, RenderPassDesc,
     RenderTargetKind, StoreOp,
 };
-use crate::pipeline::{ComputePso, ComputePsoInner, GraphicsPso, GraphicsPsoInner, MeshletPso};
+use crate::error::{RhiError, RhiResult};
+use crate::pipeline::{ComputePso, GraphicsPso, MeshletPso};
 use crate::texture::{ResolvedRegion, Texture, bytes_per_pixel};
-use crate::types::{BlasDesc, GeometryType, GpuPtr, TextureId, TlasDesc};
-use ash::{
-    ext::{debug_utils, descriptor_heap, mesh_shader as vk_mesh_shader},
-    khr::{acceleration_structure as vk_accel_structure, device_address_commands},
-    vk,
-};
+use crate::types::{BlasDesc, GpuPtr, MAX_FRAMES_IN_FLIGHT, TextureId, TlasDesc};
+use ash::{khr::acceleration_structure as vk_accel_structure, vk};
 use smallvec::SmallVec;
 use std::rc::Rc;
 
@@ -23,30 +23,38 @@ use std::rc::Rc;
 /// application's `GraphicsPso`/`ComputePso`/`MeshletPso` mid-recording cannot destroy a
 /// `VkPipeline` the command buffer still refers to.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) enum RetainedPipeline {
     Graphics(Rc<super::pipeline::VulkanGraphicsPso>),
     Compute(Rc<super::pipeline::VulkanComputePso>),
     Meshlet(Rc<super::pipeline::VulkanMeshletPso>),
 }
 
+impl RetainedPipeline {
+    /// The `VkPipeline` this entry keeps alive, for deduplicating repeated binds.
+    fn handle(&self) -> vk::Pipeline {
+        match self {
+            Self::Graphics(pso) => pso.pipeline,
+            Self::Compute(pso) => pso.pipeline,
+            Self::Meshlet(pso) => pso.pipeline,
+        }
+    }
+}
+
 /// Vulkan command buffer wrapper.
 pub struct VulkanCommandBuffer {
     pub(crate) command_buffer: vk::CommandBuffer,
-    pub(crate) device: ash::Device,
+    /// Shared with the device rather than copied: see [`VulkanLoaders`].
+    pub(crate) loaders: Rc<VulkanLoaders>,
     pub(crate) swapchain_image_views: Rc<[vk::ImageView]>,
     pub(crate) swapchain_images: Rc<[vk::Image]>,
-    pub(crate) depth_image_view: vk::ImageView,
-    pub(crate) descriptor_heap_loader: descriptor_heap::Device,
-    pub(crate) address_commands: device_address_commands::Device,
-    pub(crate) debug_labels: Option<debug_utils::Device>,
     /// Set when the open pass pushed a label region for `end_render_pass` to pop.
     pub(crate) in_labelled_pass: bool,
-    pub(crate) pending_split_barrier: Option<(StageFlags, HazardFlags)>,
     pub(crate) textures: SharedTextures,
-    pub(crate) mesh_shader: vk_mesh_shader::Device,
-    pub(crate) acceleration_structure: vk_accel_structure::Device,
     pub(crate) rendered_swapchain_images: SmallVec<[u32; 4]>,
+    /// The pipeline bound by the last `set_*_pipeline`, so re-binding the same one does not
+    /// push another `Rc` onto `retained_pipelines`. A command buffer that binds per draw would
+    /// otherwise accumulate one clone per draw.
+    pub(crate) last_bound_pipeline: vk::Pipeline,
     /// Pipelines bound into this buffer. A pipeline dropped by the application while still
     /// referenced here must not be destroyed until the submission retires, which matches Metal,
     /// where the command buffer holds its own reference.
@@ -64,9 +72,10 @@ impl VulkanCommandBuffer {
             self.transition_to_present(index);
         }
         unsafe {
-            self.device
+            self.loaders
+                .device
                 .end_command_buffer(self.command_buffer)
-                .map_err(|error| crate::error::RhiError::CommandBuffer(error.to_string()))?;
+                .map_err(|error| crate::error::RhiError::CommandBuffer(error.into()))?;
         }
         self.ended = true;
         Ok(())
@@ -89,12 +98,9 @@ impl VulkanCommandBuffer {
     }
 
     fn resolve_texture_info(&self, id: TextureId) -> (vk::Image, vk::ImageView) {
-        let textures = self.textures.borrow();
-        let tex = textures
-            .get(id.0 as usize)
-            .and_then(|t| t.as_ref())
-            .expect("Invalid texture ID");
-        (tex.image, tex.image_view)
+        self.textures
+            .with(id.0, |tex| (tex.image, tex.image_view))
+            .expect("Invalid texture ID")
     }
 
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) {
@@ -102,7 +108,7 @@ impl VulkanCommandBuffer {
 
         // Opened before the attachment transitions so the capture attributes them to this pass.
         self.in_labelled_pass = false;
-        if let (Some(loader), Some(label)) = (self.debug_labels.as_ref(), desc.label)
+        if let (Some(loader), Some(label)) = (self.loaders.debug_labels.as_ref(), desc.label)
             && let Ok(label) = std::ffi::CString::new(label)
         {
             let info = vk::DebugUtilsLabelEXT::default().label_name(&label);
@@ -151,7 +157,7 @@ impl VulkanCommandBuffer {
                         layer_count: 1,
                     });
                 unsafe {
-                    self.device.cmd_pipeline_barrier2(
+                    self.loaders.device.cmd_pipeline_barrier2(
                         cmd,
                         &vk::DependencyInfo::default()
                             .image_memory_barriers(std::slice::from_ref(&barrier)),
@@ -199,8 +205,11 @@ impl VulkanCommandBuffer {
 
         let depth_attachment = desc.depth_attachment.as_ref().map(|da| {
             let image_view = match da.target.kind() {
-                RenderTargetKind::SwapchainImage(_) => self.depth_image_view,
                 RenderTargetKind::Texture(id) => self.resolve_texture_info(id).1,
+                // The swapchain has colour images only; depth comes from a texture you own.
+                RenderTargetKind::SwapchainImage(_) => {
+                    panic!("a swapchain image cannot be a depth attachment")
+                }
             };
 
             let load_op = match da.load_op {
@@ -247,18 +256,20 @@ impl VulkanCommandBuffer {
         }
 
         unsafe {
-            self.device.cmd_begin_rendering(cmd, &rendering_info);
+            self.loaders
+                .device
+                .cmd_begin_rendering(cmd, &rendering_info);
 
-            self.device.cmd_set_depth_bias_enable(cmd, false);
+            self.loaders.device.cmd_set_depth_bias_enable(cmd, false);
         }
     }
 
     pub fn end_render_pass(&mut self) {
         unsafe {
-            self.device.cmd_end_rendering(self.command_buffer);
+            self.loaders.device.cmd_end_rendering(self.command_buffer);
         }
         if self.in_labelled_pass
-            && let Some(loader) = self.debug_labels.as_ref()
+            && let Some(loader) = self.loaders.debug_labels.as_ref()
         {
             unsafe { loader.cmd_end_debug_utils_label(self.command_buffer) };
             self.in_labelled_pass = false;
@@ -266,22 +277,45 @@ impl VulkanCommandBuffer {
     }
 
     pub fn set_graphics_pipeline(&mut self, pso: &GraphicsPso) {
-        let vk_pso = backend_expect!(&pso.inner, GraphicsPsoInner::Vulkan);
-        self.retained_pipelines
-            .push(RetainedPipeline::Graphics(vk_pso.clone()));
+        let vk_pso = &pso.inner;
+        self.retain_pipeline(vk_pso.pipeline, || {
+            RetainedPipeline::Graphics(vk_pso.clone())
+        });
         self.bind_pipeline(vk::PipelineBindPoint::GRAPHICS, vk_pso.pipeline);
     }
 
     pub fn set_compute_pipeline(&mut self, pso: &ComputePso) {
-        let vk_pso = backend_expect!(&pso.inner, ComputePsoInner::Vulkan);
-        self.retained_pipelines
-            .push(RetainedPipeline::Compute(vk_pso.clone()));
+        let vk_pso = &pso.inner;
+        self.retain_pipeline(vk_pso.pipeline, || {
+            RetainedPipeline::Compute(vk_pso.clone())
+        });
         self.bind_pipeline(vk::PipelineBindPoint::COMPUTE, vk_pso.pipeline);
+    }
+
+    /// Keep `pipeline` alive for this command buffer's submission, unless it is already the one
+    /// bound or already retained.
+    fn retain_pipeline(
+        &mut self,
+        pipeline: vk::Pipeline,
+        retained: impl FnOnce() -> RetainedPipeline,
+    ) {
+        if self.last_bound_pipeline == pipeline {
+            return;
+        }
+        self.last_bound_pipeline = pipeline;
+        if !self
+            .retained_pipelines
+            .iter()
+            .any(|entry| entry.handle() == pipeline)
+        {
+            self.retained_pipelines.push(retained());
+        }
     }
 
     fn bind_pipeline(&mut self, bind_point: vk::PipelineBindPoint, pipeline: vk::Pipeline) {
         unsafe {
-            self.device
+            self.loaders
+                .device
                 .cmd_bind_pipeline(self.command_buffer, bind_point, pipeline);
         }
     }
@@ -292,7 +326,8 @@ impl VulkanCommandBuffer {
             .offset(0)
             .data(vk::HostAddressRangeConstEXT::default().address(&bytes));
         unsafe {
-            self.descriptor_heap_loader
+            self.loaders
+                .descriptor_heap
                 .cmd_push_data(self.command_buffer, &info);
         }
     }
@@ -305,7 +340,7 @@ impl VulkanCommandBuffer {
         first_instance: u32,
     ) {
         unsafe {
-            self.device.cmd_draw(
+            self.loaders.device.cmd_draw(
                 self.command_buffer,
                 vertex_count,
                 instance_count,
@@ -315,21 +350,38 @@ impl VulkanCommandBuffer {
         }
     }
 
-    pub fn draw_indexed(&mut self, indices: GpuPtr<u8>, index_count: u32, instance_count: u32) {
+    pub fn draw_indexed(
+        &mut self,
+        indices: GpuPtr<u8>,
+        index_count: u32,
+        instance_count: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    ) {
         let info = vk::BindIndexBuffer3InfoKHR::default()
             .address_range(Self::range(indices, index_count as u64 * 4))
             .index_type(vk::IndexType::UINT32);
         unsafe {
-            self.address_commands
+            self.loaders
+                .address_commands
                 .cmd_bind_index_buffer3(self.command_buffer, &info);
-            self.device
-                .cmd_draw_indexed(self.command_buffer, index_count, instance_count, 0, 0, 0);
+            // `first_index` is always 0: the bound range starts at the caller's pointer.
+            self.loaders.device.cmd_draw_indexed(
+                self.command_buffer,
+                index_count,
+                instance_count,
+                0,
+                vertex_offset,
+                first_instance,
+            );
         }
     }
 
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
         unsafe {
-            self.device.cmd_dispatch(self.command_buffer, x, y, z);
+            self.loaders
+                .device
+                .cmd_dispatch(self.command_buffer, x, y, z);
         }
     }
 
@@ -337,7 +389,8 @@ impl VulkanCommandBuffer {
         let info = vk::DispatchIndirect2InfoKHR::default()
             .address_range(Self::range(args, size_of::<DispatchIndirectArgs>() as u64));
         unsafe {
-            self.address_commands
+            self.loaders
+                .address_commands
                 .cmd_dispatch_indirect2(self.command_buffer, &info);
         }
     }
@@ -348,7 +401,8 @@ impl VulkanCommandBuffer {
             .address_range(Self::strided_range(args, stride, stride))
             .draw_count(1);
         unsafe {
-            self.address_commands
+            self.loaders
+                .address_commands
                 .cmd_draw_indirect2(self.command_buffer, &info);
         }
     }
@@ -356,20 +410,22 @@ impl VulkanCommandBuffer {
     pub fn draw_indexed_indirect(
         &mut self,
         indices: GpuPtr<u8>,
-        _max_index_count: u32,
+        max_index_count: u32,
         args: GpuPtr<u8>,
     ) {
         let stride = size_of::<DrawIndexedIndirectArgs>() as u64;
         let index_info = vk::BindIndexBuffer3InfoKHR::default()
-            .address_range(Self::range(indices, _max_index_count.max(1) as u64 * 4))
+            .address_range(Self::range(indices, max_index_count.max(1) as u64 * 4))
             .index_type(vk::IndexType::UINT32);
         let draw_info = vk::DrawIndirect2InfoKHR::default()
             .address_range(Self::strided_range(args, stride, stride))
             .draw_count(1);
         unsafe {
-            self.address_commands
+            self.loaders
+                .address_commands
                 .cmd_bind_index_buffer3(self.command_buffer, &index_info);
-            self.address_commands
+            self.loaders
+                .address_commands
                 .cmd_draw_indexed_indirect2(self.command_buffer, &draw_info);
         }
     }
@@ -383,7 +439,8 @@ impl VulkanCommandBuffer {
             .dst_range(Self::range(dst, size));
         let info = vk::CopyDeviceMemoryInfoKHR::default().regions(std::slice::from_ref(&region));
         unsafe {
-            self.address_commands
+            self.loaders
+                .address_commands
                 .cmd_copy_memory(self.command_buffer, &info);
         }
     }
@@ -401,7 +458,8 @@ impl VulkanCommandBuffer {
             .image(image)
             .regions(std::slice::from_ref(&copy));
         unsafe {
-            self.address_commands
+            self.loaders
+                .address_commands
                 .cmd_copy_memory_to_image(self.command_buffer, &info);
         }
     }
@@ -419,7 +477,8 @@ impl VulkanCommandBuffer {
             .image(image)
             .regions(std::slice::from_ref(&copy));
         unsafe {
-            self.address_commands
+            self.loaders
+                .address_commands
                 .cmd_copy_image_to_memory(self.command_buffer, &info);
         }
     }
@@ -446,7 +505,7 @@ impl VulkanCommandBuffer {
             .dst_offset(to_vk_offset(dst_region.origin))
             .extent(to_vk_extent(src_region.extent));
         unsafe {
-            self.device.cmd_copy_image(
+            self.loaders.device.cmd_copy_image(
                 self.command_buffer,
                 src_image,
                 IMAGE_LAYOUT,
@@ -478,12 +537,8 @@ impl VulkanCommandBuffer {
         )
     }
 
-    /// The no-hazard case: `to_vk_access_flags(empty)` is `NONE` and the descriptor-buffer path
-    /// is skipped, leaving exactly the write-to-read dependency.
-    pub fn barrier(&mut self, src: StageFlags, dst: StageFlags) {
-        self.barrier_with_hazard(src, dst, HazardFlags::empty());
-    }
-
+    /// With an empty `hazard`, `to_vk_access_flags` is `NONE` and the descriptor-heap path is
+    /// skipped, leaving exactly the write-to-read dependency.
     pub fn barrier_with_hazard(&mut self, src: StageFlags, dst: StageFlags, hazard: HazardFlags) {
         let use_descriptor_heap_hazard = hazard.contains(HazardFlags::DESCRIPTORS);
         let hazard_for_access = if use_descriptor_heap_hazard {
@@ -524,26 +579,10 @@ impl VulkanCommandBuffer {
             vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&memory_barrier));
 
         unsafe {
-            self.device
+            self.loaders
+                .device
                 .cmd_pipeline_barrier2(self.command_buffer, &dep_info);
         }
-    }
-
-    pub fn signal_after(&mut self, src: StageFlags, hazard: HazardFlags) {
-        if let Some((pending_src, pending_hazard)) = self.pending_split_barrier.as_mut() {
-            *pending_src |= src;
-            *pending_hazard |= hazard;
-            return;
-        }
-        self.pending_split_barrier = Some((src, hazard));
-    }
-
-    pub fn wait_before(&mut self, dst: StageFlags, hazard: HazardFlags) {
-        let (src, pending_hazard) = self
-            .pending_split_barrier
-            .take()
-            .expect("wait_before called without a matching signal_after");
-        self.barrier_with_hazard(src, dst, pending_hazard | hazard);
     }
 
     pub fn set_viewport(
@@ -565,7 +604,8 @@ impl VulkanCommandBuffer {
             max_depth,
         };
         unsafe {
-            self.device
+            self.loaders
+                .device
                 .cmd_set_viewport(self.command_buffer, 0, &[viewport]);
         }
     }
@@ -576,25 +616,27 @@ impl VulkanCommandBuffer {
             extent: vk::Extent2D { width, height },
         };
         unsafe {
-            self.device
+            self.loaders
+                .device
                 .cmd_set_scissor(self.command_buffer, 0, &[scissor]);
         }
     }
 
-    pub fn reset_queries(&mut self, pool: vk::QueryPool, first: u32, count: u32) {
+    pub fn reset_queries(&mut self, pool: &super::query::VulkanQueryPool, count: u32) {
         unsafe {
-            self.device
-                .cmd_reset_query_pool(self.command_buffer, pool, first, count);
+            self.loaders
+                .device
+                .cmd_reset_query_pool(self.command_buffer, pool.pool, 0, count);
         }
     }
 
-    pub fn write_timestamp(&mut self, pool: vk::QueryPool, query: u32) {
+    pub fn write_timestamp(&mut self, pool: &super::query::VulkanQueryPool, query: u32) {
         // Bracket GPU time with bottom-of-pipe timestamps.
         unsafe {
-            self.device.cmd_write_timestamp2(
+            self.loaders.device.cmd_write_timestamp2(
                 self.command_buffer,
                 vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
-                pool,
+                pool.pool,
                 query,
             );
         }
@@ -620,7 +662,7 @@ impl VulkanCommandBuffer {
                 layer_count: 1,
             });
         unsafe {
-            self.device.cmd_pipeline_barrier2(
+            self.loaders.device.cmd_pipeline_barrier2(
                 self.command_buffer,
                 &vk::DependencyInfo::default()
                     .image_memory_barriers(std::slice::from_ref(&barrier)),
@@ -629,15 +671,17 @@ impl VulkanCommandBuffer {
     }
 
     pub fn set_meshlet_pipeline(&mut self, pso: &MeshletPso) {
-        let vk_pso = backend_expect!(&pso.inner, crate::pipeline::MeshletPsoInner::Vulkan);
-        self.retained_pipelines
-            .push(RetainedPipeline::Meshlet(vk_pso.clone()));
+        let vk_pso = &pso.inner;
+        self.retain_pipeline(vk_pso.pipeline, || {
+            RetainedPipeline::Meshlet(vk_pso.clone())
+        });
         self.bind_pipeline(vk::PipelineBindPoint::GRAPHICS, vk_pso.pipeline);
     }
 
     pub fn draw_meshlets(&mut self, x: u32, y: u32, z: u32) {
         unsafe {
-            self.mesh_shader
+            self.loaders
+                .mesh_shader
                 .cmd_draw_mesh_tasks(self.command_buffer, x, y, z);
         }
     }
@@ -649,67 +693,16 @@ impl VulkanCommandBuffer {
             .address_range(Self::strided_range(args, stride, stride))
             .draw_count(1);
         unsafe {
-            self.address_commands
+            self.loaders
+                .address_commands
                 .cmd_draw_mesh_tasks_indirect2(self.command_buffer, &info);
         }
     }
 
-    pub fn build_blas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &BlasDesc) {
+    pub fn build_blas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &BlasDesc<'_>) {
         let (accel_loader, vk_as, scratch_address) = self.resolve_accel(accel);
 
-        let geometries: Vec<vk::AccelerationStructureGeometryKHR> = desc
-            .meshes
-            .iter()
-            .map(|m| match m.geometry_type {
-                GeometryType::Triangles => {
-                    let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
-                        .vertex_format(vk::Format::R32G32B32_SFLOAT)
-                        .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.vertex_buffer.address,
-                        })
-                        .vertex_stride(m.vertex_stride)
-                        .max_vertex(m.vertex_count.saturating_sub(1))
-                        .index_type(if m.index_count > 0 {
-                            vk::IndexType::UINT32
-                        } else {
-                            vk::IndexType::NONE_KHR
-                        })
-                        .index_data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.index_buffer.address,
-                        });
-                    vk::AccelerationStructureGeometryKHR::default()
-                        .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
-                        .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
-                        .flags(geometry_flags_to_vk(m.flags))
-                }
-                GeometryType::Aabbs => {
-                    let aabbs = vk::AccelerationStructureGeometryAabbsDataKHR::default()
-                        .data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: m.aabb_buffer.address,
-                        })
-                        .stride(std::mem::size_of::<vk::AabbPositionsKHR>() as u64);
-                    vk::AccelerationStructureGeometryKHR::default()
-                        .geometry_type(vk::GeometryTypeKHR::AABBS)
-                        .geometry(vk::AccelerationStructureGeometryDataKHR { aabbs })
-                        .flags(geometry_flags_to_vk(m.flags))
-                }
-            })
-            .collect();
-
-        let primitive_counts: Vec<u32> = desc
-            .meshes
-            .iter()
-            .map(|m| match m.geometry_type {
-                GeometryType::Triangles => {
-                    if m.index_count > 0 {
-                        m.index_count / 3
-                    } else {
-                        m.vertex_count / 3
-                    }
-                }
-                GeometryType::Aabbs => m.aabb_count,
-            })
-            .collect();
+        let (geometries, primitive_counts) = super::accel::blas_geometries(desc);
 
         let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
@@ -721,15 +714,16 @@ impl VulkanCommandBuffer {
                 device_address: scratch_address,
             });
 
-        let range_infos: Vec<vk::AccelerationStructureBuildRangeInfoKHR> = primitive_counts
-            .iter()
-            .map(|&pc| vk::AccelerationStructureBuildRangeInfoKHR {
-                primitive_count: pc,
-                primitive_offset: 0,
-                first_vertex: 0,
-                transform_offset: 0,
-            })
-            .collect();
+        let range_infos: SmallVec<[vk::AccelerationStructureBuildRangeInfoKHR; 4]> =
+            primitive_counts
+                .iter()
+                .map(|&pc| vk::AccelerationStructureBuildRangeInfoKHR {
+                    primitive_count: pc,
+                    primitive_offset: 0,
+                    first_vertex: 0,
+                    transform_offset: 0,
+                })
+                .collect();
         let range_infos_ref: Option<&[vk::AccelerationStructureBuildRangeInfoKHR]> =
             Some(&range_infos);
         let build_range_infos: &[Option<&[vk::AccelerationStructureBuildRangeInfoKHR]>] =
@@ -787,17 +781,19 @@ impl VulkanCommandBuffer {
         }
     }
 
+    /// Borrows the loader rather than cloning it: `vk_accel_structure::Device` is a table of
+    /// function pointers, and a build has no reason to copy one.
     fn resolve_accel(
         &self,
         accel: &crate::accel::AccelerationStructure,
     ) -> (
-        vk_accel_structure::Device,
+        &vk_accel_structure::Device,
         vk::AccelerationStructureKHR,
         u64,
     ) {
-        let a = backend_expect!(&accel.inner, crate::accel::AccelInner::Vulkan);
+        let a = &accel.inner;
         (
-            self.acceleration_structure.clone(),
+            &self.loaders.acceleration_structure,
             a.acceleration_structure,
             a.scratch_address,
         )
@@ -847,5 +843,88 @@ fn to_vk_extent(extent: [u32; 3]) -> vk::Extent3D {
         width: extent[0],
         height: extent[1],
         depth: extent[2],
+    }
+}
+
+impl VulkanDevice {
+    fn acquire_command_buffer(&self) -> RhiResult<vk::CommandBuffer> {
+        self.queue.acquire_command_buffer()
+    }
+
+    pub(crate) fn recycle_command_buffer(&self, command_buffer: vk::CommandBuffer) {
+        self.queue.recycle_command_buffer(command_buffer)
+    }
+
+    pub fn create_command_buffer(&self) -> RhiResult<CommandBuffer> {
+        self.begin_command_buffer(None)
+    }
+
+    /// Begin recording, optionally wired to a swapchain's images.
+    ///
+    /// `swapchain` is `Some` only for the frame's own command buffer, which is the one allowed to
+    /// name [`RenderTarget::swapchain_image`](crate::RenderTarget::swapchain_image); everything
+    /// else differs not at all between the two entry points.
+    fn begin_command_buffer(
+        &self,
+        swapchain: Option<&super::swapchain::VulkanSwapchain>,
+    ) -> RhiResult<CommandBuffer> {
+        // Texture creation records initial-layout transitions into one reusable setup command
+        // buffer. Flush the batch once before user work starts instead of queue-idling once per
+        // texture.
+        self.flush_setup_barriers()?;
+        let cmd = self.acquire_command_buffer()?;
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        // SAFETY: `cmd` came from this device's pool and is not recording.
+        unsafe {
+            self.loaders
+                .device
+                .begin_command_buffer(cmd, &begin_info)
+                .map_err(|e| RhiError::CommandBuffer(e.into()))?;
+        }
+
+        // Both heaps are bound once here and stay bound: they are the only ones the device owns.
+        self.bind_descriptor_heaps(cmd);
+
+        Ok(CommandBuffer::new(Box::new(VulkanCommandBuffer {
+            command_buffer: cmd,
+            loaders: self.loaders.clone(),
+            swapchain_image_views: swapchain
+                .map_or_else(|| Rc::from([]), |sc| sc.image_views.clone()),
+            swapchain_images: swapchain.map_or_else(|| Rc::from([]), |sc| sc.images.clone()),
+            in_labelled_pass: false,
+            textures: self.textures.clone(),
+            rendered_swapchain_images: SmallVec::new(),
+            retained_pipelines: SmallVec::new(),
+            last_bound_pipeline: vk::Pipeline::null(),
+            ended: false,
+        })))
+    }
+
+    /// Bind the resource and sampler heaps for the lifetime of `cmd`.
+    fn bind_descriptor_heaps(&self, cmd: vk::CommandBuffer) {
+        let heaps = &self.descriptor_heaps;
+        unsafe {
+            self.loaders
+                .descriptor_heap
+                .cmd_bind_resource_heap(cmd, &heaps.resource.bind_info());
+            self.loaders
+                .descriptor_heap
+                .cmd_bind_sampler_heap(cmd, &heaps.sampler.bind_info());
+        }
+    }
+
+    /// Create a command buffer pre-configured with swapchain image views for rendering.
+    pub fn create_command_buffer_for_swapchain(
+        &self,
+        sc: &VulkanSwapchain,
+        frame_index: usize,
+    ) -> RhiResult<CommandBuffer> {
+        if frame_index >= MAX_FRAMES_IN_FLIGHT {
+            return Err(RhiError::CommandBuffer("invalid Vulkan frame index".into()));
+        }
+        self.begin_command_buffer(Some(sc))
     }
 }

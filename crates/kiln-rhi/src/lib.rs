@@ -9,7 +9,9 @@
 //! - Stage-only barriers (no per-resource state tracking)
 //! - Minimal PSO (topology + formats + MSAA + blend baked; separate DepthStencil)
 //! - Transient command buffers (create, record, submit, auto-reclaim)
-//! - `destroy` whenever you are done: releases are held until the work referencing them retires
+//! - `destroy` whenever you are done: releases are held until the work referencing them retires.
+//!   [`Allocation`], [`Texture`], [`Sampler`], [`QueryPool`] and [`AccelerationStructure`] are the
+//!   [`DeviceResource`]s this covers; everything else frees on `Drop` like normal Rust
 //! - Single-threaded: `Device` and `CommandBuffer` are `Rc`-backed and deliberately not `Send`
 //! - Validation is left to the backends; the RHI only checks what they cannot see
 //! - Timeline semaphores for cross-submit ordering; frame pacing uses the swapchain fence
@@ -71,6 +73,7 @@ mod sealed {
     }
 
     impl_sealed!(
+        crate::accel::AccelerationStructure,
         crate::memory::Allocation,
         crate::pipeline::ComputePso,
         crate::pipeline::GraphicsPso,
@@ -82,6 +85,15 @@ mod sealed {
 }
 
 pub mod accel;
+#[cfg(not(any(feature = "vulkan", feature = "metal")))]
+compile_error!("kiln-rhi needs a backend: enable `vulkan` or `metal`");
+
+// The Vulkan backend requires Vulkan 1.4 features (descriptor heaps, device-address commands,
+// untyped pointers) that MoltenVK does not provide, so the two backends never target the same
+// platform. One is compiled in, which is why a handle's `inner` is its backend type outright.
+#[cfg(all(feature = "vulkan", feature = "metal"))]
+compile_error!("kiln-rhi builds one backend at a time: enable `vulkan` or `metal`, not both");
+
 pub(crate) mod backend;
 pub mod barrier;
 pub mod command;
@@ -129,7 +141,7 @@ pub use command::{
     DrawIndirectArgs, LoadOp, Pipeline, RenderPassDesc, RenderTarget, StoreOp,
 };
 pub use device::{Backend, Device, DeviceDesc, DeviceResource};
-pub use error::{RhiError, RhiResult};
+pub use error::{ErrorDetail, RhiError, RhiResult};
 pub use memory::{
     Allocation, AllocationDesc, BumpAllocator, DEFAULT_ALIGN, GpuPod, Mapped, MemoryType,
 };
@@ -139,10 +151,9 @@ pub use queue::{Queue, SubmitDesc};
 pub use sampler::{Sampler, SamplerDesc};
 pub use shader::{ShaderModule, ShaderModuleDesc, ShaderStage};
 pub use surface::{Surface, SurfaceDesc};
-pub use swapchain::{AcquiredImage, Swapchain, SwapchainDesc};
+pub use swapchain::{Swapchain, SwapchainDesc};
 pub use sync::TimelineSemaphore;
 pub use texture::{
-    ALL_LAYERS, ALL_MIPS, Texture, TextureDesc, TextureRegion, TextureUsage, TextureViewDesc,
-    ViewKind, bytes_per_pixel, formats_are_view_compatible,
+    Texture, TextureDesc, TextureRegion, TextureUsage, TextureViewDesc, ViewKind, bytes_per_pixel,
 };
 pub use types::*;

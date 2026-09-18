@@ -13,10 +13,11 @@ impl FrameArenas {
     pub(crate) fn new(device: &Device, size: u64, label: &str) -> Result<Self> {
         let mut slots = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for slot in 0..MAX_FRAMES_IN_FLIGHT {
+            let slot_label = format!("{label}-{slot}");
             match device.create_allocation(&AllocationDesc {
                 size,
                 memory: MemoryType::Upload,
-                label: Some(format!("{label}-{slot}")),
+                label: Some(&slot_label),
                 ..Default::default()
             }) {
                 Ok(buffer) => slots.push(BumpAllocator::new(buffer)),

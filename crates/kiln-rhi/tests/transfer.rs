@@ -28,7 +28,7 @@ fn gpu_memcpy_roundtrip() {
         let mut cmd = device.create_command_buffer().expect("cmd");
         cmd.memcpy(dst.gpu(), src.gpu(), SIZE);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
-        cmd.end();
+        cmd.end().expect("end command buffer");
         let queue = device.queue();
         queue.submit(cmd).expect("submit");
         queue.wait_idle();
@@ -57,7 +57,7 @@ fn gpu_memcpy_size_sweep() {
             let mut cmd = device.create_command_buffer().expect("cmd");
             cmd.memcpy(dst.gpu(), src.gpu(), size);
             cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
-            cmd.end();
+            cmd.end().expect("end command buffer");
             let queue = device.queue();
             queue.submit(cmd).expect("submit");
             queue.wait_idle();
@@ -92,7 +92,7 @@ fn destroy_while_in_flight_keeps_storage_alive() {
     let mut cmd = device.create_command_buffer().expect("cmd");
     cmd.memcpy(dst.gpu(), src.gpu(), SIZE);
     cmd.barrier(StageFlags::TRANSFER, StageFlags::ALL_COMMANDS);
-    cmd.end();
+    cmd.end().expect("end command buffer");
     device.queue().submit(cmd).expect("submit");
 
     // No fence of any kind between the submit and the destroy.

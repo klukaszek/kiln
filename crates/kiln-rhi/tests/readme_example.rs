@@ -28,7 +28,7 @@ fn readme_direct_example(device: &Device, vertex_count: u32) -> RhiResult<()> {
     let mut root = device.create_allocation(&AllocationDesc {
         size: size_of::<DrawRoot>() as u64,
         memory: MemoryType::Upload,
-        label: Some("draw-root".into()),
+        label: Some("draw-root"),
         ..Default::default()
     })?;
     root.upload(&DrawRoot {
@@ -45,7 +45,7 @@ fn readme_arena_example(device: &Device, vertex_count: u32) -> RhiResult<()> {
     let allocation = device.create_allocation(&AllocationDesc {
         size: 64 * 1024,
         memory: MemoryType::Upload,
-        label: Some("frame-roots".into()),
+        label: Some("frame-roots"),
         ..Default::default()
     })?;
     let mut frame_arena = BumpAllocator::new(allocation);

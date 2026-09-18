@@ -71,8 +71,18 @@ impl<T: ?Sized> GpuPtr<T> {
         self.address == 0
     }
 
+    /// Whether this address is a multiple of `align`.
+    ///
+    /// # Panics
+    /// In debug builds, if `align` is not a non-zero power of two. Release builds report `false`
+    /// rather than aborting, but a non-power-of-two alignment is always a caller bug: returning
+    /// `false` silently is how an unaligned address gets blamed on the allocator.
     #[inline]
     pub fn is_aligned_to(self, align: u64) -> bool {
+        debug_assert!(
+            align.is_power_of_two(),
+            "alignment {align} is not a non-zero power of two"
+        );
         align.is_power_of_two() && self.address & (align - 1) == 0
     }
 
@@ -137,10 +147,27 @@ impl<T: ?Sized> std::fmt::LowerHex for GpuPtr<T> {
     }
 }
 
-/// Maximum number of bindless textures supported by the RHI.
-pub const MAX_BINDLESS_TEXTURES: u32 = 1_000_000;
-/// Maximum number of bindless samplers supported by the RHI.
-pub const MAX_BINDLESS_SAMPLERS: u32 = 256;
+/// Default bindless texture-heap capacity. See [`DeviceDesc::bindless`](crate::DeviceDesc).
+pub const DEFAULT_BINDLESS_TEXTURES: u32 = 1_000_000;
+/// Default bindless sampler-heap capacity.
+pub const DEFAULT_BINDLESS_SAMPLERS: u32 = 256;
+
+/// How many bindless slots a device reserves. Both heaps are allocated in full at creation and
+/// cannot grow, and the default million textures costs tens of MiB on Vulkan, 8 MiB on Metal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BindlessCapacity {
+    pub textures: u32,
+    pub samplers: u32,
+}
+
+impl Default for BindlessCapacity {
+    fn default() -> Self {
+        Self {
+            textures: DEFAULT_BINDLESS_TEXTURES,
+            samplers: DEFAULT_BINDLESS_SAMPLERS,
+        }
+    }
+}
 
 /// Texture handle -- index into the global bindless heap.
 #[repr(transparent)]
@@ -182,6 +209,32 @@ pub enum Format {
     R32Uint,
 }
 
+/// Every [`Format`] the RHI defines, so conversion tables can be checked exhaustively.
+/// The `match` in [`bytes_per_pixel`] is the compiler-checked list; this one is kept beside it.
+#[cfg(test)]
+pub(crate) const ALL_FORMATS: &[Format] = &[
+    Format::R8Unorm,
+    Format::R8G8Unorm,
+    Format::R8G8B8A8Unorm,
+    Format::R8G8B8A8Srgb,
+    Format::B8G8R8A8Unorm,
+    Format::B8G8R8A8Srgb,
+    Format::R16Float,
+    Format::R16G16Float,
+    Format::R16G16B16A16Float,
+    Format::R32Float,
+    Format::R32G32Float,
+    Format::R32G32B32A32Float,
+    Format::R10G10B10A2Unorm,
+    Format::R11G11B10Float,
+    Format::D16Unorm,
+    Format::D32Float,
+    Format::D24UnormS8Uint,
+    Format::D32FloatS8Uint,
+    Format::R16Uint,
+    Format::R32Uint,
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Topology {
     TriangleList,
@@ -195,6 +248,19 @@ pub enum SampleCount {
     S4,
     S8,
     S16,
+}
+
+impl SampleCount {
+    /// Samples per pixel, as both backends' APIs want it.
+    pub const fn count(self) -> u32 {
+        match self {
+            Self::S1 => 1,
+            Self::S2 => 2,
+            Self::S4 => 4,
+            Self::S8 => 8,
+            Self::S16 => 16,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -234,8 +300,10 @@ pub enum BlendOp {
 
 /// Texture dimension.
 ///
-/// `TextureDesc::array_layers` means: slices for `D2Array`; total faces (n×6) for `CubeArray`;
-/// cube count for `Cube` (backends multiply by 6 for storage).
+/// [`TextureDesc::array_layers`](crate::TextureDesc::array_layers) counts whole *images*, never
+/// faces: slices for `D2Array`, cubes for `Cube` (always 1) and `CubeArray`. Backends multiply by
+/// six where their own API wants faces. Every other dimension requires `array_layers == 1`; use
+/// `D2Array` for an array of 2D images.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TextureDimension {
     D1,
@@ -244,6 +312,22 @@ pub enum TextureDimension {
     D3,
     Cube,
     CubeArray,
+}
+
+impl TextureDimension {
+    /// Whether this dimension stores more than one image, i.e. whether `array_layers` may exceed 1.
+    pub(crate) const fn is_array(self) -> bool {
+        matches!(self, Self::D2Array | Self::CubeArray)
+    }
+
+    /// Number of 2D faces backing `array_layers` images: six per cube, one otherwise. This is what
+    /// Vulkan calls `arrayLayers` and what a Metal texture view counts as slices.
+    pub(crate) const fn face_count(self, array_layers: u32) -> u32 {
+        match self {
+            Self::Cube | Self::CubeArray => array_layers.saturating_mul(6),
+            _ => array_layers,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -281,28 +365,20 @@ bitflags::bitflags! {
     }
 }
 
-/// Cull mode. Front face is always CCW; the variant names the winding culled.
+/// Cull mode. Front face is always CCW; the variant names the winding culled. `Cw` is the common
+/// case (back-face culling).
 ///
-/// - `Cw` — back-face culling (the common case) · `Ccw` — front-face · `All` · `None`
+/// No "cull everything": Metal has no `FRONT_AND_BACK`, and flipping the winding to fake it culls
+/// only half the triangles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cull {
     None,
     Cw,
     Ccw,
-    All,
 }
 
 /// Maximum frames in flight.
 pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
-
-/// Geometry type inside a BLAS.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum GeometryType {
-    /// Triangle geometry, read from `vertex_buffer` at `vertex_stride`.
-    Triangles,
-    /// Axis-aligned bounding boxes for procedural geometry.
-    Aabbs,
-}
 
 bitflags::bitflags! {
     /// Per-geometry flags for a BLAS build.
@@ -327,10 +403,10 @@ bitflags::bitflags! {
 }
 
 bitflags::bitflags! {
-    /// Acceleration structure build flags.
+    /// Acceleration structure build flags. No `ALLOW_UPDATE`: every build is a full rebuild, so
+    /// the flag would describe an operation the RHI cannot request.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
     pub struct BuildAccelFlags: u8 {
-        const ALLOW_UPDATE      = 0x01;
         const PREFER_FAST_TRACE = 0x02;
         const PREFER_FAST_BUILD = 0x04;
         const MINIMIZE_MEMORY   = 0x08;
@@ -338,22 +414,45 @@ bitflags::bitflags! {
 }
 
 /// One geometry entry in a BLAS descriptor.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct BlasMeshDesc {
-    pub geometry_type: GeometryType,
     pub flags: GeometryFlags,
-    /// Vertex positions (for triangles).
-    pub vertex_buffer: GpuPtr<[f32; 3]>,
-    /// Bytes between successive vertex positions (for Triangles).
-    pub vertex_stride: u64,
-    pub vertex_count: u32,
-    /// Triangle indices, or [`GpuPtr::NULL`] for non-indexed geometry.
-    pub index_buffer: GpuPtr<u32>,
-    /// Index count (0 = non-indexed).
-    pub index_count: u32,
-    /// Axis-aligned bounding boxes (for AABB geometry).
-    pub aabb_buffer: GpuPtr<Aabb>,
-    pub aabb_count: u32,
+    pub geometry: BlasGeometry,
+}
+
+/// What a BLAS geometry holds. The variant *is* the geometry type, so a mesh cannot carry
+/// bounding boxes, a procedural one cannot carry indices, and neither can lack its buffer.
+#[derive(Clone, Copy, Debug)]
+pub enum BlasGeometry {
+    Triangles {
+        /// Vertex positions.
+        vertices: GpuPtr<[f32; 3]>,
+        /// Bytes between successive positions.
+        stride: u64,
+        count: u32,
+        /// `None` reads `vertices` three at a time.
+        indices: Option<BlasIndices>,
+    },
+    /// Axis-aligned bounding boxes, for procedural geometry.
+    Aabbs { buffer: GpuPtr<Aabb>, count: u32 },
+}
+
+/// The index buffer of an indexed triangle geometry.
+#[derive(Clone, Copy, Debug)]
+pub struct BlasIndices {
+    pub buffer: GpuPtr<u32>,
+    pub count: u32,
+}
+
+impl BlasGeometry {
+    /// Primitives this geometry builds. Both backends size their builds from it, so the rule
+    /// lives here rather than in each of them.
+    pub(crate) fn primitive_count(self) -> u32 {
+        match self {
+            Self::Triangles { count, indices, .. } => indices.map_or(count, |i| i.count) / 3,
+            Self::Aabbs { count, .. } => count,
+        }
+    }
 }
 
 /// Axis-aligned bounding box consumed by procedural BLAS geometry.
@@ -366,8 +465,8 @@ pub struct Aabb {
 
 /// Descriptor for building a Bottom-Level Acceleration Structure.
 #[derive(Clone, Debug, Default)]
-pub struct BlasDesc {
-    pub meshes: Vec<BlasMeshDesc>,
+pub struct BlasDesc<'a> {
+    pub meshes: &'a [BlasMeshDesc],
     pub flags: BuildAccelFlags,
 }
 

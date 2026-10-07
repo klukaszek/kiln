@@ -47,7 +47,7 @@ fn texture_create_and_views() {
     );
 
     let mem = device
-        .allocate_aligned(size_align.size, size_align.align, MemoryType::GpuOnly)
+        .allocate_bytes_aligned(size_align.size, size_align.align, MemoryType::GpuOnly)
         .expect("texture backing memory");
     let mut texture = common::timed("create_texture (placement)", || {
         device
@@ -86,7 +86,7 @@ fn texture_copy_roundtrip() {
     let desc = test_texture_desc();
     let size_align = device.texture_size_align(&desc).expect("size_align");
     let mem = device
-        .allocate_aligned(size_align.size, size_align.align, MemoryType::GpuOnly)
+        .allocate_bytes_aligned(size_align.size, size_align.align, MemoryType::GpuOnly)
         .expect("texture backing");
     let texture = device
         .create_texture(&desc, mem.gpu())
@@ -94,14 +94,14 @@ fn texture_copy_roundtrip() {
 
     let bytes = (W as usize) * (H as usize) * BPP;
     let mut src = device
-        .allocate(bytes as u64, MemoryType::Upload)
+        .allocate_bytes(bytes as u64, MemoryType::Upload)
         .expect("upload");
     let dst = device
-        .allocate(bytes as u64, MemoryType::Readback)
+        .allocate_bytes(bytes as u64, MemoryType::Readback)
         .expect("readback");
 
     for (i, b) in src
-        .as_mut_slice::<u8>()
+        .as_mut_slice()
         .expect("src slice")
         .iter_mut()
         .enumerate()
@@ -121,7 +121,7 @@ fn texture_copy_roundtrip() {
         queue.wait_idle();
     });
 
-    for (i, &b) in dst.as_slice::<u8>().expect("dst slice").iter().enumerate() {
+    for (i, &b) in dst.as_slice().expect("dst slice").iter().enumerate() {
         let expected = (i as u8).wrapping_mul(31).wrapping_add(5);
         assert_eq!(b, expected, "texel byte {i} mismatch");
     }
@@ -226,7 +226,7 @@ fn srgb_texture_view_reinterprets_the_same_texels() {
     };
     let tex_sa = device.texture_size_align(&tex_desc).expect("size_align");
     let tex_mem = device
-        .allocate_aligned(tex_sa.size, tex_sa.align, MemoryType::GpuOnly)
+        .allocate_bytes_aligned(tex_sa.size, tex_sa.align, MemoryType::GpuOnly)
         .expect("tex mem");
     let mut texture = device
         .create_texture(&tex_desc, tex_mem.gpu())
@@ -261,7 +261,7 @@ fn srgb_texture_view_reinterprets_the_same_texels() {
         .expect("create_sampler");
 
     let mut root = device
-        .allocate(std::mem::size_of::<ViewRoot>() as u64, MemoryType::Upload)
+        .allocate::<ViewRoot>(MemoryType::Upload)
         .expect("root");
     root.upload(&ViewRoot {
         unorm: texture.gpu(),
@@ -284,11 +284,11 @@ fn srgb_texture_view_reinterprets_the_same_texels() {
     };
     let rt_sa = device.texture_size_align(&rt_desc).expect("rt size_align");
     let rt_mem = device
-        .allocate_aligned(rt_sa.size, rt_sa.align, MemoryType::GpuOnly)
+        .allocate_bytes_aligned(rt_sa.size, rt_sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let rt = device.create_texture(&rt_desc, rt_mem.gpu()).expect("rt");
     let readback = device
-        .allocate((W * H * 4) as u64, MemoryType::Readback)
+        .allocate_bytes((W * H * 4) as u64, MemoryType::Readback)
         .expect("readback");
 
     common::timed("sample through both views · submit+wait", || {
@@ -324,7 +324,7 @@ fn srgb_texture_view_reinterprets_the_same_texels() {
         queue.wait_idle();
     });
 
-    let pixels = readback.as_slice::<u8>().expect("readback slice");
+    let pixels = readback.as_slice().expect("readback slice");
     common::save_rgba_png("srgb_texture_view", W, H, pixels);
 
     let texel_at = |x: u32, y: u32| {
@@ -385,7 +385,7 @@ fn texture_subresource_copy_roundtrip() {
     };
     let size_align = device.texture_size_align(&desc).expect("size_align");
     let mem = device
-        .allocate_aligned(size_align.size, size_align.align, MemoryType::GpuOnly)
+        .allocate_bytes_aligned(size_align.size, size_align.align, MemoryType::GpuOnly)
         .expect("texture backing");
     let texture = device
         .create_texture(&desc, mem.gpu())
@@ -394,10 +394,10 @@ fn texture_subresource_copy_roundtrip() {
     // One distinct byte pattern per (mip, layer), sized to that mip.
     let staging_bytes = (W as usize) * (H as usize) * BPP;
     let mut src = device
-        .allocate(staging_bytes as u64, MemoryType::Upload)
+        .allocate_bytes(staging_bytes as u64, MemoryType::Upload)
         .expect("upload");
     let dst = device
-        .allocate(staging_bytes as u64, MemoryType::Readback)
+        .allocate_bytes(staging_bytes as u64, MemoryType::Readback)
         .expect("readback");
 
     let pattern = |mip: u32, layer: u32, i: usize| -> u8 {
@@ -418,7 +418,7 @@ fn texture_subresource_copy_roundtrip() {
             let mip_h = (H >> mip).max(1) as usize;
             let len = mip_w * mip_h * BPP;
 
-            for (i, b) in src.as_mut_slice::<u8>().expect("src slice")[..len]
+            for (i, b) in src.as_mut_slice().expect("src slice")[..len]
                 .iter_mut()
                 .enumerate()
             {
@@ -453,7 +453,7 @@ fn texture_subresource_copy_roundtrip() {
             device.queue().submit(cmd).expect("submit");
             device.queue().wait_idle();
 
-            let got = dst.as_slice::<u8>().expect("dst slice");
+            let got = dst.as_slice().expect("dst slice");
             for (i, &b) in got[..len].iter().enumerate() {
                 assert_eq!(
                     b,

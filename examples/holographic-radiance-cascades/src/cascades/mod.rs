@@ -15,16 +15,16 @@ mod resources;
 
 use glam::{IVec2, UVec2, Vec4};
 use kiln_rhi::{
-    AllocationDesc, BumpAllocator, CommandBuffer, Device, Format, GpuPtr, MAX_FRAMES_IN_FLIGHT,
-    MemoryType, RhiResult, StageFlags,
+    BumpAllocator, CommandBuffer, Device, Format, GpuPtr, MAX_FRAMES_IN_FLIGHT, MemoryType,
+    RhiResult, StageFlags,
 };
 
 use crate::scene::{self, Prim};
 
 use program::{
     CASCADE_THREADS, CLEAR_THREADS, CONE_STRIDE, ClearRoot, EDGES_PER_PRIM, FIELD_THREADS,
-    GRID_CELLS, Pipelines, REFERENCE_EPSILON, REFERENCE_MAX_STEPS, ReferenceRoot, Root,
-    SEGMENT_STRIDE,
+    GRID_CELLS, Half3, Half4, Pipelines, REFERENCE_EPSILON, REFERENCE_MAX_STEPS, ReferenceRoot,
+    Root, SEGMENT_STRIDE,
 };
 pub use program::{DIRECT_TRACE_LEVELS, REFERENCE_DIRECTIONS};
 use resources::SceneResources;
@@ -168,17 +168,27 @@ pub fn plan_resolution(extent: UVec2, probes_thousands: u32) -> (UVec2, u32) {
 }
 
 /// One cascade level's storage: where it starts and the shape the index arithmetic assumes.
+/// `E` is the element: `Half4` segments for a `T` level, `Half3` cones for an `R` level.
 #[derive(Clone, Copy)]
-struct Level {
-    base: GpuPtr<u8>,
+struct Level<E> {
+    base: GpuPtr<E>,
     width: u32,
     /// Directions for a `T` level, cones for an `R` level.
     dirs: u32,
 }
 
-impl Level {
+impl<E> Level<E> {
     fn entries(&self, height: u32) -> u64 {
         u64::from(self.width) * u64::from(height) * u64::from(self.dirs)
+    }
+
+    /// The same storage holding `U`s: every level is carved out of one byte allocation.
+    fn typed<U>(self) -> Level<U> {
+        Level {
+            base: self.base.cast(),
+            width: self.width,
+            dirs: self.dirs,
+        }
     }
 }
 
@@ -187,9 +197,9 @@ impl Level {
 struct Parity {
     levels: u32,
     canon: UVec2,
-    segments: Vec<Level>,
+    segments: Vec<Level<Half4>>,
     /// Indexed by level; entry 0 is unused, because R_0 is stored per quadrant instead.
-    cones: Vec<Level>,
+    cones: Vec<Level<Half3>>,
 }
 
 /// Everything sized to one probe grid, replaced wholesale when the grid changes. Absent until the
@@ -199,9 +209,9 @@ struct Layout {
     /// One allocation behind every cascade level; sub-buffers are offsets into it.
     cascades: kiln_rhi::Allocation,
     /// The resolved field, plus the two blur scratch buffers.
-    field: kiln_rhi::Allocation,
+    field: kiln_rhi::Allocation<Vec4>,
     parities: [Parity; 2],
-    quadrant_cones: [GpuPtr<u8>; 4],
+    quadrant_cones: [GpuPtr<Half3>; 4],
     field_buffers: [GpuPtr<Vec4>; 3],
     /// The buffer holding the field as it will be displayed, which is also what the next frame's
     /// surfaces re-emit.
@@ -231,13 +241,8 @@ impl HrcRenderer {
             .map(|slot| {
                 let label = format!("hrc-frame-roots-{slot}");
                 device
-                    .create_allocation(&AllocationDesc {
-                        size: ARENA_BYTES,
-                        memory: MemoryType::Upload,
-                        label: Some(&label),
-                        ..Default::default()
-                    })
-                    .map(BumpAllocator::new)
+                    .allocate_bytes(ARENA_BYTES, MemoryType::Upload)
+                    .map(|allocation| BumpAllocator::new(allocation.labeled(&label)))
             })
             .collect::<RhiResult<_>>()?;
         let arenas: [BumpAllocator; MAX_FRAMES_IN_FLIGHT] = arenas
@@ -305,18 +310,13 @@ impl HrcRenderer {
         let plan = plan(res);
         let field_entries = u64::from(res.x) * u64::from(res.y);
 
-        let cascades = device.create_allocation(&AllocationDesc {
-            size: plan.cascade_bytes,
-            memory: MemoryType::GpuOnly,
-            label: Some("hrc-cascades"),
-            ..Default::default()
-        })?;
-        let field = device.create_allocation(&AllocationDesc {
-            size: plan.field_bytes,
-            memory: MemoryType::GpuOnly,
-            label: Some("hrc-fluence-field"),
-            ..Default::default()
-        })?;
+        let cascades = device
+            .allocate_bytes(plan.cascade_bytes, MemoryType::GpuOnly)?
+            .labeled("hrc-cascades");
+        // The resolved field and its two blur scratch buffers.
+        let field = device
+            .allocate_array::<Vec4>(3 * field_entries as usize, MemoryType::GpuOnly)?
+            .labeled("hrc-fluence-field");
 
         let base = cascades.gpu();
         let mut offset = 0u64;
@@ -340,7 +340,7 @@ impl HrcRenderer {
             let mut segments = Vec::with_capacity(levels as usize + 1);
             let mut cones = Vec::with_capacity(levels as usize + 1);
             for n in 0..=levels {
-                segments.push(take(level_width(c.x, n), c.y, (1 << n) + 1, SEGMENT_STRIDE));
+                segments.push(take(level_width(c.x, n), c.y, (1 << n) + 1, SEGMENT_STRIDE).typed());
             }
             // Two levels have no storage: R_0 lives in the per-quadrant buffers below, and R_N is
             // uniform so the sweep evaluates it. Both keep a slot, so `cones[n]` still indexes by
@@ -352,7 +352,7 @@ impl HrcRenderer {
             };
             cones.push(placeholder);
             for n in 1..levels {
-                cones.push(take(level_width(c.x, n), c.y, 1 << n, CONE_STRIDE));
+                cones.push(take(level_width(c.x, n), c.y, 1 << n, CONE_STRIDE).typed());
             }
             cones.push(placeholder);
             parities[parity] = Parity {
@@ -364,13 +364,13 @@ impl HrcRenderer {
         }
         for quadrant in 0..4 {
             let c = canon(res, quadrant & 1);
-            quadrant_cones[quadrant] = take(level_width(c.x, 0), c.y, 1, CONE_STRIDE).base;
+            quadrant_cones[quadrant] = take(level_width(c.x, 0), c.y, 1, CONE_STRIDE)
+                .typed::<Half3>()
+                .base;
         }
         debug_assert!(offset <= cascades.size());
 
-        let field_base = field.gpu().cast::<Vec4>();
-        let field_buffers =
-            std::array::from_fn(|i| field_base.byte_add(field_entries * 16 * i as u64));
+        let field_buffers = std::array::from_fn(|i| field.gpu().offset(field_entries * i as u64));
 
         if let Some(previous) = self.layout.replace(Layout {
             cascades,
@@ -388,25 +388,23 @@ impl HrcRenderer {
 
         // The field is read a frame before it is first written: surfaces re-emit whatever reached
         // them last frame, and on the first frame that is this buffer's uninitialised contents.
-        self.clear(cmd, slot, field_base, plan.field_bytes / 4);
+        self.clear(cmd, slot, field_buffers[0], plan.field_bytes / 4);
         cmd.barrier(StageFlags::COMPUTE, StageFlags::COMPUTE);
         Ok(())
     }
 
     fn clear(&self, cmd: &mut CommandBuffer, slot: usize, target: GpuPtr<Vec4>, u32_count: u64) {
         let count = u32_count as u32;
-        let root = self.arenas[slot]
-            .alloc(size_of::<ClearRoot>() as u64, 16)
-            .expect("frame arena exhausted")
-            .cast::<ClearRoot>();
-        root.write(&ClearRoot {
-            target: target.cast(),
-            count,
-            pad: 0,
-        })
-        .expect("write clear root");
+        let root = self.upload(
+            slot,
+            &ClearRoot {
+                target: target.cast(),
+                count,
+                pad: 0,
+            },
+        );
         cmd.set_pipeline(&self.pipelines.clear);
-        cmd.dispatch(root.gpu(), count.div_ceil(CLEAR_THREADS), 1, 1);
+        cmd.dispatch(root, count.div_ceil(CLEAR_THREADS), 1, 1);
     }
 
     // --- dispatch -----------------------------------------------------------
@@ -461,11 +459,9 @@ impl HrcRenderer {
 
         let bytes = std::mem::size_of_val(self.packed.as_slice()) as u64;
         let staging = self.arenas[slot]
-            .alloc(bytes, 16)
-            .expect("frame arena exhausted")
-            .cast::<Vec4>();
-        staging.write_slice(&self.packed).expect("write scene");
-        cmd.memcpy(self.resources.scene.gpu(), staging.gpu(), bytes);
+            .upload_slice(&self.packed)
+            .expect("frame arena exhausted");
+        cmd.memcpy(self.resources.scene.gpu(), staging, bytes);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::COMPUTE);
     }
 
@@ -535,7 +531,7 @@ impl HrcRenderer {
                     slot,
                     &Root {
                         level: n as i32,
-                        segments_out: level.base.cast(),
+                        segments_out: level.base,
                         ..quad
                     },
                 );
@@ -550,8 +546,8 @@ impl HrcRenderer {
                     slot,
                     &Root {
                         level: n as i32,
-                        segments_out: level.base.cast(),
-                        segments_prev: p.segments[n as usize - 1].base.cast(),
+                        segments_out: level.base,
+                        segments_prev: p.segments[n as usize - 1].base,
                         ..quad
                     },
                 );
@@ -576,10 +572,10 @@ impl HrcRenderer {
                     slot,
                     &Root {
                         level: n as i32,
-                        cones_out: level.base.cast(),
-                        cones_next: p.cones[n as usize + 1].base.cast(),
-                        segments_cur: p.segments[n as usize].base.cast(),
-                        segments_next: p.segments[n as usize + 1].base.cast(),
+                        cones_out: level.base,
+                        cones_next: p.cones[n as usize + 1].base,
+                        segments_cur: p.segments[n as usize].base,
+                        segments_next: p.segments[n as usize + 1].base,
                         ..quad
                     },
                 );
@@ -652,11 +648,11 @@ impl HrcRenderer {
 
     /// Cascade passes flatten (direction, column) across the threadgroup and take the row from the
     /// dispatch's second axis, so threads adjacent in x touch adjacent addresses.
-    fn dispatch_level(
+    fn dispatch_level<E>(
         &self,
         cmd: &mut CommandBuffer,
         root: GpuPtr<Root>,
-        level: Level,
+        level: Level<E>,
         height: u32,
     ) {
         cmd.dispatch(
@@ -672,13 +668,13 @@ impl HrcRenderer {
         let sky = settings.sky;
         Root {
             sky: Vec4::new(sky * 0.6, sky * 0.75, sky, 0.0),
-            scene: self.resources.scene.gpu().cast(),
-            cell_count: self.resources.cell_count.gpu().cast(),
-            cell_prims: self.resources.cell_prims.gpu().cast(),
-            cell_clear: self.resources.cell_clear.gpu().cast(),
-            tri_prim: self.resources.tri_prim.gpu().cast(),
+            scene: self.resources.scene.gpu(),
+            cell_count: self.resources.cell_count.gpu(),
+            cell_prims: self.resources.cell_prims.gpu(),
+            cell_clear: self.resources.cell_clear.gpu(),
+            tri_prim: self.resources.tri_prim.gpu(),
             vertices: self.resources.vertices.gpu().cast(),
-            indices: self.resources.indices.gpu().cast(),
+            indices: self.resources.indices.gpu(),
             // Last frame's resolved field, which surfaces re-emit.
             history: self.layout().resolved,
             fluence_in: self.layout().resolved,
@@ -689,10 +685,10 @@ impl HrcRenderer {
             segments_next: GpuPtr::NULL,
             cones_out: GpuPtr::NULL,
             cones_next: GpuPtr::NULL,
-            cones0_q0: self.layout().quadrant_cones[0].cast(),
-            cones0_q1: self.layout().quadrant_cones[1].cast(),
-            cones0_q2: self.layout().quadrant_cones[2].cast(),
-            cones0_q3: self.layout().quadrant_cones[3].cast(),
+            cones0_q0: self.layout().quadrant_cones[0],
+            cones0_q1: self.layout().quadrant_cones[1],
+            cones0_q2: self.layout().quadrant_cones[2],
+            cones0_q3: self.layout().quadrant_cones[3],
             tlas: self.resources.tlas.gpu(),
             res: self.layout().res.as_ivec2(),
             out_res: self.out_res.as_ivec2(),
@@ -756,7 +752,7 @@ impl HrcRenderer {
         let sky = settings.sky;
         ReferenceRoot {
             sky: Vec4::new(sky * 0.6, sky * 0.75, sky, 0.0),
-            scene: self.resources.scene.gpu().cast(),
+            scene: self.resources.scene.gpu(),
             fluence_in: self.layout().resolved,
             fluence_out: dst,
             res: self.layout().res.as_ivec2(),
@@ -800,12 +796,9 @@ impl HrcRenderer {
     }
 
     fn upload<T: kiln_rhi::GpuPod>(&self, slot: usize, root: &T) -> GpuPtr<T> {
-        let allocation = self.arenas[slot]
-            .alloc(size_of::<T>() as u64, 16)
+        self.arenas[slot]
+            .upload(root)
             .expect("frame arena exhausted")
-            .cast::<T>();
-        allocation.write(root).expect("write root");
-        allocation.gpu()
     }
 
     pub fn destroy(self, device: &Device) {

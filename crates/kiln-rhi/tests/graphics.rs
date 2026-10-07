@@ -8,10 +8,9 @@ mod common;
 
 use kiln_rhi::gpu_struct;
 use kiln_rhi::{
-    AllocationDesc, BumpAllocator, ColorAttachment, ColorTarget, ColorWriteMask, Cull, Device,
-    Format, GpuPtr, GraphicsPso, GraphicsPsoDesc, LoadOp, MemoryType, RenderPassDesc, SampleCount,
-    ShaderModule, ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension, TextureUsage,
-    Topology,
+    BumpAllocator, ColorAttachment, ColorTarget, ColorWriteMask, Cull, Device, Format, GpuPtr,
+    GraphicsPso, GraphicsPsoDesc, LoadOp, MemoryType, RenderPassDesc, SampleCount, ShaderModule,
+    ShaderStage, StageFlags, StoreOp, TextureDesc, TextureDimension, TextureUsage, Topology,
 };
 
 // Shared host/device root: a single colour, used by the pixel shader.
@@ -58,16 +57,14 @@ fn graphics_fullscreen_color() {
         make_graphics_pso(&device, &vs, &fs, "fullscreen")
     });
 
-    let mut root = device
-        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Upload)
-        .expect("root");
+    let mut root = device.allocate::<Root>(MemoryType::Upload).expect("root");
     root.upload(&Root {
         color: [1.0, 0.0, 0.0, 1.0],
     })
     .expect("upload root");
 
     let pixels = common::timed("render full-screen triangle \u{b7} submit+wait", || {
-        render_draw(&device, &pso, root.gpu(), SIZE, 3, 1)
+        render_draw(&device, &pso, root.gpu().cast(), SIZE, 3, 1)
     });
     common::save_rgba_png("graphics_fullscreen_color", SIZE, SIZE, &pixels);
     for (px, pixel) in pixels.chunks_exact(4).enumerate() {
@@ -101,15 +98,13 @@ fn graphics_static_color_write_mask() {
             &fs,
         )
         .expect("create masked graphics pso");
-    let mut root = device
-        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Upload)
-        .expect("root");
+    let mut root = device.allocate::<Root>(MemoryType::Upload).expect("root");
     root.upload(&Root {
         color: [1.0, 1.0, 1.0, 0.0],
     })
     .expect("upload root");
 
-    let pixels = render_draw(&device, &pso, root.gpu(), SIZE, 3, 1);
+    let pixels = render_draw(&device, &pso, root.gpu().cast(), SIZE, 3, 1);
     for (pixel_index, pixel) in pixels.chunks_exact(4).enumerate() {
         assert_eq!(
             pixel,
@@ -189,13 +184,13 @@ fn render(
     };
     let sa = device.texture_size_align(&tex_desc).expect("size_align");
     let tex_mem = device
-        .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
+        .allocate_bytes_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let texture = device
         .create_texture(&tex_desc, tex_mem.gpu())
         .expect("create_texture");
     let readback = device
-        .allocate((size * size * 4) as u64, MemoryType::Readback)
+        .allocate_bytes((size * size * 4) as u64, MemoryType::Readback)
         .expect("readback");
 
     let depth_buf = depth.then(|| {
@@ -209,7 +204,7 @@ fn render(
         };
         let sa = device.texture_size_align(&desc).expect("depth size_align");
         let mem = device
-            .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
+            .allocate_bytes_aligned(sa.size, sa.align, MemoryType::GpuOnly)
             .expect("depth mem");
         let tex = device.create_texture(&desc, mem.gpu()).expect("depth tex");
         (tex, mem)
@@ -250,7 +245,7 @@ fn render(
     queue.submit(cmd).expect("submit");
     queue.wait_idle();
 
-    let pixels = readback.as_slice::<u8>().expect("read readback").to_vec();
+    let pixels = readback.as_slice().expect("read readback").to_vec();
     device.destroy(readback);
     device.destroy(texture);
     device.destroy(tex_mem);
@@ -455,15 +450,10 @@ fn graphics_instanced_grid() {
     let pso = make_graphics_pso(&device, &vs, &fs, "grid");
 
     let bump = common::test_bump(&device);
-    let cfg = bump
-        .alloc(std::mem::size_of::<GridCfg>() as u64, 16)
-        .expect("bump cfg");
-    cfg.cast::<GridCfg>()
-        .write(&GridCfg { dim: GRID })
-        .expect("upload cfg");
+    let cfg = bump.upload(&GridCfg { dim: GRID }).expect("bump cfg");
 
     let pixels = common::timed("instanced grid (4×4) · submit+wait", || {
-        render_draw(&device, &pso, cfg.gpu(), GRID_SIZE, 6, GRID * GRID)
+        render_draw(&device, &pso, cfg.cast(), GRID_SIZE, 6, GRID * GRID)
     });
     common::save_rgba_png("graphics_instanced_grid", GRID_SIZE, GRID_SIZE, &pixels);
 
@@ -504,19 +494,12 @@ fn graphics_root_from_bump_allocator() {
 
     // The root is a transient sub-allocation from one CPU-mapped buffer.
     let buffer = device
-        .create_allocation(&AllocationDesc {
-            size: 4096,
-            memory: MemoryType::Upload,
-            label: Some("bump-root"),
-            ..Default::default()
-        })
-        .expect("create_buffer");
+        .allocate_bytes(4096, MemoryType::Upload)
+        .expect("create_buffer")
+        .labeled("bump-root");
     let bump = BumpAllocator::new(buffer);
 
-    let root = bump
-        .alloc(std::mem::size_of::<Root>() as u64, 16)
-        .expect("bump alloc for root")
-        .cast::<Root>();
+    let root = bump.alloc::<Root>().expect("bump alloc for root");
     root.write(&Root {
         color: [0.0, 0.0, 1.0, 1.0],
     })
@@ -605,20 +588,14 @@ fn depth_test_rejects_farther_geometry() {
 
     let bump = common::test_bump(&device);
     let near = bump
-        .alloc(std::mem::size_of::<DepthRoot>() as u64, 16)
-        .unwrap();
-    near.cast::<DepthRoot>()
-        .write(&DepthRoot {
+        .upload(&DepthRoot {
             color: [0.0, 1.0, 0.0, 1.0], // green, near
             depth: 0.25,
             pad: [0.0; 3],
         })
         .unwrap();
     let far = bump
-        .alloc(std::mem::size_of::<DepthRoot>() as u64, 16)
-        .unwrap();
-    far.cast::<DepthRoot>()
-        .write(&DepthRoot {
+        .upload(&DepthRoot {
             color: [1.0, 0.0, 0.0, 1.0], // red, far — must lose
             depth: 0.75,
             pad: [0.0; 3],
@@ -630,7 +607,7 @@ fn depth_test_rejects_farther_geometry() {
         &pso,
         SIZE,
         true,
-        &[(near.gpu(), 3, 1), (far.gpu(), 3, 1)],
+        &[(near.cast(), 3, 1), (far.cast(), 3, 1)],
     );
     for (i, px) in pixels.chunks_exact(4).enumerate() {
         assert_eq!(

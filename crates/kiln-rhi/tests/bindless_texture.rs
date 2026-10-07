@@ -91,7 +91,7 @@ fn bindless_texture_sample() {
         .texture_size_align(&tex_desc)
         .expect("tex size_align");
     let tex_mem = device
-        .allocate_aligned(tex_sa.size, tex_sa.align, MemoryType::GpuOnly)
+        .allocate_bytes_aligned(tex_sa.size, tex_sa.align, MemoryType::GpuOnly)
         .expect("tex mem");
     let texture = device
         .create_texture(&tex_desc, tex_mem.gpu())
@@ -114,9 +114,7 @@ fn bindless_texture_sample() {
         })
         .expect("create_sampler");
 
-    let mut root = device
-        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Upload)
-        .expect("root");
+    let mut root = device.allocate::<Root>(MemoryType::Upload).expect("root");
     root.upload(&Root {
         tex: texture.gpu(),
         samp: sampler.gpu(),
@@ -137,13 +135,13 @@ fn bindless_texture_sample() {
     };
     let rt_sa = device.texture_size_align(&rt_desc).expect("rt size_align");
     let rt_mem = device
-        .allocate_aligned(rt_sa.size, rt_sa.align, MemoryType::GpuOnly)
+        .allocate_bytes_aligned(rt_sa.size, rt_sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let rt = device
         .create_texture(&rt_desc, rt_mem.gpu())
         .expect("create rt");
     let readback = device
-        .allocate((SIZE * SIZE * 4) as u64, MemoryType::Readback)
+        .allocate_bytes((SIZE * SIZE * 4) as u64, MemoryType::Readback)
         .expect("readback");
 
     common::timed("sample bindless texture · submit+wait", || {
@@ -182,7 +180,7 @@ fn bindless_texture_sample() {
         queue.wait_idle();
     });
 
-    let pixels = readback.as_slice::<u8>().expect("read readback");
+    let pixels = readback.as_slice().expect("read readback");
     common::save_rgba_png("bindless_texture_sample", SIZE, SIZE, pixels);
 
     let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 1;

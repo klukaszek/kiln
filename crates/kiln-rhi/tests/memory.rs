@@ -2,7 +2,7 @@
 
 mod common;
 
-use kiln_rhi::{AllocationDesc, BumpAllocator, MemoryType};
+use kiln_rhi::{BumpAllocator, MemoryType};
 
 /// `Default` memory is CPU-mapped GPU memory: a write through the mapped pointer must read
 /// straight back (the dual-pointer model the whole RHI is built on).
@@ -13,13 +13,13 @@ fn default_memory_is_cpu_mapped_roundtrip() {
     const N: usize = 4096;
     let mut allocation = common::timed("allocate 4 KiB (Default)", || {
         device
-            .allocate(N as u64, MemoryType::Upload)
+            .allocate_bytes(N as u64, MemoryType::Upload)
             .expect("allocate(Default) should succeed")
     });
 
     common::timed("CPU write+read 4 KiB roundtrip", || {
         for (i, b) in allocation
-            .as_mut_slice::<u8>()
+            .as_mut_slice()
             .expect("mapped slice")
             .iter_mut()
             .enumerate()
@@ -27,7 +27,7 @@ fn default_memory_is_cpu_mapped_roundtrip() {
             *b = (i as u8).wrapping_mul(7);
         }
         for (i, &b) in allocation
-            .as_slice::<u8>()
+            .as_slice()
             .expect("mapped slice")
             .iter()
             .enumerate()
@@ -46,10 +46,10 @@ fn host_to_device_pointer_translates_with_offset() {
     let (device, _gpu) = common::device();
 
     let mut allocation = device
-        .allocate(256, MemoryType::Upload)
+        .allocate_bytes(256, MemoryType::Upload)
         .expect("allocate(Default) should succeed");
     let cpu = allocation
-        .mapped::<u8>()
+        .mapped()
         .expect("Default memory must expose a CPU-mapped pointer")
         .cpu();
 
@@ -73,13 +73,9 @@ fn host_to_device_pointer_translates_with_offset() {
 
 fn bump(device: &kiln_rhi::Device, size: u64) -> BumpAllocator {
     let buffer = device
-        .create_allocation(&AllocationDesc {
-            size,
-            memory: MemoryType::Upload,
-            label: Some("bump"),
-            ..Default::default()
-        })
-        .expect("create_buffer(Default)");
+        .allocate_bytes(size, MemoryType::Upload)
+        .expect("create_buffer(Default)")
+        .labeled("bump");
     BumpAllocator::new(buffer)
 }
 
@@ -96,7 +92,9 @@ fn bump_alloc_aligns_and_accounts() {
     let mut prev_end = bump.gpu().addr();
     for align in [16u64, 64, 256, 4096] {
         let used_before = bump.used();
-        let a = bump.alloc(100, align).expect("fits in a 64 KiB block");
+        let a = bump
+            .alloc_bytes(100, align)
+            .expect("fits in a 64 KiB block");
         assert!(
             a.gpu().is_aligned_to(align),
             "gpu address {:#x} not aligned to {align}",
@@ -114,6 +112,38 @@ fn bump_alloc_aligns_and_accounts() {
     device.destroy(bump.into_allocation());
 }
 
+/// Typed allocations take their alignment from the type, never below `DEFAULT_ALIGN`, and
+/// `upload_slice` lands the values at the address it returns.
+#[test]
+fn bump_typed_allocs_align_and_upload() {
+    #[repr(C, align(64))]
+    struct Aligned64([u8; 64]);
+
+    let (device, _gpu) = common::device();
+    let bump = bump(&device, 4096);
+
+    let _pad = bump.alloc_bytes(1, 1).expect("pad");
+    let small = bump.alloc::<u8>().expect("small");
+    assert!(small.gpu().is_aligned_to(kiln_rhi::DEFAULT_ALIGN));
+    let wide = bump.alloc::<Aligned64>().expect("wide");
+    assert!(wide.gpu().is_aligned_to(64));
+    let before = bump.used();
+    let array = bump.alloc_array::<u32>(10).expect("array");
+    assert_eq!(bump.used() - (array.gpu().addr() - bump.gpu().addr()), 40);
+    assert!(bump.used() > before);
+
+    let values = [7u32, 11, 13];
+    let gpu = bump.upload_slice(&values).expect("upload");
+    let start = ((gpu.addr() - bump.gpu().addr()) / 4) as usize;
+    let allocation = bump.into_allocation().cast::<u32>();
+    assert_eq!(
+        &allocation.as_slice().expect("mapped")[start..start + 3],
+        &values
+    );
+
+    device.destroy(allocation);
+}
+
 /// The dual-pointer invariant: `cpu` and `gpu` from one allocation name the *same*
 /// memory. `host_to_device_pointer(cpu)` must return exactly `gpu`, and a CPU write
 /// through `cpu` must read straight back.
@@ -123,8 +153,8 @@ fn bump_alloc_cpu_gpu_correspond() {
     let bump = bump(&device, 4096);
 
     // Bump past offset 0 so the correspondence is exercised at a non-base address.
-    let _pad = bump.alloc(48, 16).expect("pad");
-    let a = bump.alloc(256, 16).expect("alloc");
+    let _pad = bump.alloc_bytes(48, 16).expect("pad");
+    let a = bump.alloc_bytes(256, 16).expect("alloc");
 
     let translated = device
         .host_to_device_pointer(a.cpu())
@@ -155,13 +185,13 @@ fn bump_full_returns_none() {
     let bump = bump(&device, 256);
 
     assert!(
-        bump.alloc(512, 16).is_none(),
+        bump.alloc_bytes(512, 16).is_none(),
         "a request larger than capacity must return None"
     );
 
     // Drain the allocator; once it can't fit another chunk it keeps returning None.
     let mut count = 0;
-    while bump.alloc(64, 16).is_some() {
+    while bump.alloc_bytes(64, 16).is_some() {
         count += 1;
         assert!(
             count <= 4,
@@ -169,7 +199,10 @@ fn bump_full_returns_none() {
         );
     }
     assert_eq!(count, 4, "exactly four 64B chunks fit in 256 bytes");
-    assert!(bump.alloc(1, 1).is_none(), "exhausted allocator stays full");
+    assert!(
+        bump.alloc_bytes(1, 1).is_none(),
+        "exhausted allocator stays full"
+    );
 
     device.destroy(bump.into_allocation());
 }
@@ -181,15 +214,15 @@ fn bump_reset_reuses_space() {
     let (device, _gpu) = common::device();
     let mut bump = bump(&device, 4096);
 
-    let first = bump.alloc(128, 16).expect("first");
+    let first = bump.alloc_bytes(128, 16).expect("first");
     let (first_cpu, first_gpu) = (first.cpu(), first.gpu());
-    let _second = bump.alloc(128, 16).expect("second");
+    let _second = bump.alloc_bytes(128, 16).expect("second");
     assert_eq!(bump.used(), 256, "two 128B allocs used 256 bytes");
 
     bump.reset();
     assert_eq!(bump.used(), 0, "reset rewinds the offset");
 
-    let reused = bump.alloc(128, 16).expect("post-reset alloc");
+    let reused = bump.alloc_bytes(128, 16).expect("post-reset alloc");
     assert_eq!(reused.cpu(), first_cpu, "reset reuses the same cpu pointer");
     assert_eq!(reused.gpu(), first_gpu, "reset reuses the same gpu address");
 

@@ -166,7 +166,8 @@ fn build_into(
 
     let instance_buffer_size =
         device.tlas_instance_stride() as u64 * scene.geometry.instances.len() as u64;
-    partial.instance_buffer = Some(device.allocate(instance_buffer_size, MemoryType::Upload)?);
+    partial.instance_buffer =
+        Some(device.allocate_bytes(instance_buffer_size, MemoryType::Upload)?);
     let instance_buffer = partial
         .instance_buffer
         .as_mut()

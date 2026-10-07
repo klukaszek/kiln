@@ -72,9 +72,10 @@ mod sealed {
         ($($ty:ty),+ $(,)?) => { $( impl Sealed for $ty {} )+ };
     }
 
+    impl<T> Sealed for crate::memory::Allocation<T> {}
+
     impl_sealed!(
         crate::accel::AccelerationStructure,
-        crate::memory::Allocation,
         crate::pipeline::ComputePso,
         crate::pipeline::GraphicsPso,
         crate::pipeline::MeshletPso,
@@ -142,9 +143,7 @@ pub use command::{
 };
 pub use device::{Backend, Device, DeviceDesc, DeviceResource};
 pub use error::{ErrorDetail, RhiError, RhiResult};
-pub use memory::{
-    Allocation, AllocationDesc, BumpAllocator, DEFAULT_ALIGN, GpuPod, Mapped, MemoryType,
-};
+pub use memory::{Allocation, BumpAllocator, DEFAULT_ALIGN, GpuPod, Mapped, MemoryType};
 pub use pipeline::*;
 pub use query::QueryPool;
 pub use queue::{Queue, SubmitDesc};

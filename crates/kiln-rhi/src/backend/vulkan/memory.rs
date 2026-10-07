@@ -6,7 +6,7 @@ use super::queue::VulkanRetiredResource;
 use crate::backend::mapped::{MappedAllocation, resolve_mapped_pointer};
 use crate::backend::suballoc::BlockPool;
 use crate::error::{RhiError, RhiResult};
-use crate::memory::{Allocation, AllocationDesc, MemoryType};
+use crate::memory::{Allocation, MemoryType};
 use crate::types::GpuPtr;
 use ash::vk;
 use ash::vk::TaggedStructure as _;
@@ -58,6 +58,9 @@ impl VulkanBuffer {
     pub fn gpu_address(&self) -> GpuPtr<u8> {
         self.gpu_address
     }
+
+    /// An allocation is a range inside a shared block buffer, with no object of its own to name.
+    pub fn set_label(&self, _label: &str) {}
 }
 
 /// The native half of a pooled block: one `VkDeviceMemory` plus the buffer spanning it.
@@ -352,17 +355,22 @@ impl VulkanDevice {
         })
     }
 
-    pub fn create_allocation(&self, desc: &AllocationDesc) -> RhiResult<Allocation> {
+    pub fn create_allocation(
+        &self,
+        size: u64,
+        align: u64,
+        memory: MemoryType,
+    ) -> RhiResult<Allocation> {
         // An allocation is a range inside a pooled block, so its requirements come from the
         // block's usage and are the same for every allocation.
-        let mut mem_requirements = self.buffer_requirements(desc.size, BLOCK_BUFFER_USAGE)?;
+        let mut mem_requirements = self.buffer_requirements(size, BLOCK_BUFFER_USAGE)?;
         // The caller's alignment may be stricter than the buffer's own requirement; the pool
         // carves at whichever is larger.
-        mem_requirements.alignment = mem_requirements.alignment.max(desc.align).max(1);
+        mem_requirements.alignment = mem_requirements.alignment.max(align).max(1);
 
-        let mem_flags = buffer_memory_flags(desc.memory);
+        let mem_flags = buffer_memory_flags(memory);
 
-        let preferred_flags = match desc.memory {
+        let preferred_flags = match memory {
             MemoryType::Upload => vk::MemoryPropertyFlags::DEVICE_LOCAL,
             MemoryType::GpuOnly | MemoryType::Readback => vk::MemoryPropertyFlags::empty(),
         };
@@ -404,14 +412,14 @@ impl VulkanDevice {
         let gpu_addr = suballocation.address;
 
         // `GpuOnly` promises no CPU pointer even when it happens to land in host-visible memory.
-        let mapped_ptr = match desc.memory {
+        let mapped_ptr = match memory {
             MemoryType::Upload | MemoryType::Readback => suballocation.mapped_ptr,
             MemoryType::GpuOnly => None,
         };
 
         let vk_buffer = VulkanBuffer {
             memory: suballocation.memory,
-            size: desc.size,
+            size,
             mapped_ptr,
             gpu_address: GpuPtr::from_addr(gpu_addr),
             block_index: suballocation.block_index,
@@ -444,7 +452,8 @@ impl VulkanDevice {
         Ok(Allocation {
             inner: vk_buffer,
             _owner: None,
-            size: desc.size,
+            size,
+            _type: std::marker::PhantomData,
         })
     }
 

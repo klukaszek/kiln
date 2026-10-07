@@ -3,8 +3,7 @@
 
 use kiln_rhi::gpu_struct;
 use kiln_rhi::{
-    AllocationDesc, BumpAllocator, CommandBuffer, Device, GpuPtr, GraphicsPso, MemoryType,
-    RhiResult,
+    Allocation, BumpAllocator, CommandBuffer, Device, GraphicsPso, MemoryType, RhiResult,
 };
 
 gpu_struct! {
@@ -24,15 +23,14 @@ gpu_struct! {
 
 /// The direct-allocation snippet from the README.
 #[allow(dead_code)]
-fn readme_direct_example(device: &Device, vertex_count: u32) -> RhiResult<()> {
-    let mut root = device.create_allocation(&AllocationDesc {
-        size: size_of::<DrawRoot>() as u64,
-        memory: MemoryType::Upload,
-        label: Some("draw-root"),
-        ..Default::default()
-    })?;
+fn readme_direct_example(device: &Device, vertices: &[Vertex], vertex_count: u32) -> RhiResult<()> {
+    let vertex_buffer = device.upload_slice(vertices)?;
+
+    let mut root = device
+        .allocate::<DrawRoot>(MemoryType::Upload)?
+        .labeled("draw-root");
     root.upload(&DrawRoot {
-        vertices: GpuPtr::from_addr(0),
+        vertices: vertex_buffer.gpu(),
         count: vertex_count,
         pad: 0,
     })?;
@@ -41,25 +39,25 @@ fn readme_direct_example(device: &Device, vertex_count: u32) -> RhiResult<()> {
 
 /// The bump-arena snippet from the README.
 #[allow(dead_code)]
-fn readme_arena_example(device: &Device, vertex_count: u32) -> RhiResult<()> {
-    let allocation = device.create_allocation(&AllocationDesc {
-        size: 64 * 1024,
-        memory: MemoryType::Upload,
-        label: Some("frame-roots"),
-        ..Default::default()
-    })?;
-    let mut frame_arena = BumpAllocator::new(allocation);
+fn readme_arena_example(
+    device: &Device,
+    vertex_buffer: &Allocation<Vertex>,
+    vertex_count: u32,
+) -> RhiResult<()> {
+    let mut frame_arena = BumpAllocator::new(
+        device
+            .allocate_bytes(64 * 1024, MemoryType::Upload)?
+            .labeled("frame-roots"),
+    );
 
     frame_arena.reset();
-    let root = frame_arena
-        .alloc(size_of::<DrawRoot>() as u64, 16)
-        .expect("frame arena exhausted")
-        .cast::<DrawRoot>();
-    root.write(&DrawRoot {
-        vertices: GpuPtr::from_addr(0),
-        count: vertex_count,
-        pad: 0,
-    })?;
+    let _root = frame_arena
+        .upload(&DrawRoot {
+            vertices: vertex_buffer.gpu(),
+            count: vertex_count,
+            pad: 0,
+        })
+        .expect("frame arena exhausted");
     Ok(())
 }
 

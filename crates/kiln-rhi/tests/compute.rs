@@ -48,26 +48,26 @@ fn compute_barrier_across_pipeline_switches() {
     ];
     const N: u32 = 65536;
     let mut a = device
-        .allocate(u64::from(N) * 4, MemoryType::Readback)
+        .allocate_array::<u32>(N as usize, MemoryType::Readback)
         .expect("a");
     let b = device
-        .allocate(u64::from(N) * 4, MemoryType::Readback)
+        .allocate_array::<u32>(N as usize, MemoryType::Readback)
         .expect("b");
-    a.as_mut_slice::<u32>().expect("mapped a").fill(1);
+    a.as_mut_slice().expect("mapped a").fill(1);
     let mut roots = device
-        .allocate(2 * std::mem::size_of::<Data>() as u64, MemoryType::Upload)
+        .allocate_array::<Data>(2, MemoryType::Upload)
         .expect("roots");
     roots
         .upload_slice(&[
             Data {
-                input: a.gpu().cast(),
-                output: b.gpu().cast(),
+                input: a.gpu(),
+                output: b.gpu(),
                 count: N,
                 pad: 0,
             },
             Data {
-                input: b.gpu().cast(),
-                output: a.gpu().cast(),
+                input: b.gpu(),
+                output: a.gpu(),
                 count: N,
                 pad: 0,
             },
@@ -77,18 +77,13 @@ fn compute_barrier_across_pipeline_switches() {
     for pass in 0..16 {
         let index = pass % 2;
         cmd.set_pipeline(&pipelines[index]);
-        let root = roots.gpu().cast::<Data>().offset(index as u64);
+        let root = roots.gpu().offset(index as u64);
         cmd.dispatch(root, N / 64, 1, 1);
         cmd.barrier(StageFlags::COMPUTE, StageFlags::COMPUTE);
     }
     device.queue().submit(cmd).expect("submit");
     device.queue().wait_idle();
-    assert!(
-        a.as_slice::<u32>()
-            .expect("read a")
-            .iter()
-            .all(|&v| v == 1 << 16)
-    );
+    assert!(a.as_slice().expect("read a").iter().all(|&v| v == 1 << 16));
     device.destroy(a);
     device.destroy(b);
     device.destroy(roots);
@@ -117,21 +112,21 @@ fn compute_doubles_buffer() {
 
     const N: u32 = 1024;
     let mut input = device
-        .allocate((N * 4) as u64, MemoryType::Upload)
+        .allocate_array::<u32>(N as usize, MemoryType::Upload)
         .expect("input");
     let output = device
-        .allocate((N * 4) as u64, MemoryType::Readback)
+        .allocate_array::<u32>(N as usize, MemoryType::Readback)
         .expect("output");
     let mut data = device
-        .allocate(std::mem::size_of::<Data>() as u64, MemoryType::Upload)
+        .allocate::<Data>(MemoryType::Upload)
         .expect("root data");
 
     input
         .upload_slice(&(0..N).collect::<Vec<u32>>())
         .expect("upload input");
     data.upload(&Data {
-        input: input.gpu().cast(),
-        output: output.gpu().cast(),
+        input: input.gpu(),
+        output: output.gpu(),
         count: N,
         pad: 0,
     })
@@ -140,7 +135,7 @@ fn compute_doubles_buffer() {
     common::timed("dispatch 1024 · submit+wait", || {
         let mut cmd = device.create_command_buffer().expect("cmd");
         cmd.set_pipeline(&pso);
-        cmd.dispatch(data.gpu().cast::<Data>(), N.div_ceil(64), 1, 1);
+        cmd.dispatch(data.gpu(), N.div_ceil(64), 1, 1);
         cmd.barrier(StageFlags::COMPUTE, StageFlags::ALL_COMMANDS);
         // Submitting unrelated work must not retire a pipeline referenced by `cmd`.
         drop(pso);
@@ -154,7 +149,7 @@ fn compute_doubles_buffer() {
         queue.wait_idle();
     });
 
-    let result = output.as_slice::<u32>().expect("read output");
+    let result = output.as_slice().expect("read output");
     for (i, &value) in result.iter().enumerate() {
         assert_eq!(value, i as u32 * 2, "element {i} not doubled");
     }

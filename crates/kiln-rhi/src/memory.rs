@@ -84,39 +84,20 @@ pub enum MemoryType {
     Readback,
 }
 
-/// Description for creating a GPU allocation.
-#[derive(Clone, Debug)]
-pub struct AllocationDesc<'a> {
-    pub size: u64,
-    /// Power of two. The RHI pads the backing allocation so `gpu()` comes back aligned.
-    pub align: u64,
-    pub memory: MemoryType,
-    pub label: Option<&'a str>,
-}
-
-impl Default for AllocationDesc<'_> {
-    /// `size` is 0, which no allocation wants: this exists so `..Default::default()` can fill in
-    /// `align` and `label`, not as a usable descriptor on its own.
-    fn default() -> Self {
-        Self {
-            size: 0,
-            align: DEFAULT_ALIGN,
-            // Fail-soft: always mappable, so a desc that forgets to choose still runs.
-            memory: MemoryType::Upload,
-            label: None,
-        }
-    }
-}
-
 /// Alignment used when a caller does not ask for one; wide enough for a `float4`.
 pub const DEFAULT_ALIGN: u64 = 16;
 
-/// Owned GPU memory: an optional CPU mapping, a GPU address, and a byte length. The backend
-/// buffer or heap behind the address is deliberately not part of the API.
-pub struct Allocation {
+/// Owned GPU memory holding `T`s: an optional CPU mapping, a GPU address, and a byte length. The
+/// backend buffer or heap behind the address is deliberately not part of the API.
+///
+/// `T` is what the allocation was created for, so [`gpu`](Self::gpu) and the CPU accessors are
+/// typed without a cast. Raw byte regions are `Allocation<u8>`, the default; [`cast`](Self::cast)
+/// reinterprets one as another type.
+pub struct Allocation<T = u8> {
     pub(crate) inner: AllocationInner,
     pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
     pub(crate) size: u64,
+    pub(crate) _type: PhantomData<fn() -> T>,
 }
 
 backend_enum!(AllocationInner {
@@ -124,54 +105,78 @@ backend_enum!(AllocationInner {
     metal: crate::backend::metal::memory::MetalBuffer
 });
 
-impl Allocation {
+impl<T> Allocation<T> {
     fn cpu(&self) -> Option<*mut u8> {
-        {
-            let allocation = &self.inner;
-            allocation.mapped_ptr()
-        }
+        self.inner.mapped_ptr()
     }
 
-    /// GPU virtual address; present even for `GpuOnly`. Aligned to the `align` the allocation was
-    /// created with — the backend's suballocator carves the range that way.
-    pub fn gpu(&self) -> GpuPtr<u8> {
-        {
-            let allocation = &self.inner;
-            allocation.gpu_address()
-        }
+    /// GPU virtual address; present even for `GpuOnly`. Aligned to the alignment the allocation
+    /// was created with.
+    pub fn gpu(&self) -> GpuPtr<T> {
+        self.inner.gpu_address().cast()
     }
 
-    /// Typed handle to the mapped bytes, or `None` for `GpuOnly`. The mutable borrow excludes
-    /// allocation reads while a writable handle is live.
-    pub fn mapped<T>(&mut self) -> Option<Mapped<'_, T>> {
-        self.cpu().map(|cpu| Mapped {
-            cpu,
-            gpu: self.gpu().cast(),
-            bytes: self.size,
-            _borrow: PhantomData,
-        })
-    }
-
+    /// Size in bytes.
     pub fn size(&self) -> u64 {
         self.size
     }
 
-    /// Bounds-checked. The caller orders the write before the submit that reads it.
-    pub fn upload<T: GpuPod>(&mut self, value: &T) -> RhiResult<()> {
+    /// How many whole `T`s fit.
+    pub fn len(&self) -> usize {
+        (self.size / size_of::<T>().max(1) as u64) as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The same memory, viewed as `U`s.
+    pub fn cast<U>(self) -> Allocation<U> {
+        Allocation {
+            inner: self.inner,
+            _owner: self._owner,
+            size: self.size,
+            _type: PhantomData,
+        }
+    }
+
+    /// Name the allocation in GPU captures. A no-op on Vulkan, where an allocation is a range
+    /// inside a shared buffer and has no object of its own to name.
+    pub fn labeled(self, label: &str) -> Self {
+        self.inner.set_label(label);
+        self
+    }
+
+    /// Handle to the mapped memory, or `None` for `GpuOnly`. The mutable borrow excludes
+    /// allocation reads while a writable handle is live.
+    pub fn mapped(&mut self) -> Option<Mapped<'_, T>> {
+        self.cpu().map(|cpu| Mapped {
+            cpu,
+            gpu: self.gpu(),
+            bytes: self.size,
+            _borrow: PhantomData,
+        })
+    }
+}
+
+impl<T: GpuPod> Allocation<T> {
+    /// Write one `T` at the start. Bounds-checked; the caller orders the write before the submit
+    /// that reads it.
+    pub fn upload(&mut self, value: &T) -> RhiResult<()> {
         mapped_write(self.cpu(), self.size, value.as_bytes())
     }
 
-    pub fn upload_slice<T: GpuPod>(&mut self, data: &[T]) -> RhiResult<()> {
+    pub fn upload_slice(&mut self, data: &[T]) -> RhiResult<()> {
         mapped_write(self.cpu(), self.size, data.as_bytes())
     }
 
-    /// Read back, e.g. from `Readback` memory after a GPU write.
-    pub fn read<T: GpuPod>(&self) -> RhiResult<T> {
+    /// Read the first `T` back, e.g. from `Readback` memory after a GPU write.
+    pub fn read(&self) -> RhiResult<T> {
         mapped_read(self.cpu(), self.size)
     }
 
     /// Errors if not mapped, or if the size is not a whole number of `T`.
-    pub fn as_slice<T: GpuPod>(&self) -> RhiResult<&[T]> {
+    pub fn as_slice(&self) -> RhiResult<&[T]> {
         let ptr = self
             .cpu()
             .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
@@ -180,7 +185,7 @@ impl Allocation {
     }
 
     /// `&mut self` rules out CPU aliasing.
-    pub fn as_mut_slice<T: GpuPod>(&mut self) -> RhiResult<&mut [T]> {
+    pub fn as_mut_slice(&mut self) -> RhiResult<&mut [T]> {
         let ptr = self
             .cpu()
             .ok_or_else(|| RhiError::AllocationFailed("allocation is not CPU-mapped".into()))?;
@@ -318,9 +323,34 @@ impl BumpAllocator {
         }
     }
 
-    /// Allocate `size` bytes with the given power-of-two alignment.
-    /// Returns `None` when the allocator has no room.
-    pub fn alloc(&self, size: u64, align: u64) -> Option<Mapped<'_, u8>> {
+    /// Room for one `T`, aligned to `T` and to at least [`DEFAULT_ALIGN`]. `None` when full.
+    pub fn alloc<T>(&self) -> Option<Mapped<'_, T>> {
+        self.alloc_array::<T>(1)
+    }
+
+    /// Room for `count` contiguous `T`s, aligned as [`alloc`](Self::alloc). `None` when full.
+    pub fn alloc_array<T>(&self, count: usize) -> Option<Mapped<'_, T>> {
+        let size = size_of::<T>().checked_mul(count)? as u64;
+        let align = (align_of::<T>() as u64).max(DEFAULT_ALIGN);
+        self.alloc_bytes(size, align).map(Mapped::cast)
+    }
+
+    /// Copy `value` into the arena and return its GPU address. `None` when full.
+    pub fn upload<T: GpuPod>(&self, value: &T) -> Option<GpuPtr<T>> {
+        let mapped = self.alloc::<T>()?;
+        mapped.write(value).ok()?;
+        Some(mapped.gpu())
+    }
+
+    /// Copy `values` into the arena and return the GPU address of the first. `None` when full.
+    pub fn upload_slice<T: GpuPod>(&self, values: &[T]) -> Option<GpuPtr<T>> {
+        let mapped = self.alloc_array::<T>(values.len())?;
+        mapped.write_slice(values).ok()?;
+        Some(mapped.gpu())
+    }
+
+    /// `size` bytes at a power-of-two `align`. `None` when full.
+    pub fn alloc_bytes(&self, size: u64, align: u64) -> Option<Mapped<'_, u8>> {
         let (aligned_offset, end) =
             aligned_bump_range(self.offset.get(), size, align, self.capacity)?;
 

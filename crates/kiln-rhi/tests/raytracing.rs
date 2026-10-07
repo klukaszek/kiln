@@ -42,7 +42,7 @@ void rqMain(uint3 tid : SV_DispatchThreadID, uniform Root* data)
 struct Scene {
     blas: kiln_rhi::AccelerationStructure,
     tlas: kiln_rhi::AccelerationStructure,
-    vbuf: kiln_rhi::Allocation,
+    vbuf: kiln_rhi::Allocation<[f32; 3]>,
     instbuf: kiln_rhi::Allocation,
     pso: kiln_rhi::ComputePso,
 }
@@ -86,16 +86,13 @@ fn build_scene(device: &kiln_rhi::Device) -> Scene {
 
     // Triangle at z=0, with the ray starting at z=-1.
     let verts: [[f32; 3]; 3] = [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]];
-    let mut vbuf = device
-        .allocate(std::mem::size_of_val(&verts) as u64, MemoryType::Upload)
-        .expect("vertex buffer");
-    vbuf.upload(&verts).expect("upload vertices");
+    let vbuf = device.upload_slice(&verts).expect("vertex buffer");
 
     let blas_desc = BlasDesc {
         meshes: &[BlasMeshDesc {
             flags: GeometryFlags::OPAQUE,
             geometry: BlasGeometry::Triangles {
-                vertices: vbuf.gpu().cast(),
+                vertices: vbuf.gpu(),
                 stride: 12,
                 count: 3,
                 indices: None,
@@ -117,7 +114,7 @@ fn build_scene(device: &kiln_rhi::Device) -> Scene {
     // Identity instance referencing the BLAS.
     let stride = device.tlas_instance_stride();
     let mut instbuf = device
-        .allocate(stride as u64, MemoryType::Upload)
+        .allocate_bytes(stride as u64, MemoryType::Upload)
         .expect("instance buffer");
     let instance = TlasInstance {
         transform: [
@@ -163,13 +160,13 @@ fn build_scene(device: &kiln_rhi::Device) -> Scene {
 fn dispatch_ray_query(
     device: &kiln_rhi::Device,
     scene: &Scene,
-) -> (kiln_rhi::Allocation, kiln_rhi::Allocation) {
-    let output = device.allocate(4, MemoryType::Readback).expect("output");
-    let mut root = device
-        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Upload)
-        .expect("root");
+) -> (kiln_rhi::Allocation<u32>, kiln_rhi::Allocation<Root>) {
+    let output = device
+        .allocate::<u32>(MemoryType::Readback)
+        .expect("output");
+    let mut root = device.allocate::<Root>(MemoryType::Upload).expect("root");
     root.upload(&Root {
-        output: output.gpu().cast(),
+        output: output.gpu(),
         tlas: scene.tlas.gpu(),
     })
     .expect("upload root");
@@ -194,7 +191,7 @@ fn ray_query_triangle_hit() {
         handles
     });
 
-    let hit = output.read::<u32>().expect("read hit result");
+    let hit = output.read().expect("read hit result");
     assert_eq!(hit, 1, "ray query should report a triangle hit");
 
     // An acceleration structure is a `DeviceResource`: `destroy` hands it to the retirement
@@ -223,12 +220,12 @@ fn destroying_an_acceleration_structure_in_flight_defers_its_release() {
 
     // Churn the pool so a prematurely released range would be handed straight back out.
     let squatter = device
-        .allocate(1 << 20, MemoryType::Upload)
+        .allocate_bytes(1 << 20, MemoryType::Upload)
         .expect("squatter");
 
     device.queue().wait_idle();
 
-    let hit = output.read::<u32>().expect("read hit result");
+    let hit = output.read().expect("read hit result");
     assert_eq!(
         hit, 1,
         "the ray query must still see the TLAS it was recorded against"

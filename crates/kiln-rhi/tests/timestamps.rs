@@ -8,8 +8,12 @@ use std::time::Instant;
 fn timestamps_bracket_transfers() {
     let (device, _gpu) = common::device();
     const SIZE: u64 = 16 * 1024 * 1024;
-    let src = device.allocate(SIZE, MemoryType::Upload).expect("src");
-    let dst = device.allocate(SIZE, MemoryType::GpuOnly).expect("dst");
+    let src = device
+        .allocate_bytes(SIZE, MemoryType::Upload)
+        .expect("src");
+    let dst = device
+        .allocate_bytes(SIZE, MemoryType::GpuOnly)
+        .expect("dst");
     let pool = device.create_query_pool(2).expect("query pool");
     let mut valid_samples = 0;
     let mut previous_end = 0;

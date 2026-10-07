@@ -23,7 +23,7 @@ impl FilmSignature {
 }
 
 pub(super) struct Film {
-    accum: Option<Allocation>,
+    accum: Option<Allocation<f32>>,
     pub(super) extent: UVec2,
     pub(super) pass_count: u32,
     signature: Option<FilmSignature>,
@@ -62,10 +62,7 @@ impl Film {
                     device.destroy(stale);
                 }
                 element_count = self.element_count_for(extent)?;
-                device.allocate(
-                    u64::from(element_count) * std::mem::size_of::<f32>() as u64,
-                    MemoryType::GpuOnly,
-                )?
+                device.allocate_array::<f32>(element_count as usize, MemoryType::GpuOnly)?
             }
         };
 
@@ -79,7 +76,7 @@ impl Film {
 
     pub(super) fn readback(&self, device: &Device) -> render::Result<Vec<f32>> {
         let accum = self.accum();
-        let readback = device.allocate(accum.size(), MemoryType::Readback)?;
+        let readback = device.allocate_array::<f32>(accum.len(), MemoryType::Readback)?;
         let result = copy_to_readback(device, accum, &readback);
         device.destroy(readback);
         result
@@ -97,7 +94,7 @@ impl Film {
         self.signature = None;
     }
 
-    pub(super) fn accum(&self) -> &Allocation {
+    pub(super) fn accum(&self) -> &Allocation<f32> {
         self.accum
             .as_ref()
             .expect("film allocation follows successful prepare")
@@ -116,8 +113,8 @@ impl Film {
 
 fn copy_to_readback(
     device: &Device,
-    source: &Allocation,
-    destination: &Allocation,
+    source: &Allocation<f32>,
+    destination: &Allocation<f32>,
 ) -> render::Result<Vec<f32>> {
     device.wait_idle();
     let mut cmd = device.create_command_buffer()?;
@@ -126,7 +123,7 @@ fn copy_to_readback(
     let queue = device.queue();
     queue.submit(cmd)?;
     queue.wait_idle();
-    Ok(destination.as_slice::<f32>()?.to_vec())
+    Ok(destination.as_slice()?.to_vec())
 }
 
 pub(super) fn format_is_srgb(format: Format) -> bool {

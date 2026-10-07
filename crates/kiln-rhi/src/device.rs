@@ -3,7 +3,7 @@
 use crate::accel::AccelerationStructure;
 use crate::command::CommandBuffer;
 use crate::error::{RhiError, RhiResult};
-use crate::memory::{Allocation, AllocationDesc, GpuPod, MemoryType};
+use crate::memory::{Allocation, DEFAULT_ALIGN, GpuPod, MemoryType};
 use crate::pipeline::{
     ComputePso, ComputePsoDesc, GraphicsPso, GraphicsPsoDesc, MeshletPso, MeshletPsoDesc,
 };
@@ -82,11 +82,16 @@ macro_rules! impl_device_owned {
     };
 }
 
+impl<T> DeviceOwned for Allocation<T> {
+    fn owner_mut(&mut self) -> &mut Option<Rc<DeviceInner>> {
+        &mut self._owner
+    }
+}
+
 impl_device_owned!(
     AccelerationStructure,
     CommandBuffer,
     ComputePso,
-    Allocation,
     GraphicsPso,
     MeshletPso,
     QueryPool,
@@ -123,8 +128,13 @@ macro_rules! impl_device_resource {
     };
 }
 
+impl<T> DeviceResource for Allocation<T> {
+    fn destroy_on(self, device: &Device) {
+        device.inner.destroy_allocation(self.inner)
+    }
+}
+
 impl_device_resource!(
-    Allocation => destroy_allocation,
     QueryPool => destroy_query_pool,
     AccelerationStructure => destroy_accel,
 );
@@ -234,57 +244,58 @@ impl Device {
         self.inner.recreate_swapchain(swapchain, desc)
     }
 
-    /// The canonical allocation path; [`allocate`](Self::allocate) and
-    /// [`allocate_aligned`](Self::allocate_aligned) are shorthands over it.
-    ///
-    /// `desc.align` reaches the backend's suballocator, which already carves ranges at a
-    /// requested alignment. Nothing is over-allocated to make room for a shift.
-    pub fn create_allocation(&self, desc: &AllocationDesc) -> RhiResult<Allocation> {
-        if !desc.align.is_power_of_two() {
-            return Err(RhiError::AllocationFailed(
-                format!(
-                    "allocation alignment {} is not a non-zero power of two",
-                    desc.align
-                )
-                .into(),
-            ));
-        }
-        let allocation = self
-            .inner
-            .create_allocation(desc)
-            .map(|resource| self.own(resource))?;
-        debug_assert!(
-            allocation.gpu().is_aligned_to(desc.align),
-            "backend returned {:#x} for a {}-byte alignment",
-            allocation.gpu().addr(),
-            desc.align
-        );
-        Ok(allocation)
+    /// Allocate room for one `T`, aligned to `T` and to at least
+    /// [`DEFAULT_ALIGN`](crate::memory::DEFAULT_ALIGN).
+    pub fn allocate<T>(&self, memory: MemoryType) -> RhiResult<Allocation<T>> {
+        self.allocate_array::<T>(1, memory)
     }
 
-    /// Allocate with [`DEFAULT_ALIGN`](crate::memory::DEFAULT_ALIGN) alignment.
-    pub fn allocate(&self, size: u64, memory: MemoryType) -> RhiResult<Allocation> {
-        self.allocate_aligned(size, crate::memory::DEFAULT_ALIGN, memory)
+    /// Allocate room for `count` contiguous `T`s, aligned as [`allocate`](Self::allocate).
+    pub fn allocate_array<T>(&self, count: usize, memory: MemoryType) -> RhiResult<Allocation<T>> {
+        let size = size_of::<T>().checked_mul(count).ok_or_else(|| {
+            RhiError::AllocationFailed(
+                format!("{count} x {} bytes overflows", size_of::<T>()).into(),
+            )
+        })?;
+        let align = (align_of::<T>() as u64).max(DEFAULT_ALIGN);
+        Ok(self
+            .allocate_bytes_aligned(size.max(1) as u64, align, memory)?
+            .cast())
     }
 
-    pub fn allocate_aligned(
+    /// Allocate `size` bytes aligned to [`DEFAULT_ALIGN`](crate::memory::DEFAULT_ALIGN).
+    pub fn allocate_bytes(&self, size: u64, memory: MemoryType) -> RhiResult<Allocation> {
+        self.allocate_bytes_aligned(size, DEFAULT_ALIGN, memory)
+    }
+
+    /// Allocate `size` bytes aligned to `align`, a power of two. The backend's suballocator carves
+    /// the range at that alignment, so nothing is over-allocated to make room for a shift.
+    pub fn allocate_bytes_aligned(
         &self,
         size: u64,
         align: u64,
         memory: MemoryType,
     ) -> RhiResult<Allocation> {
-        self.create_allocation(&AllocationDesc {
-            size,
-            align,
-            memory,
-            label: None,
-        })
+        if !align.is_power_of_two() {
+            return Err(RhiError::AllocationFailed(
+                format!("allocation alignment {align} is not a non-zero power of two").into(),
+            ));
+        }
+        let allocation = self
+            .inner
+            .create_allocation(size, align, memory)
+            .map(|resource| self.own(resource))?;
+        debug_assert!(
+            allocation.gpu().is_aligned_to(align),
+            "backend returned {:#x} for a {align}-byte alignment",
+            allocation.gpu().addr(),
+        );
+        Ok(allocation)
     }
 
     /// Allocate mapped memory and upload `data`. Use `std::slice::from_ref` for a single value.
-    pub fn upload_slice<T: GpuPod>(&self, data: &[T]) -> RhiResult<Allocation> {
-        let size = std::mem::size_of_val(data).max(1) as u64;
-        let mut alloc = self.allocate(size, MemoryType::Upload)?;
+    pub fn upload_slice<T: GpuPod>(&self, data: &[T]) -> RhiResult<Allocation<T>> {
+        let mut alloc = self.allocate_array::<T>(data.len(), MemoryType::Upload)?;
         if !data.is_empty() {
             alloc.upload_slice(data)?;
         }
@@ -408,7 +419,7 @@ impl Device {
         instance: &TlasInstance,
     ) -> RhiResult<()> {
         let stride = self.tlas_instance_stride() as u64;
-        let base = dst.mapped::<u8>().ok_or_else(|| {
+        let base = dst.mapped().ok_or_else(|| {
             RhiError::AllocationFailed("instance buffer is not CPU-mapped".into())
         })?;
         let slot = base.byte_offset(stride.saturating_mul(index as u64));

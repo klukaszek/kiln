@@ -136,14 +136,14 @@ mod frames_in_flight {
         let targets: Vec<_> = (0..frames)
             .map(|_| {
                 let mem = device
-                    .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
+                    .allocate_bytes_aligned(sa.size, sa.align, MemoryType::GpuOnly)
                     .unwrap();
                 let texture = device.create_texture(&desc, mem.gpu()).unwrap();
                 (texture, mem)
             })
             .collect();
         let readback = device
-            .allocate(u64::from(out.x * out.y * 4), MemoryType::Readback)
+            .allocate_bytes(u64::from(out.x * out.y * 4), MemoryType::Readback)
             .unwrap();
         let mut unlit = Vec::new();
         for round in 0..rounds {
@@ -210,7 +210,7 @@ mod frames_in_flight {
                 device.queue().submit(copy).unwrap();
                 device.queue().wait_idle();
                 let lit = readback
-                    .as_slice::<u8>()
+                    .as_slice()
                     .unwrap()
                     .chunks_exact(4)
                     .filter(|p| p[0] > 4 || p[1] > 4 || p[2] > 4)

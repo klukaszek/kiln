@@ -141,14 +141,13 @@ struct DrawRoot {
 A root is just an upload-visible allocation, so the direct path is the whole story:
 
 ```rust
-let mut root = device.create_allocation(&AllocationDesc {
-    size: size_of::<DrawRoot>() as u64,
-    memory: MemoryType::Upload,
-    label: Some("draw-root".into()),
-    ..Default::default()
-})?;
+let vertex_buffer = device.upload_slice(&vertices)?; // Allocation<Vertex>
+
+let mut root = device
+    .allocate::<DrawRoot>(MemoryType::Upload)?
+    .labeled("draw-root");
 root.upload(&DrawRoot {
-    vertices: vertex_buffer.gpu().cast(),
+    vertices: vertex_buffer.gpu(),
     count: vertex_count,
     pad: 0,
 })?;
@@ -165,25 +164,22 @@ An allocation per root is fine for anything long-lived. For per-frame roots a ma
 once:
 
 ```rust
-let mut frame_arena = BumpAllocator::new(device.create_allocation(&AllocationDesc {
-    size: 64 * 1024,
-    memory: MemoryType::Upload,
-    label: Some("frame-roots".into()),
-    ..Default::default()
-})?);
+let mut frame_arena = BumpAllocator::new(
+    device
+        .allocate_bytes(64 * 1024, MemoryType::Upload)?
+        .labeled("frame-roots"),
+);
 
 frame_arena.reset();
 let root = frame_arena
-    .alloc(size_of::<DrawRoot>() as u64, 16)
-    .expect("frame arena exhausted")
-    .cast::<DrawRoot>();
-root.write(&DrawRoot {
-    vertices: vertex_buffer.gpu().cast(),
-    count: vertex_count,
-    pad: 0,
-})?;
+    .upload(&DrawRoot {
+        vertices: vertex_buffer.gpu(),
+        count: vertex_count,
+        pad: 0,
+    })
+    .expect("frame arena exhausted");
 
-cmd.draw(root.gpu(), vertex_count, 1, 0, 0);
+cmd.draw(root, vertex_count, 1, 0, 0);
 ```
 
 Keep one arena per in-flight frame slot. `reset()` is only safe once that slot's previous GPU work

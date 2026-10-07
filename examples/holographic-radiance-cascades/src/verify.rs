@@ -61,9 +61,9 @@ pub fn run(options: &Options) -> RhiResult<()> {
     let (name, build) = SCENES[options.scene];
     let prims = build(0.0);
 
-    let solved = device.allocate(bytes, MemoryType::GpuOnly)?;
-    let reference = device.allocate(bytes, MemoryType::GpuOnly)?;
-    let readback = device.allocate(bytes, MemoryType::Readback)?;
+    let solved = device.allocate_array::<Vec4>(pixels as usize, MemoryType::GpuOnly)?;
+    let reference = device.allocate_array::<Vec4>(pixels as usize, MemoryType::GpuOnly)?;
+    let readback = device.allocate_array::<Vec4>(pixels as usize, MemoryType::Readback)?;
 
     for _ in 0..SETTLE_FRAMES {
         let mut cmd = device.create_command_buffer()?;
@@ -81,9 +81,9 @@ pub fn run(options: &Options) -> RhiResult<()> {
 
     let mut cmd = device.create_command_buffer()?;
     renderer.reset_arena(0);
-    renderer.record_light_field_linear(&mut cmd, 0, settings, solved.gpu().cast());
+    renderer.record_light_field_linear(&mut cmd, 0, settings, solved.gpu());
     // The reference accumulates, so it starts from a cleared target.
-    renderer.record_clear(&mut cmd, 0, reference.gpu().cast(), bytes / 4);
+    renderer.record_clear(&mut cmd, 0, reference.gpu(), bytes / 4);
     cmd.end()?;
     device.queue().submit(cmd)?;
     device.queue().wait_idle();
@@ -97,7 +97,7 @@ pub fn run(options: &Options) -> RhiResult<()> {
             &mut cmd,
             0,
             settings,
-            reference.gpu().cast(),
+            reference.gpu(),
             options.dirs,
             begin..end,
         );
@@ -155,8 +155,8 @@ pub fn run(options: &Options) -> RhiResult<()> {
 /// Copy a device buffer back and flatten it to interleaved RGB, scaled by `1 / divisor`.
 fn read_rgb(
     device: &Device,
-    source: &kiln_rhi::Allocation,
-    readback: &kiln_rhi::Allocation,
+    source: &kiln_rhi::Allocation<Vec4>,
+    readback: &kiln_rhi::Allocation<Vec4>,
     bytes: u64,
     divisor: f32,
 ) -> RhiResult<Vec<f32>> {

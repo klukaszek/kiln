@@ -3,7 +3,7 @@
 
 //! Tests drive the real backend without a window or swapchain.
 
-use kiln_rhi::{AllocationDesc, BumpAllocator, Device, DeviceDesc, MemoryType};
+use kiln_rhi::{BumpAllocator, Device, DeviceDesc, MemoryType};
 
 /// Serializes GPU access across test threads in the same binary.
 pub type GpuGuard = std::sync::MutexGuard<'static, ()>;
@@ -51,13 +51,9 @@ pub fn device() -> (Device, GpuGuard) {
 /// per-draw arguments. Release with `device.destroy(bump.into_allocation())` after the draw.
 pub fn test_bump(device: &Device) -> BumpAllocator {
     let buffer = device
-        .create_allocation(&AllocationDesc {
-            size: 64 * 1024,
-            memory: MemoryType::Upload,
-            label: Some("test-bump"),
-            ..Default::default()
-        })
-        .expect("create_buffer");
+        .allocate_bytes(64 * 1024, MemoryType::Upload)
+        .expect("create_buffer")
+        .labeled("test-bump");
     BumpAllocator::new(buffer)
 }
 

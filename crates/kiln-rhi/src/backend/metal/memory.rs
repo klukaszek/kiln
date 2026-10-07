@@ -15,7 +15,7 @@ use super::device::{BufferAllocation, MetalDevice, MetalRetiredResource};
 use crate::backend::mapped::{MappedAllocation, resolve_mapped_pointer};
 use crate::backend::suballoc::BlockPool;
 use crate::error::{RhiError, RhiResult};
-use crate::memory::{Allocation, AllocationDesc, MemoryType};
+use crate::memory::{Allocation, MemoryType};
 use crate::types::GpuPtr;
 
 pub(crate) type SharedMetalBufferPool = Rc<RefCell<MetalBufferPool>>;
@@ -42,6 +42,11 @@ impl MetalBuffer {
 
     pub fn gpu_address(&self) -> GpuPtr<u8> {
         GpuPtr::from_addr(self.buffer.gpuAddress())
+    }
+
+    pub fn set_label(&self, label: &str) {
+        use objc2_metal::MTLResource as _;
+        self.buffer.setLabel(Some(&NSString::from_str(label)));
     }
 
     /// Byte offset of this suballocation within its `MTLHeap`. Placed resources are positioned
@@ -199,18 +204,17 @@ fn resource_options(memory: MemoryType) -> MTLResourceOptions {
 }
 
 impl MetalDevice {
-    pub fn create_allocation(&self, desc: &AllocationDesc) -> RhiResult<Allocation> {
-        let length = usize::try_from(desc.size).map_err(|_| {
+    pub fn create_allocation(
+        &self,
+        size: u64,
+        align: u64,
+        memory: MemoryType,
+    ) -> RhiResult<Allocation> {
+        let length = usize::try_from(size).map_err(|_| {
             RhiError::BufferCreation("Metal buffer size exceeds the host address space".into())
         })?;
         let metal_buffer =
-            MetalBufferPool::allocate_shared(&self.buffer_pool, length, desc.align, desc.memory)?;
-
-        if let Some(label) = &desc.label {
-            use objc2_metal::MTLResource;
-            let ns_label = NSString::from_str(label);
-            metal_buffer.buffer.setLabel(Some(&ns_label));
-        }
+            MetalBufferPool::allocate_shared(&self.buffer_pool, length, align, memory)?;
 
         {
             let mut allocations = self.shared.allocations.borrow_mut();
@@ -238,7 +242,8 @@ impl MetalDevice {
         Ok(Allocation {
             inner: metal_buffer,
             _owner: None,
-            size: desc.size,
+            size,
+            _type: std::marker::PhantomData,
         })
     }
 

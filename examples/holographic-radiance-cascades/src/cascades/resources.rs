@@ -5,10 +5,10 @@
 //! sized its acceleration structures once for the same reason: releasing one and creating a
 //! replacement every frame is a lot of churn for geometry whose topology never changes.
 
+use glam::Vec4;
 use kiln_rhi::{
-    AccelerationStructure, Allocation, AllocationDesc, BlasDesc, BlasGeometry, BlasIndices,
-    BlasMeshDesc, BuildAccelFlags, Device, GeometryFlags, GpuPtr, MemoryType, RhiResult, TlasDesc,
-    TlasInstance,
+    AccelerationStructure, Allocation, BlasDesc, BlasGeometry, BlasIndices, BlasMeshDesc,
+    BuildAccelFlags, Device, GeometryFlags, GpuPtr, MemoryType, RhiResult, TlasDesc, TlasInstance,
 };
 
 use crate::scene::{MAX_PRIMS, ROWS_PER_PRIM};
@@ -26,16 +26,17 @@ const VERTEX_STRIDE: u64 = 12;
 const MAX_EDGES: u32 = MAX_PRIMS * EDGES_PER_PRIM;
 
 pub(super) struct SceneResources {
-    /// Packed primitives, `ROWS_PER_PRIM` `float4` rows each.
-    pub(super) scene: Allocation,
-    pub(super) vertices: Allocation,
-    pub(super) indices: Allocation,
+    /// Packed primitives, `ROWS_PER_PRIM` rows each.
+    pub(super) scene: Allocation<Vec4>,
+    pub(super) vertices: Allocation<[f32; 3]>,
+    pub(super) indices: Allocation<u32>,
     /// Primitive that produced each BVH triangle, so a hit can be resolved to its material.
-    pub(super) tri_prim: Allocation,
-    pub(super) cell_count: Allocation,
-    pub(super) cell_prims: Allocation,
+    pub(super) tri_prim: Allocation<u32>,
+    pub(super) cell_count: Allocation<u32>,
+    pub(super) cell_prims: Allocation<u32>,
     /// Per-cell distance to the nearest primitive, from the cell's bounding circle outwards.
-    pub(super) cell_clear: Allocation,
+    pub(super) cell_clear: Allocation<f32>,
+    /// Sized by the backend's instance stride, which is not `size_of::<TlasInstance>()` on Metal.
     instances: Allocation,
     blas: AccelerationStructure,
     pub(super) tlas: AccelerationStructure,
@@ -45,54 +46,35 @@ pub(super) struct SceneResources {
 
 impl SceneResources {
     pub(super) fn new(device: &Device) -> RhiResult<Self> {
-        let device_buffer = |size: u64, label: &'static str| {
-            device.create_allocation(&AllocationDesc {
-                size,
-                memory: MemoryType::GpuOnly,
-                label: Some(label),
-                ..Default::default()
-            })
-        };
+        fn device_buffer<T>(device: &Device, count: u32, label: &str) -> RhiResult<Allocation<T>> {
+            Ok(device
+                .allocate_array::<T>(count as usize, MemoryType::GpuOnly)?
+                .labeled(label))
+        }
 
-        let scene = device_buffer(
-            u64::from(MAX_PRIMS * ROWS_PER_PRIM) * 16,
-            "hrc-scene-primitives",
-        )?;
-        let vertices = device_buffer(
-            u64::from(MAX_EDGES * VERTS_PER_EDGE) * VERTEX_STRIDE,
-            "hrc-bvh-vertices",
-        )?;
-        let indices = device_buffer(
-            u64::from(MAX_EDGES * INDICES_PER_EDGE) * 4,
-            "hrc-bvh-indices",
-        )?;
-        let tri_prim = device_buffer(u64::from(MAX_EDGES * 2) * 4, "hrc-bvh-triangle-primitive")?;
-        let cell_count = device_buffer(u64::from(GRID_CELLS * GRID_CELLS) * 4, "hrc-grid-count")?;
+        let scene = device_buffer(device, MAX_PRIMS * ROWS_PER_PRIM, "hrc-scene-primitives")?;
+        let vertices = device_buffer(device, MAX_EDGES * VERTS_PER_EDGE, "hrc-bvh-vertices")?;
+        let indices = device_buffer(device, MAX_EDGES * INDICES_PER_EDGE, "hrc-bvh-indices")?;
+        let tri_prim = device_buffer(device, MAX_EDGES * 2, "hrc-bvh-triangle-primitive")?;
+        let cell_count = device_buffer(device, GRID_CELLS * GRID_CELLS, "hrc-grid-count")?;
         let cell_prims = device_buffer(
-            u64::from(GRID_CELLS * GRID_CELLS * GRID_CAPACITY) * 4,
+            device,
+            GRID_CELLS * GRID_CELLS * GRID_CAPACITY,
             "hrc-grid-primitives",
         )?;
-        let cell_clear =
-            device_buffer(u64::from(GRID_CELLS * GRID_CELLS) * 4, "hrc-grid-clearance")?;
+        let cell_clear = device_buffer(device, GRID_CELLS * GRID_CELLS, "hrc-grid-clearance")?;
 
         // Sized for the largest scene that will ever be traced; each frame builds whatever the
         // current one actually uses.
-        let meshes = [blas_mesh(
-            vertices.gpu().cast(),
-            indices.gpu().cast(),
-            MAX_PRIMS,
-        )];
+        let meshes = [blas_mesh(vertices.gpu(), indices.gpu(), MAX_PRIMS)];
         let blas = device.create_blas(&BlasDesc {
             meshes: &meshes,
             flags: BLAS_FLAGS,
         })?;
 
-        let mut instances = device.create_allocation(&AllocationDesc {
-            size: device.tlas_instance_stride() as u64,
-            memory: MemoryType::Upload,
-            label: Some("hrc-tlas-instances"),
-            ..Default::default()
-        })?;
+        let mut instances = device
+            .allocate_bytes(device.tlas_instance_stride() as u64, MemoryType::Upload)?
+            .labeled("hrc-tlas-instances");
         // One instance at the identity, written once: the BLAS is rebuilt in place, so neither its
         // handle nor its transform ever changes.
         device.write_tlas_instance(
@@ -127,11 +109,7 @@ impl SceneResources {
     }
 
     pub(super) fn blas_mesh(&self) -> BlasMeshDesc {
-        blas_mesh(
-            self.vertices.gpu().cast(),
-            self.indices.gpu().cast(),
-            self.prim_count,
-        )
+        blas_mesh(self.vertices.gpu(), self.indices.gpu(), self.prim_count)
     }
 
     pub(super) fn tlas_desc(&self) -> TlasDesc {

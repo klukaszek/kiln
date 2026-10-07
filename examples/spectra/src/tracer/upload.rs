@@ -1,7 +1,5 @@
 //! Batched uploads shared by renderer-owned device data.
 
-use std::marker::PhantomData;
-
 use kiln_rhi::{
     Allocation, CommandBuffer, Device, GpuPod, GpuPtr, MemoryType, StageFlags, Texture,
 };
@@ -11,14 +9,13 @@ use crate::render::Result;
 /// A device-local array of `T`. The type parameter is what keeps sixteen same-shaped scene buffers
 /// from being swapped for one another.
 pub(crate) struct GpuArray<T> {
-    allocation: Allocation,
+    allocation: Allocation<T>,
     len: u32,
-    marker: PhantomData<fn() -> T>,
 }
 
 impl<T> GpuArray<T> {
     pub(crate) fn gpu(&self) -> GpuPtr<T> {
-        self.allocation.gpu().cast()
+        self.allocation.gpu()
     }
 
     pub(crate) fn len(&self) -> u32 {
@@ -67,10 +64,9 @@ impl<'a> GpuUploadBatch<'a> {
     }
 
     pub(crate) fn upload<T: GpuPod>(&mut self, data: &[T]) -> Result<GpuArray<T>> {
-        let allocation = self.device.allocate(
-            (std::mem::size_of_val(data) as u64).max(1),
-            MemoryType::GpuOnly,
-        )?;
+        let allocation = self
+            .device
+            .allocate_array::<T>(data.len(), MemoryType::GpuOnly)?;
         let staging = match self.device.upload_slice(data) {
             Ok(staging) => staging,
             Err(error) => {
@@ -84,7 +80,6 @@ impl<'a> GpuUploadBatch<'a> {
         Ok(GpuArray {
             allocation,
             len: data.len() as u32,
-            marker: PhantomData,
         })
     }
 
@@ -97,9 +92,10 @@ impl<'a> GpuUploadBatch<'a> {
     }
 
     /// Take ownership of a staging allocation, flushing first if too much is already in flight.
-    fn stage(&mut self, staging: Allocation) -> Result<()> {
+    fn stage<T>(&mut self, staging: Allocation<T>) -> Result<()> {
         self.staged_bytes += staging.size();
-        self.staging.push(staging);
+        // Held only to be destroyed, so the element type no longer matters.
+        self.staging.push(staging.cast());
         if self.staged_bytes >= STAGING_BUDGET {
             self.flush()?;
             self.commands = Some(self.device.create_command_buffer()?);

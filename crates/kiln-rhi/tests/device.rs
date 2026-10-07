@@ -3,7 +3,7 @@
 mod common;
 
 use kiln_rhi::Backend;
-use kiln_rhi::{AllocationDesc, Device, DeviceDesc, MemoryType};
+use kiln_rhi::{Device, DeviceDesc, MemoryType};
 
 /// Device creation exposes a usable backend and bindless mode.
 #[test]
@@ -27,13 +27,9 @@ fn resources_may_outlive_the_device_handle() {
     let (device, _gpu) = common::device();
 
     let allocation = device
-        .create_allocation(&AllocationDesc {
-            size: 256,
-            memory: MemoryType::Upload,
-            label: Some("device-lifetime-buffer"),
-            ..Default::default()
-        })
-        .expect("allocation");
+        .allocate_bytes(256, MemoryType::Upload)
+        .expect("allocation")
+        .labeled("device-lifetime-buffer");
     let queries = device.create_query_pool(2).expect("query pool");
     let timeline = device.create_timeline_semaphore(0).expect("timeline");
 

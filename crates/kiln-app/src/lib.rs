@@ -233,7 +233,7 @@ fn make_depth(device: &Device, format: Format, w: u32, h: u32) -> (Texture, Allo
     };
     let sa = device.texture_size_align(&desc).expect("depth size_align");
     let mem = device
-        .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
+        .allocate_bytes_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("depth mem");
     let texture = device
         .create_texture(&desc, mem.gpu())

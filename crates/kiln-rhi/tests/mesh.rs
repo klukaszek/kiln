@@ -54,16 +54,14 @@ fn mesh_fullscreen_color() {
 
     let pso = make_meshlet_pso(&device, &ms, &fs, "mesh");
 
-    let mut root = device
-        .allocate(std::mem::size_of::<Root>() as u64, MemoryType::Upload)
-        .expect("root");
+    let mut root = device.allocate::<Root>(MemoryType::Upload).expect("root");
     root.upload(&Root {
         color: [0.0, 1.0, 0.0, 1.0],
     })
     .expect("upload root");
 
     let pixels = common::timed("mesh draw full-screen triangle \u{b7} submit+wait", || {
-        render_meshlets(&device, &pso, root.gpu(), SIZE, [1, 1, 1])
+        render_meshlets(&device, &pso, root.gpu().cast(), SIZE, [1, 1, 1])
     });
     common::save_rgba_png("mesh_fullscreen_color", SIZE, SIZE, &pixels);
     for (px, pixel) in pixels.chunks_exact(4).enumerate() {
@@ -126,13 +124,13 @@ fn render_meshlets(
     };
     let sa = device.texture_size_align(&tex_desc).expect("size_align");
     let tex_mem = device
-        .allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)
+        .allocate_bytes_aligned(sa.size, sa.align, MemoryType::GpuOnly)
         .expect("rt mem");
     let texture = device
         .create_texture(&tex_desc, tex_mem.gpu())
         .expect("create_texture");
     let readback = device
-        .allocate((size * size * 4) as u64, MemoryType::Readback)
+        .allocate_bytes((size * size * 4) as u64, MemoryType::Readback)
         .expect("readback");
 
     let mut cmd = device.create_command_buffer().expect("cmd");
@@ -161,7 +159,7 @@ fn render_meshlets(
     queue.submit(cmd).expect("submit");
     queue.wait_idle();
 
-    let pixels = readback.as_slice::<u8>().expect("read readback").to_vec();
+    let pixels = readback.as_slice().expect("read readback").to_vec();
     device.destroy(readback);
     device.destroy(texture);
     device.destroy(tex_mem);
@@ -288,15 +286,10 @@ fn mesh_meshlet_grid() {
     let pso = make_meshlet_pso(&device, &ms, &fs, "grid");
 
     let bump = common::test_bump(&device);
-    let cfg = bump
-        .alloc(std::mem::size_of::<GridCfg>() as u64, 16)
-        .expect("bump cfg");
-    cfg.cast::<GridCfg>()
-        .write(&GridCfg { dim: GRID })
-        .expect("upload cfg");
+    let cfg = bump.upload(&GridCfg { dim: GRID }).expect("bump cfg");
 
     let pixels = common::timed("meshlet grid (4×4) · submit+wait", || {
-        render_meshlets(&device, &pso, cfg.gpu(), GRID_SIZE, [GRID, GRID, 1])
+        render_meshlets(&device, &pso, cfg.cast(), GRID_SIZE, [GRID, GRID, 1])
     });
     common::save_rgba_png("mesh_meshlet_grid", GRID_SIZE, GRID_SIZE, &pixels);
 

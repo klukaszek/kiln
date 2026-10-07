@@ -120,7 +120,7 @@ impl GpuImage {
             label: Some(&image.name),
         };
         let size = device.texture_size_align(&desc)?;
-        let memory = device.allocate_aligned(size.size, size.align, MemoryType::GpuOnly)?;
+        let memory = device.allocate_bytes_aligned(size.size, size.align, MemoryType::GpuOnly)?;
         let texture = match device.create_texture(&desc, memory.gpu()) {
             Ok(texture) => texture,
             Err(error) => {

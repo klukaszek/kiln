@@ -23,11 +23,11 @@ use std::collections::HashMap;
 use std::mem::size_of;
 
 use kiln_rhi::{
-    AddressMode, Allocation, AllocationDesc, BlendAttachment, BlendFactor, BlendOp, ColorTarget,
-    CommandBuffer, Cull, Device, FilterMode, Format, GraphicsPso, GraphicsPsoDesc,
-    MAX_FRAMES_IN_FLIGHT, MemoryType, RhiError, RhiResult, SampleCount, Sampler, SamplerDesc,
-    SamplerHandle, ShaderStage, StageFlags, Texture, TextureDesc, TextureDimension, TextureHandle,
-    TextureUsage, Topology, gpu_struct,
+    AddressMode, Allocation, BlendAttachment, BlendFactor, BlendOp, ColorTarget, CommandBuffer,
+    Cull, Device, FilterMode, Format, GraphicsPso, GraphicsPsoDesc, MAX_FRAMES_IN_FLIGHT,
+    MemoryType, RhiError, RhiResult, SampleCount, Sampler, SamplerDesc, SamplerHandle, ShaderStage,
+    StageFlags, Texture, TextureDesc, TextureDimension, TextureHandle, TextureUsage, Topology,
+    gpu_struct,
 };
 
 gpu_struct! {
@@ -433,6 +433,7 @@ fn is_srgb(format: Format) -> bool {
 fn mapped<T>(buf: &mut Allocation) -> kiln_rhi::Mapped<'_, T> {
     buf.mapped()
         .expect("egui geometry buffer must be CPU-mapped")
+        .cast()
 }
 
 /// Ensure `buf` exists and holds at least `need` bytes, reallocating (and freeing the old) on
@@ -451,12 +452,11 @@ fn grow(
         device.destroy(old);
     }
     let size = need.next_power_of_two().max(4096);
-    *buf = Some(device.create_allocation(&AllocationDesc {
-        size,
-        memory: MemoryType::Upload,
-        label: Some(label),
-        ..Default::default()
-    })?);
+    *buf = Some(
+        device
+            .allocate_bytes(size, MemoryType::Upload)?
+            .labeled(label),
+    );
     Ok(())
 }
 
@@ -509,7 +509,7 @@ fn create_texture(
         label: Some("egui-texture"),
     };
     let sa = device.texture_size_align(&desc)?;
-    let mem = device.allocate_aligned(sa.size, sa.align, MemoryType::GpuOnly)?;
+    let mem = device.allocate_bytes_aligned(sa.size, sa.align, MemoryType::GpuOnly)?;
     let texture = device.create_texture(&desc, mem.gpu())?;
     let handle = texture.gpu();
     Ok(ManagedTexture {

@@ -100,8 +100,8 @@ from SlangPy and what profiling it did and did not find.
 
 Every example takes `--help`.
 
-Shaders compile through `slangc` and cache in your temp directory under
-`kiln-rhi-<uid>/shader-cache/`. The key covers the source and everything about how it got
+Shaders compile through `slangc` and cache in your user cache directory under
+`kiln-rhi/shaders/` (`~/Library/Caches` on macOS, `~/.cache` on Linux). The key covers the source and everything about how it got
 compiled, `slangc` version included, so upgrading the compiler doesn't hand you a stale binary.
 
 Metal compiles target `metallib_4_0`, so `[numthreads]` reaches the kernel as

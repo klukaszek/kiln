@@ -16,6 +16,10 @@ log = "0.4"
 thiserror = "2"
 bitflags = "2"
 smallvec = "1"
+# Shader compiler cache
+dirs = "7"
+tempfile = "3"
+twox-hash = { version = "2", default-features = false, features = ["xxhash3_128"] }
 
 # Vulkan backend
 # Tracks ash master: the Vulkan 1.4 binding model (VK_EXT_descriptor_heap,

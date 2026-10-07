@@ -2,37 +2,82 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4AlphaToCoverageState, MTL4BlendState, MTL4Compiler, MTL4IndirectCommandBufferSupportState,
-    MTL4LibraryFunctionDescriptor, MTL4PipelineDescriptor,
-    MTL4RenderPipelineColorAttachmentDescriptor, MTL4RenderPipelineDescriptor, MTLBlendFactor,
-    MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLDevice, MTLLibrary, MTLPrimitiveType,
-    MTLRenderPipelineState, MTLWinding,
+    MTL4AlphaToCoverageState, MTL4BlendState, MTL4Compiler, MTL4ComputePipelineDescriptor,
+    MTL4IndirectCommandBufferSupportState, MTL4MeshRenderPipelineDescriptor,
+    MTL4PipelineDescriptor, MTL4RenderPipelineColorAttachmentDescriptorArray,
+    MTL4RenderPipelineDescriptor, MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask,
+    MTLCompareFunction, MTLComputePipelineState, MTLCullMode, MTLDepthStencilDescriptor,
+    MTLDepthStencilState, MTLDevice, MTLPrimitiveType, MTLRenderPipelineState, MTLSize, MTLWinding,
 };
 
-use super::device::MetalDevice;
-use super::device::cull_to_mtl;
+use super::device::{MetalDevice, cull_to_mtl};
 use super::shader::MetalShaderModule;
 use super::texture::format_to_mtl;
 use crate::error::{RhiError, RhiResult};
-use crate::pipeline::{BlendAttachment, DepthState};
 use crate::pipeline::{
-    ComputePso, ComputePsoDesc, GraphicsPso, GraphicsPsoDesc, MeshletPso, MeshletPsoDesc,
+    BlendAttachment, ColorTarget, ComputePso, ComputePsoDesc, DepthState, GraphicsPso, MeshletPso,
+    RasterPsoDesc,
 };
 use crate::shader::{ShaderModule, ShaderModuleDesc};
-use crate::types::Topology;
-use crate::types::{BlendFactor, BlendOp, ColorWriteMask, CompareOp, DepthFlags};
-use objc2_metal::MTL4ComputePipelineDescriptor;
-use smallvec::SmallVec;
+use crate::types::{BlendFactor, BlendOp, ColorWriteMask, CompareOp, DepthFlags, Topology};
 
-pub(crate) fn make_depth_stencil_state(
+/// One SIMD group, for a mesh module whose threadgroup size is unknown.
+const DEFAULT_THREADS_PER_MESH_GROUP: MTLSize = MTLSize {
+    width: 32,
+    height: 1,
+    depth: 1,
+};
+
+/// The encoder state a graphics or mesh pipeline sets when bound.
+pub(crate) struct MetalRasterState {
+    pub(crate) pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    pub(crate) depth_stencil: Retained<ProtocolObject<dyn MTLDepthStencilState>>,
+    pub(crate) depth_bias: (f32, f32, f32),
+    pub(crate) cull_mode: MTLCullMode,
+    pub(crate) winding: MTLWinding,
+}
+
+pub struct MetalGraphicsPso {
+    pub(crate) raster: MetalRasterState,
+    pub(crate) topology: MTLPrimitiveType,
+}
+
+/// Needs an Apple GPU family with mesh shaders; pipeline compilation fails otherwise.
+pub struct MetalMeshletPso {
+    pub(crate) raster: MetalRasterState,
+    /// The mesh shader's `[numthreads]`. Metal drops a draw dispatched at any other size.
+    pub(crate) threads_per_mesh_group: MTLSize,
+}
+
+pub struct MetalComputePso {
+    pub(crate) pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub(crate) threads_per_threadgroup: [u32; 3],
+    /// Names every encoder this pipeline opens.
+    pub(crate) label: Option<String>,
+}
+
+pub(crate) fn compare_op_to_mtl(op: CompareOp) -> MTLCompareFunction {
+    match op {
+        CompareOp::Never => MTLCompareFunction::Never,
+        CompareOp::Less => MTLCompareFunction::Less,
+        CompareOp::Equal => MTLCompareFunction::Equal,
+        CompareOp::LessOrEqual => MTLCompareFunction::LessEqual,
+        CompareOp::Greater => MTLCompareFunction::Greater,
+        CompareOp::NotEqual => MTLCompareFunction::NotEqual,
+        CompareOp::GreaterOrEqual => MTLCompareFunction::GreaterEqual,
+        CompareOp::Always => MTLCompareFunction::Always,
+    }
+}
+
+fn depth_stencil_state(
     device: &ProtocolObject<dyn MTLDevice>,
     depth: DepthState,
-) -> RhiResult<Retained<ProtocolObject<dyn objc2_metal::MTLDepthStencilState>>> {
-    let desc = objc2_metal::MTLDepthStencilDescriptor::new();
+) -> RhiResult<Retained<ProtocolObject<dyn MTLDepthStencilState>>> {
+    let desc = MTLDepthStencilDescriptor::new();
     desc.setDepthCompareFunction(if depth.mode.contains(DepthFlags::READ) {
         compare_op_to_mtl(depth.compare)
     } else {
-        objc2_metal::MTLCompareFunction::Always
+        MTLCompareFunction::Always
     });
     desc.setDepthWriteEnabled(depth.mode.contains(DepthFlags::WRITE));
     device
@@ -42,133 +87,36 @@ pub(crate) fn make_depth_stencil_state(
         })
 }
 
-pub(crate) fn compare_op_to_mtl(op: CompareOp) -> objc2_metal::MTLCompareFunction {
-    use objc2_metal::MTLCompareFunction as F;
-    match op {
-        CompareOp::Never => F::Never,
-        CompareOp::Less => F::Less,
-        CompareOp::Equal => F::Equal,
-        CompareOp::LessOrEqual => F::LessEqual,
-        CompareOp::Greater => F::Greater,
-        CompareOp::NotEqual => F::NotEqual,
-        CompareOp::GreaterOrEqual => F::GreaterEqual,
-        CompareOp::Always => F::Always,
-    }
-}
-
-pub struct MetalGraphicsPso {
-    pub(crate) pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    pub(crate) depth_stencil: Retained<ProtocolObject<dyn objc2_metal::MTLDepthStencilState>>,
-    pub(crate) depth_bias: (f32, f32, f32),
-    pub(crate) cull_mode: MTLCullMode,
-    pub(crate) winding: MTLWinding,
-    pub(crate) topology: MTLPrimitiveType,
-}
-
-pub struct MetalComputePso {
-    pub(crate) pipeline: Retained<ProtocolObject<dyn objc2_metal::MTLComputePipelineState>>,
-    pub(crate) threads_per_threadgroup: [u32; 3],
-    /// Owned: outlives the descriptor, and names every encoder this pipeline binds to.
-    pub(crate) label: Option<String>,
-}
-
-/// One shader stage of a Metal render pipeline: the library plus the entry point in it.
-pub(crate) struct MetalStage<'a> {
-    pub(crate) library: &'a ProtocolObject<dyn MTLLibrary>,
-    pub(crate) entry_point: &'a str,
-}
-
-impl MetalStage<'_> {
-    fn function_descriptor(&self) -> Retained<MTL4LibraryFunctionDescriptor> {
-        let desc = MTL4LibraryFunctionDescriptor::new();
-        desc.setName(Some(&NSString::from_str(self.entry_point)));
-        desc.setLibrary(Some(self.library));
-        desc
-    }
-}
-
-/// Everything `compile_pipeline_state` needs beyond the two shader stages.
-pub(crate) struct MetalRasterState<'a> {
-    pub(crate) color_formats: &'a [objc2_metal::MTLPixelFormat],
-    pub(crate) color_write_masks: &'a [ColorWriteMask],
-    pub(crate) sample_count: usize,
-    pub(crate) alpha_to_coverage: bool,
-    pub(crate) blend: &'a [BlendAttachment],
-    pub(crate) label: Option<&'a str>,
-}
-
-impl MetalGraphicsPso {
-    pub(crate) fn compile_pipeline_state(
-        compiler: &ProtocolObject<dyn MTL4Compiler>,
-        vertex: MetalStage<'_>,
-        fragment: MetalStage<'_>,
-        state: &MetalRasterState<'_>,
-    ) -> RhiResult<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
-        let vertex_desc = vertex.function_descriptor();
-        let fragment_desc = fragment.function_descriptor();
-
-        let pso_desc = MTL4RenderPipelineDescriptor::new();
-        pso_desc.setVertexFunctionDescriptor(Some(vertex_desc.as_ref()));
-        pso_desc.setFragmentFunctionDescriptor(Some(fragment_desc.as_ref()));
-        if let Some(label) = state.label {
-            let base: &MTL4PipelineDescriptor = pso_desc.as_ref();
-            base.setLabel(Some(&NSString::from_str(label)));
-        }
-
-        let color_attachments = pso_desc.colorAttachments();
-        for (i, fmt) in state.color_formats.iter().enumerate() {
-            let att = unsafe { color_attachments.objectAtIndexedSubscript(i) };
-            att.setPixelFormat(*fmt);
-            let blend_att = state.blend.get(i).copied().unwrap_or_default();
-            let write_mask = state
-                .color_write_masks
-                .get(i)
-                .copied()
-                .unwrap_or(ColorWriteMask::ALL);
-            apply_blend_to_attachment(att.as_ref(), blend_att, write_mask);
-        }
-
-        // Metal 4 supplies depth/stencil formats when the render pass is created, not here.
-
-        unsafe {
-            pso_desc.setRasterSampleCount(state.sample_count);
-        }
-        pso_desc.setAlphaToCoverageState(if state.alpha_to_coverage {
-            MTL4AlphaToCoverageState::Enabled
-        } else {
-            MTL4AlphaToCoverageState::Disabled
-        });
-        pso_desc.setSupportIndirectCommandBuffers(MTL4IndirectCommandBufferSupportState::Enabled);
-
-        let base_desc: &MTL4PipelineDescriptor = pso_desc.as_ref();
-        compiler
-            .newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(base_desc, None)
-            .map_err(|e| {
-                RhiError::PipelineCreation(
-                    format!("Metal 4 graphics PSO creation failed: {e}").into(),
-                )
-            })
-    }
-}
-
-pub(crate) fn apply_blend_to_attachment(
-    att: &MTL4RenderPipelineColorAttachmentDescriptor,
-    blend: BlendAttachment,
-    write_mask: ColorWriteMask,
+/// Depth formats are given to Metal 4 by the render pass, not the pipeline.
+fn set_color_targets(
+    attachments: &MTL4RenderPipelineColorAttachmentDescriptorArray,
+    targets: &[ColorTarget],
+    blend: &[BlendAttachment],
 ) {
-    att.setBlendingState(if blend.blend_enable {
-        MTL4BlendState::Enabled
+    for (i, target) in targets.iter().enumerate() {
+        let att = unsafe { attachments.objectAtIndexedSubscript(i) };
+        att.setPixelFormat(format_to_mtl(target.format));
+        att.setWriteMask(color_write_mask_to_mtl(target.write_mask));
+        let blend = blend.get(i).copied().unwrap_or_default();
+        if blend.blend_enable {
+            att.setBlendingState(MTL4BlendState::Enabled);
+            att.setSourceRGBBlendFactor(blend_factor_to_mtl(blend.src_color));
+            att.setDestinationRGBBlendFactor(blend_factor_to_mtl(blend.dst_color));
+            att.setRgbBlendOperation(blend_op_to_mtl(blend.color_op));
+            att.setSourceAlphaBlendFactor(blend_factor_to_mtl(blend.src_alpha));
+            att.setDestinationAlphaBlendFactor(blend_factor_to_mtl(blend.dst_alpha));
+            att.setAlphaBlendOperation(blend_op_to_mtl(blend.alpha_op));
+        } else {
+            att.setBlendingState(MTL4BlendState::Disabled);
+        }
+    }
+}
+
+fn alpha_to_coverage(enabled: bool) -> MTL4AlphaToCoverageState {
+    if enabled {
+        MTL4AlphaToCoverageState::Enabled
     } else {
-        MTL4BlendState::Disabled
-    });
-    att.setWriteMask(color_write_mask_to_mtl(write_mask));
-    if blend.blend_enable {
-        att.setSourceRGBBlendFactor(blend_factor_to_mtl(blend.src_color));
-        att.setDestinationRGBBlendFactor(blend_factor_to_mtl(blend.dst_color));
-        att.setRgbBlendOperation(blend_op_to_mtl(blend.color_op));
-        att.setSourceAlphaBlendFactor(blend_factor_to_mtl(blend.src_alpha));
-        att.setDestinationAlphaBlendFactor(blend_factor_to_mtl(blend.dst_alpha));
-        att.setAlphaBlendOperation(blend_op_to_mtl(blend.alpha_op));
+        MTL4AlphaToCoverageState::Disabled
     }
 }
 
@@ -214,19 +162,14 @@ fn blend_op_to_mtl(op: BlendOp) -> MTLBlendOperation {
     }
 }
 
-/// Metal meshlet (mesh shader) pipeline state. Mesh shaders need an Apple GPU family that
-/// supports them; `create_meshlet_pso` fails at PSO compilation otherwise.
-pub struct MetalMeshletPso {
-    pub(crate) cull_mode: MTLCullMode,
-    pub(crate) winding: MTLWinding,
-    pub(crate) depth_stencil: Retained<ProtocolObject<dyn objc2_metal::MTLDepthStencilState>>,
-    pub(crate) depth_bias: (f32, f32, f32),
-    pub(crate) default_pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+fn set_label(desc: &MTL4PipelineDescriptor, label: Option<&str>) {
+    if let Some(label) = label {
+        desc.setLabel(Some(&NSString::from_str(label)));
+    }
 }
 
 impl MetalDevice {
     pub fn create_shader_module(&self, desc: &ShaderModuleDesc) -> RhiResult<ShaderModule> {
-        // For Metal, `code` should be a compiled .metallib binary.
         if desc.code.is_empty() {
             return Err(RhiError::ShaderCompilation(
                 "Metal shader module needs a non-empty metallib".into(),
@@ -234,6 +177,8 @@ impl MetalDevice {
         }
         let ptr = std::ptr::NonNull::new(desc.code.as_ptr().cast::<std::ffi::c_void>().cast_mut())
             .ok_or_else(|| RhiError::ShaderCompilation("shader code pointer is null".into()))?;
+        // SAFETY: `ptr` covers `desc.code`, which outlives this call; with no destructor, the
+        // dispatch data copies it.
         let dispatch_data = unsafe {
             dispatch2::DispatchData::new(ptr, desc.code.len(), None, std::ptr::null_mut())
         };
@@ -257,66 +202,100 @@ impl MetalDevice {
         })
     }
 
+    /// Compile a render pipeline and the depth state that goes with it.
+    fn raster_state(
+        &self,
+        desc: &RasterPsoDesc,
+        pipeline_desc: &MTL4PipelineDescriptor,
+    ) -> RhiResult<MetalRasterState> {
+        let pipeline = self
+            .compiler
+            .newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(pipeline_desc, None)
+            .map_err(|e| {
+                RhiError::PipelineCreation(format!("Metal render PSO creation failed: {e}").into())
+            })?;
+        let (cull_mode, winding) = cull_to_mtl(desc.cull);
+        Ok(MetalRasterState {
+            pipeline,
+            depth_stencil: depth_stencil_state(&self.shared.device, desc.depth)?,
+            depth_bias: (
+                desc.depth.bias,
+                desc.depth.bias_slope,
+                desc.depth.bias_clamp,
+            ),
+            cull_mode,
+            winding,
+        })
+    }
+
     pub fn create_graphics_pso(
         &self,
-        desc: &GraphicsPsoDesc,
-        vert_module: &MetalShaderModule,
-        frag_module: &MetalShaderModule,
+        desc: &RasterPsoDesc,
+        vertex: &MetalShaderModule,
+        fragment: &MetalShaderModule,
     ) -> RhiResult<GraphicsPso> {
-        // SmallVec: a pipeline with more than four colour targets is rare enough that the
-        // inline capacity covers every real case without touching the heap.
-        let color_formats: SmallVec<[_; 4]> = desc
-            .color_targets
-            .iter()
-            .map(|target| format_to_mtl(target.format))
-            .collect();
-        let color_write_masks: SmallVec<[_; 4]> = desc
-            .color_targets
-            .iter()
-            .map(|target| target.write_mask)
-            .collect();
-        let pipeline_state = MetalGraphicsPso::compile_pipeline_state(
-            self.compiler.as_ref(),
-            super::pipeline::MetalStage {
-                library: vert_module.library.as_ref(),
-                entry_point: &vert_module.entry_point,
-            },
-            super::pipeline::MetalStage {
-                library: frag_module.library.as_ref(),
-                entry_point: &frag_module.entry_point,
-            },
-            &super::pipeline::MetalRasterState {
-                color_formats: &color_formats,
-                color_write_masks: &color_write_masks,
-                sample_count: desc.sample_count.count() as usize,
-                alpha_to_coverage: desc.alpha_to_coverage,
-                blend: desc.blend,
-                label: desc.label,
-            },
-        )?;
-
-        let (cull_mode, winding) = cull_to_mtl(desc.cull);
-
-        let topology = match desc.topology {
-            Topology::TriangleList => objc2_metal::MTLPrimitiveType::Triangle,
-            Topology::TriangleStrip => objc2_metal::MTLPrimitiveType::TriangleStrip,
-        };
+        let pipeline_desc = MTL4RenderPipelineDescriptor::new();
+        pipeline_desc.setVertexFunctionDescriptor(Some(&vertex.function_descriptor()));
+        pipeline_desc.setFragmentFunctionDescriptor(Some(&fragment.function_descriptor()));
+        set_color_targets(
+            &pipeline_desc.colorAttachments(),
+            desc.color_targets,
+            desc.blend,
+        );
+        unsafe { pipeline_desc.setRasterSampleCount(desc.sample_count.count() as usize) };
+        pipeline_desc.setAlphaToCoverageState(alpha_to_coverage(desc.alpha_to_coverage));
+        pipeline_desc
+            .setSupportIndirectCommandBuffers(MTL4IndirectCommandBufferSupportState::Enabled);
+        set_label(&pipeline_desc, desc.label);
 
         Ok(GraphicsPso {
             inner: Box::new(MetalGraphicsPso {
-                pipeline: pipeline_state,
-                depth_stencil: super::pipeline::make_depth_stencil_state(
-                    self.shared.device.as_ref(),
-                    desc.depth,
-                )?,
-                depth_bias: (
-                    desc.depth.bias,
-                    desc.depth.bias_slope,
-                    desc.depth.bias_clamp,
-                ),
-                cull_mode,
-                winding,
-                topology,
+                raster: self.raster_state(desc, &pipeline_desc)?,
+                topology: match desc.topology {
+                    Topology::TriangleList => MTLPrimitiveType::Triangle,
+                    Topology::TriangleStrip => MTLPrimitiveType::TriangleStrip,
+                },
+            }),
+            _owner: None,
+        })
+    }
+
+    pub fn create_meshlet_pso(
+        &self,
+        desc: &RasterPsoDesc,
+        mesh: &MetalShaderModule,
+        fragment: &MetalShaderModule,
+        threads_per_mesh_group: Option<[u32; 3]>,
+    ) -> RhiResult<MeshletPso> {
+        let pipeline_desc = MTL4MeshRenderPipelineDescriptor::new();
+        pipeline_desc.setMeshFunctionDescriptor(Some(&mesh.function_descriptor()));
+        pipeline_desc.setFragmentFunctionDescriptor(Some(&fragment.function_descriptor()));
+        set_color_targets(
+            &pipeline_desc.colorAttachments(),
+            desc.color_targets,
+            desc.blend,
+        );
+        unsafe { pipeline_desc.setRasterSampleCount(desc.sample_count.count() as usize) };
+        pipeline_desc.setAlphaToCoverageState(alpha_to_coverage(desc.alpha_to_coverage));
+        set_label(&pipeline_desc, desc.label);
+
+        let threads_per_mesh_group = match threads_per_mesh_group {
+            Some([width, height, depth]) => {
+                let size = MTLSize {
+                    width: width as usize,
+                    height: height as usize,
+                    depth: depth as usize,
+                };
+                pipeline_desc.setRequiredThreadsPerMeshThreadgroup(size);
+                size
+            }
+            None => DEFAULT_THREADS_PER_MESH_GROUP,
+        };
+
+        Ok(MeshletPso {
+            inner: Box::new(MetalMeshletPso {
+                raster: self.raster_state(desc, &pipeline_desc)?,
+                threads_per_mesh_group,
             }),
             _owner: None,
         })
@@ -325,11 +304,10 @@ impl MetalDevice {
     pub fn create_compute_pso(
         &self,
         desc: &ComputePsoDesc,
-        compute_module: &MetalShaderModule,
+        module: &MetalShaderModule,
         threads_per_threadgroup: Option<[u32; 3]>,
     ) -> RhiResult<ComputePso> {
-        // Unlike Vulkan, Metal cannot recover `[numthreads]` from the compiled library: it has to
-        // be told, both to size the dispatch and to set `requiredThreadsPerThreadgroup`.
+        // Metal cannot read `[numthreads]` back out of a library, so it has to be supplied.
         let threads_per_threadgroup = threads_per_threadgroup.ok_or_else(|| {
             RhiError::PipelineCreation(
                 "Metal needs the compute shader's threadgroup size, and this module carries no \
@@ -337,45 +315,33 @@ impl MetalDevice {
                     .into(),
             )
         })?;
-        let fn_name = NSString::from_str(&compute_module.entry_point);
-        let func_desc = MTL4LibraryFunctionDescriptor::new();
-        func_desc.setName(Some(&fn_name));
-        func_desc.setLibrary(Some(&compute_module.library));
+        let [width, height, depth] = threads_per_threadgroup;
+        let threads = MTLSize {
+            width: width as usize,
+            height: height as usize,
+            depth: depth as usize,
+        };
 
         let pipeline_desc = MTL4ComputePipelineDescriptor::new();
-        pipeline_desc.setComputeFunctionDescriptor(Some(&func_desc));
-        if let Some(label) = desc.label {
-            let base: &MTL4PipelineDescriptor = pipeline_desc.as_ref();
-            base.setLabel(Some(&NSString::from_str(label)));
-        }
-        // `Device::create_compute_pso` already settled and range-checked this.
-        let tg = objc2_metal::MTLSize {
-            width: threads_per_threadgroup[0] as usize,
-            height: threads_per_threadgroup[1] as usize,
-            depth: threads_per_threadgroup[2] as usize,
-        };
-        pipeline_desc.setRequiredThreadsPerThreadgroup(tg);
+        pipeline_desc.setComputeFunctionDescriptor(Some(&module.function_descriptor()));
+        pipeline_desc.setRequiredThreadsPerThreadgroup(threads);
+        set_label(&pipeline_desc, desc.label);
 
-        let pipeline_state = self
+        let pipeline = self
             .compiler
             .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&pipeline_desc, None)
             .map_err(|e| {
                 RhiError::PipelineCreation(format!("Metal compute PSO creation failed: {e}").into())
             })?;
 
-        // A threadgroup wider than the pipeline's register budget is undefined in Metal: the
-        // dispatch is dropped and the frame comes out black, with nothing raised anywhere. Vulkan
-        // rejects the same mistake at validation, so report it here rather than let it render.
-        let max_threads = {
-            use objc2_metal::MTLComputePipelineState;
-            pipeline_state.maxTotalThreadsPerThreadgroup()
-        };
-        let requested = tg.width * tg.height * tg.depth;
+        // Metal silently drops a dispatch wider than the pipeline's register budget allows.
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
+        let requested = threads.width * threads.height * threads.depth;
         if requested > max_threads {
             return Err(RhiError::PipelineCreation(
                 format!(
-                    "Metal compute PSO {:?} requested {requested} threads per threadgroup, but the \
-                 compiled shader's register use allows at most {max_threads}",
+                    "Metal compute PSO {:?} requested {requested} threads per threadgroup, but \
+                     the compiled shader's register use allows at most {max_threads}",
                     desc.label.unwrap_or("<unlabelled>"),
                 )
                 .into(),
@@ -384,78 +350,9 @@ impl MetalDevice {
 
         Ok(ComputePso {
             inner: Box::new(MetalComputePso {
-                pipeline: pipeline_state,
+                pipeline,
                 threads_per_threadgroup,
                 label: desc.label.map(str::to_owned),
-            }),
-            _owner: None,
-        })
-    }
-
-    pub fn create_meshlet_pso(
-        &self,
-        desc: &MeshletPsoDesc,
-        mesh_module: &MetalShaderModule,
-        frag_module: &MetalShaderModule,
-    ) -> RhiResult<MeshletPso> {
-        use super::pipeline::MetalMeshletPso;
-        use objc2_metal::MTL4MeshRenderPipelineDescriptor;
-
-        let mesh_fn_name = NSString::from_str(&mesh_module.entry_point);
-        let mesh_func_desc = MTL4LibraryFunctionDescriptor::new();
-        mesh_func_desc.setName(Some(&mesh_fn_name));
-        mesh_func_desc.setLibrary(Some(&mesh_module.library));
-
-        let frag_fn_name = NSString::from_str(&frag_module.entry_point);
-        let frag_func_desc = MTL4LibraryFunctionDescriptor::new();
-        frag_func_desc.setName(Some(&frag_fn_name));
-        frag_func_desc.setLibrary(Some(&frag_module.library));
-
-        let pipeline_desc = MTL4MeshRenderPipelineDescriptor::new();
-        pipeline_desc.setMeshFunctionDescriptor(Some(&mesh_func_desc));
-        pipeline_desc.setFragmentFunctionDescriptor(Some(&frag_func_desc));
-        if let Some(label) = desc.label {
-            let base: &MTL4PipelineDescriptor = pipeline_desc.as_ref();
-            base.setLabel(Some(&NSString::from_str(label)));
-        }
-
-        unsafe {
-            pipeline_desc.setRasterSampleCount(desc.sample_count.count() as usize);
-            if desc.alpha_to_coverage {
-                pipeline_desc
-                    .setAlphaToCoverageState(objc2_metal::MTL4AlphaToCoverageState::Enabled);
-            }
-        }
-
-        for (i, target) in desc.color_targets.iter().enumerate() {
-            let att = unsafe { pipeline_desc.colorAttachments().objectAtIndexedSubscript(i) };
-            att.setPixelFormat(super::texture::format_to_mtl(target.format));
-            let blend_att = desc.blend.get(i).copied().unwrap_or_default();
-            super::pipeline::apply_blend_to_attachment(att.as_ref(), blend_att, target.write_mask);
-        }
-
-        let base_desc: &MTL4PipelineDescriptor = pipeline_desc.as_ref();
-        let default_pipeline = self
-            .compiler
-            .newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(base_desc, None)
-            .map_err(|e| RhiError::PipelineCreation(format!("Mesh PSO: {e}").into()))?;
-
-        let (cull_mode, winding) = cull_to_mtl(desc.cull);
-
-        Ok(MeshletPso {
-            inner: Box::new(MetalMeshletPso {
-                cull_mode,
-                winding,
-                depth_stencil: super::pipeline::make_depth_stencil_state(
-                    self.shared.device.as_ref(),
-                    desc.depth,
-                )?,
-                depth_bias: (
-                    desc.depth.bias,
-                    desc.depth.bias_slope,
-                    desc.depth.bias_clamp,
-                ),
-                default_pipeline,
             }),
             _owner: None,
         })

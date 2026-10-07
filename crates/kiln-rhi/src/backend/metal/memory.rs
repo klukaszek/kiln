@@ -8,17 +8,15 @@ use objc2_metal::{
     MTLResourceOptions,
 };
 
-use super::as_allocation;
+use objc2_foundation::NSString;
 
-use super::device::BufferAllocation;
-use super::device::{MetalDevice, MetalRetiredResource};
+use super::as_allocation;
+use super::device::{BufferAllocation, MetalDevice, MetalRetiredResource};
 use crate::backend::mapped::{MappedAllocation, resolve_mapped_pointer};
 use crate::backend::suballoc::BlockPool;
 use crate::error::{RhiError, RhiResult};
-use crate::memory::MemoryType;
-use crate::memory::{Allocation, AllocationDesc};
+use crate::memory::{Allocation, AllocationDesc, MemoryType};
 use crate::types::GpuPtr;
-use objc2_foundation::NSString;
 
 pub(crate) type SharedMetalBufferPool = Rc<RefCell<MetalBufferPool>>;
 
@@ -199,9 +197,6 @@ fn resource_options(memory: MemoryType) -> MTLResourceOptions {
         MemoryType::GpuOnly => MTLResourceOptions::StorageModePrivate,
     }
 }
-
-// The free-range bookkeeping these tests used to cover now lives in `backend::suballoc`, shared
-// with the Vulkan block allocator, and is tested there.
 
 impl MetalDevice {
     pub fn create_allocation(&self, desc: &AllocationDesc) -> RhiResult<Allocation> {

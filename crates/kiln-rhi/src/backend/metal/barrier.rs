@@ -13,12 +13,11 @@ pub(crate) const ALL_RENDER_STAGES: MTLRenderStages = MTLRenderStages(
 
 /// Empty in means empty out; see `to_vk_stage_flags` for why this must not widen to `All`.
 pub(crate) fn to_mtl_stages(flags: StageFlags) -> MTLStages {
-    let mut stages = MTLStages::empty();
-
     if flags.contains(StageFlags::ALL_COMMANDS) {
         return MTLStages::All;
     }
 
+    let mut stages = MTLStages::empty();
     if flags.contains(StageFlags::VERTEX_SHADER) {
         stages |= MTLStages::Vertex;
     }

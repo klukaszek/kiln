@@ -76,8 +76,6 @@ pub(crate) fn shared_event_as_event(
     unsafe { super::cast_protocol(&**event) }
 }
 
-// Metal 4 argument tables carry root and bindless-heap buffer addresses.
-
 #[derive(Clone)]
 pub(crate) struct BufferAllocation {
     pub base: GpuPtr<u8>,
@@ -95,18 +93,15 @@ pub struct MetalDevice {
     pub(crate) compiler: Retained<ProtocolObject<dyn MTL4Compiler>>,
     pub(crate) buffer_pool: SharedMetalBufferPool,
     pub(crate) queue: Rc<MetalQueue>,
-    /// The same queue, wrapped for [`RhiDevice::queue`]. Both point at one `MetalQueue`.
+    /// `queue`, wrapped for [`Device::queue`](crate::Device::queue).
     rhi_queue: Queue,
     pub(crate) mapped_allocations: SharedMappedAllocations,
-    /// Shared event carrying the submission timeline, used for per-frame synchronization.
-    pub(crate) frame_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     pub(crate) frame_table_slots: SharedFrameTableSlots,
     /// Free list of table slots for non-swapchain command buffers.
     pub(crate) table_slot_pool: SharedTableSlotPool,
 }
 
-/// Translate the unified `Cull` value into Metal's `(cull_mode, front-face winding)` pair.
-/// Every variant implies CCW as the front-face convention.
+/// Kiln's front face is always counter-clockwise.
 pub(crate) fn cull_to_mtl(cull: Cull) -> (MTLCullMode, MTLWinding) {
     let winding = MTLWinding::CounterClockwise;
     match cull {
@@ -196,7 +191,7 @@ impl MetalDevice {
             shared: shared.clone(),
             frame_fence_values,
             frame_fence_next,
-            frame_event: frame_event.clone(),
+            frame_event,
             in_flight_frame_commands,
             pending_submissions,
             retired_resources: RetirementQueue::default(),
@@ -212,19 +207,16 @@ impl MetalDevice {
                 RhiError::DeviceCreation(format!("Metal MTL4 compiler creation failed: {e}").into())
             })?;
 
-        let device = Self {
+        Ok(Self {
             shared,
             compiler,
             buffer_pool,
             queue,
             rhi_queue,
             mapped_allocations: Rc::new(RefCell::new(BTreeMap::new())),
-            frame_event,
             frame_table_slots,
             table_slot_pool: Rc::new(RefCell::new(Vec::new())),
-        };
-
-        Ok(device)
+        })
     }
 
     pub fn queue(&self) -> &Queue {
@@ -239,16 +231,6 @@ impl MetalDevice {
     }
 
     pub fn wait_for_frame(&self, frame_index: usize) {
-        let q = &self.queue;
-        let value = q.frame_fence_values.borrow()[frame_index];
-        if value != 0 {
-            assert!(
-                self.frame_event
-                    .waitUntilSignaledValue_timeoutMS(value, u64::MAX),
-                "Failed to wait for Metal frame completion"
-            );
-        }
-        q.in_flight_frame_commands.borrow_mut()[frame_index] = None;
-        q.reclaim_completed_submissions();
+        self.queue.wait_for_frame(frame_index);
     }
 }

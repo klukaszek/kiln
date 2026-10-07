@@ -17,9 +17,6 @@ pub mod swapchain;
 pub mod sync;
 pub mod texture;
 
-// Barriers have no module of their own: Metal 4 encodes them directly on the command encoder,
-// so they live in `command.rs` beside the encoder state they act on.
-
 /// Reinterpret a `ProtocolObject` as another protocol the object conforms to; objc2 has no upcast.
 ///
 /// # Safety

@@ -381,6 +381,8 @@ impl VulkanDevice {
         desc: &MeshletPsoDesc,
         mesh_module: &VulkanShaderModule,
         frag_module: &VulkanShaderModule,
+        // Vulkan reads the mesh threadgroup size from the SPIR-V.
+        _threads_per_mesh_group: Option<[u32; 3]>,
     ) -> RhiResult<MeshletPso> {
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()

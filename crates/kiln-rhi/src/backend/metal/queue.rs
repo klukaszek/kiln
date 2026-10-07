@@ -69,7 +69,6 @@ impl MetalQueue {
         match resource {
             MetalRetiredResource::Texture { id, .. } => self.shared.textures.recycle(id.0),
             MetalRetiredResource::Sampler { id, sampler } => {
-                // The submissions that could read this slot have retired, so the deferral ends.
                 drop(sampler);
                 self.shared.samplers.recycle(id.0);
             }
@@ -81,7 +80,7 @@ impl MetalQueue {
 
     pub fn submit_with_desc(
         &self,
-        cmd: MetalCommandBuffer,
+        mut cmd: MetalCommandBuffer,
         desc: &SubmitDesc<'_>,
     ) -> RhiResult<()> {
         if self.shared.residency_dirty.replace(false) {
@@ -95,7 +94,6 @@ impl MetalQueue {
                 .waitForEvent_value(shared_event_as_event(&event.event), *value);
         }
 
-        let mut cmd = cmd;
         cmd.finish();
         self.commit_single(&cmd.command_buffer);
 
@@ -116,7 +114,7 @@ impl MetalQueue {
 
     pub fn submit_frame(
         &self,
-        cmd: MetalCommandBuffer,
+        mut cmd: MetalCommandBuffer,
         sc: &MetalSwapchain,
         frame_index: usize,
         _image_index: u32,
@@ -131,14 +129,13 @@ impl MetalQueue {
         }
         self.reclaim_completed_submissions();
 
-        // Taken during recording, so the queue-side wait is enqueued here — still before the
-        // commit that renders into it. A frame that never touched the swapchain skips this.
+        // The drawable was taken during recording; the queue must wait on it before the commit
+        // that renders into it.
         let drawable = sc.drawable.current();
         if let Some(drawable) = drawable.as_ref() {
             self.queue.waitForDrawable(drawable);
         }
 
-        let mut cmd = cmd;
         cmd.finish();
         self.commit_single(&cmd.command_buffer);
 
@@ -159,8 +156,14 @@ impl MetalQueue {
     }
 
     pub fn acquire_image(&self, _sc: &MetalSwapchain, frame_index: usize) -> RhiResult<u32> {
-        self.reclaim_completed_submissions();
+        self.wait_for_frame(frame_index);
+        // The drawable is taken when the frame first encodes into it; see `MetalDrawableSlot`.
+        // Metal has one current drawable, so the index is always 0.
+        Ok(0)
+    }
 
+    /// Block until the last submission in `frame_index`'s slot has completed.
+    pub(crate) fn wait_for_frame(&self, frame_index: usize) {
         let value = self.frame_fence_values.borrow()[frame_index];
         if value != 0 {
             assert!(
@@ -170,10 +173,7 @@ impl MetalQueue {
             );
         }
         self.in_flight_frame_commands.borrow_mut()[frame_index] = None;
-
-        // No `nextDrawable` here: the drawable stays in the pool until the frame encodes into
-        // it. See `MetalDrawableSlot`. Metal has one current drawable, so the index is always 0.
-        Ok(0)
+        self.reclaim_completed_submissions();
     }
 
     pub fn wait_idle(&self) {
@@ -215,8 +215,7 @@ impl MetalQueue {
         self.collect_retired(completed);
     }
 
-    /// Commit one command buffer. `commit_count` is the batching entry point, but the RHI hands
-    /// buffers to the queue one at a time, so there is never more than one to pass.
+    /// Commit one command buffer. Metal 4 only exposes the batched `commit:count:`.
     fn commit_single(&self, cmd: &Retained<ProtocolObject<dyn MTL4CommandBuffer>>) {
         let mut buffers: [NonNull<ProtocolObject<dyn MTL4CommandBuffer>>; 1] =
             [NonNull::from(cmd.as_ref())];

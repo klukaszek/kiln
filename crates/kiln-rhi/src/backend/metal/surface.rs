@@ -9,8 +9,7 @@ use super::device::MetalDevice;
 use crate::error::{RhiError, RhiResult};
 use crate::surface::{Surface, SurfaceDesc};
 
-/// The `CAMetalLayer` a swapchain is built from. Lives beside `MetalDrawableSlot`, which holds
-/// the same layer: a Metal surface is nothing but that layer.
+/// The `CAMetalLayer` a swapchain is built from.
 pub struct MetalSurface {
     pub(crate) layer: Retained<CAMetalLayer>,
 }

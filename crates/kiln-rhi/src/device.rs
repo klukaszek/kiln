@@ -376,7 +376,7 @@ impl Device {
             let d = self.inner.as_ref();
             let m = &mesh.inner;
             let p = &pixel.inner;
-            d.create_meshlet_pso(desc, m, p)
+            d.create_meshlet_pso(desc, m, p, mesh.threads_per_threadgroup)
         }
         .map(|resource| self.own(resource))
     }

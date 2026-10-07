@@ -1,8 +1,19 @@
-use objc2_metal::MTLPixelFormat;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::{NSRange, NSString};
+use objc2_metal::{
+    MTLDevice, MTLHeap, MTLPixelFormat, MTLResidencySet, MTLResource, MTLStorageMode, MTLTexture,
+    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage as MtlTextureUsage,
+};
 
-use crate::types::Format;
+use super::as_allocation;
+use super::device::{MetalDevice, MetalRetiredResource};
+use crate::error::{RhiError, RhiResult};
+use crate::texture::{
+    Texture, TextureDesc, TextureSizeAlign, TextureUsage, TextureViewDesc, ViewKind,
+};
+use crate::types::{Format, GpuPtr, TextureDimension, TextureHandle, TextureId};
 
-/// Convert RHI Format to MTLPixelFormat.
 pub fn format_to_mtl(format: Format) -> MTLPixelFormat {
     match format {
         // Color
@@ -20,17 +31,15 @@ pub fn format_to_mtl(format: Format) -> MTLPixelFormat {
         Format::R32G32B32A32Float => MTLPixelFormat::RGBA32Float,
         Format::R10G10B10A2Unorm => MTLPixelFormat::RGB10A2Unorm,
         Format::R11G11B10Float => MTLPixelFormat::RG11B10Float,
-        // Depth
+        Format::R16Uint => MTLPixelFormat::R16Uint,
+        Format::R32Uint => MTLPixelFormat::R32Uint,
         Format::D16Unorm => MTLPixelFormat::Depth16Unorm,
         Format::D32Float => MTLPixelFormat::Depth32Float,
         Format::D24UnormS8Uint => MTLPixelFormat::Depth24Unorm_Stencil8,
         Format::D32FloatS8Uint => MTLPixelFormat::Depth32Float_Stencil8,
-        Format::R16Uint => MTLPixelFormat::R16Uint,
-        Format::R32Uint => MTLPixelFormat::R32Uint,
     }
 }
 
-/// Convert an `MTLPixelFormat` to the corresponding RHI format.
 pub fn mtl_to_format(mtl: MTLPixelFormat) -> Format {
     match mtl {
         MTLPixelFormat::R8Unorm => Format::R8Unorm,
@@ -57,22 +66,17 @@ pub fn mtl_to_format(mtl: MTLPixelFormat) -> Format {
     }
 }
 
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
-use objc2_metal::{
-    MTLDevice, MTLHeap, MTLResidencySet, MTLStorageMode, MTLTexture, MTLTextureDescriptor,
-    MTLTextureType, MTLTextureUsage as MtlTextureUsage,
-};
+fn texture_type(dimension: TextureDimension) -> MTLTextureType {
+    match dimension {
+        TextureDimension::D1 => MTLTextureType::Type1D,
+        TextureDimension::D2 => MTLTextureType::Type2D,
+        TextureDimension::D2Array => MTLTextureType::Type2DArray,
+        TextureDimension::D3 => MTLTextureType::Type3D,
+        TextureDimension::Cube => MTLTextureType::TypeCube,
+        TextureDimension::CubeArray => MTLTextureType::TypeCubeArray,
+    }
+}
 
-use super::as_allocation;
-use super::device::{MetalDevice, MetalRetiredResource};
-use crate::error::{RhiError, RhiResult};
-use crate::texture::{Texture, TextureDesc, TextureSizeAlign, TextureUsage, ViewKind};
-use crate::types::{GpuPtr, TextureDimension, TextureHandle, TextureId};
-
-/// A texture slot's contents. Mirrors `VulkanTexture`: the view flag lives with the texture
-/// rather than in a parallel array that has to be kept in step.
 pub(crate) struct MetalTexture {
     pub(crate) texture: Retained<ProtocolObject<dyn MTLTexture>>,
     /// True when this entry is a view into another texture rather than a heap placement.
@@ -80,19 +84,8 @@ pub(crate) struct MetalTexture {
 }
 
 impl MetalDevice {
-    /// Build the native `MTLTextureDescriptor` for a `TextureDesc`. Shared by
-    /// `texture_size_align` and `create_texture` so the mapping lives in one place.
     fn build_texture_descriptor(&self, desc: &TextureDesc) -> Retained<MTLTextureDescriptor> {
         let mtl_desc = MTLTextureDescriptor::new();
-
-        let texture_type = match desc.dimension {
-            TextureDimension::D1 => MTLTextureType::Type1D,
-            TextureDimension::D2 => MTLTextureType::Type2D,
-            TextureDimension::D2Array => MTLTextureType::Type2DArray,
-            TextureDimension::D3 => MTLTextureType::Type3D,
-            TextureDimension::Cube => MTLTextureType::TypeCube,
-            TextureDimension::CubeArray => MTLTextureType::TypeCubeArray,
-        };
 
         let mut usage = MtlTextureUsage::empty();
         if desc.usage.contains(TextureUsage::SAMPLED) {
@@ -120,7 +113,7 @@ impl MetalDevice {
             // Metal counts cubes, not faces, so `array_layers` goes through unchanged for every
             // dimension. `TypeCube` requires exactly 1, which `TextureDesc::validate` enforces.
             mtl_desc.setArrayLength(desc.array_layers as usize);
-            mtl_desc.setTextureType(texture_type);
+            mtl_desc.setTextureType(texture_type(desc.dimension));
             mtl_desc.setSampleCount(desc.sample_count.count() as usize);
             mtl_desc.setUsage(usage);
             mtl_desc.setStorageMode(MTLStorageMode::Private);
@@ -153,27 +146,25 @@ impl MetalDevice {
         }
 
         let mtl_desc = self.build_texture_descriptor(desc);
-        let (heap, heap_offset) =
-            {
-                let allocations = self.shared.allocations.borrow();
-                let alloc =
-                    allocations
-                        .range(..=texture_gpu.address)
-                        .next_back()
-                        .map(|(_, alloc)| alloc)
-                        .filter(|alloc| texture_gpu.address - alloc.base.address < alloc.size)
-                        .ok_or_else(|| {
-                            RhiError::TextureCreation(format!(
-                        "texture allocation address 0x{:x} was not returned by gpuMalloc",
-                        texture_gpu.address
-                    ).into())
-                        })?;
-
-                let offset = texture_gpu.address - alloc.base.address;
-                // Offsets are heap-relative, so the allocation's own placement adds in. Only the
-                // lookup is checked: a bad placement returns nil just below.
-                (alloc.heap.clone(), alloc.heap_offset + offset)
-            };
+        let address = texture_gpu.address;
+        let (heap, heap_offset) = {
+            let allocations = self.shared.allocations.borrow();
+            let alloc = allocations
+                .range(..=address)
+                .next_back()
+                .map(|(_, alloc)| alloc)
+                .filter(|alloc| address - alloc.base.address < alloc.size)
+                .ok_or_else(|| {
+                    RhiError::TextureCreation(
+                        format!("texture address {address:#x} is not inside any allocation").into(),
+                    )
+                })?;
+            // Placement offsets are heap-relative. A bad placement returns nil just below.
+            (
+                alloc.heap.clone(),
+                alloc.heap_offset + (address - alloc.base.address),
+            )
+        };
 
         let texture =
             unsafe { heap.newTextureWithDescriptor_offset(&mtl_desc, heap_offset as usize) }
@@ -182,9 +173,7 @@ impl MetalDevice {
                 })?;
 
         if let Some(label) = &desc.label {
-            use objc2_metal::MTLResource;
-            let ns_label = NSString::from_str(label);
-            texture.setLabel(Some(&ns_label));
+            texture.setLabel(Some(&NSString::from_str(label)));
         }
 
         let resource_id = texture.gpuResourceID().to_raw();
@@ -221,8 +210,7 @@ impl MetalDevice {
     }
 
     pub fn destroy_texture_view(&self, id: TextureId) {
-        // Taking the entry is itself the claim, so a second call finds nothing to do. Only
-        // entries that really are views are claimed; a base texture keeps its slot.
+        // Only claims views, and only once; a base texture keeps its slot.
         if let Some(texture) = self.shared.textures.take_if(id.0, |t| t.is_view) {
             self.queue.release_resource(MetalRetiredResource::Texture {
                 id,
@@ -242,16 +230,13 @@ impl MetalDevice {
             .expect("texture id has no live slot")
     }
 
-    /// `_kind` is unused: a Metal view inherits its usage from the source texture, so sampled and
-    /// storage views are built identically. Vulkan needs the distinction for the descriptor.
+    /// A Metal view inherits its usage from the source, so `_kind` makes no difference here.
     pub fn create_texture_view(
         &self,
         source: &Texture,
-        view: &crate::texture::TextureViewDesc,
+        view: &TextureViewDesc,
         _kind: ViewKind,
     ) -> RhiResult<TextureId> {
-        use objc2_foundation::NSRange;
-
         let src_texture = self
             .shared
             .textures
@@ -260,18 +245,8 @@ impl MetalDevice {
                 RhiError::TextureCreation("create texture view: invalid source TextureId".into())
             })?;
 
-        let src_format =
-            super::texture::format_to_mtl(view.format.unwrap_or_else(|| source.desc().format));
-        // Mirrors `build_texture_descriptor`: a view must name the same texture type the source
-        // was created with, so the two matches have to stay identical.
-        let src_type = match source.desc().dimension {
-            TextureDimension::D1 => objc2_metal::MTLTextureType::Type1D,
-            TextureDimension::D2 => objc2_metal::MTLTextureType::Type2D,
-            TextureDimension::D2Array => objc2_metal::MTLTextureType::Type2DArray,
-            TextureDimension::D3 => objc2_metal::MTLTextureType::Type3D,
-            TextureDimension::Cube => objc2_metal::MTLTextureType::TypeCube,
-            TextureDimension::CubeArray => objc2_metal::MTLTextureType::TypeCubeArray,
-        };
+        let src_format = format_to_mtl(view.format.unwrap_or_else(|| source.desc().format));
+        let src_type = texture_type(source.desc().dimension);
 
         let src_mips = source.desc().mip_levels;
         // `newTextureViewWithPixelFormat:` slices are faces for a cube, images otherwise.
@@ -301,7 +276,7 @@ impl MetalDevice {
                 })?
         };
 
-        // Views share the source allocation but still need residency tracking.
+        // A view is not placed in a heap, so it needs its own residency entry.
         self.shared
             .residency_set
             .addAllocation(as_allocation(&view_texture));
@@ -334,7 +309,6 @@ impl MetalDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TextureDimension;
 
     #[test]
     fn mtl_to_format_is_the_inverse_of_format_to_mtl() {

@@ -100,17 +100,14 @@ from SlangPy and what profiling it did and did not find.
 
 Every example takes `--help`.
 
-Shaders compile through `slangc` and cache in your temp directory under `kiln-shader-cache/`. The
-key covers the source and everything about how it got compiled, `slangc` version included, so
-upgrading the compiler doesn't hand you a stale binary.
+Shaders compile through `slangc` and cache in your temp directory under
+`kiln-rhi-<uid>/shader-cache/`. The key covers the source and everything about how it got
+compiled, `slangc` version included, so upgrading the compiler doesn't hand you a stale binary.
 
-Metal compute takes one detour. Slang drops `[numthreads]` on its Metal target, which leaves the
-threadgroup size binding on Vulkan and ignored on Metal — and a dispatch wider than whatever
-Metal's register allocator happened to allow is silently dropped rather than refused. So compute
-entry points compile to MSL, have `[[max_total_threads_per_threadgroup]]` injected from slangc's
-own reflection, and are assembled by `xcrun metal`. That wants the Xcode command line tools; if
-they are missing it falls back to slangc's direct metallib and the backend's threadgroup check
-stays the safety net.
+Metal compiles target `metallib_4_0`, so `[numthreads]` reaches the kernel as
+`[[required_threads_per_threadgroup]]`. If a pipeline's register use still allows fewer threads
+than requested, the backend refuses to build it, since Metal would otherwise drop the dispatch
+silently.
 
 ## Design
 

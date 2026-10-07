@@ -3,30 +3,45 @@ use std::rc::Rc;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSArray;
-
-use super::as_allocation;
-use super::device::MetalShared;
 use objc2_metal::{
     MTL4AccelerationStructureBoundingBoxGeometryDescriptor,
     MTL4AccelerationStructureGeometryDescriptor,
-    MTL4AccelerationStructureTriangleGeometryDescriptor, MTL4BufferRange, MTLAccelerationStructure,
-    MTLAccelerationStructureDescriptor, MTLAccelerationStructureUsage, MTLBuffer, MTLIndexType,
-    MTLResidencySet,
+    MTL4AccelerationStructureTriangleGeometryDescriptor, MTL4BufferRange,
+    MTL4InstanceAccelerationStructureDescriptor, MTL4PrimitiveAccelerationStructureDescriptor,
+    MTLAccelerationStructure, MTLAccelerationStructureDescriptor,
+    MTLAccelerationStructureInstanceOptions, MTLAccelerationStructureSizes,
+    MTLAccelerationStructureUsage, MTLBuffer, MTLDevice, MTLIndexType,
+    MTLIndirectAccelerationStructureInstanceDescriptor, MTLPackedFloat3, MTLPackedFloat4x3,
+    MTLResidencySet, MTLResourceID, MTLResourceOptions,
 };
 
-use smallvec::SmallVec;
-
-use super::device::{MetalDevice, MetalRetiredResource};
+use super::as_allocation;
+use super::device::{MetalDevice, MetalRetiredResource, MetalShared};
 use crate::accel::AccelerationStructure;
 use crate::error::{RhiError, RhiResult};
-use crate::types::{Aabb, BlasDesc, BlasGeometry, BuildAccelFlags, GeometryFlags};
-use crate::types::{InstanceFlags, TlasDesc};
-use objc2_metal::MTLDevice;
+use crate::types::{
+    Aabb, BlasDesc, BlasGeometry, BuildAccelFlags, GeometryFlags, InstanceFlags, TlasDesc,
+    TlasInstance,
+};
 
-pub(crate) fn set_accel_usage(
-    descriptor: &MTLAccelerationStructureDescriptor,
-    flags: BuildAccelFlags,
-) {
+pub struct MetalAccelerationStructure {
+    pub(crate) acceleration_structure: Retained<ProtocolObject<dyn MTLAccelerationStructure>>,
+    pub(crate) gpu_resource_id: u64,
+    pub(crate) scratch_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) shared: Rc<MetalShared>,
+}
+
+impl MetalAccelerationStructure {
+    /// Called by the queue once no submission can still be tracing against the structure.
+    pub(crate) fn release_residency(&self) {
+        let residency = &self.shared.residency_set;
+        residency.removeAllocation(as_allocation(&self.acceleration_structure));
+        residency.removeAllocation(as_allocation(&self.scratch_buffer));
+        self.shared.residency_dirty.set(true);
+    }
+}
+
+fn set_usage(descriptor: &MTLAccelerationStructureDescriptor, flags: BuildAccelFlags) {
     let mut usage = MTLAccelerationStructureUsage::None;
     if flags.contains(BuildAccelFlags::PREFER_FAST_TRACE) {
         usage |= MTLAccelerationStructureUsage::PreferFastIntersection;
@@ -40,204 +55,124 @@ pub(crate) fn set_accel_usage(
     descriptor.setUsage(usage);
 }
 
-pub struct MetalAccelerationStructure {
-    pub(crate) acceleration_structure: Retained<ProtocolObject<dyn MTLAccelerationStructure>>,
-    pub(crate) gpu_resource_id: u64,
-    pub(crate) scratch_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub(crate) shared: Rc<MetalShared>,
-}
-
-impl MetalAccelerationStructure {
-    /// Drop the structure's residency entries. Called from the queue's retirement path once every
-    /// submission that could be tracing against it has completed — never from `Drop`, which would
-    /// run while an in-flight frame still references the structure.
-    pub(crate) fn release_residency(&self) {
-        self.shared
-            .residency_set
-            .removeAllocation(as_allocation(&self.acceleration_structure));
-        self.shared
-            .residency_set
-            .removeAllocation(as_allocation(&self.scratch_buffer));
-        self.shared.residency_dirty.set(true);
-    }
-}
-
-enum MetalBlasGeometryDescriptor {
-    Triangle(Retained<MTL4AccelerationStructureTriangleGeometryDescriptor>),
-    Aabb(Retained<MTL4AccelerationStructureBoundingBoxGeometryDescriptor>),
-}
-
-impl MetalBlasGeometryDescriptor {
-    /// The common base every geometry descriptor inherits, for the flags that are not
-    /// triangle- or AABB-specific.
-    fn as_base(&self) -> &MTL4AccelerationStructureGeometryDescriptor {
-        // SAFETY: both descriptor classes derive from
-        // MTL4AccelerationStructureGeometryDescriptor.
-        match self {
-            Self::Triangle(desc) => unsafe {
-                downcast_base::<MTL4AccelerationStructureTriangleGeometryDescriptor, _>(desc)
-            },
-            Self::Aabb(desc) => unsafe {
-                downcast_base::<MTL4AccelerationStructureBoundingBoxGeometryDescriptor, _>(desc)
-            },
-        }
-    }
-}
-
-/// Reinterpret an acceleration-structure descriptor as one of its base classes.
-///
-/// objc2 exposes these as plain structs rather than `ProtocolObject`s, so `cast_protocol` does not
-/// apply and the cast is spelled out here once instead of at each of the five call sites.
-///
-/// # Safety
-/// `Base` must actually be a base class of `Derived`.
-pub(crate) unsafe fn downcast_base<Derived, Base>(derived: &Derived) -> &Base {
-    unsafe { &*std::ptr::from_ref(derived).cast::<Base>() }
-}
-
-/// `NSArray` retains its elements, so the descriptors need no separate owner.
-pub(crate) struct MetalBlasGeometryDescriptors {
-    pub(crate) array: Retained<NSArray<MTL4AccelerationStructureGeometryDescriptor>>,
-}
-
-pub(crate) fn make_blas_geometry_descriptors(desc: &BlasDesc<'_>) -> MetalBlasGeometryDescriptors {
-    let mut descriptors = Vec::with_capacity(desc.meshes.len());
-
-    for (mesh_index, mesh) in desc.meshes.iter().enumerate() {
-        let descriptor = match mesh.geometry {
-            BlasGeometry::Triangles {
-                vertices,
-                stride,
-                count,
-                indices,
-            } => {
-                let geo = MTL4AccelerationStructureTriangleGeometryDescriptor::new();
-                unsafe {
-                    geo.setVertexBuffer(MTL4BufferRange {
-                        bufferAddress: vertices.address,
-                        length: (count as u64) * stride,
-                    });
-                    geo.setVertexStride(stride as usize);
-                    geo.setTriangleCount(mesh.geometry.primitive_count() as usize);
-                    if let Some(indices) = indices {
-                        geo.setIndexBuffer(MTL4BufferRange {
-                            bufferAddress: indices.buffer.address,
-                            length: (indices.count as u64) * size_of::<u32>() as u64,
-                        });
-                        geo.setIndexType(MTLIndexType::UInt32);
-                    }
-                }
-                MetalBlasGeometryDescriptor::Triangle(geo)
-            }
-            BlasGeometry::Aabbs { buffer, count } => {
-                // `Aabb` is the layout Metal expects, so its size is the stride.
-                const STRIDE: u64 = size_of::<Aabb>() as u64;
-                let geo = MTL4AccelerationStructureBoundingBoxGeometryDescriptor::new();
-                geo.setBoundingBoxBuffer(MTL4BufferRange {
-                    bufferAddress: buffer.address,
-                    length: (count as u64) * STRIDE,
+fn geometry_descriptor(
+    desc: &BlasDesc<'_>,
+    mesh_index: usize,
+) -> Retained<MTL4AccelerationStructureGeometryDescriptor> {
+    let mesh = &desc.meshes[mesh_index];
+    let descriptor: Retained<MTL4AccelerationStructureGeometryDescriptor> = match mesh.geometry {
+        BlasGeometry::Triangles {
+            vertices,
+            stride,
+            count,
+            indices,
+        } => {
+            let geo = MTL4AccelerationStructureTriangleGeometryDescriptor::new();
+            unsafe {
+                geo.setVertexBuffer(MTL4BufferRange {
+                    bufferAddress: vertices.address,
+                    length: u64::from(count) * stride,
                 });
-                unsafe {
-                    geo.setBoundingBoxStride(STRIDE as usize);
-                    geo.setBoundingBoxCount(count as usize);
+                geo.setVertexStride(stride as usize);
+                geo.setTriangleCount(mesh.geometry.primitive_count() as usize);
+                if let Some(indices) = indices {
+                    geo.setIndexBuffer(MTL4BufferRange {
+                        bufferAddress: indices.buffer.address,
+                        length: u64::from(indices.count) * size_of::<u32>() as u64,
+                    });
+                    geo.setIndexType(MTLIndexType::UInt32);
                 }
-                MetalBlasGeometryDescriptor::Aabb(geo)
             }
-        };
-
-        let base = descriptor.as_base();
-        base.setOpaque(mesh.flags.contains(GeometryFlags::OPAQUE));
-        base.setAllowDuplicateIntersectionFunctionInvocation(
-            !mesh.flags.contains(GeometryFlags::NO_DUPLICATE_ANYHIT),
-        );
-        unsafe {
-            base.setIntersectionFunctionTableOffset(mesh_index);
+            Retained::into_super(geo)
         }
-        descriptors.push(descriptor);
-    }
-
-    let bases: SmallVec<[&MTL4AccelerationStructureGeometryDescriptor; 4]> = descriptors
-        .iter()
-        .map(MetalBlasGeometryDescriptor::as_base)
-        .collect();
-    MetalBlasGeometryDescriptors {
-        array: NSArray::from_slice(&bases),
-    }
+        BlasGeometry::Aabbs { buffer, count } => {
+            // `Aabb` matches Metal's bounding-box layout.
+            const STRIDE: u64 = size_of::<Aabb>() as u64;
+            let geo = MTL4AccelerationStructureBoundingBoxGeometryDescriptor::new();
+            geo.setBoundingBoxBuffer(MTL4BufferRange {
+                bufferAddress: buffer.address,
+                length: u64::from(count) * STRIDE,
+            });
+            unsafe {
+                geo.setBoundingBoxStride(STRIDE as usize);
+                geo.setBoundingBoxCount(count as usize);
+            }
+            Retained::into_super(geo)
+        }
+    };
+    descriptor.setOpaque(mesh.flags.contains(GeometryFlags::OPAQUE));
+    descriptor.setAllowDuplicateIntersectionFunctionInvocation(
+        !mesh.flags.contains(GeometryFlags::NO_DUPLICATE_ANYHIT),
+    );
+    unsafe { descriptor.setIntersectionFunctionTableOffset(mesh_index) };
+    descriptor
 }
+
+/// The descriptor used both to size a BLAS and to build it.
+pub(crate) fn blas_descriptor(
+    desc: &BlasDesc<'_>,
+) -> Retained<MTL4PrimitiveAccelerationStructureDescriptor> {
+    let geometries: Vec<_> = (0..desc.meshes.len())
+        .map(|i| geometry_descriptor(desc, i))
+        .collect();
+    let descriptor = MTL4PrimitiveAccelerationStructureDescriptor::new();
+    descriptor.setGeometryDescriptors(Some(&NSArray::from_retained_slice(&geometries)));
+    set_usage(&descriptor, desc.flags);
+    descriptor
+}
+
+/// The descriptor used both to size a TLAS and to build it.
+pub(crate) fn tlas_descriptor(
+    desc: &TlasDesc,
+) -> Retained<MTL4InstanceAccelerationStructureDescriptor> {
+    let descriptor = MTL4InstanceAccelerationStructureDescriptor::new();
+    unsafe {
+        descriptor.setInstanceDescriptorBuffer(MTL4BufferRange {
+            bufferAddress: desc.instance_buffer.address,
+            length: u64::from(desc.instance_count) * TLAS_INSTANCE_STRIDE as u64,
+        });
+        descriptor.setInstanceCount(desc.instance_count as usize);
+    }
+    set_usage(&descriptor, desc.flags);
+    descriptor
+}
+
+/// Metal's instance acceleration structure uses the indirect layout, which names each BLAS by
+/// `gpuResourceID`.
+const TLAS_INSTANCE_STRIDE: usize = size_of::<MTLIndirectAccelerationStructureInstanceDescriptor>();
 
 impl MetalDevice {
     pub fn create_blas(&self, desc: &BlasDesc<'_>) -> RhiResult<AccelerationStructure> {
-        use super::accel::make_blas_geometry_descriptors;
-        use objc2_metal::MTL4PrimitiveAccelerationStructureDescriptor;
-
-        let geometries = make_blas_geometry_descriptors(desc);
-        let primitive_desc = MTL4PrimitiveAccelerationStructureDescriptor::new();
-        primitive_desc.setGeometryDescriptors(Some(&geometries.array));
-        // SAFETY: MTL4PrimitiveAccelerationStructureDescriptor derives from
-        // MTLAccelerationStructureDescriptor.
-        let primitive_base: &objc2_metal::MTLAccelerationStructureDescriptor =
-            unsafe { super::accel::downcast_base(&*primitive_desc) };
-        super::accel::set_accel_usage(primitive_base, desc.flags);
-
         let sizes = self
             .shared
             .device
-            .accelerationStructureSizesWithDescriptor(primitive_base);
-        self.finalize_accel_structure(sizes, "BLAS")
+            .accelerationStructureSizesWithDescriptor(&blas_descriptor(desc));
+        self.allocate_accel(sizes, "BLAS")
     }
 
     pub fn create_tlas(&self, desc: &TlasDesc) -> RhiResult<AccelerationStructure> {
-        use objc2_metal::MTL4InstanceAccelerationStructureDescriptor;
-
-        let instance_desc = MTL4InstanceAccelerationStructureDescriptor::new();
-        unsafe {
-            instance_desc.setInstanceDescriptorBuffer(objc2_metal::MTL4BufferRange {
-                bufferAddress: desc.instance_buffer.address,
-                // The descriptor uses Metal's indirect instance layout; callers write it with
-                // `Device::write_tlas_instance`.
-                length: (desc.instance_count as u64) * self.tlas_instance_stride() as u64,
-            });
-            instance_desc.setInstanceCount(desc.instance_count as usize);
-        }
-        // SAFETY: MTL4InstanceAccelerationStructureDescriptor derives from
-        // MTLAccelerationStructureDescriptor.
-        let instance_base: &objc2_metal::MTLAccelerationStructureDescriptor =
-            unsafe { super::accel::downcast_base(&*instance_desc) };
-        super::accel::set_accel_usage(instance_base, desc.flags);
-
         let sizes = self
             .shared
             .device
-            .accelerationStructureSizesWithDescriptor(instance_base);
-        self.finalize_accel_structure(sizes, "TLAS")
+            .accelerationStructureSizesWithDescriptor(&tlas_descriptor(desc));
+        self.allocate_accel(sizes, "TLAS")
     }
 
-    /// Native size of one TLAS instance descriptor. Metal's instance acceleration structure
-    /// uses the *indirect* descriptor layout (references the BLAS by `gpuResourceID`).
     pub fn tlas_instance_stride(&self) -> usize {
-        std::mem::size_of::<objc2_metal::MTLIndirectAccelerationStructureInstanceDescriptor>()
+        TLAS_INSTANCE_STRIDE
     }
 
-    /// Encode `inst` into `dst` in Metal's native indirect instance-descriptor layout.
-    ///
-    /// `inst.acceleration_structure_reference` must be the BLAS handle (`blas.gpu()`).
-    pub fn write_tlas_instance(&self, dst: &mut [u8], inst: &crate::types::TlasInstance) {
-        use objc2_metal::{
-            MTLAccelerationStructureInstanceOptions,
-            MTLIndirectAccelerationStructureInstanceDescriptor, MTLPackedFloat3, MTLPackedFloat4x3,
-            MTLResourceID,
-        };
-
-        // TlasInstance.transform is row-major 3x4 (transform[row][col]); Metal's packed 4x3
-        // is column-major (columns[c] = (m[0][c], m[1][c], m[2][c])).
+    /// Encode `inst` into `dst` in Metal's indirect instance layout.
+    /// `inst.acceleration_structure_reference` must be a BLAS handle (`blas.gpu()`).
+    pub fn write_tlas_instance(&self, dst: &mut [u8], inst: &TlasInstance) {
+        // `transform` is row-major 3x4; Metal's packed 4x3 is column-major.
         let t = &inst.transform;
         let col = |c: usize| MTLPackedFloat3 {
             x: t[0][c],
             y: t[1][c],
             z: t[2][c],
         };
-        // SAFETY: the handle came from `MTLAccelerationStructure::gpuResourceID().to_raw()`
-        // in `create_blas` / `create_tlas`, so it is a live resource ID for this device.
+        // SAFETY: the handle came from `gpuResourceID().to_raw()` on a live structure.
         let resource_id =
             unsafe { MTLResourceID::from_raw(inst.acceleration_structure_reference.0) };
 
@@ -268,9 +203,9 @@ impl MetalDevice {
             userID: inst.instance_custom_index_and_mask & 0x00FF_FFFF,
             accelerationStructureID: resource_id,
         };
-        assert!(dst.len() >= size_of::<MTLIndirectAccelerationStructureInstanceDescriptor>());
-        // SAFETY: `dst` is at least one descriptor long, checked above, and `&mut` rules out
-        // aliasing. Unaligned because the caller's buffer is only stride-aligned.
+        assert!(dst.len() >= TLAS_INSTANCE_STRIDE);
+        // SAFETY: `dst` holds at least one descriptor, checked above. Unaligned because the
+        // caller's buffer is only stride-aligned.
         unsafe {
             std::ptr::write_unaligned(
                 dst.as_mut_ptr()
@@ -280,26 +215,19 @@ impl MetalDevice {
         }
     }
 
-    /// Allocate the acceleration structure + scratch buffer for `sizes`, register both
-    /// with the residency set and query the GPU resource ID. Shared by `create_blas`/`create_tlas`.
-    fn finalize_accel_structure(
+    /// Allocate a structure and its scratch buffer and make both resident.
+    fn allocate_accel(
         &self,
-        sizes: objc2_metal::MTLAccelerationStructureSizes,
+        sizes: MTLAccelerationStructureSizes,
         label: &'static str,
     ) -> RhiResult<AccelerationStructure> {
-        use super::accel::MetalAccelerationStructure;
-        use objc2_metal::{MTLAccelerationStructure as _, MTLDevice, MTLResourceOptions};
-
-        let accel = self
-            .shared
-            .device
+        let device = &self.shared.device;
+        let accel = device
             .newAccelerationStructureWithSize(sizes.accelerationStructureSize)
             .ok_or_else(|| {
                 RhiError::AllocationFailed(format!("Failed to allocate Metal {label}").into())
             })?;
-        let scratch = self
-            .shared
-            .device
+        let scratch = device
             .newBufferWithLength_options(
                 sizes.buildScratchBufferSize,
                 MTLResourceOptions::StorageModePrivate,
@@ -310,20 +238,15 @@ impl MetalDevice {
                 )
             })?;
 
-        self.shared
-            .residency_set
-            .addAllocation(as_allocation(&accel));
-        self.shared
-            .residency_set
-            .addAllocation(as_allocation(&scratch));
+        let residency = &self.shared.residency_set;
+        residency.addAllocation(as_allocation(&accel));
+        residency.addAllocation(as_allocation(&scratch));
         self.shared.residency_dirty.set(true);
-
-        let gpu_resource_id = accel.gpuResourceID().to_raw();
 
         Ok(AccelerationStructure {
             inner: Box::new(MetalAccelerationStructure {
+                gpu_resource_id: accel.gpuResourceID().to_raw(),
                 acceleration_structure: accel,
-                gpu_resource_id,
                 scratch_buffer: scratch,
                 shared: self.shared.clone(),
             }),
@@ -331,7 +254,7 @@ impl MetalDevice {
         })
     }
 
-    pub fn destroy_accel(&self, accel: Box<super::accel::MetalAccelerationStructure>) {
+    pub fn destroy_accel(&self, accel: Box<MetalAccelerationStructure>) {
         self.queue
             .release_resource(MetalRetiredResource::Accel(accel));
     }

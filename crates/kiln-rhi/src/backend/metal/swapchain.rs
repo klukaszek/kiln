@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use super::device::MetalDevice;
 use super::surface::MetalSurface;
-use super::texture::mtl_to_format;
+use super::texture::{format_to_mtl, mtl_to_format};
 use crate::error::RhiResult;
 use crate::swapchain::{Swapchain, SwapchainDesc};
 use objc2::rc::Retained;
@@ -59,14 +59,10 @@ impl MetalDrawableSlot {
     }
 }
 
-/// Apply a [`SwapchainDesc`] to the layer a swapchain presents through.
-///
-/// Create and recreate set exactly the same four properties, so they share this rather than
-/// keeping two copies that have to be edited together.
-pub(crate) fn configure_layer(layer: &CAMetalLayer, desc: &crate::swapchain::SwapchainDesc) {
+fn configure_layer(layer: &CAMetalLayer, desc: &SwapchainDesc) {
     use objc2_core_foundation::CGSize;
 
-    layer.setPixelFormat(super::texture::format_to_mtl(desc.format));
+    layer.setPixelFormat(format_to_mtl(desc.format));
     layer.setDisplaySyncEnabled(desc.vsync);
     // Metal allows 2 or 3 drawables; anything else is clamped rather than refused.
     layer.setMaximumDrawableCount(desc.image_count.clamp(2, 3) as usize);
@@ -92,7 +88,7 @@ impl MetalDevice {
         // them resident. The layer outlives every swapchain built from it, so this happens once.
         self.queue.queue.addResidencySet(&layer.residencySet());
 
-        super::swapchain::configure_layer(layer, desc);
+        configure_layer(layer, desc);
         let format = mtl_to_format(layer.pixelFormat());
 
         Ok(Swapchain::new(
@@ -112,7 +108,7 @@ impl MetalDevice {
         self.wait_idle();
         swapchain.inner.drawable.release();
         let layer = &swapchain.inner.drawable.layer;
-        super::swapchain::configure_layer(layer, desc);
+        configure_layer(layer, desc);
         swapchain.format = mtl_to_format(layer.pixelFormat());
         swapchain.extent = [desc.width, desc.height];
         Ok(())

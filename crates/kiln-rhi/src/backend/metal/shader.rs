@@ -2,11 +2,19 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLLibrary;
+use objc2_foundation::NSString;
+use objc2_metal::{MTL4LibraryFunctionDescriptor, MTLLibrary};
 
-/// A compiled `.metallib` plus the entry point a PSO selects from it. Lives here rather than in a
-/// module of its own: pipeline creation is the only thing that ever consumes one.
 pub struct MetalShaderModule {
     pub(crate) library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pub(crate) entry_point: String,
+}
+
+impl MetalShaderModule {
+    pub(crate) fn function_descriptor(&self) -> Retained<MTL4LibraryFunctionDescriptor> {
+        let desc = MTL4LibraryFunctionDescriptor::new();
+        desc.setName(Some(&NSString::from_str(&self.entry_point)));
+        desc.setLibrary(Some(&self.library));
+        desc
+    }
 }

@@ -1,54 +1,79 @@
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
-    MTL4CommandEncoder, MTL4ComputeCommandEncoder, MTL4RenderCommandEncoder,
-    MTL4RenderPassDescriptor, MTL4VisibilityOptions, MTLBuffer, MTLDevice, MTLGPUAddress,
-    MTLIndexType, MTLLoadAction, MTLOrigin, MTLPrimitiveType, MTLResidencySet, MTLResourceOptions,
+    MTL4AccelerationStructureDescriptor, MTL4ArgumentTable, MTL4ArgumentTableDescriptor,
+    MTL4BufferRange, MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder,
+    MTL4ComputeCommandEncoder, MTL4RenderCommandEncoder, MTL4RenderPassDescriptor,
+    MTL4VisibilityOptions, MTLBuffer, MTLClearColor, MTLDevice, MTLGPUAddress, MTLIndexType,
+    MTLLoadAction, MTLOrigin, MTLPrimitiveType, MTLResidencySet, MTLResourceOptions,
     MTLScissorRect, MTLSize, MTLStages, MTLStoreAction, MTLTexture, MTLViewport,
 };
 use smallvec::SmallVec;
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 
-use crate::barrier::{HazardFlags, StageFlags};
-use crate::command::{LoadOp, RenderPassDesc, RenderTarget, RenderTargetKind, StoreOp};
-use crate::pipeline::{ComputePso, GraphicsPso, MeshletPso};
-use crate::texture::{ResolvedRegion, Texture, bytes_per_pixel};
-use crate::types::{BlasDesc, GpuPtr, TextureId, TlasDesc};
-
-use super::accel::downcast_base;
+use super::accel::{MetalAccelerationStructure, blas_descriptor, tlas_descriptor};
 use super::as_allocation;
 use super::barrier::{ALL_RENDER_STAGES, to_mtl_stages, visibility_from_hazard};
-use super::device::MetalDevice;
-use super::device::MetalShared;
-use super::swapchain::MetalSwapchain;
-use super::swapchain::SharedDrawableSlot;
-use crate::command::CommandBuffer;
+use super::device::{MetalDevice, MetalShared};
+use super::pipeline::MetalRasterState;
+use super::query::MetalQueryPool;
+use super::swapchain::{MetalSwapchain, SharedDrawableSlot};
+use crate::accel::AccelerationStructure;
+use crate::barrier::{HazardFlags, StageFlags};
+use crate::command::{
+    CommandBuffer, LoadOp, RenderPassDesc, RenderTarget, RenderTargetKind, StoreOp,
+};
 use crate::error::{RhiError, RhiResult};
+use crate::pipeline::{ComputePso, GraphicsPso, MeshletPso};
+use crate::texture::{ResolvedRegion, Texture, bytes_per_pixel};
+use crate::types::{BlasDesc, GpuPtr, MAX_FRAMES_IN_FLIGHT, TextureId, TlasDesc};
 
-// Metal root-table entries are 16 bytes.
-fn to_mtl_origin(origin: [u32; 3]) -> MTLOrigin {
-    MTLOrigin {
-        x: origin[0] as usize,
-        y: origin[1] as usize,
-        z: origin[2] as usize,
-    }
-}
+/// Argument-table buffer slots. Slang's Metal output reads the root pointer from `buffer(0)`
+/// and lowers `DescriptorHandle`s onto the texture and sampler heaps at 1 and 2.
+const ROOT_SLOT: usize = 0;
+const TEXTURE_HEAP_SLOT: usize = 1;
+const SAMPLER_HEAP_SLOT: usize = 2;
 
 /// Metal argument-table entries are 16 bytes.
 const ROOT_TABLE_SLOT_BYTES: usize = 16;
 
-/// Threads per object/mesh threadgroup for a mesh draw. Fixed: no amplification stage is exposed,
-/// so the object group is one thread and the mesh group one SIMD width.
+fn to_mtl_size([width, height, depth]: [u32; 3]) -> MTLSize {
+    MTLSize {
+        width: width as usize,
+        height: height as usize,
+        depth: depth as usize,
+    }
+}
+
+fn to_mtl_origin([x, y, z]: [u32; 3]) -> MTLOrigin {
+    MTLOrigin {
+        x: x as usize,
+        y: y as usize,
+        z: z as usize,
+    }
+}
+
+fn load_action(op: LoadOp) -> MTLLoadAction {
+    match op {
+        LoadOp::Clear => MTLLoadAction::Clear,
+        LoadOp::Load => MTLLoadAction::Load,
+        LoadOp::DontCare => MTLLoadAction::DontCare,
+    }
+}
+
+fn store_action(op: StoreOp) -> MTLStoreAction {
+    match op {
+        StoreOp::Store => MTLStoreAction::Store,
+        StoreOp::DontCare => MTLStoreAction::DontCare,
+    }
+}
+
+/// No object (amplification) stage is exposed, so its threadgroup is a single thread.
 const MESH_THREADS_PER_OBJECT_GROUP: MTLSize = MTLSize {
     width: 1,
-    height: 1,
-    depth: 1,
-};
-const MESH_THREADS_PER_MESH_GROUP: MTLSize = MTLSize {
-    width: 32,
     height: 1,
     depth: 1,
 };
@@ -115,37 +140,8 @@ struct PendingQueueBarrier {
     visibility: MTL4VisibilityOptions,
 }
 
-fn add_buffer_to_residency(
-    buffer: &ProtocolObject<dyn MTLBuffer>,
-    residency_set: &ProtocolObject<dyn MTLResidencySet>,
-    residency_dirty: &Cell<bool>,
-) {
-    residency_set.addAllocation(as_allocation(buffer));
-    residency_dirty.set(true);
-}
-
-pub(crate) fn create_root_table_buffer(
-    device: &ProtocolObject<dyn MTLDevice>,
-    residency_set: &ProtocolObject<dyn MTLResidencySet>,
-    residency_dirty: &Cell<bool>,
-) -> crate::error::RhiResult<Retained<ProtocolObject<dyn MTLBuffer>>> {
-    let root_table_buffer = device
-        .newBufferWithLength_options(
-            ROOT_TABLE_ARENA_BYTES,
-            MTLResourceOptions::StorageModeShared,
-        )
-        .ok_or_else(|| {
-            crate::error::RhiError::CommandBuffer(
-                "Failed to allocate Metal root table arena".into(),
-            )
-        })?;
-    add_buffer_to_residency(root_table_buffer.as_ref(), residency_set, residency_dirty);
-    Ok(root_table_buffer)
-}
-
-/// One command buffer's worth of reusable native state, recycled rather than rebuilt: the root
-/// arena alone is a 1 MiB allocation that has to join the residency set. Only handed out again
-/// once its fence has retired.
+/// One command buffer's reusable native state, recycled once its fence has retired. The root
+/// arena alone is a 1 MiB allocation in the residency set.
 pub(crate) struct MetalFrameTableSlot {
     pub(crate) root_table_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub(crate) command_allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
@@ -157,8 +153,8 @@ pub(crate) struct MetalFrameTableSlot {
 }
 
 pub(crate) type SharedFrameTableSlots =
-    Rc<RefCell<[Option<Rc<MetalFrameTableSlot>>; crate::types::MAX_FRAMES_IN_FLIGHT]>>;
-/// Free list of generic (non-swapchain) table slots.
+    Rc<RefCell<[Option<Rc<MetalFrameTableSlot>>; MAX_FRAMES_IN_FLIGHT]>>;
+/// Free list of non-swapchain table slots.
 pub(crate) type SharedTableSlotPool = Rc<RefCell<Vec<Rc<MetalFrameTableSlot>>>>;
 
 pub struct MetalCommandBuffer {
@@ -172,7 +168,8 @@ pub struct MetalCommandBuffer {
     argument_table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
     frame_table_slot: Rc<MetalFrameTableSlot>,
     root_arena: RootArena,
-    current_threads_per_threadgroup: [u32; 3],
+    /// Threads per threadgroup of the bound compute or mesh pipeline.
+    threads_per_group: MTLSize,
     pending_queue_barrier: Option<PendingQueueBarrier>,
     /// Render targets already written by an earlier pass in this command buffer. Metal 4 tracks no
     /// hazards of its own, so a second pass on the same attachment needs an explicit dependency.
@@ -183,9 +180,9 @@ pub struct MetalCommandBuffer {
 impl MetalCommandBuffer {
     fn create_argument_table(
         device: &ProtocolObject<dyn MTLDevice>,
-    ) -> crate::error::RhiResult<Retained<ProtocolObject<dyn MTL4ArgumentTable>>> {
+    ) -> RhiResult<Retained<ProtocolObject<dyn MTL4ArgumentTable>>> {
         let desc = MTL4ArgumentTableDescriptor::new();
-        desc.setMaxBufferBindCount(6);
+        desc.setMaxBufferBindCount(SAMPLER_HEAP_SLOT + 1);
         desc.setMaxTextureBindCount(0);
         desc.setMaxSamplerStateBindCount(0);
         desc.setInitializeBindings(true);
@@ -194,7 +191,7 @@ impl MetalCommandBuffer {
         device
             .newArgumentTableWithDescriptor_error(&desc)
             .map_err(|e| {
-                crate::error::RhiError::CommandBuffer(
+                RhiError::CommandBuffer(
                     format!("Failed to create Metal 4 argument table: {e}").into(),
                 )
             })
@@ -257,25 +254,23 @@ impl MetalCommandBuffer {
         command_buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
         shared: Rc<MetalShared>,
         frame_table_slot: Rc<MetalFrameTableSlot>,
-    ) -> crate::error::RhiResult<Self> {
+    ) -> RhiResult<Self> {
         command_buffer.beginCommandBufferWithAllocator(&frame_table_slot.command_allocator);
-        // The queue owns the residency set for every submitted command buffer; attaching it here
-        // too would repeat a setup call per frame without changing residency.
 
-        let argument_table =
-            if let Some(argument_table) = frame_table_slot.argument_table.borrow_mut().take() {
-                argument_table
-            } else {
-                Self::create_argument_table(shared.device.as_ref())?
-            };
-
+        let recycled = frame_table_slot.argument_table.borrow_mut().take();
+        let argument_table = match recycled {
+            Some(table) => table,
+            None => Self::create_argument_table(shared.device.as_ref())?,
+        };
         let root_arena = RootArena::new(&frame_table_slot.root_table_buffer);
 
         unsafe {
-            argument_table.setAddress_atIndex(shared.textures.heap().gpuAddress(), 1);
-            argument_table.setAddress_atIndex(shared.samplers.heap().gpuAddress(), 2);
-            // Recycled tables would otherwise carry the previous frame's root pointer.
-            argument_table.setAddress_atIndex(0, 0);
+            argument_table
+                .setAddress_atIndex(shared.textures.heap().gpuAddress(), TEXTURE_HEAP_SLOT);
+            argument_table
+                .setAddress_atIndex(shared.samplers.heap().gpuAddress(), SAMPLER_HEAP_SLOT);
+            // A recycled table still holds the previous frame's root pointer.
+            argument_table.setAddress_atIndex(0, ROOT_SLOT);
         }
 
         Ok(Self {
@@ -288,7 +283,7 @@ impl MetalCommandBuffer {
             argument_table,
             frame_table_slot,
             root_arena,
-            current_threads_per_threadgroup: [1, 1, 1],
+            threads_per_group: to_mtl_size([1, 1, 1]),
             pending_queue_barrier: None,
             written_targets: SmallVec::new(),
             ended: false,
@@ -313,7 +308,7 @@ impl MetalCommandBuffer {
             let attachment = unsafe { color_attachments.objectAtIndexedSubscript(i) };
 
             match color_att.target.kind() {
-                RenderTargetKind::SwapchainImage(_idx) => {
+                RenderTargetKind::SwapchainImage(_) => {
                     if let Some(tex) = self.drawable_slot.as_ref().and_then(|slot| slot.texture()) {
                         attachment.setTexture(Some(&tex));
                     }
@@ -324,20 +319,11 @@ impl MetalCommandBuffer {
                 }
             }
 
-            attachment.setLoadAction(match color_att.load_op {
-                LoadOp::Clear => MTLLoadAction::Clear,
-                LoadOp::Load => MTLLoadAction::Load,
-                LoadOp::DontCare => MTLLoadAction::DontCare,
-            });
-
-            attachment.setStoreAction(match color_att.store_op {
-                StoreOp::Store => MTLStoreAction::Store,
-                StoreOp::DontCare => MTLStoreAction::DontCare,
-            });
-
+            attachment.setLoadAction(load_action(color_att.load_op));
+            attachment.setStoreAction(store_action(color_att.store_op));
             if color_att.load_op == LoadOp::Clear {
                 let c = color_att.clear_color;
-                attachment.setClearColor(objc2_metal::MTLClearColor {
+                attachment.setClearColor(MTLClearColor {
                     red: c[0] as f64,
                     green: c[1] as f64,
                     blue: c[2] as f64,
@@ -350,24 +336,13 @@ impl MetalCommandBuffer {
             let depth = pass_desc.depthAttachment();
             let texture = match depth_att.target.kind() {
                 RenderTargetKind::Texture(id) => self.resolve_texture(id),
-                // The swapchain has colour images only; depth comes from a texture you own.
                 RenderTargetKind::SwapchainImage(_) => {
                     panic!("a swapchain image cannot be a depth attachment")
                 }
             };
             depth.setTexture(Some(&texture));
-
-            depth.setLoadAction(match depth_att.load_op {
-                LoadOp::Clear => MTLLoadAction::Clear,
-                LoadOp::Load => MTLLoadAction::Load,
-                LoadOp::DontCare => MTLLoadAction::DontCare,
-            });
-
-            depth.setStoreAction(match depth_att.store_op {
-                StoreOp::Store => MTLStoreAction::Store,
-                StoreOp::DontCare => MTLStoreAction::DontCare,
-            });
-
+            depth.setLoadAction(load_action(depth_att.load_op));
+            depth.setStoreAction(store_action(depth_att.store_op));
             if depth_att.load_op == LoadOp::Clear {
                 depth.setClearDepth(depth_att.clear_depth as f64);
             }
@@ -378,9 +353,7 @@ impl MetalCommandBuffer {
             .renderCommandEncoderWithDescriptor(&pass_desc)
             .expect("Failed to create Metal render command encoder");
         encoder.setLabel(Some(&NSString::from_str(desc.label.unwrap_or("render"))));
-
         encoder.setArgumentTable_atStages(&self.argument_table, ALL_RENDER_STAGES);
-
         // SAFETY: MTL4RenderCommandEncoder refines MTL4CommandEncoder.
         self.apply_pending_queue_barrier(unsafe { super::cast_protocol(&*encoder) });
 
@@ -393,12 +366,8 @@ impl MetalCommandBuffer {
         }
     }
 
-    /// Order a pass against earlier passes in this command buffer that wrote the same attachment.
-    /// Metal 4 tracks no hazards, so two render encoders on one texture are free to overlap;
-    /// Vulkan gets this ordering from the attachment's layout transition instead.
-    ///
-    /// Merged into `pending_queue_barrier` so it lands on the new encoder alongside whatever the
-    /// caller already asked for.
+    /// Order a pass after earlier passes in this command buffer that wrote the same attachment.
+    /// Metal 4 tracks no hazards, so two render encoders on one texture would otherwise overlap.
     fn order_after_previous_writes(&mut self, desc: &RenderPassDesc) {
         let targets = desc
             .color_attachments
@@ -426,25 +395,35 @@ impl MetalCommandBuffer {
     }
 
     pub fn set_graphics_pipeline(&mut self, pso: &GraphicsPso) {
-        let mtl_pso = &pso.inner;
-        let (pipeline, depth_stencil, depth_bias, cull_mode, winding, topology) = (
-            &mtl_pso.pipeline,
-            &mtl_pso.depth_stencil,
-            mtl_pso.depth_bias,
-            mtl_pso.cull_mode,
-            mtl_pso.winding,
-            mtl_pso.topology,
-        );
-        self.current_topology = topology;
-        let encoder = self
-            .render_encoder
-            .as_ref()
-            .expect("No active render encoder");
-        encoder.setRenderPipelineState(pipeline);
-        encoder.setCullMode(cull_mode);
-        encoder.setFrontFacingWinding(winding);
-        encoder.setDepthStencilState(Some(depth_stencil));
-        encoder.setDepthBias_slopeScale_clamp(depth_bias.0, depth_bias.1, depth_bias.2);
+        self.current_topology = pso.inner.topology;
+        self.bind_raster_state(&pso.inner.raster);
+    }
+
+    pub fn set_meshlet_pipeline(&mut self, pso: &MeshletPso) {
+        self.threads_per_group = pso.inner.threads_per_mesh_group;
+        self.bind_raster_state(&pso.inner.raster);
+    }
+
+    fn bind_raster_state(&self, state: &MetalRasterState) {
+        let encoder = self.render_encoder();
+        let (bias, slope, clamp) = state.depth_bias;
+        encoder.setRenderPipelineState(&state.pipeline);
+        encoder.setCullMode(state.cull_mode);
+        encoder.setFrontFacingWinding(state.winding);
+        encoder.setDepthStencilState(Some(&state.depth_stencil));
+        encoder.setDepthBias_slopeScale_clamp(bias, slope, clamp);
+    }
+
+    fn render_encoder(&self) -> &ProtocolObject<dyn MTL4RenderCommandEncoder> {
+        self.render_encoder
+            .as_deref()
+            .expect("no active render pass")
+    }
+
+    fn compute_encoder(&self) -> &ProtocolObject<dyn MTL4ComputeCommandEncoder> {
+        self.compute_encoder
+            .as_deref()
+            .expect("no compute pipeline bound")
     }
 
     pub fn set_compute_pipeline(&mut self, pso: &ComputePso) {
@@ -457,9 +436,8 @@ impl MetalCommandBuffer {
             self.begin_compute_encoder(mtl_pso.label.as_deref().unwrap_or("compute"))
         });
         encoder.setComputePipelineState(&mtl_pso.pipeline);
-
-        self.current_threads_per_threadgroup = mtl_pso.threads_per_threadgroup;
         encoder.setArgumentTable(Some(&self.argument_table));
+        self.threads_per_group = to_mtl_size(mtl_pso.threads_per_threadgroup);
 
         self.compute_encoder = Some(encoder);
     }
@@ -468,7 +446,7 @@ impl MetalCommandBuffer {
         let (slot_addr, slot_ptr) = self.root_arena.alloc(std::mem::size_of::<u64>());
         unsafe {
             std::ptr::write_unaligned(slot_ptr.cast::<u64>(), root.address);
-            self.argument_table.setAddress_atIndex(slot_addr, 0);
+            self.argument_table.setAddress_atIndex(slot_addr, ROOT_SLOT);
         }
     }
 
@@ -480,10 +458,7 @@ impl MetalCommandBuffer {
         first_instance: u32,
     ) {
         let topology = self.current_topology;
-        let encoder = self
-            .render_encoder
-            .as_ref()
-            .expect("No active render encoder");
+        let encoder = self.render_encoder();
         unsafe {
             encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 topology,
@@ -503,22 +478,17 @@ impl MetalCommandBuffer {
         vertex_offset: i32,
         first_instance: u32,
     ) {
-        // Indices are U32 and Metal 4 consumes the buffer as a raw GPU address.
-        let index_addr_gpu: MTLGPUAddress = indices.address;
-        let index_len = (index_count as u64) * 4;
+        let index_len = index_count as usize * size_of::<u32>();
         let topology = self.current_topology;
-        let encoder = self
-            .render_encoder
-            .as_ref()
-            .expect("No active render encoder");
+        let encoder = self.render_encoder();
         unsafe {
             encoder
                 .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferLength_instanceCount_baseVertex_baseInstance(
                     topology,
                     index_count as usize,
                     MTLIndexType::UInt32,
-                    index_addr_gpu,
-                    index_len as usize,
+                    indices.address,
+                    index_len,
                     instance_count as usize,
                     vertex_offset as isize,
                     first_instance as usize,
@@ -527,49 +497,26 @@ impl MetalCommandBuffer {
     }
 
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
-        let encoder = self
-            .compute_encoder
-            .as_ref()
-            .expect("No active compute encoder");
-        let threads_per_group = self.current_threads_per_threadgroup;
-        let tg = MTLSize {
-            width: threads_per_group[0] as usize,
-            height: threads_per_group[1] as usize,
-            depth: threads_per_group[2] as usize,
-        };
-        let groups = MTLSize {
-            width: x as usize,
-            height: y as usize,
-            depth: z as usize,
-        };
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, tg);
+        self.compute_encoder()
+            .dispatchThreadgroups_threadsPerThreadgroup(
+                to_mtl_size([x, y, z]),
+                self.threads_per_group,
+            );
     }
 
     pub fn dispatch_indirect(&mut self, args: GpuPtr<u8>) {
-        let encoder = self
-            .compute_encoder
-            .as_ref()
-            .expect("No active compute encoder");
-        let arg_addr_gpu: MTLGPUAddress = args.address;
-        let threads_per_group = self.current_threads_per_threadgroup;
-        let tg = MTLSize {
-            width: threads_per_group[0] as usize,
-            height: threads_per_group[1] as usize,
-            depth: threads_per_group[2] as usize,
-        };
         unsafe {
-            encoder.dispatchThreadgroupsWithIndirectBuffer_threadsPerThreadgroup(arg_addr_gpu, tg);
+            self.compute_encoder()
+                .dispatchThreadgroupsWithIndirectBuffer_threadsPerThreadgroup(
+                    args.address,
+                    self.threads_per_group,
+                );
         }
     }
 
     pub fn draw_indirect(&mut self, args: GpuPtr<u8>) {
-        let arg_addr_gpu: MTLGPUAddress = args.address;
-        let topology = self.current_topology;
-        let encoder = self
-            .render_encoder
-            .as_ref()
-            .expect("No active render encoder");
-        encoder.drawPrimitives_indirectBuffer(topology, arg_addr_gpu);
+        self.render_encoder()
+            .drawPrimitives_indirectBuffer(self.current_topology, args.address);
     }
 
     pub fn draw_indexed_indirect(
@@ -578,21 +525,16 @@ impl MetalCommandBuffer {
         max_index_count: u32,
         args: GpuPtr<u8>,
     ) {
-        let index_addr_gpu: MTLGPUAddress = indices.address;
-        let index_len = (max_index_count as u64) * 4;
-        let arg_addr_gpu: MTLGPUAddress = args.address;
+        let index_len = max_index_count as usize * size_of::<u32>();
         let topology = self.current_topology;
-        let encoder = self
-            .render_encoder
-            .as_ref()
-            .expect("No active render encoder");
+        let encoder = self.render_encoder();
         unsafe {
             encoder.drawIndexedPrimitives_indexType_indexBuffer_indexBufferLength_indirectBuffer(
                 topology,
                 MTLIndexType::UInt32,
-                index_addr_gpu,
-                index_len as usize,
-                arg_addr_gpu,
+                indices.address,
+                index_len,
+                args.address,
             );
         }
     }
@@ -677,11 +619,7 @@ impl MetalCommandBuffer {
     ) {
         let src_texture = self.resolve_texture(src.id());
         let dst_texture = self.resolve_texture(dst.id());
-        let size = MTLSize {
-            width: src_region.extent[0] as usize,
-            height: src_region.extent[1] as usize,
-            depth: src_region.extent[2] as usize,
-        };
+        let size = to_mtl_size(src_region.extent);
 
         let encoder = self.begin_copy_encoder("copy texture to texture");
         unsafe {
@@ -700,8 +638,6 @@ impl MetalCommandBuffer {
         self.compute_encoder = Some(encoder);
     }
 
-    /// Resolve the texture and linear buffer, and compute the row / image strides for a
-    /// buffer↔texture copy on the Metal 4 compute encoder.
     fn prepare_texture_copy(
         &self,
         buffer_gpu: GpuPtr<u8>,
@@ -721,11 +657,7 @@ impl MetalCommandBuffer {
             texture: mtl_texture,
             buffer,
             offset,
-            size: MTLSize {
-                width: region.extent[0] as usize,
-                height: region.extent[1] as usize,
-                depth: region.extent[2] as usize,
-            },
+            size: to_mtl_size(region.extent),
             origin: to_mtl_origin(region.origin),
             bytes_per_row,
             bytes_per_image,
@@ -750,19 +682,14 @@ impl MetalCommandBuffer {
         self.ended = true;
     }
 
-    /// Write a GPU timestamp into `heap` at `index`. This is a command-buffer-level command, so
-    /// any open encoder must be closed first; the RHI contract calls this outside a render pass.
-    pub fn write_timestamp(&mut self, pool: &super::query::MetalQueryPool, query: u32) {
+    /// A command-buffer-level command, so any open encoder is closed first.
+    pub fn write_timestamp(&mut self, pool: &MetalQueryPool, query: u32) {
         self.end_active_encoders();
         // SAFETY: `query` is within the pool's count; the heap is of type Timestamp.
         unsafe {
             self.command_buffer
                 .writeTimestampIntoHeap_atIndex(&pool.heap, query as usize)
         };
-    }
-
-    pub fn barrier_with_hazard(&mut self, src: StageFlags, dst: StageFlags, hazard: HazardFlags) {
-        self.encode_barrier(src, dst, hazard);
     }
 
     pub fn set_viewport(
@@ -782,11 +709,7 @@ impl MetalCommandBuffer {
             znear: min_depth as f64,
             zfar: max_depth as f64,
         };
-        let encoder = self
-            .render_encoder
-            .as_ref()
-            .expect("No active render encoder");
-        encoder.setViewport(viewport);
+        self.render_encoder().setViewport(viewport);
     }
 
     pub fn set_scissor(&mut self, x: i32, y: i32, width: u32, height: u32) {
@@ -796,16 +719,12 @@ impl MetalCommandBuffer {
             width: width as usize,
             height: height as usize,
         };
-        let encoder = self
-            .render_encoder
-            .as_ref()
-            .expect("No active render encoder");
-        encoder.setScissorRect(scissor);
+        self.render_encoder().setScissorRect(scissor);
     }
 
     /// Only a barrier at an encoder's head makes that encoder wait, so `dst` splits: what this
     /// encoder runs, and what needs a publish here plus a wait on every encoder after.
-    fn encode_barrier(&mut self, src: StageFlags, dst: StageFlags, hazard: HazardFlags) {
+    pub fn barrier_with_hazard(&mut self, src: StageFlags, dst: StageFlags, hazard: HazardFlags) {
         let after = to_mtl_stages(src);
         let before = to_mtl_stages(dst);
         let visibility = visibility_from_hazard(hazard);
@@ -831,10 +750,7 @@ impl MetalCommandBuffer {
         }
     }
 
-    /// The open encoder as the protocol both render and compute encoders conform to.
-    ///
-    /// `MTL4CommandEncoder` carries the barrier calls, so the two cases differ only in which
-    /// field holds the encoder — not in what is done with it.
+    /// The open encoder as `MTL4CommandEncoder`, which carries the barrier calls.
     fn open_encoder(&self) -> Option<&ProtocolObject<dyn MTL4CommandEncoder>> {
         if let Some(encoder) = self.render_encoder.as_ref() {
             // SAFETY: MTL4RenderCommandEncoder refines MTL4CommandEncoder.
@@ -847,8 +763,7 @@ impl MetalCommandBuffer {
         None
     }
 
-    /// Blit: Metal 4 routes copies through the compute encoder. Not AccelerationStructure:
-    /// builds always take their own encoder.
+    /// Copies run on the compute encoder, hence `Blit`. Accel builds always open their own.
     fn open_encoder_stages(&self) -> Option<MTLStages> {
         if self.render_encoder.is_some() {
             return Some(
@@ -895,154 +810,53 @@ impl MetalCommandBuffer {
         }
     }
 
-    pub fn set_meshlet_pipeline(&mut self, pso: &MeshletPso) {
-        use objc2_metal::MTL4RenderCommandEncoder as _;
-
-        let mtl_pso = &pso.inner;
-        let (pipeline, depth_stencil, depth_bias, cull_mode, winding) = (
-            &mtl_pso.default_pipeline,
-            &mtl_pso.depth_stencil,
-            mtl_pso.depth_bias,
-            mtl_pso.cull_mode,
-            mtl_pso.winding,
-        );
-        let encoder = self
-            .render_encoder
-            .as_ref()
-            .expect("set_meshlet_pipeline: no active render encoder");
-        encoder.setRenderPipelineState(pipeline);
-        encoder.setCullMode(cull_mode);
-        encoder.setFrontFacingWinding(winding);
-        encoder.setDepthStencilState(Some(depth_stencil));
-        encoder.setDepthBias_slopeScale_clamp(depth_bias.0, depth_bias.1, depth_bias.2);
-    }
-
-    /// Draw using the bound mesh-shader pipeline, set via `CommandBuffer::set_pipeline`.
     pub fn draw_meshlets(&mut self, x: u32, y: u32, z: u32) {
-        use objc2_metal::MTL4RenderCommandEncoder as _;
-        let tg_obj = MESH_THREADS_PER_OBJECT_GROUP;
-        let tg_mesh = MESH_THREADS_PER_MESH_GROUP;
-        let groups = MTLSize {
-            width: x as usize,
-            height: y as usize,
-            depth: z as usize,
-        };
-        let encoder = self
-            .render_encoder
-            .as_ref()
-            .expect("No active render encoder");
-        encoder.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
-            groups, tg_obj, tg_mesh,
-        );
+        self.render_encoder()
+            .drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                to_mtl_size([x, y, z]),
+                MESH_THREADS_PER_OBJECT_GROUP,
+                self.threads_per_group,
+            );
     }
 
-    /// Indirect mesh draw. Pipeline must be set via `CommandBuffer::set_pipeline`.
     /// `args` points to one indirect mesh dispatch command.
     pub fn draw_meshlets_indirect(&mut self, args: GpuPtr<u8>) {
-        use objc2_metal::MTL4RenderCommandEncoder as _;
-        let tg_obj = MESH_THREADS_PER_OBJECT_GROUP;
-        let tg_mesh = MESH_THREADS_PER_MESH_GROUP;
-        let encoder = self
-            .render_encoder
-            .as_ref()
-            .expect("No active render encoder");
-        encoder.drawMeshThreadgroupsWithIndirectBuffer_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
-            args.address,
-            tg_obj,
-            tg_mesh,
-        );
-    }
-
-    pub fn build_blas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &BlasDesc<'_>) {
-        use super::accel::make_blas_geometry_descriptors;
-        use objc2_metal::{
-            MTL4ComputeCommandEncoder as _, MTL4PrimitiveAccelerationStructureDescriptor,
-            MTLBuffer as _,
-        };
-
-        let (mtl_as, scratch) = (
-            &accel.inner.acceleration_structure,
-            &accel.inner.scratch_buffer,
-        );
-        let geometries = make_blas_geometry_descriptors(desc);
-
-        let primitive_desc = MTL4PrimitiveAccelerationStructureDescriptor::new();
-        primitive_desc.setGeometryDescriptors(Some(&geometries.array));
-        // SAFETY: MTL4PrimitiveAccelerationStructureDescriptor derives from
-        // MTLAccelerationStructureDescriptor.
-        let primitive_base: &objc2_metal::MTLAccelerationStructureDescriptor =
-            unsafe { super::accel::downcast_base(&*primitive_desc) };
-        super::accel::set_accel_usage(primitive_base, desc.flags);
-
-        self.end_active_encoders();
-        let encoder = self.begin_compute_encoder("build BLAS");
-
-        let scratch_addr = scratch.gpuAddress();
-        let scratch_range = objc2_metal::MTL4BufferRange {
-            bufferAddress: scratch_addr,
-            length: !0u64, // full remaining length
-        };
-
-        unsafe {
-            encoder.buildAccelerationStructure_descriptor_scratchBuffer(
-                mtl_as,
-                // SAFETY: MTL4PrimitiveAccelerationStructureDescriptor derives from
-                // MTL4AccelerationStructureDescriptor.
-                downcast_base::<_, objc2_metal::MTL4AccelerationStructureDescriptor>(
-                    &*primitive_desc,
-                ),
-                scratch_range,
+        self.render_encoder()
+            .drawMeshThreadgroupsWithIndirectBuffer_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                args.address,
+                MESH_THREADS_PER_OBJECT_GROUP,
+                self.threads_per_group,
             );
-        }
-        encoder.endEncoding();
     }
 
-    pub fn build_tlas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &TlasDesc) {
-        use objc2_metal::{
-            MTL4ComputeCommandEncoder as _, MTL4InstanceAccelerationStructureDescriptor,
-            MTLBuffer as _,
-        };
+    pub fn build_blas(&mut self, accel: &AccelerationStructure, desc: &BlasDesc<'_>) {
+        self.build_accel(&accel.inner, &blas_descriptor(desc), "build BLAS");
+    }
 
-        let (mtl_as, scratch) = (
-            &accel.inner.acceleration_structure,
-            &accel.inner.scratch_buffer,
-        );
-        let instance_desc = MTL4InstanceAccelerationStructureDescriptor::new();
-        unsafe {
-            instance_desc.setInstanceDescriptorBuffer(objc2_metal::MTL4BufferRange {
-                bufferAddress: desc.instance_buffer.address,
-                // Metal uses its indirect instance layout, written by `Device::write_tlas_instance`.
-                length: (desc.instance_count as u64)
-                    * std::mem::size_of::<
-                        objc2_metal::MTLIndirectAccelerationStructureInstanceDescriptor,
-                    >() as u64,
-            });
-            instance_desc.setInstanceCount(desc.instance_count as usize);
-        }
-        // SAFETY: MTL4InstanceAccelerationStructureDescriptor derives from
-        // MTLAccelerationStructureDescriptor.
-        let instance_base: &objc2_metal::MTLAccelerationStructureDescriptor =
-            unsafe { super::accel::downcast_base(&*instance_desc) };
-        super::accel::set_accel_usage(instance_base, desc.flags);
+    pub fn build_tlas(&mut self, accel: &AccelerationStructure, desc: &TlasDesc) {
+        self.build_accel(&accel.inner, &tlas_descriptor(desc), "build TLAS");
+    }
 
+    /// Builds take an encoder of their own, so that barriers can order them against the
+    /// encoders on either side.
+    fn build_accel(
+        &mut self,
+        accel: &MetalAccelerationStructure,
+        descriptor: &MTL4AccelerationStructureDescriptor,
+        label: &str,
+    ) {
         self.end_active_encoders();
-        let encoder = self.begin_compute_encoder("build TLAS");
-
-        let scratch_addr = scratch.gpuAddress();
-        let scratch_range = objc2_metal::MTL4BufferRange {
-            bufferAddress: scratch_addr,
-            length: !0u64,
+        let encoder = self.begin_compute_encoder(label);
+        let scratch = MTL4BufferRange {
+            bufferAddress: accel.scratch_buffer.gpuAddress(),
+            // All of it.
+            length: u64::MAX,
         };
-
         unsafe {
             encoder.buildAccelerationStructure_descriptor_scratchBuffer(
-                mtl_as,
-                // SAFETY: MTL4InstanceAccelerationStructureDescriptor derives from
-                // MTL4AccelerationStructureDescriptor.
-                downcast_base::<_, objc2_metal::MTL4AccelerationStructureDescriptor>(
-                    &*instance_desc,
-                ),
-                scratch_range,
+                &accel.acceleration_structure,
+                descriptor,
+                scratch,
             );
         }
         encoder.endEncoding();
@@ -1058,8 +872,8 @@ impl Drop for MetalCommandBuffer {
             .replace(self.argument_table.clone());
         debug_assert!(previous.is_none());
         slot.in_use.set(false);
-        // The queue holds submitted command buffers until their fence signals, so reaching
-        // this drop means the GPU is done with the slot.
+        // The queue holds submitted command buffers until their fence signals, so the GPU is
+        // done with the slot.
         if let Some(pool) = slot.pool.clone() {
             pool.borrow_mut().push(slot);
         }
@@ -1074,11 +888,20 @@ impl MetalDevice {
         pool: Option<SharedTableSlotPool>,
         what: &str,
     ) -> RhiResult<Rc<MetalFrameTableSlot>> {
-        let root_table_buffer = create_root_table_buffer(
-            self.shared.device.as_ref(),
-            self.shared.residency_set.as_ref(),
-            &self.shared.residency_dirty,
-        )?;
+        let root_table_buffer = self
+            .shared
+            .device
+            .newBufferWithLength_options(
+                ROOT_TABLE_ARENA_BYTES,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or_else(|| {
+                RhiError::CommandBuffer("Failed to allocate Metal root table arena".into())
+            })?;
+        self.shared
+            .residency_set
+            .addAllocation(as_allocation(&root_table_buffer));
+        self.shared.residency_dirty.set(true);
         let command_allocator = self.shared.device.newCommandAllocator().ok_or_else(|| {
             RhiError::CommandBuffer(format!("Failed to create {what} MTL4CommandAllocator").into())
         })?;
@@ -1116,9 +939,7 @@ impl MetalDevice {
         Ok(slot)
     }
 
-    /// Take a generic table slot from the free list, or build one when empty. Without this,
-    /// `create_command_buffer` rebuilt an allocator, command buffer, argument table and 1 MiB root
-    /// ring on every call — Vulkan pools all of its command buffers, so this keeps parity.
+    /// Take a table slot from the free list, or build one when it is empty.
     fn acquire_pooled_table_slot(&self) -> RhiResult<Rc<MetalFrameTableSlot>> {
         let pooled = self.table_slot_pool.borrow_mut().pop();
         let slot = match pooled {
@@ -1131,8 +952,7 @@ impl MetalDevice {
         Ok(slot)
     }
 
-    /// Wrap an acquired slot in a recording command buffer, releasing it again on failure so a
-    /// failed create never strands it as in-use.
+    /// Wrap an acquired slot in a recording command buffer, releasing the slot on failure.
     fn create_command_buffer_in_slot(
         &self,
         slot: Rc<MetalFrameTableSlot>,

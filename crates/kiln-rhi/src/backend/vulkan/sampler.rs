@@ -10,11 +10,7 @@ use crate::types::{FilterMode, SamplerHandle, SamplerId};
 
 impl VulkanDevice {
     pub fn create_sampler(&self, desc: &SamplerDesc) -> RhiResult<Sampler> {
-        let mag_filter = match desc.mag_filter {
-            FilterMode::Nearest => vk::Filter::NEAREST,
-            FilterMode::Linear => vk::Filter::LINEAR,
-        };
-        let min_filter = match desc.min_filter {
+        let filter = |mode| match mode {
             FilterMode::Nearest => vk::Filter::NEAREST,
             FilterMode::Linear => vk::Filter::LINEAR,
         };
@@ -27,8 +23,8 @@ impl VulkanDevice {
         let address_w = address_mode_to_vk(desc.address_w);
 
         let mut sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(mag_filter)
-            .min_filter(min_filter)
+            .mag_filter(filter(desc.mag_filter))
+            .min_filter(filter(desc.min_filter))
             .mipmap_mode(mip_mode)
             .address_mode_u(address_u)
             .address_mode_v(address_v)
@@ -51,7 +47,7 @@ impl VulkanDevice {
 
         let id = SamplerId(self.samplers.allocate_id()?);
         if let Err(err) = self.write_sampler_descriptor(id, &sampler_info) {
-            self.recycle_sampler_id(id);
+            self.samplers.recycle(id.0);
             return Err(err);
         }
 

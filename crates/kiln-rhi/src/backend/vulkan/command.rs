@@ -1,42 +1,54 @@
+use std::rc::Rc;
+
+use ash::vk;
+use smallvec::SmallVec;
+
+use super::accel::{blas_geometries, build_geometry_info, tlas_geometry};
 use super::barrier::{to_vk_access_flags, to_vk_stage_flags};
-use super::device::VulkanDevice;
-use super::device::{IMAGE_LAYOUT, SharedTextures, VulkanLoaders, build_accel_flags_to_vk};
+use super::device::{IMAGE_LAYOUT, SharedTextures, VulkanDevice, VulkanLoaders};
+use super::pipeline::VulkanPipeline;
+use super::query::VulkanQueryPool;
 use super::swapchain::VulkanSwapchain;
 use super::texture::texture_aspect;
+use crate::accel::AccelerationStructure;
 use crate::barrier::{HazardFlags, StageFlags};
-use crate::command::CommandBuffer;
 use crate::command::{
-    DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectArgs, LoadOp, RenderPassDesc,
-    RenderTargetKind, StoreOp,
+    CommandBuffer, DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectArgs, LoadOp,
+    RenderPassDesc, RenderTargetKind, StoreOp,
 };
 use crate::error::{RhiError, RhiResult};
 use crate::pipeline::{ComputePso, GraphicsPso, MeshletPso};
 use crate::texture::{ResolvedRegion, Texture, bytes_per_pixel};
 use crate::types::{BlasDesc, GpuPtr, MAX_FRAMES_IN_FLIGHT, TextureId, TlasDesc};
-use ash::{khr::acceleration_structure as vk_accel_structure, vk};
-use smallvec::SmallVec;
-use std::rc::Rc;
 
-/// A pipeline kept alive for as long as a command buffer references it.
-///
-/// The handles are never read back; holding the `Rc` is the entire point, so that dropping the
-/// application's `GraphicsPso`/`ComputePso`/`MeshletPso` mid-recording cannot destroy a
-/// `VkPipeline` the command buffer still refers to.
-#[derive(Clone)]
-pub(crate) enum RetainedPipeline {
-    Graphics(Rc<super::pipeline::VulkanGraphicsPso>),
-    Compute(Rc<super::pipeline::VulkanComputePso>),
-    Meshlet(Rc<super::pipeline::VulkanMeshletPso>),
+/// Mip 0, layer 0 of a colour image: the whole of a swapchain image.
+pub(crate) const COLOR_SUBRESOURCE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
+    aspect_mask: vk::ImageAspectFlags::COLOR,
+    base_mip_level: 0,
+    level_count: 1,
+    base_array_layer: 0,
+    layer_count: 1,
+};
+
+/// Shader stages that read the descriptor heaps.
+const HEAP_READING_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
+    vk::PipelineStageFlags2::VERTEX_SHADER.as_raw()
+        | vk::PipelineStageFlags2::FRAGMENT_SHADER.as_raw()
+        | vk::PipelineStageFlags2::COMPUTE_SHADER.as_raw(),
+);
+
+fn load_op_to_vk(op: LoadOp) -> vk::AttachmentLoadOp {
+    match op {
+        LoadOp::Load => vk::AttachmentLoadOp::LOAD,
+        LoadOp::Clear => vk::AttachmentLoadOp::CLEAR,
+        LoadOp::DontCare => vk::AttachmentLoadOp::DONT_CARE,
+    }
 }
 
-impl RetainedPipeline {
-    /// The `VkPipeline` this entry keeps alive, for deduplicating repeated binds.
-    fn handle(&self) -> vk::Pipeline {
-        match self {
-            Self::Graphics(pso) => pso.pipeline,
-            Self::Compute(pso) => pso.pipeline,
-            Self::Meshlet(pso) => pso.pipeline,
-        }
+fn store_op_to_vk(op: StoreOp) -> vk::AttachmentStoreOp {
+    match op {
+        StoreOp::Store => vk::AttachmentStoreOp::STORE,
+        StoreOp::DontCare => vk::AttachmentStoreOp::DONT_CARE,
     }
 }
 
@@ -52,18 +64,16 @@ pub struct VulkanCommandBuffer {
     pub(crate) textures: SharedTextures,
     pub(crate) rendered_swapchain_images: SmallVec<[u32; 4]>,
     /// The pipeline bound by the last `set_*_pipeline`, so re-binding the same one does not
-    /// push another `Rc` onto `retained_pipelines`. A command buffer that binds per draw would
-    /// otherwise accumulate one clone per draw.
+    /// push another `Rc` onto `retained_pipelines`.
     pub(crate) last_bound_pipeline: vk::Pipeline,
-    /// Pipelines bound into this buffer. A pipeline dropped by the application while still
-    /// referenced here must not be destroyed until the submission retires, which matches Metal,
-    /// where the command buffer holds its own reference.
-    pub(crate) retained_pipelines: SmallVec<[RetainedPipeline; 4]>,
+    /// Every pipeline bound into this buffer, kept alive until the submission retires even if the
+    /// application drops it. Metal command buffers hold their own reference the same way.
+    pub(crate) retained_pipelines: SmallVec<[Rc<VulkanPipeline>; 4]>,
     pub(crate) ended: bool,
 }
 
 impl VulkanCommandBuffer {
-    pub(crate) fn finish(&mut self) -> crate::error::RhiResult<()> {
+    pub(crate) fn finish(&mut self) -> RhiResult<()> {
         if self.ended {
             return Ok(());
         }
@@ -75,7 +85,7 @@ impl VulkanCommandBuffer {
             self.loaders
                 .device
                 .end_command_buffer(self.command_buffer)
-                .map_err(|error| crate::error::RhiError::CommandBuffer(error.into()))?;
+                .map_err(|error| RhiError::CommandBuffer(error.into()))?;
         }
         self.ended = true;
         Ok(())
@@ -149,13 +159,7 @@ impl VulkanCommandBuffer {
                     .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                     .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | extra_dst_access)
                     .image(image)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    });
+                    .subresource_range(COLOR_SUBRESOURCE);
                 unsafe {
                     self.loaders.device.cmd_pipeline_barrier2(
                         cmd,
@@ -179,22 +183,11 @@ impl VulkanCommandBuffer {
                     }
                     RenderTargetKind::Texture(id) => self.resolve_texture_info(id).1,
                 };
-
-                let load_op = match ca.load_op {
-                    LoadOp::Load => vk::AttachmentLoadOp::LOAD,
-                    LoadOp::Clear => vk::AttachmentLoadOp::CLEAR,
-                    LoadOp::DontCare => vk::AttachmentLoadOp::DONT_CARE,
-                };
-                let store_op = match ca.store_op {
-                    StoreOp::Store => vk::AttachmentStoreOp::STORE,
-                    StoreOp::DontCare => vk::AttachmentStoreOp::DONT_CARE,
-                };
-
                 vk::RenderingAttachmentInfo::default()
                     .image_view(image_view)
                     .image_layout(IMAGE_LAYOUT)
-                    .load_op(load_op)
-                    .store_op(store_op)
+                    .load_op(load_op_to_vk(ca.load_op))
+                    .store_op(store_op_to_vk(ca.store_op))
                     .clear_value(vk::ClearValue {
                         color: vk::ClearColorValue {
                             float32: ca.clear_color,
@@ -206,27 +199,15 @@ impl VulkanCommandBuffer {
         let depth_attachment = desc.depth_attachment.as_ref().map(|da| {
             let image_view = match da.target.kind() {
                 RenderTargetKind::Texture(id) => self.resolve_texture_info(id).1,
-                // The swapchain has colour images only; depth comes from a texture you own.
                 RenderTargetKind::SwapchainImage(_) => {
                     panic!("a swapchain image cannot be a depth attachment")
                 }
             };
-
-            let load_op = match da.load_op {
-                LoadOp::Load => vk::AttachmentLoadOp::LOAD,
-                LoadOp::Clear => vk::AttachmentLoadOp::CLEAR,
-                LoadOp::DontCare => vk::AttachmentLoadOp::DONT_CARE,
-            };
-            let store_op = match da.store_op {
-                StoreOp::Store => vk::AttachmentStoreOp::STORE,
-                StoreOp::DontCare => vk::AttachmentStoreOp::DONT_CARE,
-            };
-
             vk::RenderingAttachmentInfo::default()
                 .image_view(image_view)
                 .image_layout(IMAGE_LAYOUT)
-                .load_op(load_op)
-                .store_op(store_op)
+                .load_op(load_op_to_vk(da.load_op))
+                .store_op(store_op_to_vk(da.store_op))
                 .clear_value(vk::ClearValue {
                     depth_stencil: vk::ClearDepthStencilValue {
                         depth: da.clear_depth,
@@ -277,46 +258,34 @@ impl VulkanCommandBuffer {
     }
 
     pub fn set_graphics_pipeline(&mut self, pso: &GraphicsPso) {
-        let vk_pso = &pso.inner;
-        self.retain_pipeline(vk_pso.pipeline, || {
-            RetainedPipeline::Graphics(vk_pso.clone())
-        });
-        self.bind_pipeline(vk::PipelineBindPoint::GRAPHICS, vk_pso.pipeline);
+        self.bind_pipeline(vk::PipelineBindPoint::GRAPHICS, &pso.inner);
     }
 
     pub fn set_compute_pipeline(&mut self, pso: &ComputePso) {
-        let vk_pso = &pso.inner;
-        self.retain_pipeline(vk_pso.pipeline, || {
-            RetainedPipeline::Compute(vk_pso.clone())
-        });
-        self.bind_pipeline(vk::PipelineBindPoint::COMPUTE, vk_pso.pipeline);
+        self.bind_pipeline(vk::PipelineBindPoint::COMPUTE, &pso.inner);
     }
 
-    /// Keep `pipeline` alive for this command buffer's submission, unless it is already the one
-    /// bound or already retained.
-    fn retain_pipeline(
-        &mut self,
-        pipeline: vk::Pipeline,
-        retained: impl FnOnce() -> RetainedPipeline,
-    ) {
-        if self.last_bound_pipeline == pipeline {
-            return;
-        }
-        self.last_bound_pipeline = pipeline;
-        if !self
-            .retained_pipelines
-            .iter()
-            .any(|entry| entry.handle() == pipeline)
-        {
-            self.retained_pipelines.push(retained());
-        }
+    pub fn set_meshlet_pipeline(&mut self, pso: &MeshletPso) {
+        self.bind_pipeline(vk::PipelineBindPoint::GRAPHICS, &pso.inner);
     }
 
-    fn bind_pipeline(&mut self, bind_point: vk::PipelineBindPoint, pipeline: vk::Pipeline) {
+    /// Bind `pso`, retaining it for this command buffer's submission unless it is already the
+    /// one bound or already retained.
+    fn bind_pipeline(&mut self, bind_point: vk::PipelineBindPoint, pso: &Rc<VulkanPipeline>) {
+        if self.last_bound_pipeline != pso.pipeline {
+            self.last_bound_pipeline = pso.pipeline;
+            if !self
+                .retained_pipelines
+                .iter()
+                .any(|retained| Rc::ptr_eq(retained, pso))
+            {
+                self.retained_pipelines.push(pso.clone());
+            }
+        }
         unsafe {
             self.loaders
                 .device
-                .cmd_bind_pipeline(self.command_buffer, bind_point, pipeline);
+                .cmd_bind_pipeline(self.command_buffer, bind_point, pso.pipeline);
         }
     }
 
@@ -517,7 +486,7 @@ impl VulkanCommandBuffer {
     }
 
     /// Resolve the texture and the linear memory backing the copy, returning
-    /// `(image, aspect, current layout, address range)`.
+    /// `(image, aspect, address range)`.
     fn prepare_texture_copy(
         &self,
         buffer_gpu: GpuPtr<u8>,
@@ -559,12 +528,8 @@ impl VulkanCommandBuffer {
 
         if use_descriptor_heap_hazard {
             // Descriptor heap reads are not covered by MEMORY_READ.
-            src_stage |= vk::PipelineStageFlags2::VERTEX_SHADER
-                | vk::PipelineStageFlags2::FRAGMENT_SHADER
-                | vk::PipelineStageFlags2::COMPUTE_SHADER;
-            dst_stage |= vk::PipelineStageFlags2::VERTEX_SHADER
-                | vk::PipelineStageFlags2::FRAGMENT_SHADER
-                | vk::PipelineStageFlags2::COMPUTE_SHADER;
+            src_stage |= HEAP_READING_STAGES;
+            dst_stage |= HEAP_READING_STAGES;
             dst_access |=
                 vk::AccessFlags2::RESOURCE_HEAP_READ_EXT | vk::AccessFlags2::SAMPLER_HEAP_READ_EXT;
         }
@@ -622,7 +587,7 @@ impl VulkanCommandBuffer {
         }
     }
 
-    pub fn reset_queries(&mut self, pool: &super::query::VulkanQueryPool, count: u32) {
+    pub fn reset_queries(&mut self, pool: &VulkanQueryPool, count: u32) {
         unsafe {
             self.loaders
                 .device
@@ -630,7 +595,7 @@ impl VulkanCommandBuffer {
         }
     }
 
-    pub fn write_timestamp(&mut self, pool: &super::query::VulkanQueryPool, query: u32) {
+    pub fn write_timestamp(&mut self, pool: &VulkanQueryPool, query: u32) {
         // Bracket GPU time with bottom-of-pipe timestamps.
         unsafe {
             self.loaders.device.cmd_write_timestamp2(
@@ -654,13 +619,7 @@ impl VulkanCommandBuffer {
             .dst_stage_mask(vk::PipelineStageFlags2::NONE)
             .dst_access_mask(vk::AccessFlags2::NONE)
             .image(image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
+            .subresource_range(COLOR_SUBRESOURCE);
         unsafe {
             self.loaders.device.cmd_pipeline_barrier2(
                 self.command_buffer,
@@ -668,14 +627,6 @@ impl VulkanCommandBuffer {
                     .image_memory_barriers(std::slice::from_ref(&barrier)),
             );
         }
-    }
-
-    pub fn set_meshlet_pipeline(&mut self, pso: &MeshletPso) {
-        let vk_pso = &pso.inner;
-        self.retain_pipeline(vk_pso.pipeline, || {
-            RetainedPipeline::Meshlet(vk_pso.clone())
-        });
-        self.bind_pipeline(vk::PipelineBindPoint::GRAPHICS, vk_pso.pipeline);
     }
 
     pub fn draw_meshlets(&mut self, x: u32, y: u32, z: u32) {
@@ -686,9 +637,9 @@ impl VulkanCommandBuffer {
         }
     }
 
-    /// `args` points to one `VkDrawMeshTasksIndirectCommandEXT` (x, y, z: u32 = 12 bytes).
+    /// `args` points to one `VkDrawMeshTasksIndirectCommandEXT`.
     pub fn draw_meshlets_indirect(&mut self, args: GpuPtr<u8>) {
-        let stride = 12u64;
+        let stride = size_of::<vk::DrawMeshTasksIndirectCommandEXT>() as u64;
         let info = vk::DrawIndirect2InfoKHR::default()
             .address_range(Self::strided_range(args, stride, stride))
             .draw_count(1);
@@ -699,104 +650,66 @@ impl VulkanCommandBuffer {
         }
     }
 
-    pub fn build_blas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &BlasDesc<'_>) {
-        let (accel_loader, vk_as, scratch_address) = self.resolve_accel(accel);
-
-        let (geometries, primitive_counts) = super::accel::blas_geometries(desc);
-
-        let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
-            .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-            .flags(build_accel_flags_to_vk(desc.flags))
-            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-            .dst_acceleration_structure(vk_as)
-            .geometries(&geometries)
-            .scratch_data(vk::DeviceOrHostAddressKHR {
-                device_address: scratch_address,
-            });
-
-        let range_infos: SmallVec<[vk::AccelerationStructureBuildRangeInfoKHR; 4]> =
-            primitive_counts
-                .iter()
-                .map(|&pc| vk::AccelerationStructureBuildRangeInfoKHR {
-                    primitive_count: pc,
-                    primitive_offset: 0,
-                    first_vertex: 0,
-                    transform_offset: 0,
-                })
-                .collect();
-        let range_infos_ref: Option<&[vk::AccelerationStructureBuildRangeInfoKHR]> =
-            Some(&range_infos);
-        let build_range_infos: &[Option<&[vk::AccelerationStructureBuildRangeInfoKHR]>] =
-            std::slice::from_ref(&range_infos_ref);
-
-        unsafe {
-            accel_loader.cmd_build_acceleration_structures(
-                self.command_buffer,
-                std::slice::from_ref(&build_info),
-                build_range_infos,
-            );
-        }
+    pub fn build_blas(&mut self, accel: &AccelerationStructure, desc: &BlasDesc<'_>) {
+        let (geometries, primitive_counts) = blas_geometries(desc);
+        let ranges: SmallVec<[vk::AccelerationStructureBuildRangeInfoKHR; 4]> = primitive_counts
+            .iter()
+            .map(
+                |&primitive_count| vk::AccelerationStructureBuildRangeInfoKHR {
+                    primitive_count,
+                    ..Default::default()
+                },
+            )
+            .collect();
+        self.build_accel(
+            accel,
+            build_geometry_info(
+                vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+                desc.flags,
+                &geometries,
+            ),
+            &ranges,
+        );
     }
 
-    pub fn build_tlas(&mut self, accel: &crate::accel::AccelerationStructure, desc: &TlasDesc) {
-        let (accel_loader, vk_as, scratch_address) = self.resolve_accel(accel);
-
-        let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::default()
-            .array_of_pointers(false)
-            .data(vk::DeviceOrHostAddressConstKHR {
-                device_address: desc.instance_buffer.address,
-            });
-        let geometry = vk::AccelerationStructureGeometryKHR::default()
-            .geometry_type(vk::GeometryTypeKHR::INSTANCES)
-            .geometry(vk::AccelerationStructureGeometryDataKHR {
-                instances: instances_data,
-            });
-        let geometries = [geometry];
-
-        let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
-            .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-            .flags(build_accel_flags_to_vk(desc.flags))
-            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-            .dst_acceleration_structure(vk_as)
-            .geometries(&geometries)
-            .scratch_data(vk::DeviceOrHostAddressKHR {
-                device_address: scratch_address,
-            });
-
-        let range_info = [vk::AccelerationStructureBuildRangeInfoKHR {
+    pub fn build_tlas(&mut self, accel: &AccelerationStructure, desc: &TlasDesc) {
+        let geometries = [tlas_geometry(desc)];
+        let ranges = [vk::AccelerationStructureBuildRangeInfoKHR {
             primitive_count: desc.instance_count,
-            primitive_offset: 0,
-            first_vertex: 0,
-            transform_offset: 0,
+            ..Default::default()
         }];
-        let build_range_infos: &[Option<&[vk::AccelerationStructureBuildRangeInfoKHR]>] =
-            &[Some(&range_info)];
-
-        unsafe {
-            accel_loader.cmd_build_acceleration_structures(
-                self.command_buffer,
-                std::slice::from_ref(&build_info),
-                build_range_infos,
-            );
-        }
+        self.build_accel(
+            accel,
+            build_geometry_info(
+                vk::AccelerationStructureTypeKHR::TOP_LEVEL,
+                desc.flags,
+                &geometries,
+            ),
+            &ranges,
+        );
     }
 
-    /// Borrows the loader rather than cloning it: `vk_accel_structure::Device` is a table of
-    /// function pointers, and a build has no reason to copy one.
-    fn resolve_accel(
-        &self,
-        accel: &crate::accel::AccelerationStructure,
-    ) -> (
-        &vk_accel_structure::Device,
-        vk::AccelerationStructureKHR,
-        u64,
+    fn build_accel(
+        &mut self,
+        accel: &AccelerationStructure,
+        info: vk::AccelerationStructureBuildGeometryInfoKHR<'_>,
+        ranges: &[vk::AccelerationStructureBuildRangeInfoKHR],
     ) {
-        let a = &accel.inner;
-        (
-            &self.loaders.acceleration_structure,
-            a.acceleration_structure,
-            a.scratch_address,
-        )
+        let accel = &accel.inner;
+        let info = info
+            .dst_acceleration_structure(accel.acceleration_structure)
+            .scratch_data(vk::DeviceOrHostAddressKHR {
+                device_address: accel.scratch_address,
+            });
+        unsafe {
+            self.loaders
+                .acceleration_structure
+                .cmd_build_acceleration_structures(
+                    self.command_buffer,
+                    std::slice::from_ref(&info),
+                    &[Some(ranges)],
+                );
+        }
     }
 }
 
@@ -847,10 +760,6 @@ fn to_vk_extent(extent: [u32; 3]) -> vk::Extent3D {
 }
 
 impl VulkanDevice {
-    fn acquire_command_buffer(&self) -> RhiResult<vk::CommandBuffer> {
-        self.queue.acquire_command_buffer()
-    }
-
     pub(crate) fn recycle_command_buffer(&self, command_buffer: vk::CommandBuffer) {
         self.queue.recycle_command_buffer(command_buffer)
     }
@@ -861,18 +770,17 @@ impl VulkanDevice {
 
     /// Begin recording, optionally wired to a swapchain's images.
     ///
-    /// `swapchain` is `Some` only for the frame's own command buffer, which is the one allowed to
-    /// name [`RenderTarget::swapchain_image`](crate::RenderTarget::swapchain_image); everything
-    /// else differs not at all between the two entry points.
+    /// `swapchain` is `Some` only for the frame's own command buffer, the one allowed to name
+    /// [`RenderTarget::swapchain_image`](crate::RenderTarget::swapchain_image).
     fn begin_command_buffer(
         &self,
-        swapchain: Option<&super::swapchain::VulkanSwapchain>,
+        swapchain: Option<&VulkanSwapchain>,
     ) -> RhiResult<CommandBuffer> {
         // Texture creation records initial-layout transitions into one reusable setup command
         // buffer. Flush the batch once before user work starts instead of queue-idling once per
         // texture.
         self.flush_setup_barriers()?;
-        let cmd = self.acquire_command_buffer()?;
+        let cmd = self.queue.acquire_command_buffer()?;
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);

@@ -21,7 +21,7 @@ use crate::memory::MemoryType;
 use crate::queue::Queue;
 use crate::types::{
     AddressMode, BuildAccelFlags, CompareOp, Format, GeometryFlags, GpuPtr, MAX_FRAMES_IN_FLIGHT,
-    SamplerId, TextureId,
+    TextureId,
 };
 
 use super::heap::{DescriptorHeaps, create_descriptor_heaps};
@@ -29,6 +29,7 @@ use super::memory::{SharedBufferPool, VulkanBufferPool};
 use super::queue::{FrameSubmission, VulkanQueue};
 use super::texture::VulkanTexture;
 use crate::backend::mapped::MappedAllocations;
+use crate::backend::retire::RetirementQueue;
 use crate::backend::slots::SlotTable;
 
 #[derive(Clone)]
@@ -40,10 +41,8 @@ pub(crate) struct BufferAllocation {
     pub memory_offset: u64,
 }
 
-/// One app-owned descriptor heap: a mapped allocation the driver indexes by slot.
-///
-/// Buffer allocations keyed by GPU base address, enabling O(log n) address->buffer
-/// resolution instead of a linear scan on every indirect/copy/index command.
+/// Buffer allocations keyed by GPU base address, so a texture placement resolves its backing
+/// memory in O(log n).
 pub(crate) type SharedAllocations = Rc<RefCell<BTreeMap<u64, BufferAllocation>>>;
 type SharedMappedAllocations = Rc<RefCell<MappedAllocations>>;
 /// Texture slots, shared with the command buffer (which resolves ids) and the queue (which
@@ -67,12 +66,12 @@ pub(crate) struct VulkanLoaders {
 
 pub struct VulkanDevice {
     /// Shared with every command buffer this device creates.
-    pub(crate) loaders: std::rc::Rc<VulkanLoaders>,
+    pub(crate) loaders: Rc<VulkanLoaders>,
     pub(crate) entry: Entry,
     pub(crate) instance: Instance,
     pub(crate) physical_device: vk::PhysicalDevice,
     pub(crate) queue: Rc<VulkanQueue>,
-    /// The same queue, wrapped for [`RhiDevice::queue`]. Both point at one `VulkanQueue`.
+    /// `queue`, wrapped for [`Device::queue`](crate::Device::queue).
     rhi_queue: Queue,
     pub(crate) command_pool: vk::CommandPool,
     pub(crate) pipeline_cache: vk::PipelineCache,
@@ -110,6 +109,7 @@ pub struct VulkanDevice {
     /// Whether the batched setup command buffer is currently recording initial image layouts.
     pub(crate) setup_recording: Cell<bool>,
 }
+
 /// Device extensions the RHI needs. One list, used both to reject an adapter that lacks them and
 /// to enable them, so the two cannot disagree.
 const REQUIRED_DEVICE_EXTENSIONS: &[&CStr] = &[
@@ -198,9 +198,9 @@ unsafe extern "system" fn vulkan_debug_callback(
 ) -> vk::Bool32 {
     let callback_data = unsafe { *p_callback_data };
     let message = if callback_data.p_message.is_null() {
-        std::borrow::Cow::from("")
+        Cow::from("")
     } else {
-        unsafe { std::ffi::CStr::from_ptr(callback_data.p_message).to_string_lossy() }
+        unsafe { CStr::from_ptr(callback_data.p_message).to_string_lossy() }
     };
 
     match message_severity {
@@ -218,7 +218,7 @@ unsafe extern "system" fn vulkan_debug_callback(
     vk::FALSE
 }
 
-/// Helper: find memory type index.
+/// The first memory type allowed by `memory_req` that has all of `flags`.
 pub(crate) fn find_memorytype_index(
     memory_req: &vk::MemoryRequirements,
     memory_prop: &vk::PhysicalDeviceMemoryProperties,
@@ -329,18 +329,11 @@ fn select_physical_device(instance: &ash::Instance) -> RhiResult<(vk::PhysicalDe
             .map_err(|e| RhiError::DeviceCreation(format!("Enumerate devices: {e}").into()))?
     };
 
-    // Filter on the complete required feature set before scoring devices. Selecting the
-    // first Vulkan 1.3 queue and discovering missing descriptor-buffer features later makes
-    // adapter choice depend on enumeration order and can fail on perfectly usable systems.
     let selected = physical_devices
         .iter()
         .filter_map(|pdevice| {
             let props = unsafe { instance.get_physical_device_properties(*pdevice) };
-            let api_version = props.api_version;
-            let supports_vulkan_13 = vk::api_version_major(api_version) > 1
-                || (vk::api_version_major(api_version) == 1
-                    && vk::api_version_minor(api_version) >= 3);
-            if !supports_vulkan_13 {
+            if props.api_version < vk::API_VERSION_1_4 {
                 return None;
             }
 
@@ -489,9 +482,7 @@ fn create_instance(
     ))
 }
 
-/// Negotiate optional device extensions against `capabilities`, enable the feature set the RHI
-/// depends on, and create the logical device. Bindless requires descriptor buffers and mutable
-/// descriptor types; both are hard requirements, so their absence fails here.
+/// Create the logical device with every required extension and feature enabled.
 fn create_logical_device(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -508,7 +499,7 @@ fn create_logical_device(
         .queue_family_index(queue_family_index)
         .queue_priorities(&priorities);
 
-    let device = with_required_features(|features| {
+    with_required_features(|features| {
         // SAFETY: `extend` rather than `push` because `features` already carries the chain the
         // macro assembled; every link is live for this call.
         let create_info = unsafe {
@@ -519,9 +510,7 @@ fn create_logical_device(
         };
         unsafe { instance.create_device(physical_device, &create_info, None) }
     })
-    .map_err(|e| RhiError::DeviceCreation(format!("Failed to create device: {e}").into()))?;
-
-    Ok(device)
+    .map_err(|e| RhiError::DeviceCreation(format!("Failed to create device: {e}").into()))
 }
 
 impl VulkanDevice {
@@ -535,12 +524,8 @@ impl VulkanDevice {
         let (physical_device, queue_family_index) = select_physical_device(&instance)?;
 
         let device_props = unsafe { instance.get_physical_device_properties(physical_device) };
-        let device_name = unsafe {
-            std::ffi::CStr::from_ptr(device_props.device_name.as_ptr())
-                .to_string_lossy()
-                .to_string()
-        };
-        log::info!("RHI: Selected GPU: {}", device_name);
+        let device_name = unsafe { CStr::from_ptr(device_props.device_name.as_ptr()) };
+        log::info!("RHI: Selected GPU: {}", device_name.to_string_lossy());
 
         let device = create_logical_device(&instance, physical_device, queue_family_index)?;
 
@@ -631,9 +616,9 @@ impl VulkanDevice {
             pending_commands: RefCell::new(VecDeque::new()),
             available_commands: RefCell::new(Vec::new()),
             completion_semaphore,
-            next_completion_value: RefCell::new(0),
+            next_completion_value: Cell::new(0),
             frames: RefCell::new([FrameSubmission::default(); MAX_FRAMES_IN_FLIGHT]),
-            retired_resources: crate::backend::retire::RetirementQueue::default(),
+            retired_resources: RetirementQueue::default(),
             textures: textures.clone(),
             samplers: samplers.clone(),
         });
@@ -641,7 +626,7 @@ impl VulkanDevice {
             inner: queue.clone(),
         };
 
-        let loaders = std::rc::Rc::new(VulkanLoaders {
+        let loaders = Rc::new(VulkanLoaders {
             device,
             descriptor_heap: descriptor_heap_loader,
             address_commands: address_commands_loader,
@@ -712,10 +697,6 @@ impl VulkanDevice {
         if let Err(error) = unsafe { loader.set_debug_utils_object_name(&info) } {
             log::warn!("vkSetDebugUtilsObjectNameEXT failed: {error}");
         }
-    }
-
-    pub(crate) fn recycle_sampler_id(&self, id: SamplerId) {
-        self.samplers.recycle(id.0);
     }
 
     /// Write one image descriptor into the resource heap at slot `id`.
@@ -822,7 +803,6 @@ impl VulkanDevice {
         if !self.setup_recording.replace(false) {
             return Ok(());
         }
-        let queue = &self.queue;
         // SAFETY: the setup buffer is recording (the flag above) and belongs to this device.
         unsafe {
             self.loaders
@@ -830,7 +810,7 @@ impl VulkanDevice {
                 .end_command_buffer(self.setup_command_buffer)
                 .map_err(|e| RhiError::CommandBuffer(e.into()))?;
         }
-        queue.submit_setup_and_wait(self.setup_command_buffer)
+        self.queue.submit_setup_and_wait(self.setup_command_buffer)
     }
 }
 
@@ -872,9 +852,8 @@ impl Drop for VulkanDevice {
                 .device
                 .destroy_command_pool(self.command_pool, None);
 
-            // Buffers the application never destroyed are still bound into pool blocks, and
-            // freeing block memory underneath a live buffer is invalid usage.
-            // Allocations own no Vulkan object; the pool's blocks are freed just below.
+            // Allocations own no Vulkan object, so ones the application never destroyed only
+            // need forgetting before their blocks are freed.
             self.allocations.borrow_mut().clear();
             self.buffer_pool
                 .borrow_mut()
@@ -1007,7 +986,7 @@ mod tests {
         let magic = SPIRV_MAGIC.to_le_bytes();
         let valid = [magic.as_slice(), &[0u8; 4]].concat();
         assert!(spirv_words(&valid).is_ok());
-        // A trailing partial word used to be dropped silently by `chunks_exact`.
+        // `chunks_exact` alone would silently drop a trailing partial word.
         let truncated = [magic.as_slice(), &[0u8; 2]].concat();
         assert!(spirv_words(&truncated).is_err());
         assert!(spirv_words(&[]).is_err());

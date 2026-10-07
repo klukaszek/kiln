@@ -1,21 +1,46 @@
 //! Vulkan acceleration structures: creation and TLAS instance encoding.
 
-use ash::khr::acceleration_structure as vk_accel_structure;
 use ash::vk;
+use smallvec::SmallVec;
+use zerocopy::IntoBytes as _;
 
 use super::device::{
     VulkanDevice, build_accel_flags_to_vk, find_memorytype_index, geometry_flags_to_vk,
 };
-use super::memory::SharedBufferPool;
-
+use super::memory::{BLOCK_BUFFER_USAGE, SCRATCH_BUFFER_USAGE, SharedBufferPool};
 use super::queue::VulkanRetiredResource;
 use crate::accel::AccelerationStructure;
 use crate::error::{RhiError, RhiResult};
-use crate::types::{BlasDesc, BlasGeometry, TlasDesc};
-use smallvec::SmallVec;
+use crate::types::{BlasDesc, BlasGeometry, BuildAccelFlags, TlasDesc, TlasInstance};
 
-/// Geometry descriptors and primitive counts for a BLAS, shared by `create_blas` (which sizes the
-/// structure) and `build_blas` (which records it), so the two cannot disagree.
+/// The build info `create_*` sizes a structure with and `build_*` records it with, minus the
+/// destination and scratch only a build has. Sharing it keeps the two from disagreeing.
+pub(crate) fn build_geometry_info<'a>(
+    ty: vk::AccelerationStructureTypeKHR,
+    flags: BuildAccelFlags,
+    geometries: &'a [vk::AccelerationStructureGeometryKHR<'a>],
+) -> vk::AccelerationStructureBuildGeometryInfoKHR<'a> {
+    vk::AccelerationStructureBuildGeometryInfoKHR::default()
+        .ty(ty)
+        .flags(build_accel_flags_to_vk(flags))
+        .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+        .geometries(geometries)
+}
+
+/// The single instances geometry of a TLAS.
+pub(crate) fn tlas_geometry(desc: &TlasDesc) -> vk::AccelerationStructureGeometryKHR<'static> {
+    vk::AccelerationStructureGeometryKHR::default()
+        .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+        .geometry(vk::AccelerationStructureGeometryDataKHR {
+            instances: vk::AccelerationStructureGeometryInstancesDataKHR::default()
+                .array_of_pointers(false)
+                .data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: desc.instance_buffer.address,
+                }),
+        })
+}
+
+/// Geometry descriptors and primitive counts for a BLAS.
 pub(crate) fn blas_geometries(
     desc: &BlasDesc<'_>,
 ) -> (
@@ -127,102 +152,58 @@ impl VulkanAccelerationStructure {
 
 impl VulkanDevice {
     pub fn create_blas(&self, desc: &BlasDesc<'_>) -> RhiResult<AccelerationStructure> {
-        let accel_loader = &self.loaders.acceleration_structure;
-
         let (geometries, primitive_counts) = blas_geometries(desc);
-
-        let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
-            .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-            .flags(build_accel_flags_to_vk(desc.flags))
-            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-            .geometries(&geometries);
-
-        let mut size_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
-        unsafe {
-            accel_loader.get_acceleration_structure_build_sizes(
-                vk::AccelerationStructureBuildTypeKHR::DEVICE,
-                &build_info,
-                Some(&primitive_counts),
-                &mut size_info,
-            );
-        }
-
-        self.finalize_accel_structure(
-            accel_loader,
-            size_info.acceleration_structure_size,
-            size_info.build_scratch_size,
+        self.create_accel(
             vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+            desc.flags,
+            &geometries,
+            &primitive_counts,
+        )
+    }
+
+    pub fn create_tlas(&self, desc: &TlasDesc) -> RhiResult<AccelerationStructure> {
+        self.create_accel(
+            vk::AccelerationStructureTypeKHR::TOP_LEVEL,
+            desc.flags,
+            &[tlas_geometry(desc)],
+            &[desc.instance_count],
         )
     }
 
     /// Vulkan's native TLAS instance layout matches the public fields byte-for-byte.
     pub fn tlas_instance_stride(&self) -> usize {
-        std::mem::size_of::<crate::types::TlasInstance>()
+        size_of::<TlasInstance>()
     }
 
     /// The public layout is already Vulkan's: an [`AccelHandle`](crate::AccelHandle) is the
-    /// structure's device address, which is what the instance descriptor wants. So this is a
-    /// byte copy, with no native descriptor type in between.
-    pub fn write_tlas_instance(&self, dst: &mut [u8], inst: &crate::types::TlasInstance) {
-        use zerocopy::IntoBytes;
-        dst[..size_of::<crate::types::TlasInstance>()].copy_from_slice(inst.as_bytes());
+    /// structure's device address, which is what the instance descriptor wants.
+    pub fn write_tlas_instance(&self, dst: &mut [u8], inst: &TlasInstance) {
+        dst[..size_of::<TlasInstance>()].copy_from_slice(inst.as_bytes());
     }
 
-    pub fn create_tlas(&self, desc: &TlasDesc) -> RhiResult<AccelerationStructure> {
+    /// Size a structure, allocate its storage and scratch, and create it.
+    fn create_accel(
+        &self,
+        ty: vk::AccelerationStructureTypeKHR,
+        flags: BuildAccelFlags,
+        geometries: &[vk::AccelerationStructureGeometryKHR<'_>],
+        primitive_counts: &[u32],
+    ) -> RhiResult<AccelerationStructure> {
         let accel_loader = &self.loaders.acceleration_structure;
-
-        let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::default()
-            .array_of_pointers(false)
-            .data(vk::DeviceOrHostAddressConstKHR {
-                device_address: desc.instance_buffer.address,
-            });
-        let geo_data = vk::AccelerationStructureGeometryDataKHR {
-            instances: instances_data,
-        };
-        let geometry = vk::AccelerationStructureGeometryKHR::default()
-            .geometry_type(vk::GeometryTypeKHR::INSTANCES)
-            .geometry(geo_data);
-        let geometries = [geometry];
-
-        let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
-            .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-            .flags(build_accel_flags_to_vk(desc.flags))
-            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-            .geometries(&geometries);
-
-        let mut size_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
+        let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
         unsafe {
             accel_loader.get_acceleration_structure_build_sizes(
                 vk::AccelerationStructureBuildTypeKHR::DEVICE,
-                &build_info,
-                Some(&[desc.instance_count]),
-                &mut size_info,
+                &build_geometry_info(ty, flags, geometries),
+                Some(primitive_counts),
+                &mut sizes,
             );
         }
+        let size = sizes.acceleration_structure_size;
 
-        self.finalize_accel_structure(
-            accel_loader,
-            size_info.acceleration_structure_size,
-            size_info.build_scratch_size,
-            vk::AccelerationStructureTypeKHR::TOP_LEVEL,
-        )
-    }
-
-    /// Allocate the backing buffer, create the acceleration structure, query its
-    /// device address, and wrap everything into the public `AccelerationStructure`.
-    /// Shared by `create_blas` / `create_tlas` — both only differ in the geometry
-    /// build info (which feeds size_info before this is called).
-    pub(crate) fn finalize_accel_structure(
-        &self,
-        accel_loader: &vk_accel_structure::Device,
-        size: u64,
-        scratch_size: u64,
-        ty: vk::AccelerationStructureTypeKHR,
-    ) -> RhiResult<AccelerationStructure> {
         // `create_acceleration_structure2` takes an address range, so the storage is an ordinary
         // suballocation rather than a dedicated buffer.
-        let (backing, backing_address) =
-            self.allocate_accel_range(size, 1, super::memory::BLOCK_BUFFER_USAGE)?;
+        let (backing, backing_address) = self.allocate_accel_range(size, 1, BLOCK_BUFFER_USAGE)?;
         let create_info = vk::AccelerationStructureCreateInfo2KHR::default()
             .address_range(
                 vk::DeviceAddressRangeKHR::default()
@@ -243,12 +224,11 @@ impl VulkanDevice {
             )
         };
 
-        // The pool carves at the alignment asked for, so the scratch range is exactly the size
-        // the build needs. It used to over-allocate by a whole `scratch_align` and shift inside.
+        // The pool carves at the alignment asked for, so the range is exactly the scratch size.
         let (scratch, scratch_address) = self.allocate_accel_range(
-            scratch_size,
+            sizes.build_scratch_size,
             self.accel_scratch_alignment,
-            super::memory::SCRATCH_BUFFER_USAGE,
+            SCRATCH_BUFFER_USAGE,
         )?;
         debug_assert_eq!(
             scratch_address % self.accel_scratch_alignment,

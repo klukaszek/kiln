@@ -88,7 +88,7 @@ pub struct GraphicsPso {
     pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
-backend_enum!(GraphicsPsoInner { vulkan: std::rc::Rc<crate::backend::vulkan::pipeline::VulkanGraphicsPso>, metal: Box<crate::backend::metal::pipeline::MetalGraphicsPso> });
+backend_enum!(GraphicsPsoInner { vulkan: std::rc::Rc<crate::backend::vulkan::pipeline::VulkanPipeline>, metal: Box<crate::backend::metal::pipeline::MetalGraphicsPso> });
 
 /// Description for creating a compute pipeline.
 #[derive(Clone, Debug, Default)]
@@ -108,7 +108,7 @@ pub struct ComputePso {
     pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
-backend_enum!(ComputePsoInner { vulkan: std::rc::Rc<crate::backend::vulkan::pipeline::VulkanComputePso>, metal: Box<crate::backend::metal::pipeline::MetalComputePso> });
+backend_enum!(ComputePsoInner { vulkan: std::rc::Rc<crate::backend::vulkan::pipeline::VulkanPipeline>, metal: Box<crate::backend::metal::pipeline::MetalComputePso> });
 
 /// Depth test and bias, baked into the pipeline.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -177,4 +177,4 @@ pub struct MeshletPso {
     pub(crate) _owner: Option<std::rc::Rc<crate::device::DeviceInner>>,
 }
 
-backend_enum!(MeshletPsoInner { vulkan: std::rc::Rc<crate::backend::vulkan::pipeline::VulkanMeshletPso>, metal: Box<crate::backend::metal::pipeline::MetalMeshletPso> });
+backend_enum!(MeshletPsoInner { vulkan: std::rc::Rc<crate::backend::vulkan::pipeline::VulkanPipeline>, metal: Box<crate::backend::metal::pipeline::MetalMeshletPso> });

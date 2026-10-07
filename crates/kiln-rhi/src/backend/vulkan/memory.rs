@@ -189,32 +189,14 @@ fn create_block(
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let buffer = unsafe { device.create_buffer(&buffer_info, None) }
         .map_err(|e| RhiError::AllocationFailed(e.into()))?;
-
-    let mut alloc_flags_info =
-        vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(size)
-        .memory_type_index(memory_type_index)
-        .push(&mut alloc_flags_info);
-    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
-        Ok(memory) => memory,
-        Err(error) => {
-            unsafe { device.destroy_buffer(buffer, None) };
-            return Err(RhiError::AllocationFailed(error.into()));
-        }
-    };
-
-    if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
-        unsafe {
-            device.destroy_buffer(buffer, None);
-            device.free_memory(memory, None);
-        }
-        return Err(RhiError::AllocationFailed(error.into()));
-    }
-
-    let base_address = unsafe {
-        device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
-    };
+    let (memory, base_address) =
+        match bind_device_address_memory(device, buffer, size, memory_type_index) {
+            Ok(bound) => bound,
+            Err(error) => {
+                unsafe { device.destroy_buffer(buffer, None) };
+                return Err(RhiError::AllocationFailed(error.into()));
+            }
+        };
 
     let mapped_ptr = if host_visible {
         match unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) } {
@@ -237,6 +219,34 @@ fn create_block(
         base_address,
         mapped_ptr,
     })
+}
+
+/// Allocate `size` bytes of `memory_type_index` with the `DEVICE_ADDRESS` flag, bind `buffer` to
+/// it, and return the memory and the buffer's address. The flag is required for any buffer whose
+/// address is taken and easy to omit, so every such allocation goes through here.
+///
+/// On failure the memory is freed; the buffer remains the caller's to destroy.
+fn bind_device_address_memory(
+    device: &ash::Device,
+    buffer: vk::Buffer,
+    size: u64,
+    memory_type_index: u32,
+) -> Result<(vk::DeviceMemory, u64), vk::Result> {
+    let mut flags =
+        vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(size)
+        .memory_type_index(memory_type_index)
+        .push(&mut flags);
+    let memory = unsafe { device.allocate_memory(&alloc_info, None) }?;
+    if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+        unsafe { device.free_memory(memory, None) };
+        return Err(error);
+    }
+    let address = unsafe {
+        device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+    };
+    Ok((memory, address))
 }
 
 /// # Safety
@@ -262,8 +272,6 @@ fn granularity_padded(alignment: u64, size: u64, granularity: u64) -> Option<(u6
 }
 
 /// Create a buffer, back it with memory of `properties`, bind it, and return its device address.
-/// The `DEVICE_ADDRESS` allocate flag is required for any buffer whose address is taken and is
-/// easy to omit, so every such allocation goes through here.
 pub(crate) fn allocate_bound_buffer(
     device: &ash::Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
@@ -280,48 +288,20 @@ pub(crate) fn allocate_bound_buffer(
     let buffer = unsafe { device.create_buffer(&buffer_info, None) }
         .map_err(|e| RhiError::AllocationFailed(format!("{what}: {e}").into()))?;
 
-    // Every failure past this point owns objects already created, so each unwinds what it holds
-    // rather than returning straight out.
     let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let Some(memory_type) =
-        crate::backend::vulkan::device::find_memorytype_index(&reqs, memory_properties, properties)
-    else {
-        unsafe { device.destroy_buffer(buffer, None) };
-        return Err(RhiError::AllocationFailed(
-            format!("No memory type for {what}").into(),
-        ));
-    };
-
-    let mut flags =
-        vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(reqs.size)
-        .memory_type_index(memory_type)
-        .push(&mut flags);
-    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
-        Ok(memory) => memory,
+    let bound = find_memorytype_index(&reqs, memory_properties, properties)
+        .ok_or_else(|| RhiError::AllocationFailed(format!("No memory type for {what}").into()))
+        .and_then(|memory_type| {
+            bind_device_address_memory(device, buffer, reqs.size, memory_type)
+                .map_err(|error| RhiError::AllocationFailed(format!("{what}: {error}").into()))
+        });
+    match bound {
+        Ok((memory, address)) => Ok((buffer, memory, address)),
         Err(error) => {
             unsafe { device.destroy_buffer(buffer, None) };
-            return Err(RhiError::AllocationFailed(
-                format!("{what}: {error}").into(),
-            ));
+            Err(error)
         }
-    };
-
-    if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
-        unsafe {
-            device.destroy_buffer(buffer, None);
-            device.free_memory(memory, None);
-        }
-        return Err(RhiError::AllocationFailed(
-            format!("{what}: {error}").into(),
-        ));
     }
-
-    let address = unsafe {
-        device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
-    };
-    Ok((buffer, memory, address))
 }
 
 impl VulkanDevice {
@@ -373,11 +353,9 @@ impl VulkanDevice {
     }
 
     pub fn create_allocation(&self, desc: &AllocationDesc) -> RhiResult<Allocation> {
-        // Allocations no longer own a `VkBuffer`: the pool's block does, and this is a range
-        // inside it. Requirements come from the block's usage, so they are the same for every
-        // allocation and are queried once.
-        let mut mem_requirements =
-            self.buffer_requirements(desc.size, super::memory::BLOCK_BUFFER_USAGE)?;
+        // An allocation is a range inside a pooled block, so its requirements come from the
+        // block's usage and are the same for every allocation.
+        let mut mem_requirements = self.buffer_requirements(desc.size, BLOCK_BUFFER_USAGE)?;
         // The caller's alignment may be stricter than the buffer's own requirement; the pool
         // carves at whichever is larger.
         mem_requirements.alignment = mem_requirements.alignment.max(desc.align).max(1);
@@ -401,9 +379,6 @@ impl VulkanDevice {
         if candidates[0] == candidates[1] {
             candidates[1] = None;
         }
-        if candidates.iter().all(Option::is_none) {
-            return Err(RhiError::AllocationFailed("No suitable memory type".into()));
-        }
 
         let mut attempt = Err(RhiError::AllocationFailed("No suitable memory type".into()));
         for candidate in candidates.into_iter().flatten() {
@@ -419,7 +394,7 @@ impl VulkanDevice {
                 &mem_requirements,
                 candidate,
                 host_visible,
-                super::memory::BLOCK_BUFFER_USAGE,
+                BLOCK_BUFFER_USAGE,
             );
             if attempt.is_ok() {
                 break;

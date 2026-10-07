@@ -5,8 +5,8 @@ use std::rc::Rc;
 
 use ash::vk;
 
+use super::command::COLOR_SUBRESOURCE;
 use super::device::{VulkanDevice, format_to_vk, vk_to_format};
-
 use super::surface::VulkanSurface;
 use crate::error::{RhiError, RhiResult};
 use crate::swapchain::{Swapchain, SwapchainDesc};
@@ -328,13 +328,7 @@ impl VulkanDevice {
                         b: vk::ComponentSwizzle::IDENTITY,
                         a: vk::ComponentSwizzle::IDENTITY,
                     })
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
+                    .subresource_range(COLOR_SUBRESOURCE)
                     .image(image);
                 unsafe {
                     self.loaders

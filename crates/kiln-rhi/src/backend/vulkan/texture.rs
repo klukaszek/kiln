@@ -3,13 +3,25 @@
 use ash::vk;
 
 use super::device::{
-    IMAGE_LAYOUT, VulkanDevice, format_has_stencil, format_to_vk, is_depth_format,
+    IMAGE_LAYOUT, SharedTextures, VulkanDevice, format_has_stencil, format_to_vk, is_depth_format,
 };
 use super::queue::VulkanRetiredResource;
-
 use crate::error::{RhiError, RhiResult};
-use crate::texture::{Texture, TextureDesc, TextureSizeAlign, TextureUsage, ViewKind};
+use crate::texture::{
+    Texture, TextureDesc, TextureSizeAlign, TextureUsage, TextureViewDesc, ViewKind,
+};
 use crate::types::{Format, GpuPtr, TextureDimension, TextureHandle, TextureId};
+
+fn view_type(dimension: TextureDimension) -> vk::ImageViewType {
+    match dimension {
+        TextureDimension::D1 => vk::ImageViewType::TYPE_1D,
+        TextureDimension::D2 => vk::ImageViewType::TYPE_2D,
+        TextureDimension::D2Array => vk::ImageViewType::TYPE_2D_ARRAY,
+        TextureDimension::D3 => vk::ImageViewType::TYPE_3D,
+        TextureDimension::Cube => vk::ImageViewType::CUBE,
+        TextureDimension::CubeArray => vk::ImageViewType::CUBE_ARRAY,
+    }
+}
 
 /// A texture under construction, destroyed on drop unless
 /// [`into_registered`](PartialTexture::into_registered) disarms it, so a failure part-way through
@@ -19,7 +31,7 @@ struct PartialTexture<'a> {
     image: vk::Image,
     image_view: vk::ImageView,
     texture_id: Option<TextureId>,
-    textures: &'a super::device::SharedTextures,
+    textures: &'a SharedTextures,
 }
 
 impl PartialTexture<'_> {
@@ -78,7 +90,6 @@ impl VulkanDevice {
         let vk_format = format_to_vk(desc.format);
 
         let mut usage = vk::ImageUsageFlags::empty();
-        use crate::texture::TextureUsage;
         let pairs = [
             (TextureUsage::SAMPLED, vk::ImageUsageFlags::SAMPLED),
             (TextureUsage::STORAGE, vk::ImageUsageFlags::STORAGE),
@@ -169,7 +180,7 @@ impl VulkanDevice {
             .ok_or_else(|| {
                 RhiError::TextureCreation(
                     format!(
-                        "texture allocation address 0x{:x} was not returned by gpuMalloc",
+                        "texture address {:#x} is not inside any allocation",
                         texture_gpu.address
                     )
                     .into(),
@@ -180,26 +191,17 @@ impl VulkanDevice {
         Ok((alloc.memory, alloc.memory_offset + offset))
     }
 
-    /// Full-resource view of `image`, covering every mip and layer.
-    /// The view description for a texture's default view. Attachments need a real `VkImageView`,
-    /// while descriptors are written from this info directly, so both are derived from it.
+    /// The full-resource view of a texture, covering every mip and layer. Attachments need a real
+    /// `VkImageView`, while descriptors are written from this info directly.
     fn default_view_info(
         desc: &TextureDesc,
         image: vk::Image,
         array_layers: u32,
         vk_format: vk::Format,
     ) -> vk::ImageViewCreateInfo<'static> {
-        let view_type = match desc.dimension {
-            TextureDimension::D1 => vk::ImageViewType::TYPE_1D,
-            TextureDimension::D2 => vk::ImageViewType::TYPE_2D,
-            TextureDimension::D2Array => vk::ImageViewType::TYPE_2D_ARRAY,
-            TextureDimension::D3 => vk::ImageViewType::TYPE_3D,
-            TextureDimension::Cube => vk::ImageViewType::CUBE,
-            TextureDimension::CubeArray => vk::ImageViewType::CUBE_ARRAY,
-        };
         vk::ImageViewCreateInfo::default()
             .image(image)
-            .view_type(view_type)
+            .view_type(view_type(desc.dimension))
             .format(vk_format)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: texture_aspect(desc.format),
@@ -303,8 +305,7 @@ impl VulkanDevice {
     }
 
     pub fn destroy_texture_view(&self, id: TextureId) {
-        // Taking the entry is itself the claim, so a second call finds nothing to do. Only
-        // entries that really are views are claimed; a base texture keeps its slot.
+        // Only claims views, and only once; a base texture keeps its slot.
         let retired = self.textures.take_if(id.0, |t| t.is_view);
         if let Some(texture) = retired {
             self.queue
@@ -321,68 +322,41 @@ impl VulkanDevice {
 
     pub fn create_texture_view(
         &self,
-        source: &crate::texture::Texture,
-        view: &crate::texture::TextureViewDesc,
+        source: &Texture,
+        view: &TextureViewDesc,
         kind: ViewKind,
     ) -> RhiResult<TextureId> {
         let storage = kind == ViewKind::Storage;
-        let (src_image, src_format, src_aspect, src_mip_levels, src_array_layers, src_view_type) = {
-            let src_image = self
-                .textures
-                .with(source.id.0, |t| t.image)
-                .ok_or_else(|| {
-                    RhiError::Backend("create texture view: invalid source TextureId".into())
-                })?;
-
-            let fmt = format_to_vk(source.desc().format);
-            let aspect = if is_depth_format(source.desc().format) {
-                vk::ImageAspectFlags::DEPTH
-            } else {
-                vk::ImageAspectFlags::COLOR
-            };
-            let mips = source.desc().mip_levels;
-            let layers = source
-                .desc()
-                .dimension
-                .face_count(source.desc().array_layers);
-            let vt = match source.desc().dimension {
-                TextureDimension::D1 => vk::ImageViewType::TYPE_1D,
-                TextureDimension::D2 => vk::ImageViewType::TYPE_2D,
-                TextureDimension::D2Array => vk::ImageViewType::TYPE_2D_ARRAY,
-                TextureDimension::D3 => vk::ImageViewType::TYPE_3D,
-                TextureDimension::Cube => vk::ImageViewType::CUBE,
-                TextureDimension::CubeArray => vk::ImageViewType::CUBE_ARRAY,
-            };
-            (src_image, fmt, aspect, mips, layers, vt)
-        };
-
-        let vk_format = view.format.map(format_to_vk).unwrap_or(src_format);
-
-        let level_count = view.resolved_mip_count(src_mip_levels);
-        let layer_count = view.resolved_layer_count(src_array_layers);
+        let src = source.desc();
+        let src_image = self
+            .textures
+            .with(source.id.0, |t| t.image)
+            .ok_or_else(|| {
+                RhiError::Backend("create texture view: invalid source TextureId".into())
+            })?;
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(src_image)
-            .view_type(src_view_type)
-            .format(vk_format)
+            .view_type(view_type(src.dimension))
+            .format(format_to_vk(view.format.unwrap_or(src.format)))
             .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: src_aspect,
+                aspect_mask: texture_aspect(src.format),
                 base_mip_level: view.base_mip as u32,
-                level_count,
+                level_count: view.resolved_mip_count(src.mip_levels),
                 base_array_layer: view.base_layer as u32,
-                layer_count,
+                layer_count: view.resolved_layer_count(src.dimension.face_count(src.array_layers)),
             });
 
-        let image_view = unsafe {
-            self.loaders
-                .device
-                .create_image_view(&view_info, None)
-                .map_err(|e| {
-                    RhiError::TextureCreation(format!("create texture view: {e}").into())
-                })?
-        };
+        let image_view = unsafe { self.loaders.device.create_image_view(&view_info, None) }
+            .map_err(|e| RhiError::TextureCreation(format!("create texture view: {e}").into()))?;
 
-        let texture_id = TextureId(self.textures.allocate_id()?);
+        let texture_id = match self.textures.allocate_id() {
+            Ok(id) => TextureId(id),
+            Err(err) => {
+                unsafe { self.loaders.device.destroy_image_view(image_view, None) };
+                return Err(err);
+            }
+        };
 
         let layout = if storage {
             vk::ImageLayout::GENERAL

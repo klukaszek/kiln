@@ -1,174 +1,52 @@
+use std::ffi::CString;
+use std::rc::Rc;
+
 use ash::vk;
 use ash::vk::TaggedStructure as _;
+use smallvec::SmallVec;
 
-use super::device::{VulkanDevice, spirv_words};
-use super::device::{compare_op_to_vk, format_to_vk};
+use super::device::{VulkanDevice, compare_op_to_vk, format_to_vk, spirv_words};
 use super::shader::VulkanShaderModule;
-use crate::error::{RhiError, RhiResult};
-use crate::pipeline::{BlendAttachment, ColorTarget, DepthState};
+use crate::error::{ErrorDetail, RhiError, RhiResult};
 use crate::pipeline::{
-    ComputePso, ComputePsoDesc, GraphicsPso, GraphicsPsoDesc, MeshletPso, MeshletPsoDesc,
+    BlendAttachment, ComputePso, ComputePsoDesc, GraphicsPso, MeshletPso, RasterPsoDesc,
 };
 use crate::shader::{ShaderModule, ShaderModuleDesc};
-use crate::types::{BlendFactor, BlendOp, ColorWriteMask, Cull, DepthFlags, SampleCount, Topology};
-use smallvec::SmallVec;
-use std::ffi::CString;
+use crate::types::{BlendFactor, BlendOp, ColorWriteMask, Cull, DepthFlags, Topology};
 
-/// Depth state is baked into the pipeline on both backends; see `RasterPsoDesc`.
-fn depth_stencil_create_info(
-    depth: DepthState,
-) -> vk::PipelineDepthStencilStateCreateInfo<'static> {
-    vk::PipelineDepthStencilStateCreateInfo::default()
-        .depth_test_enable(depth.mode.contains(DepthFlags::READ))
-        .depth_write_enable(depth.mode.contains(DepthFlags::WRITE))
-        .depth_compare_op(compare_op_to_vk(depth.compare))
-}
-
-/// Vulkan graphics pipeline state.
-///
-/// Holds the pipeline and nothing else: the descriptor it was built from is consumed by
-/// `create_raster_pipeline` and never needed again, and keeping it would mean keeping
-/// `vk::ShaderModule` handles that dangle once the caller drops the `ShaderModule`.
-pub struct VulkanGraphicsPso {
+/// A graphics, compute or mesh pipeline. Command buffers hold an `Rc` to every pipeline they
+/// bind, so dropping the application's handle never destroys one still in use.
+pub struct VulkanPipeline {
     pub(crate) pipeline: vk::Pipeline,
-    pub(crate) device: ash::Device,
+    device: ash::Device,
 }
 
-/// Vulkan compute pipeline state.
-pub struct VulkanComputePso {
-    pub(crate) pipeline: vk::Pipeline,
-    pub(crate) device: ash::Device,
-}
-
-impl Drop for VulkanComputePso {
-    /// Destroys immediately; the caller guarantees no in-flight submission still references it.
+impl Drop for VulkanPipeline {
     fn drop(&mut self) {
-        unsafe {
-            self.device.destroy_pipeline(self.pipeline, None);
-        }
+        // SAFETY: the last `Rc` is gone, so no recorded or in-flight command buffer binds it.
+        unsafe { self.device.destroy_pipeline(self.pipeline, None) };
     }
 }
 
-/// Raster state shared by the vertex and mesh pipeline paths.
-pub(crate) struct RasterState<'a> {
-    pub(crate) color_targets: &'a [ColorTarget],
-    pub(crate) depth_format: Option<vk::Format>,
-    pub(crate) depth: DepthState,
-    pub(crate) sample_count: SampleCount,
-    pub(crate) alpha_to_coverage: bool,
-    pub(crate) cull: Cull,
-    pub(crate) blend: &'a [BlendAttachment],
+fn stage_info(
+    stage: vk::ShaderStageFlags,
+    module: &VulkanShaderModule,
+) -> vk::PipelineShaderStageCreateInfo<'_> {
+    vk::PipelineShaderStageCreateInfo::default()
+        .stage(stage)
+        .module(module.module)
+        .name(&module.entry_point)
 }
 
-/// Build a raster pipeline. `topology` is `Some` for the vertex path, which also needs vertex-input
-/// and input-assembly state; the mesh path passes `None` and supplies neither.
-pub(crate) fn create_raster_pipeline(
-    device: &ash::Device,
-    cache: vk::PipelineCache,
-    stages: &[vk::PipelineShaderStageCreateInfo<'_>],
-    topology: Option<Topology>,
-    state: &RasterState<'_>,
-    what: &str,
-) -> RhiResult<vk::Pipeline> {
-    // Always empty: vertex data is read through pointers in the shader, never bound. The
-    // struct is still required for a pipeline that has a vertex stage.
-    let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
-    let input_assembly =
-        vk::PipelineInputAssemblyStateCreateInfo::default().topology(match topology {
-            Some(Topology::TriangleStrip) => vk::PrimitiveTopology::TRIANGLE_STRIP,
-            _ => vk::PrimitiveTopology::TRIANGLE_LIST,
-        });
-
-    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-        .viewport_count(1)
-        .scissor_count(1);
-
-    let (cull_mode, front_face) = cull_to_vk(state.cull);
-    let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
-        .polygon_mode(vk::PolygonMode::FILL)
-        .line_width(1.0)
-        .cull_mode(cull_mode)
-        .front_face(front_face);
-
-    // `VkSampleCountFlagBits` is the sample count itself as a single bit.
-    let samples = vk::SampleCountFlags::from_raw(state.sample_count.count());
-    let mut multisampling =
-        vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(samples);
-    if state.alpha_to_coverage {
-        multisampling = multisampling.alpha_to_coverage_enable(true);
-    }
-
-    let depth_stencil = depth_stencil_create_info(state.depth);
-
-    let color_blend_attachments: SmallVec<[vk::PipelineColorBlendAttachmentState; 4]> = state
-        .color_targets
-        .iter()
-        .enumerate()
-        .map(|(i, target)| {
-            let att = state.blend.get(i).copied().unwrap_or_default();
-            blend_attachment_to_vk(att, target.write_mask)
-        })
-        .collect();
-    let color_blending =
-        vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
-
-    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-    let dynamic_state_info =
-        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-
-    let color_attachment_formats: SmallVec<[vk::Format; 4]> = state
-        .color_targets
-        .iter()
-        .map(|t| format_to_vk(t.format))
-        .collect();
-    let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
-        .color_attachment_formats(&color_attachment_formats)
-        .depth_attachment_format(state.depth_format.unwrap_or(vk::Format::UNDEFINED))
-        .stencil_attachment_format(vk::Format::UNDEFINED);
-
-    // Bindless goes through the descriptor heap, so the pipeline opts in and carries no layout.
-    // The bit only exists on `PipelineCreateFlags2`, hence the pNext rather than `.flags()`.
-    let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default()
-        .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT);
-    let mut pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-        .stages(stages)
-        .viewport_state(&viewport_state)
-        .rasterization_state(&rasterizer)
-        .multisample_state(&multisampling)
-        .depth_stencil_state(&depth_stencil)
-        .color_blend_state(&color_blending)
-        .dynamic_state(&dynamic_state_info)
-        .layout(vk::PipelineLayout::null())
-        .push(&mut rendering_info)
-        .push(&mut flags2);
-    if topology.is_some() {
-        pipeline_info = pipeline_info
-            .vertex_input_state(&vertex_input_info)
-            .input_assembly_state(&input_assembly);
-    }
-
-    let pipelines = unsafe {
-        device
-            .create_graphics_pipelines(cache, &[pipeline_info], None)
-            .map_err(|(_, e)| {
-                RhiError::PipelineCreation(format!("Vulkan {what} pipeline creation: {e:?}").into())
-            })?
-    };
-    Ok(pipelines[0])
+/// Bindless goes through the descriptor heap, so pipelines opt in and carry no layout. The bit
+/// only exists on `PipelineCreateFlags2`, hence a pNext rather than `.flags()`.
+fn descriptor_heap_flags() -> vk::PipelineCreateFlags2CreateInfo<'static> {
+    vk::PipelineCreateFlags2CreateInfo::default()
+        .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT)
 }
 
-impl Drop for VulkanGraphicsPso {
-    /// Destroys immediately; the caller guarantees no in-flight submission still references it.
-    fn drop(&mut self) {
-        unsafe {
-            self.device.destroy_pipeline(self.pipeline, None);
-        }
-    }
-}
-
-/// Translate the unified `Cull` value into Vulkan's `(cull_mode_flags, front_face)`.
-/// All variants use CCW as the implied front-face convention.
 fn cull_to_vk(cull: Cull) -> (vk::CullModeFlags, vk::FrontFace) {
+    // Kiln's front face is always counter-clockwise.
     let front = vk::FrontFace::COUNTER_CLOCKWISE;
     match cull {
         Cull::None => (vk::CullModeFlags::NONE, front),
@@ -184,7 +62,6 @@ fn blend_attachment_to_vk(
     let mut state = vk::PipelineColorBlendAttachmentState::default()
         .color_write_mask(color_write_mask_to_vk(write_mask))
         .blend_enable(att.blend_enable);
-
     if att.blend_enable {
         state = state
             .src_color_blend_factor(blend_factor_to_vk(att.src_color))
@@ -194,7 +71,6 @@ fn blend_attachment_to_vk(
             .dst_alpha_blend_factor(blend_factor_to_vk(att.dst_alpha))
             .alpha_blend_op(blend_op_to_vk(att.alpha_op));
     }
-
     state
 }
 
@@ -240,37 +116,15 @@ fn blend_op_to_vk(op: BlendOp) -> vk::BlendOp {
     }
 }
 
-/// Vulkan meshlet (mesh shader) pipeline state. Requires `VK_EXT_mesh_shader`; built without a
-/// vertex or geometry stage, since the mesh stage replaces both.
-pub struct VulkanMeshletPso {
-    pub(crate) pipeline: vk::Pipeline,
-    pub(crate) device: ash::Device,
-}
-
-impl Drop for VulkanMeshletPso {
-    /// Destroys immediately; the caller guarantees no in-flight submission still references it.
-    fn drop(&mut self) {
-        unsafe {
-            self.device.destroy_pipeline(self.pipeline, None);
-        }
-    }
-}
-
 impl VulkanDevice {
     pub fn create_shader_module(&self, desc: &ShaderModuleDesc) -> RhiResult<ShaderModule> {
         let code = spirv_words(desc.code)?;
-
         let shader_info = vk::ShaderModuleCreateInfo::default().code(&code);
-
-        let module = unsafe {
-            self.loaders
-                .device
-                .create_shader_module(&shader_info, None)
-                .map_err(|e| RhiError::ShaderCompilation(e.into()))?
-        };
+        let module = unsafe { self.loaders.device.create_shader_module(&shader_info, None) }
+            .map_err(|e| RhiError::ShaderCompilation(e.into()))?;
 
         let entry_point = CString::new(desc.entry_point).map_err(|e| {
-            RhiError::ShaderCompilation(crate::error::ErrorDetail::with_source(
+            RhiError::ShaderCompilation(ErrorDetail::with_source(
                 format!(
                     "entry point {:?} contains an interior NUL",
                     desc.entry_point
@@ -291,135 +145,174 @@ impl VulkanDevice {
         })
     }
 
-    pub fn create_graphics_pso(
-        &self,
-        desc: &GraphicsPsoDesc,
-        vert_module: &VulkanShaderModule,
-        frag_module: &VulkanShaderModule,
-    ) -> RhiResult<GraphicsPso> {
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vert_module.module)
-                .name(&vert_module.entry_point),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(frag_module.module)
-                .name(&frag_module.entry_point),
-        ];
-        let pipeline = super::pipeline::create_raster_pipeline(
-            &self.loaders.device,
-            self.pipeline_cache,
-            &stages,
-            Some(desc.topology),
-            &super::pipeline::RasterState {
-                color_targets: desc.color_targets,
-                depth_format: desc.depth_format.map(format_to_vk),
-                depth: desc.depth,
-                sample_count: desc.sample_count,
-                alpha_to_coverage: desc.alpha_to_coverage,
-                cull: desc.cull,
-                blend: desc.blend,
-            },
-            "graphics",
-        )?;
-        if let Some(label) = desc.label {
+    fn wrap_pipeline(&self, pipeline: vk::Pipeline, label: Option<&str>) -> Rc<VulkanPipeline> {
+        if let Some(label) = label {
             self.set_object_name(pipeline, label);
         }
-
-        Ok(GraphicsPso {
-            inner: std::rc::Rc::new(VulkanGraphicsPso {
-                pipeline,
-                device: self.loaders.device.clone(),
-            }),
-            _owner: None,
+        Rc::new(VulkanPipeline {
+            pipeline,
+            device: self.loaders.device.clone(),
         })
     }
 
-    /// `_threads` is the frontend's resolved `[numthreads]`, which Metal needs at dispatch.
-    /// Vulkan takes it from the SPIR-V, so the size is validated by the caller and dropped here.
-    pub fn create_compute_pso(
+    /// Build a raster pipeline. The vertex path passes `vertex_input`, and with it the vertex-input
+    /// and input-assembly state; the mesh stage replaces both.
+    fn create_raster_pipeline(
         &self,
-        desc: &ComputePsoDesc,
-        shader: &VulkanShaderModule,
-        _threads: Option<[u32; 3]>,
-    ) -> RhiResult<ComputePso> {
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(shader.module)
-            .name(&shader.entry_point);
+        desc: &RasterPsoDesc,
+        stages: &[vk::PipelineShaderStageCreateInfo<'_>],
+        vertex_input: bool,
+        what: &str,
+    ) -> RhiResult<Rc<VulkanPipeline>> {
+        // Always empty: vertex data is read through pointers in the shader, never bound.
+        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
+        let input_assembly =
+            vk::PipelineInputAssemblyStateCreateInfo::default().topology(match desc.topology {
+                Topology::TriangleList => vk::PrimitiveTopology::TRIANGLE_LIST,
+                Topology::TriangleStrip => vk::PrimitiveTopology::TRIANGLE_STRIP,
+            });
 
-        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default()
-            .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT);
-        let pipeline_info = vk::ComputePipelineCreateInfo::default()
-            .stage(stage)
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+
+        let (cull_mode, front_face) = cull_to_vk(desc.cull);
+        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .line_width(1.0)
+            .cull_mode(cull_mode)
+            .front_face(front_face);
+
+        // `VkSampleCountFlagBits` is the sample count itself as a single bit.
+        let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::from_raw(desc.sample_count.count()))
+            .alpha_to_coverage_enable(desc.alpha_to_coverage);
+
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(desc.depth.mode.contains(DepthFlags::READ))
+            .depth_write_enable(desc.depth.mode.contains(DepthFlags::WRITE))
+            .depth_compare_op(compare_op_to_vk(desc.depth.compare));
+
+        let blend_attachments: SmallVec<[vk::PipelineColorBlendAttachmentState; 4]> = desc
+            .color_targets
+            .iter()
+            .enumerate()
+            .map(|(i, target)| {
+                blend_attachment_to_vk(
+                    desc.blend.get(i).copied().unwrap_or_default(),
+                    target.write_mask,
+                )
+            })
+            .collect();
+        let color_blending =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state_info =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+        let color_formats: SmallVec<[vk::Format; 4]> = desc
+            .color_targets
+            .iter()
+            .map(|t| format_to_vk(t.format))
+            .collect();
+        let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(
+                desc.depth_format
+                    .map_or(vk::Format::UNDEFINED, format_to_vk),
+            )
+            .stencil_attachment_format(vk::Format::UNDEFINED);
+
+        let mut flags2 = descriptor_heap_flags();
+        let mut pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(stages)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterizer)
+            .multisample_state(&multisampling)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blending)
+            .dynamic_state(&dynamic_state_info)
             .layout(vk::PipelineLayout::null())
+            .push(&mut rendering_info)
             .push(&mut flags2);
-
-        let pipelines = unsafe {
-            self.loaders
-                .device
-                .create_compute_pipelines(self.pipeline_cache, &[pipeline_info], None)
-                .map_err(|e| RhiError::PipelineCreation(format!("{e:?}").into()))?
-        };
-
-        if let Some(label) = desc.label {
-            self.set_object_name(pipelines[0], label);
+        if vertex_input {
+            pipeline_info = pipeline_info
+                .vertex_input_state(&vertex_input_info)
+                .input_assembly_state(&input_assembly);
         }
 
-        Ok(ComputePso {
-            inner: std::rc::Rc::new(VulkanComputePso {
-                pipeline: pipelines[0],
-                device: self.loaders.device.clone(),
-            }),
+        let pipelines = unsafe {
+            self.loaders.device.create_graphics_pipelines(
+                self.pipeline_cache,
+                &[pipeline_info],
+                None,
+            )
+        }
+        .map_err(|(_, e)| {
+            RhiError::PipelineCreation(format!("Vulkan {what} pipeline creation: {e:?}").into())
+        })?;
+        Ok(self.wrap_pipeline(pipelines[0], desc.label))
+    }
+
+    pub fn create_graphics_pso(
+        &self,
+        desc: &RasterPsoDesc,
+        vertex: &VulkanShaderModule,
+        fragment: &VulkanShaderModule,
+    ) -> RhiResult<GraphicsPso> {
+        let stages = [
+            stage_info(vk::ShaderStageFlags::VERTEX, vertex),
+            stage_info(vk::ShaderStageFlags::FRAGMENT, fragment),
+        ];
+        Ok(GraphicsPso {
+            inner: self.create_raster_pipeline(desc, &stages, true, "graphics")?,
             _owner: None,
         })
     }
 
     pub fn create_meshlet_pso(
         &self,
-        desc: &MeshletPsoDesc,
-        mesh_module: &VulkanShaderModule,
-        frag_module: &VulkanShaderModule,
+        desc: &RasterPsoDesc,
+        mesh: &VulkanShaderModule,
+        fragment: &VulkanShaderModule,
         // Vulkan reads the mesh threadgroup size from the SPIR-V.
         _threads_per_mesh_group: Option<[u32; 3]>,
     ) -> RhiResult<MeshletPso> {
         let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::MESH_EXT)
-                .module(mesh_module.module)
-                .name(&mesh_module.entry_point),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(frag_module.module)
-                .name(&frag_module.entry_point),
+            stage_info(vk::ShaderStageFlags::MESH_EXT, mesh),
+            stage_info(vk::ShaderStageFlags::FRAGMENT, fragment),
         ];
-        // `None` topology: the mesh stage replaces vertex input and input assembly.
-        let pipeline = super::pipeline::create_raster_pipeline(
-            &self.loaders.device,
-            self.pipeline_cache,
-            &stages,
-            None,
-            &super::pipeline::RasterState {
-                color_targets: desc.color_targets,
-                depth_format: desc.depth_format.map(format_to_vk),
-                depth: desc.depth,
-                sample_count: desc.sample_count,
-                alpha_to_coverage: desc.alpha_to_coverage,
-                cull: desc.cull,
-                blend: desc.blend,
-            },
-            "meshlet",
-        )?;
-        if let Some(label) = desc.label {
-            self.set_object_name(pipeline, label);
-        }
-
         Ok(MeshletPso {
-            inner: std::rc::Rc::new(VulkanMeshletPso {
-                pipeline,
-                device: self.loaders.device.clone(),
-            }),
+            inner: self.create_raster_pipeline(desc, &stages, false, "meshlet")?,
+            _owner: None,
+        })
+    }
+
+    /// Vulkan reads `[numthreads]` from the SPIR-V; `_threads` is for Metal, which cannot.
+    pub fn create_compute_pso(
+        &self,
+        desc: &ComputePsoDesc,
+        shader: &VulkanShaderModule,
+        _threads: Option<[u32; 3]>,
+    ) -> RhiResult<ComputePso> {
+        let mut flags2 = descriptor_heap_flags();
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage_info(vk::ShaderStageFlags::COMPUTE, shader))
+            .layout(vk::PipelineLayout::null())
+            .push(&mut flags2);
+        let pipelines = unsafe {
+            self.loaders.device.create_compute_pipelines(
+                self.pipeline_cache,
+                &[pipeline_info],
+                None,
+            )
+        }
+        .map_err(|(_, e)| {
+            RhiError::PipelineCreation(format!("Vulkan compute pipeline creation: {e:?}").into())
+        })?;
+        Ok(ComputePso {
+            inner: self.wrap_pipeline(pipelines[0], desc.label),
             _owner: None,
         })
     }

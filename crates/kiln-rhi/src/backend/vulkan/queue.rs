@@ -1,25 +1,25 @@
 //! Vulkan queue: submission, frame acquisition, presentation, and resource retirement.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 use ash::khr::swapchain;
 use ash::{Device, vk};
 use smallvec::SmallVec;
 
-use super::command::RetainedPipeline;
+use super::accel::VulkanAccelerationStructure;
+use super::command::VulkanCommandBuffer;
+use super::device::{SharedSamplerIds, SharedTextures};
 use super::memory::{SharedBufferPool, VulkanBuffer};
+use super::pipeline::VulkanPipeline;
 use super::swapchain::VulkanSwapchain;
 use super::texture::VulkanTexture;
 use crate::backend::retire::RetirementQueue;
 use crate::error::{RhiError, RhiResult};
 use crate::queue::SubmitDesc;
 use crate::sync::TimelineSemaphore;
-use crate::types::MAX_FRAMES_IN_FLIGHT;
-use crate::types::{SamplerId, TextureId};
-
-use super::command::VulkanCommandBuffer;
-use super::device::{SharedSamplerIds, SharedTextures};
+use crate::types::{MAX_FRAMES_IN_FLIGHT, SamplerId, TextureId};
 
 /// Vulkan queue wrapper.
 pub struct VulkanQueue {
@@ -35,7 +35,7 @@ pub struct VulkanQueue {
     pub(crate) pending_commands: RefCell<VecDeque<PendingCommand>>,
     pub(crate) available_commands: RefCell<Vec<vk::CommandBuffer>>,
     pub(crate) completion_semaphore: vk::Semaphore,
-    pub(crate) next_completion_value: RefCell<u64>,
+    pub(crate) next_completion_value: Cell<u64>,
     /// The last frame submission on each in-flight slot. Lives here rather than on the swapchain
     /// because a slot outlives the swapchain it last presented to.
     pub(crate) frames: RefCell<[FrameSubmission; MAX_FRAMES_IN_FLIGHT]>,
@@ -62,14 +62,14 @@ pub(crate) struct PendingCommand {
     pub(crate) completion_value: u64,
     /// Pipelines the application may have dropped while this submission still bound them.
     /// Released by [`VulkanQueue::reclaim_completed_commands`] once the submission retires.
-    pub(crate) retained_pipelines: SmallVec<[RetainedPipeline; 4]>,
+    pub(crate) retained_pipelines: SmallVec<[Rc<VulkanPipeline>; 4]>,
 }
 
 pub(crate) enum VulkanRetiredResource {
     Buffer(VulkanBuffer),
     /// The `VkAccelerationStructureKHR` plus its backing and scratch ranges. Destroying any of
     /// them while a frame is still tracing against the structure is a use-after-free.
-    Accel(Box<super::accel::VulkanAccelerationStructure>),
+    Accel(Box<VulkanAccelerationStructure>),
     Texture {
         id: TextureId,
         texture: VulkanTexture,
@@ -112,14 +112,12 @@ impl VulkanQueue {
 
     /// Hold a destroyed resource until every submission issued so far has retired, then free it:
     /// destroy the native handles, hand any bindless ID back to the free list, and return the
-    /// buffer range to the pool. Nothing has been submitted yet means nothing can reference it,
-    /// so that case frees immediately.
+    /// buffer range to the pool. With nothing submitted yet, it is freed immediately.
     pub(crate) fn release_resource(&self, resource: VulkanRetiredResource) {
-        self.retired_resources.release(
-            *self.next_completion_value.borrow(),
-            resource,
-            |resource| self.free_resource(resource),
-        );
+        self.retired_resources
+            .release(self.next_completion_value.get(), resource, |resource| {
+                self.free_resource(resource)
+            });
     }
 
     fn collect_retired(&self, completed: u64) {
@@ -129,8 +127,7 @@ impl VulkanQueue {
 
     fn free_resource(&self, resource: VulkanRetiredResource) {
         match &resource {
-            // The block owns the mapping and the memory; the buffer only returns its range.
-            // Nothing to destroy: the range simply returns to its block.
+            // The block owns the memory and its mapping; the buffer only returns its range.
             VulkanRetiredResource::Buffer(buffer) => {
                 self.buffer_pool.borrow_mut().release(
                     buffer.block_index,
@@ -175,11 +172,33 @@ impl VulkanQueue {
     }
 
     fn next_completion_value(&self) -> RhiResult<u64> {
-        let mut next = self.next_completion_value.borrow_mut();
-        *next = next
+        let next = self
+            .next_completion_value
+            .get()
             .checked_add(1)
             .ok_or_else(|| RhiError::QueueSubmit("Vulkan completion timeline exhausted".into()))?;
-        Ok(*next)
+        self.next_completion_value.set(next);
+        Ok(next)
+    }
+
+    /// Block until the completion timeline reaches `value`.
+    fn wait_for_completion(&self, value: u64) -> Result<(), vk::Result> {
+        let semaphores = [self.completion_semaphore];
+        let values = [value];
+        let wait = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        // SAFETY: the semaphore is this device's, and `value` was handed to a submission.
+        unsafe { self.device.wait_semaphores(&wait, u64::MAX) }
+    }
+
+    /// Free a command buffer that failed before it reached the queue.
+    fn discard(&self, command_buffer: vk::CommandBuffer) {
+        // SAFETY: it never reached the queue, so nothing references it.
+        unsafe {
+            self.device
+                .free_command_buffers(self.command_pool, &[command_buffer])
+        };
     }
 
     pub fn submit_with_desc(
@@ -189,14 +208,11 @@ impl VulkanQueue {
     ) -> RhiResult<()> {
         self.reclaim_completed_commands();
         if let Err(error) = cmd.finish() {
-            unsafe {
-                self.device
-                    .free_command_buffers(self.command_pool, &[cmd.command_buffer]);
-            }
+            self.discard(cmd.command_buffer);
             return Err(error);
         }
-        let waits = timeline_waits(desc.wait_semaphores);
-        let mut signals = timeline_waits(desc.signal_semaphores);
+        let waits = timeline_entries(desc.wait_semaphores);
+        let mut signals = timeline_entries(desc.signal_semaphores);
         let completion_value = self.next_completion_value()?;
         signals.push(semaphore_submit(
             self.completion_semaphore,
@@ -205,10 +221,7 @@ impl VulkanQueue {
         if let Err(err) =
             self.submit_timeline(cmd.command_buffer, &waits, &signals, vk::Fence::null())
         {
-            unsafe {
-                self.device
-                    .free_command_buffers(self.command_pool, &[cmd.command_buffer]);
-            }
+            self.discard(cmd.command_buffer);
             return Err(err);
         }
         self.pending_commands
@@ -346,8 +359,8 @@ impl VulkanQueue {
 
     pub fn submit_frame(
         &self,
-        mut cmd: super::command::VulkanCommandBuffer,
-        sc: &super::swapchain::VulkanSwapchain,
+        mut cmd: VulkanCommandBuffer,
+        sc: &VulkanSwapchain,
         frame_index: usize,
         image_index: u32,
     ) -> RhiResult<()> {
@@ -359,10 +372,7 @@ impl VulkanQueue {
             ));
         }
         if let Err(error) = cmd.finish() {
-            unsafe {
-                self.device
-                    .free_command_buffers(self.command_pool, &[cmd.command_buffer]);
-            }
+            self.discard(cmd.command_buffer);
             return Err(error);
         }
         let (present_complete, fence) = {
@@ -420,30 +430,16 @@ impl VulkanQueue {
             completion_value,
         )];
         self.submit_timeline(cmd, &[], &signals, vk::Fence::null())?;
-
-        let semaphores = [self.completion_semaphore];
-        let values = [completion_value];
-        let wait = vk::SemaphoreWaitInfo::default()
-            .semaphores(&semaphores)
-            .values(&values);
-        // SAFETY: the semaphore is this device's and the value was just signalled by the submit.
-        unsafe { self.device.wait_semaphores(&wait, u64::MAX) }
-            .map_err(|e| RhiError::SyncError(e.into()))?;
-        Ok(())
+        self.wait_for_completion(completion_value)
+            .map_err(|e| RhiError::SyncError(e.into()))
     }
 
     pub fn wait_for_frame(&self, frame_index: usize) {
         let value = self.frames.borrow()[frame_index].value;
-        if value == 0 {
-            return;
+        if value != 0 {
+            self.wait_for_completion(value)
+                .expect("Failed to wait for Vulkan frame completion");
         }
-        let semaphores = [self.completion_semaphore];
-        let values = [value];
-        let wait = vk::SemaphoreWaitInfo::default()
-            .semaphores(&semaphores)
-            .values(&values);
-        unsafe { self.device.wait_semaphores(&wait, u64::MAX) }
-            .expect("Failed to wait for Vulkan frame completion");
     }
 
     pub fn wait_idle(&self) {
@@ -466,7 +462,7 @@ fn semaphore_submit<'a>(semaphore: vk::Semaphore, value: u64) -> vk::SemaphoreSu
         .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
 }
 
-fn timeline_waits<'a>(
+fn timeline_entries<'a>(
     pairs: &[(&TimelineSemaphore, u64)],
 ) -> SmallVec<[vk::SemaphoreSubmitInfo<'a>; 4]> {
     pairs

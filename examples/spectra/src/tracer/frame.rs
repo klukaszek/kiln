@@ -120,7 +120,7 @@ impl PathTracer {
         cmd: &mut CommandBuffer,
         camera: &Camera,
     ) -> render::Result<()> {
-        self.frame_arenas.reset(ctx.slot);
+        self.frame_arena.reset(ctx.slot);
 
         let extent = self.film_extent(ctx.extent);
         let camera = CameraGpu::new(camera, extent);
@@ -182,23 +182,26 @@ impl PathTracer {
 
         let film = self.film.extent;
         let progress = self.schedule.progress(self.film.pass_count);
-        let root = self.frame_arenas.upload(
-            ctx.slot,
-            &DisplayRoot {
-                film: accum.gpu().cast(),
-                cmf: self.cmf.gpu(),
-                display_width: ctx.extent.x,
-                display_height: ctx.extent.y,
-                film_width: film.x,
-                film_height: film.y,
-                film_stride: FILM_STRIDE,
-                completed_samples: progress.completed_samples,
-                remaining_phases: progress.remaining_phases,
-                target_is_srgb: u32::from(self.display_target_is_srgb),
-                pixel_stride: self.schedule.pixel_stride,
-                spectral_capture: u32::from(self.spectral_capture),
-            },
-        );
+        let root = self
+            .frame_arena
+            .upload(
+                ctx.slot,
+                &DisplayRoot {
+                    film: accum.gpu().cast(),
+                    cmf: self.cmf.gpu(),
+                    display_width: ctx.extent.x,
+                    display_height: ctx.extent.y,
+                    film_width: film.x,
+                    film_height: film.y,
+                    film_stride: FILM_STRIDE,
+                    completed_samples: progress.completed_samples,
+                    remaining_phases: progress.remaining_phases,
+                    target_is_srgb: u32::from(self.display_target_is_srgb),
+                    pixel_stride: self.schedule.pixel_stride,
+                    spectral_capture: u32::from(self.spectral_capture),
+                },
+            )
+            .expect("frame arena exhausted");
 
         cmd.set_pipeline(&self.pipelines.display);
         cmd.draw(root, 3, 1, 0, 0);
@@ -218,44 +221,47 @@ impl PathTracer {
         } = dispatch;
         let resources = &self.scene;
         let accum = self.film.accum();
-        let root = self.frame_arenas.upload(
-            ctx.slot,
-            &TraceRoot {
-                cam_pos: camera.pos,
-                cam_right: camera.right,
-                cam_up: camera.up,
-                cam_forward: camera.forward,
-                lens: camera.lens,
-                film: accum.gpu(),
-                triangles: resources.triangles.gpu(),
-                emissive_hits: resources.emissive_hits.gpu(),
-                instances: resources.instances.gpu(),
-                materials: resources.materials.gpu(),
-                lights: resources.lights.gpu(),
-                mesh_light_triangles: resources.mesh_light_triangles.gpu(),
-                mesh_light_cdf: resources.mesh_light_cdf.gpu(),
-                light_spectrum: resources.light_spectrum.gpu(),
-                material_emission_spectrum: resources.material_emission_spectrum.gpu(),
-                spectrum: resources.spectrum.gpu(),
-                sensor_spectrum: resources.sensor_spectrum.gpu(),
-                reflectance: resources.reflectance.gpu(),
-                texture_bindings: resources.texture_bindings.gpu(),
-                texture_basis: resources.texture_basis.gpu(),
-                sobol: self.sobol.gpu(),
-                tlas: resources.accel.tlas.gpu(),
-                film_width: extent.x,
-                film_height: extent.y,
-                pass_start: batch.start,
-                pass_count: batch.count,
-                settings: glam::UVec4::new(
-                    self.scene.lights.len(),
-                    self.schedule.pixel_stride,
-                    self.schedule.pixel_stride * self.schedule.pixel_stride,
-                    u32::from(self.spectral_capture),
-                ),
-                pad: UVec2::ZERO,
-            },
-        );
+        let root = self
+            .frame_arena
+            .upload(
+                ctx.slot,
+                &TraceRoot {
+                    cam_pos: camera.pos,
+                    cam_right: camera.right,
+                    cam_up: camera.up,
+                    cam_forward: camera.forward,
+                    lens: camera.lens,
+                    film: accum.gpu(),
+                    triangles: resources.triangles.gpu(),
+                    emissive_hits: resources.emissive_hits.gpu(),
+                    instances: resources.instances.gpu(),
+                    materials: resources.materials.gpu(),
+                    lights: resources.lights.gpu(),
+                    mesh_light_triangles: resources.mesh_light_triangles.gpu(),
+                    mesh_light_cdf: resources.mesh_light_cdf.gpu(),
+                    light_spectrum: resources.light_spectrum.gpu(),
+                    material_emission_spectrum: resources.material_emission_spectrum.gpu(),
+                    spectrum: resources.spectrum.gpu(),
+                    sensor_spectrum: resources.sensor_spectrum.gpu(),
+                    reflectance: resources.reflectance.gpu(),
+                    texture_bindings: resources.texture_bindings.gpu(),
+                    texture_basis: resources.texture_basis.gpu(),
+                    sobol: self.sobol.gpu(),
+                    tlas: resources.accel.tlas.gpu(),
+                    film_width: extent.x,
+                    film_height: extent.y,
+                    pass_start: batch.start,
+                    pass_count: batch.count,
+                    settings: glam::UVec4::new(
+                        self.scene.lights.len(),
+                        self.schedule.pixel_stride,
+                        self.schedule.pixel_stride * self.schedule.pixel_stride,
+                        u32::from(self.spectral_capture),
+                    ),
+                    pad: UVec2::ZERO,
+                },
+            )
+            .expect("frame arena exhausted");
 
         cmd.set_pipeline(&self.pipelines.trace);
         let stride = self.schedule.pixel_stride;
@@ -279,14 +285,17 @@ impl PathTracer {
     fn record_film_clear(&mut self, ctx: &RenderFrame<'_>, cmd: &mut CommandBuffer) {
         let accum = self.film.accum();
         let float_count = self.film.element_count;
-        let root = self.frame_arenas.upload(
-            ctx.slot,
-            &ClearRoot {
-                film: accum.gpu(),
-                count: float_count,
-                pad: 0,
-            },
-        );
+        let root = self
+            .frame_arena
+            .upload(
+                ctx.slot,
+                &ClearRoot {
+                    film: accum.gpu(),
+                    count: float_count,
+                    pad: 0,
+                },
+            )
+            .expect("frame arena exhausted");
 
         cmd.set_pipeline(&self.pipelines.clear);
         cmd.dispatch(root, float_count.div_ceil(CLEAR_THREADS), 1, 1);

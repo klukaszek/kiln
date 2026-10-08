@@ -1,9 +1,9 @@
 //! Device creation and the top-level resource management API.
 
-use crate::accel::AccelerationStructure;
+use crate::accel::{AccelerationStructure, TlasInstances};
 use crate::command::CommandBuffer;
 use crate::error::{RhiError, RhiResult};
-use crate::memory::{Allocation, DEFAULT_ALIGN, GpuPod, MemoryType};
+use crate::memory::{Allocation, DEFAULT_ALIGN, FrameArena, GpuPod, MemoryType};
 use crate::pipeline::{
     ComputePso, ComputePsoDesc, GraphicsPso, GraphicsPsoDesc, MeshletPso, MeshletPsoDesc,
 };
@@ -15,7 +15,7 @@ use crate::surface::{Surface, SurfaceDesc};
 use crate::swapchain::{Swapchain, SwapchainDesc};
 use crate::sync::TimelineSemaphore;
 use crate::texture::{Texture, TextureDesc, TextureSizeAlign, TextureViewDesc, ViewKind};
-use crate::types::{BindlessCapacity, BlasDesc, GpuPtr, TextureHandle, TlasDesc, TlasInstance};
+use crate::types::{BindlessCapacity, BlasDesc, GpuPtr, TextureHandle, TlasDesc};
 use std::rc::Rc;
 
 /// Which GPU backend to use.
@@ -131,6 +131,20 @@ macro_rules! impl_device_resource {
 impl<T> DeviceResource for Allocation<T> {
     fn destroy_on(self, device: &Device) {
         device.inner.destroy_allocation(self.inner)
+    }
+}
+
+impl DeviceResource for FrameArena {
+    fn destroy_on(self, device: &Device) {
+        for slot in self.slots {
+            slot.into_allocation().destroy_on(device);
+        }
+    }
+}
+
+impl DeviceResource for TlasInstances {
+    fn destroy_on(self, device: &Device) {
+        self.allocation.destroy_on(device)
     }
 }
 
@@ -402,38 +416,19 @@ impl Device {
         self.create(|inner| inner.create_tlas(desc))
     }
 
-    /// Size in bytes of one native TLAS instance descriptor for this backend. The instance
-    /// buffer passed to `build_tlas` must use this stride; fill entries with
-    /// [`write_tlas_instance`](Self::write_tlas_instance).
+    /// Size in bytes of one native TLAS instance descriptor for this backend. Only needed when
+    /// the GPU writes instances itself; [`TlasInstances`] handles it otherwise.
     pub fn tlas_instance_stride(&self) -> usize {
         self.inner.tlas_instance_stride()
     }
 
-    /// Encode `instance` into slot `index` of a CPU-mapped instance buffer, using the active
-    /// backend's native instance layout (Vulkan `VkAccelerationStructureInstanceKHR`; Metal
-    /// indirect descriptor). Size the buffer as `instance_count * tlas_instance_stride()`.
-    pub fn write_tlas_instance(
-        &self,
-        dst: &mut Allocation,
-        index: usize,
-        instance: &TlasInstance,
-    ) -> RhiResult<()> {
-        let stride = self.tlas_instance_stride() as u64;
-        let base = dst.mapped().ok_or_else(|| {
-            RhiError::AllocationFailed("instance buffer is not CPU-mapped".into())
-        })?;
-        let slot = base.byte_offset(stride.saturating_mul(index as u64));
-        if slot.byte_len() < stride {
-            return Err(RhiError::AllocationFailed(
-                format!("TLAS instance {index} (stride {stride}) exceeds the instance buffer")
-                    .into(),
-            ));
-        }
-        // SAFETY: `slot` covers at least `stride` bytes of a live mapping, checked just above,
-        // and `&mut self` on `dst` rules out any other reference to them.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(slot.cpu(), stride as usize) };
-        self.inner.write_tlas_instance(bytes, instance);
-        Ok(())
+    /// Upload-visible storage for `count` TLAS instances, in this backend's instance layout.
+    pub fn create_tlas_instances(&self, count: u32) -> RhiResult<TlasInstances> {
+        let size = (count as u64 * TlasInstances::STRIDE as u64).max(1);
+        Ok(TlasInstances {
+            allocation: self.allocate_bytes(size, MemoryType::Upload)?,
+            count,
+        })
     }
 
     pub fn create_command_buffer(&self) -> RhiResult<CommandBuffer> {

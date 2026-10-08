@@ -2,7 +2,7 @@
 
 mod common;
 
-use kiln_rhi::{BumpAllocator, MemoryType};
+use kiln_rhi::{BumpAllocator, FrameArena, MemoryType};
 
 /// `Default` memory is CPU-mapped GPU memory: a write through the mapped pointer must read
 /// straight back (the dual-pointer model the whole RHI is built on).
@@ -227,4 +227,26 @@ fn bump_reset_reuses_space() {
     assert_eq!(reused.gpu(), first_gpu, "reset reuses the same gpu address");
 
     device.destroy(bump.into_allocation());
+}
+
+/// Each frame slot is separate memory, and resetting one leaves the others' data in place.
+#[test]
+fn frame_arena_slots_are_independent() {
+    let (device, _gpu) = common::device();
+    let mut arena = FrameArena::new(&device, 1024).expect("frame arena");
+
+    let first = arena.upload(0, &1u32).expect("slot 0");
+    let second = arena.upload(1, &2u32).expect("slot 1");
+    assert_ne!(first, second, "slots must not share memory");
+
+    arena.reset(0);
+    assert_eq!(arena.slot(0).used(), 0, "reset reclaims the slot");
+    assert!(arena.slot(1).used() > 0, "other slots are untouched");
+    assert_eq!(
+        arena.upload(0, &3u32).expect("slot 0 again"),
+        first,
+        "a reset slot is reused from its start"
+    );
+
+    device.destroy(arena);
 }

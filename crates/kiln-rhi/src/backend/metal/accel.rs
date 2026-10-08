@@ -139,7 +139,8 @@ pub(crate) fn tlas_descriptor(
 
 /// Metal's instance acceleration structure uses the indirect layout, which names each BLAS by
 /// `gpuResourceID`.
-const TLAS_INSTANCE_STRIDE: usize = size_of::<MTLIndirectAccelerationStructureInstanceDescriptor>();
+pub(crate) const TLAS_INSTANCE_STRIDE: usize =
+    size_of::<MTLIndirectAccelerationStructureInstanceDescriptor>();
 
 impl MetalDevice {
     pub fn create_blas(&self, desc: &BlasDesc<'_>) -> RhiResult<AccelerationStructure> {
@@ -160,59 +161,6 @@ impl MetalDevice {
 
     pub fn tlas_instance_stride(&self) -> usize {
         TLAS_INSTANCE_STRIDE
-    }
-
-    /// Encode `inst` into `dst` in Metal's indirect instance layout.
-    /// `inst.acceleration_structure_reference` must be a BLAS handle (`blas.gpu()`).
-    pub fn write_tlas_instance(&self, dst: &mut [u8], inst: &TlasInstance) {
-        // `transform` is row-major 3x4; Metal's packed 4x3 is column-major.
-        let t = &inst.transform;
-        let col = |c: usize| MTLPackedFloat3 {
-            x: t[0][c],
-            y: t[1][c],
-            z: t[2][c],
-        };
-        // SAFETY: the handle came from `gpuResourceID().to_raw()` on a live structure.
-        let resource_id =
-            unsafe { MTLResourceID::from_raw(inst.acceleration_structure_reference.0) };
-
-        let instance_flags =
-            InstanceFlags::from_bits_retain((inst.instance_sbt_offset_and_flags >> 24) as u8);
-        let mut options = MTLAccelerationStructureInstanceOptions::empty();
-        if instance_flags.contains(InstanceFlags::TRIANGLE_FACING_CULL_DISABLE) {
-            options |= MTLAccelerationStructureInstanceOptions::DisableTriangleCulling;
-        }
-        if instance_flags.contains(InstanceFlags::TRIANGLE_FLIP_FACING) {
-            options |=
-                MTLAccelerationStructureInstanceOptions::TriangleFrontFacingWindingCounterClockwise;
-        }
-        if instance_flags.contains(InstanceFlags::FORCE_OPAQUE) {
-            options |= MTLAccelerationStructureInstanceOptions::Opaque;
-        }
-        if instance_flags.contains(InstanceFlags::FORCE_NO_OPAQUE) {
-            options |= MTLAccelerationStructureInstanceOptions::NonOpaque;
-        }
-
-        let desc = MTLIndirectAccelerationStructureInstanceDescriptor {
-            transformationMatrix: MTLPackedFloat4x3 {
-                columns: [col(0), col(1), col(2), col(3)],
-            },
-            options,
-            mask: (inst.instance_custom_index_and_mask >> 24) & 0xFF,
-            intersectionFunctionTableOffset: inst.instance_sbt_offset_and_flags & 0x00FF_FFFF,
-            userID: inst.instance_custom_index_and_mask & 0x00FF_FFFF,
-            accelerationStructureID: resource_id,
-        };
-        assert!(dst.len() >= TLAS_INSTANCE_STRIDE);
-        // SAFETY: `dst` holds at least one descriptor, checked above. Unaligned because the
-        // caller's buffer is only stride-aligned.
-        unsafe {
-            std::ptr::write_unaligned(
-                dst.as_mut_ptr()
-                    .cast::<MTLIndirectAccelerationStructureInstanceDescriptor>(),
-                desc,
-            );
-        }
     }
 
     /// Allocate a structure and its scratch buffer and make both resident.
@@ -257,5 +205,57 @@ impl MetalDevice {
     pub fn destroy_accel(&self, accel: Box<MetalAccelerationStructure>) {
         self.queue
             .release_resource(MetalRetiredResource::Accel(accel));
+    }
+}
+
+/// Encode `inst` into `dst` in Metal's indirect instance layout.
+/// `inst.acceleration_structure_reference` must be a BLAS handle (`blas.gpu()`).
+pub(crate) fn encode_tlas_instance(dst: &mut [u8], inst: &TlasInstance) {
+    // `transform` is row-major 3x4; Metal's packed 4x3 is column-major.
+    let t = &inst.transform;
+    let col = |c: usize| MTLPackedFloat3 {
+        x: t[0][c],
+        y: t[1][c],
+        z: t[2][c],
+    };
+    // SAFETY: the handle came from `gpuResourceID().to_raw()` on a live structure.
+    let resource_id = unsafe { MTLResourceID::from_raw(inst.acceleration_structure_reference.0) };
+
+    let instance_flags =
+        InstanceFlags::from_bits_retain((inst.instance_sbt_offset_and_flags >> 24) as u8);
+    let mut options = MTLAccelerationStructureInstanceOptions::empty();
+    if instance_flags.contains(InstanceFlags::TRIANGLE_FACING_CULL_DISABLE) {
+        options |= MTLAccelerationStructureInstanceOptions::DisableTriangleCulling;
+    }
+    if instance_flags.contains(InstanceFlags::TRIANGLE_FLIP_FACING) {
+        options |=
+            MTLAccelerationStructureInstanceOptions::TriangleFrontFacingWindingCounterClockwise;
+    }
+    if instance_flags.contains(InstanceFlags::FORCE_OPAQUE) {
+        options |= MTLAccelerationStructureInstanceOptions::Opaque;
+    }
+    if instance_flags.contains(InstanceFlags::FORCE_NO_OPAQUE) {
+        options |= MTLAccelerationStructureInstanceOptions::NonOpaque;
+    }
+
+    let desc = MTLIndirectAccelerationStructureInstanceDescriptor {
+        transformationMatrix: MTLPackedFloat4x3 {
+            columns: [col(0), col(1), col(2), col(3)],
+        },
+        options,
+        mask: (inst.instance_custom_index_and_mask >> 24) & 0xFF,
+        intersectionFunctionTableOffset: inst.instance_sbt_offset_and_flags & 0x00FF_FFFF,
+        userID: inst.instance_custom_index_and_mask & 0x00FF_FFFF,
+        accelerationStructureID: resource_id,
+    };
+    assert!(dst.len() >= TLAS_INSTANCE_STRIDE);
+    // SAFETY: `dst` holds at least one descriptor, checked above. Unaligned because the
+    // caller's buffer is only stride-aligned.
+    unsafe {
+        std::ptr::write_unaligned(
+            dst.as_mut_ptr()
+                .cast::<MTLIndirectAccelerationStructureInstanceDescriptor>(),
+            desc,
+        );
     }
 }

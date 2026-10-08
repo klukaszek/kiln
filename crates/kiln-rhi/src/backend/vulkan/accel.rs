@@ -170,15 +170,8 @@ impl VulkanDevice {
         )
     }
 
-    /// Vulkan's native TLAS instance layout matches the public fields byte-for-byte.
     pub fn tlas_instance_stride(&self) -> usize {
-        size_of::<TlasInstance>()
-    }
-
-    /// The public layout is already Vulkan's: an [`AccelHandle`](crate::AccelHandle) is the
-    /// structure's device address, which is what the instance descriptor wants.
-    pub fn write_tlas_instance(&self, dst: &mut [u8], inst: &TlasInstance) {
-        dst[..size_of::<TlasInstance>()].copy_from_slice(inst.as_bytes());
+        TLAS_INSTANCE_STRIDE
     }
 
     /// Size a structure, allocate its storage and scratch, and create it.
@@ -287,4 +280,13 @@ impl VulkanDevice {
         self.queue
             .release_resource(VulkanRetiredResource::Accel(accel));
     }
+}
+
+/// Vulkan's native instance layout matches [`TlasInstance`] byte-for-byte.
+pub(crate) const TLAS_INSTANCE_STRIDE: usize = size_of::<TlasInstance>();
+
+/// The public layout is already Vulkan's: an [`AccelHandle`](crate::AccelHandle) is the
+/// structure's device address, which is what the instance descriptor wants.
+pub(crate) fn encode_tlas_instance(dst: &mut [u8], inst: &TlasInstance) {
+    dst[..TLAS_INSTANCE_STRIDE].copy_from_slice(inst.as_bytes());
 }

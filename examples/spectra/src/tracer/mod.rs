@@ -1,6 +1,5 @@
 //! Progressive spectral path tracer.
 
-mod arena;
 mod device;
 mod film;
 mod frame;
@@ -10,13 +9,12 @@ pub mod spectrum;
 mod upload;
 
 use glam::{UVec2, Vec3, Vec4};
-use kiln_rhi::{Device, Format};
+use kiln_rhi::{Device, Format, FrameArena};
 
 use self::spectrum::Spd;
 use crate::render::{self as render, Error};
 use crate::scene::Scene;
 
-use arena::FrameArenas;
 use device::GpuScene;
 use film::Film;
 use program::Pipelines;
@@ -119,7 +117,7 @@ impl Default for Settings {
 pub struct PathTracer {
     scene: GpuScene,
     pipelines: Pipelines,
-    frame_arenas: FrameArenas,
+    frame_arena: FrameArena,
     /// Both are constant for the life of the device, so they are built once rather than per scene.
     sobol: GpuArray<u32>,
     cmf: GpuArray<Vec4>,
@@ -148,7 +146,7 @@ impl PathTracer {
             settings.pixel_stride,
         )?;
         let scene = GpuScene::build(device, scene, light_spectrum)?;
-        let (pipelines, frame_arenas, sobol, cmf) =
+        let (pipelines, frame_arena, sobol, cmf) =
             match Self::device_resources(device, color_format) {
                 Ok(resources) => resources,
                 Err(error) => {
@@ -160,7 +158,7 @@ impl PathTracer {
         Ok(Self {
             scene,
             pipelines,
-            frame_arenas,
+            frame_arena,
             sobol,
             cmf,
             film: Film::new(FILM_STRIDE),
@@ -177,7 +175,7 @@ impl PathTracer {
     fn device_resources(
         device: &Device,
         color_format: Format,
-    ) -> render::Result<(Pipelines, FrameArenas, GpuArray<u32>, GpuArray<Vec4>)> {
+    ) -> render::Result<(Pipelines, FrameArena, GpuArray<u32>, GpuArray<Vec4>)> {
         let pipelines = Pipelines::new(device, color_format)?;
 
         let mut uploads = GpuUploadBatch::new(device)?;
@@ -185,12 +183,17 @@ impl PathTracer {
         let cmf = uploads.upload(&cmf_texels())?;
         uploads.submit()?;
 
-        match FrameArenas::new(device, FRAME_ARENA_SIZE, "spectral-frame-arena") {
-            Ok(frame_arenas) => Ok((pipelines, frame_arenas, sobol, cmf)),
+        match FrameArena::new(device, FRAME_ARENA_SIZE) {
+            Ok(frame_arena) => Ok((
+                pipelines,
+                frame_arena.labeled("spectral-frame-arena"),
+                sobol,
+                cmf,
+            )),
             Err(error) => {
                 sobol.destroy(device);
                 cmf.destroy(device);
-                Err(error)
+                Err(error.into())
             }
         }
     }
@@ -297,14 +300,14 @@ impl PathTracer {
     pub fn destroy(self, device: &Device) {
         let Self {
             scene,
-            frame_arenas,
+            frame_arena,
             sobol,
             cmf,
             film,
             ..
         } = self;
         film.destroy(device);
-        frame_arenas.destroy(device);
+        device.destroy(frame_arena);
         sobol.destroy(device);
         cmf.destroy(device);
         scene.destroy(device);

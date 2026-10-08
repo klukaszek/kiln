@@ -9,6 +9,7 @@ use glam::Vec4;
 use kiln_rhi::{
     AccelerationStructure, Allocation, BlasDesc, BlasGeometry, BlasIndices, BlasMeshDesc,
     BuildAccelFlags, Device, GeometryFlags, GpuPtr, MemoryType, RhiResult, TlasDesc, TlasInstance,
+    TlasInstances,
 };
 
 use crate::scene::{MAX_PRIMS, ROWS_PER_PRIM};
@@ -37,7 +38,7 @@ pub(super) struct SceneResources {
     /// Per-cell distance to the nearest primitive, from the cell's bounding circle outwards.
     pub(super) cell_clear: Allocation<f32>,
     /// Sized by the backend's instance stride, which is not `size_of::<TlasInstance>()` on Metal.
-    instances: Allocation,
+    instances: TlasInstances,
     blas: AccelerationStructure,
     pub(super) tlas: AccelerationStructure,
     /// Primitives in the scene currently uploaded.
@@ -73,12 +74,11 @@ impl SceneResources {
         })?;
 
         let mut instances = device
-            .allocate_bytes(device.tlas_instance_stride() as u64, MemoryType::Upload)?
+            .create_tlas_instances(1)?
             .labeled("hrc-tlas-instances");
         // One instance at the identity, written once: the BLAS is rebuilt in place, so neither its
         // handle nor its transform ever changes.
-        device.write_tlas_instance(
-            &mut instances,
+        instances.write(
             0,
             &TlasInstance {
                 transform: [
@@ -153,10 +153,6 @@ fn blas_mesh(vertices: GpuPtr<[f32; 3]>, indices: GpuPtr<u32>, prims: u32) -> Bl
     }
 }
 
-fn tlas_desc(instances: &Allocation) -> TlasDesc {
-    TlasDesc {
-        instance_buffer: instances.gpu().cast(),
-        instance_count: 1,
-        flags: BuildAccelFlags::PREFER_FAST_BUILD,
-    }
+fn tlas_desc(instances: &TlasInstances) -> TlasDesc {
+    instances.tlas_desc(BuildAccelFlags::PREFER_FAST_BUILD)
 }

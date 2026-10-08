@@ -5,7 +5,7 @@ mod common;
 use kiln_rhi::gpu_struct;
 use kiln_rhi::{
     BlasDesc, BlasGeometry, BlasMeshDesc, BuildAccelFlags, ComputePsoDesc, GeometryFlags,
-    MemoryType, ShaderStage, StageFlags, TlasDesc, TlasInstance,
+    MemoryType, ShaderStage, StageFlags, TlasInstance,
 };
 
 gpu_struct! {
@@ -43,7 +43,7 @@ struct Scene {
     blas: kiln_rhi::AccelerationStructure,
     tlas: kiln_rhi::AccelerationStructure,
     vbuf: kiln_rhi::Allocation<[f32; 3]>,
-    instbuf: kiln_rhi::Allocation,
+    instbuf: kiln_rhi::TlasInstances,
     pso: kiln_rhi::ComputePso,
 }
 
@@ -112,10 +112,7 @@ fn build_scene(device: &kiln_rhi::Device) -> Scene {
     });
 
     // Identity instance referencing the BLAS.
-    let stride = device.tlas_instance_stride();
-    let mut instbuf = device
-        .allocate_bytes(stride as u64, MemoryType::Upload)
-        .expect("instance buffer");
+    let mut instbuf = device.create_tlas_instances(1).expect("instance buffer");
     let instance = TlasInstance {
         transform: [
             [1.0, 0.0, 0.0, 0.0],
@@ -126,15 +123,13 @@ fn build_scene(device: &kiln_rhi::Device) -> Scene {
         instance_sbt_offset_and_flags: 0,
         acceleration_structure_reference: blas.gpu(),
     };
-    device
-        .write_tlas_instance(&mut instbuf, 0, &instance)
-        .expect("write instance");
+    instbuf.write(0, &instance).expect("write instance");
+    assert!(
+        instbuf.write(1, &instance).is_err(),
+        "a write past the last instance must be refused"
+    );
 
-    let tlas_desc = TlasDesc {
-        instance_buffer: instbuf.gpu().cast(),
-        instance_count: 1,
-        flags: BuildAccelFlags::PREFER_FAST_TRACE,
-    };
+    let tlas_desc = instbuf.tlas_desc(BuildAccelFlags::PREFER_FAST_TRACE);
     let tlas = device.create_tlas(&tlas_desc).expect("create_tlas");
 
     common::timed("build TLAS · submit+wait", || {

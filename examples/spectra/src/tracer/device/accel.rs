@@ -1,6 +1,6 @@
 use kiln_rhi::{
-    AccelerationStructure, Allocation, BlasDesc, BlasGeometry, BlasIndices, BlasMeshDesc,
-    BuildAccelFlags, Device, GeometryFlags, MemoryType, TlasDesc, TlasInstance,
+    AccelerationStructure, BlasDesc, BlasGeometry, BlasIndices, BlasMeshDesc, BuildAccelFlags,
+    Device, GeometryFlags, TlasInstance, TlasInstances,
 };
 
 use crate::render;
@@ -13,7 +13,7 @@ use crate::tracer::upload::{GpuArray, GpuUploadBatch};
 /// important for editor transforms: changing an instance transform must not rebuild the scene's
 /// BLAS geometry.
 pub(crate) struct SceneAccel {
-    instance_buffer: Allocation,
+    instance_buffer: TlasInstances,
     blases: Vec<AccelerationStructure>,
     pub(crate) tlas: AccelerationStructure,
     ray_vertices: Vec<GpuArray<[f32; 3]>>,
@@ -97,7 +97,7 @@ struct Partial {
     blases: Vec<AccelerationStructure>,
     ray_vertices: Vec<GpuArray<[f32; 3]>>,
     ray_indices: Vec<GpuArray<u32>>,
-    instance_buffer: Option<Allocation>,
+    instance_buffer: Option<TlasInstances>,
 }
 
 impl Partial {
@@ -164,10 +164,8 @@ fn build_into(
         )?;
     }
 
-    let instance_buffer_size =
-        device.tlas_instance_stride() as u64 * scene.geometry.instances.len() as u64;
     partial.instance_buffer =
-        Some(device.allocate_bytes(instance_buffer_size, MemoryType::Upload)?);
+        Some(device.create_tlas_instances(scene.geometry.instances.len() as u32)?);
     let instance_buffer = partial
         .instance_buffer
         .as_mut()
@@ -230,12 +228,11 @@ fn build_tlas(
     device: &Device,
     blases: &[AccelerationStructure],
     scene: &Scene,
-    instance_buffer: &mut Allocation,
+    instance_buffer: &mut TlasInstances,
 ) -> render::Result<AccelerationStructure> {
     for (index, instance) in scene.geometry.instances.iter().enumerate() {
-        device.write_tlas_instance(
-            instance_buffer,
-            index,
+        instance_buffer.write(
+            index as u32,
             &TlasInstance {
                 transform: transform_rows(instance.transform),
                 instance_custom_index_and_mask: (index as u32) | (0xFF << 24),
@@ -244,11 +241,7 @@ fn build_tlas(
             },
         )?;
     }
-    let desc = TlasDesc {
-        instance_buffer: instance_buffer.gpu().cast(),
-        instance_count: scene.geometry.instances.len() as u32,
-        flags: BuildAccelFlags::PREFER_FAST_TRACE,
-    };
+    let desc = instance_buffer.tlas_desc(BuildAccelFlags::PREFER_FAST_TRACE);
     let tlas = device.create_tlas(&desc)?;
     let mut cmd = device.create_command_buffer()?;
     cmd.build_tlas(&tlas, &desc);

@@ -76,6 +76,8 @@ mod sealed {
 
     impl_sealed!(
         crate::accel::AccelerationStructure,
+        crate::accel::TlasInstances,
+        crate::memory::FrameArena,
         crate::pipeline::ComputePso,
         crate::pipeline::GraphicsPso,
         crate::pipeline::MeshletPso,
@@ -135,7 +137,7 @@ pub fn frame_scope<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
-pub use accel::AccelerationStructure;
+pub use accel::{AccelerationStructure, TlasInstances};
 pub use barrier::{HazardFlags, StageFlags};
 pub use command::{
     ColorAttachment, CommandBuffer, DepthAttachment, DispatchIndirectArgs, DrawIndexedIndirectArgs,
@@ -143,7 +145,9 @@ pub use command::{
 };
 pub use device::{Backend, Device, DeviceDesc, DeviceResource};
 pub use error::{ErrorDetail, RhiError, RhiResult};
-pub use memory::{Allocation, BumpAllocator, DEFAULT_ALIGN, GpuPod, Mapped, MemoryType};
+pub use memory::{
+    Allocation, BumpAllocator, DEFAULT_ALIGN, FrameArena, GpuPod, Mapped, MemoryType,
+};
 pub use pipeline::*;
 pub use query::QueryPool;
 pub use queue::{Queue, SubmitDesc};

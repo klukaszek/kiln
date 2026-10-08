@@ -1,6 +1,6 @@
 //! GPU memory allocation and pointer arithmetic.
 
-use crate::types::GpuPtr;
+use crate::types::{GpuPtr, MAX_FRAMES_IN_FLIGHT};
 use crate::{RhiError, RhiResult};
 use std::marker::PhantomData;
 use zerocopy::{FromBytes, IntoBytes};
@@ -405,4 +405,65 @@ fn aligned_bump_range(offset: u64, size: u64, align: u64, capacity: u64) -> Opti
     let aligned_offset = offset.checked_add(padding)?;
     let end = aligned_offset.checked_add(size)?;
     (end <= capacity).then_some((aligned_offset, end))
+}
+
+/// One [`BumpAllocator`] per frame in flight, for per-frame root data and staging.
+///
+/// Reset a slot at the start of the frame that uses it, once that slot's previous submission has
+/// completed: after [`Queue::acquire_image`](crate::Queue::acquire_image) or
+/// [`Device::wait_for_frame`](crate::Device::wait_for_frame) for it. A
+/// [`DeviceResource`](crate::DeviceResource): release it with
+/// [`Device::destroy`](crate::Device::destroy).
+pub struct FrameArena {
+    pub(crate) slots: [BumpAllocator; MAX_FRAMES_IN_FLIGHT],
+}
+
+impl FrameArena {
+    /// `bytes_per_frame` of upload memory for each frame in flight.
+    pub fn new(device: &crate::Device, bytes_per_frame: u64) -> RhiResult<Self> {
+        let mut slots = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            match device.allocate_bytes(bytes_per_frame, MemoryType::Upload) {
+                Ok(allocation) => slots.push(BumpAllocator::new(allocation)),
+                Err(error) => {
+                    for slot in slots {
+                        device.destroy(slot.into_allocation());
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let Ok(slots) = slots.try_into() else {
+            unreachable!("one arena was made per frame in flight")
+        };
+        Ok(Self { slots })
+    }
+
+    /// Name each slot `"{label}-{slot}"` in GPU captures.
+    pub fn labeled(self, label: &str) -> Self {
+        for (index, slot) in self.slots.iter().enumerate() {
+            slot.allocation.inner.set_label(&format!("{label}-{index}"));
+        }
+        self
+    }
+
+    /// Start a new frame in `slot`, reclaiming everything it held.
+    pub fn reset(&mut self, slot: usize) {
+        self.slots[slot].reset();
+    }
+
+    /// The arena behind `slot`, for [`alloc`](BumpAllocator::alloc) and friends.
+    pub fn slot(&self, slot: usize) -> &BumpAllocator {
+        &self.slots[slot]
+    }
+
+    /// Copy `value` into `slot` and return its GPU address. `None` when the slot is full.
+    pub fn upload<T: GpuPod>(&self, slot: usize, value: &T) -> Option<GpuPtr<T>> {
+        self.slots[slot].upload(value)
+    }
+
+    /// Copy `values` into `slot` and return the address of the first. `None` when it is full.
+    pub fn upload_slice<T: GpuPod>(&self, slot: usize, values: &[T]) -> Option<GpuPtr<T>> {
+        self.slots[slot].upload_slice(values)
+    }
 }

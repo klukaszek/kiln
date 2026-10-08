@@ -15,8 +15,7 @@ mod resources;
 
 use glam::{IVec2, UVec2, Vec4};
 use kiln_rhi::{
-    BumpAllocator, CommandBuffer, Device, Format, GpuPtr, MAX_FRAMES_IN_FLIGHT, MemoryType,
-    RhiResult, StageFlags,
+    CommandBuffer, Device, Format, FrameArena, GpuPtr, MemoryType, RhiResult, StageFlags,
 };
 
 use crate::scene::{self, Prim};
@@ -223,7 +222,7 @@ struct Layout {
 pub struct HrcRenderer {
     pipelines: Pipelines,
     resources: SceneResources,
-    arenas: [BumpAllocator; MAX_FRAMES_IN_FLIGHT],
+    arena: FrameArena,
     layout: Option<Layout>,
     out_res: UVec2,
     target_is_srgb: bool,
@@ -237,22 +236,12 @@ impl HrcRenderer {
     pub fn new(device: &Device, color_format: Format) -> RhiResult<Self> {
         let pipelines = Pipelines::new(device, color_format)?;
         let resources = SceneResources::new(device)?;
-        let arenas: Vec<BumpAllocator> = (0..MAX_FRAMES_IN_FLIGHT)
-            .map(|slot| {
-                let label = format!("hrc-frame-roots-{slot}");
-                device
-                    .allocate_bytes(ARENA_BYTES, MemoryType::Upload)
-                    .map(|allocation| BumpAllocator::new(allocation.labeled(&label)))
-            })
-            .collect::<RhiResult<_>>()?;
-        let arenas: [BumpAllocator; MAX_FRAMES_IN_FLIGHT] = arenas
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("built one arena per frame in flight"));
+        let arena = FrameArena::new(device, ARENA_BYTES)?.labeled("hrc-frame-roots");
 
         Ok(Self {
             pipelines,
             resources,
-            arenas,
+            arena,
             layout: None,
             out_res: UVec2::ZERO,
             target_is_srgb: matches!(color_format, Format::R8G8B8A8Srgb | Format::B8G8R8A8Srgb),
@@ -425,7 +414,7 @@ impl HrcRenderer {
             res,
             out_res,
         } = *frame;
-        self.arenas[slot].reset();
+        self.arena.reset(slot);
         self.out_res = out_res;
 
         // Order this frame's writes after the previous in-flight frame's reads. Every cascade and
@@ -458,8 +447,9 @@ impl HrcRenderer {
         self.resources.prim_count = prims.len() as u32;
 
         let bytes = std::mem::size_of_val(self.packed.as_slice()) as u64;
-        let staging = self.arenas[slot]
-            .upload_slice(&self.packed)
+        let staging = self
+            .arena
+            .upload_slice(slot, &self.packed)
             .expect("frame arena exhausted");
         cmd.memcpy(self.resources.scene.gpu(), staging, bytes);
         cmd.barrier(StageFlags::TRANSFER, StageFlags::COMPUTE);
@@ -783,7 +773,7 @@ impl HrcRenderer {
     }
 
     pub fn reset_arena(&mut self, slot: usize) {
-        self.arenas[slot].reset();
+        self.arena.reset(slot);
     }
 
     fn dispatch_field(&self, cmd: &mut CommandBuffer, root: GpuPtr<ReferenceRoot>) {
@@ -796,16 +786,14 @@ impl HrcRenderer {
     }
 
     fn upload<T: kiln_rhi::GpuPod>(&self, slot: usize, root: &T) -> GpuPtr<T> {
-        self.arenas[slot]
-            .upload(root)
+        self.arena
+            .upload(slot, root)
             .expect("frame arena exhausted")
     }
 
     pub fn destroy(self, device: &Device) {
         self.resources.destroy(device);
-        for arena in self.arenas {
-            device.destroy(arena.into_allocation());
-        }
+        device.destroy(self.arena);
         if let Some(layout) = self.layout {
             device.destroy(layout.cascades);
             device.destroy(layout.field);
